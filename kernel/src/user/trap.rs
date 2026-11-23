@@ -171,6 +171,18 @@ fn asid_generation() -> u64 {
     unsafe { (*p).load(Ordering::Acquire) }
 }
 
+/// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
+fn debug_stat_call(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
+            .map_err(|e| (e, None, None))?;
+        Ok((Some(thread::wake_stat(a[1])), None))
+    })
+}
+
 /// The attention epoch (L12b): bumped, under the big lock, whenever a process is marked killed or stopped, **after** the mark is set and
 /// before any IPI that tells a hart to look. A hart that returns to user mode records the epoch it saw (`activate_current`, before it
 /// reads the marks); a trap from user mode that finds the epoch unchanged has nothing to die or stop for, and needs no big lock.
@@ -588,7 +600,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
         nr::THREAD_EXIT => leave(a[0] as i32, false),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
-        nr::DEBUG_STAT => frame.set_return(0, Some(thread::wake_stat(a[0])), None),
+        nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)
@@ -616,6 +628,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::JOB_KILL
         | nr::JOB_ROOT
         | nr::RESOURCE_ROOT
+        | nr::DEBUG_ROOT
         | nr::PROCESS_SELF
         | nr::PROCESS_MAP
         | nr::PROCESS_UNMAP
@@ -830,7 +843,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     }
     match n {
         nr::DEBUG_WRITE => {
-            let (ptr, len) = (a[0], a[1] as usize);
+            // (HD4: a debug resource handle with WRITE: no program writes to the console, or forges a test line, without one)
+            ipc::debug_of(objs, &p.handles, h(0), Rights::WRITE).map_err(|e| (e, None, None))?;
+            let (ptr, len) = (a[1], a[2] as usize);
             if len > MAX_DEBUG_WRITE {
                 return fail(Status::TooBig);
             }

@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
 
-pub const MAIN_PRIO: u8 = 40;
+pub const MAIN_PRIO: u8 = crate::MAIN_PRIO;
 /// Bytes of heap a test may keep for the kernel's lazily grown containers.
 const SLACK: usize = 1024;
 /// How many ticks late a wake may be. Fixed priority wakes the thread at once; plain

@@ -172,6 +172,9 @@ pub mod rights {
         );
         /// The root resource: mint device memory, DMA buffers and interrupts. Held only by early boot code.
         pub const RESOURCE: Rights = Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0);
+        /// A debug resource (HD4): `debug_write` needs WRITE, `debug_stat` INSPECT; it can be duplicated and handed on.
+        pub const DEBUG: Rights =
+            Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WRITE.0 | Self::INSPECT.0);
         /// An interrupt object: wait for it, inspect it, acknowledge it (MANAGE).
         pub const INTERRUPT: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WAIT.0 | Self::INSPECT.0 | Self::MANAGE.0,
@@ -220,6 +223,24 @@ pub mod child_flags {
 pub mod map_flags {
     /// The kernel picks a free place at random (`vaddr` must be 0); the address is returned in `a1`.
     pub const ANYWHERE: u64 = 8;
+    /// Reserved (HD5, KERNEL-V1-SPEC 7.5): a shadow-stack mapping. Named so that adding the mechanism changes nothing that exists; refused with
+    /// NOT_SUPPORTED.
+    pub const SHADOW_STACK: u64 = 1 << 8;
+    /// Reserved (HD5): refused with NOT_SUPPORTED.
+    pub const RESERVED_9: u64 = 1 << 9;
+}
+
+/// The `features` word of `process_start` (its sixth argument, HD5): it must be zero. The named bits are mechanisms this kernel does not have, and
+/// are refused with NOT_SUPPORTED; any other bit is INVALID_ARGS.
+pub mod start_features {
+    /// Forward-edge control-flow integrity (landing pads).
+    pub const LANDING_PADS: u64 = 1;
+    /// A shadow stack.
+    pub const SHADOW_STACK: u64 = 2;
+    /// Pointer masking.
+    pub const POINTER_MASKING: u64 = 4;
+    /// The named bits.
+    pub const ALL: u64 = LANDING_PADS | SHADOW_STACK | POINTER_MASKING;
 }
 
 /// Modes of `process_clone_region` (its fourth argument, MM8).
@@ -320,11 +341,13 @@ pub mod time {
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
 pub mod syscall {
+    /// `debug_write(debug, ptr, len)`: needs a debug resource handle with WRITE (HD4).
     pub const DEBUG_WRITE: usize = 0;
     pub const PROCESS_EXIT: usize = 1;
     pub const THREAD_YIELD: usize = 2;
     pub const CLOCK_GET: usize = 3;
     /// A kernel counter by index (a measuring aid for the boot-time suite, like `DEBUG_WRITE`).
+    /// `debug_stat(debug, which)`: needs a debug resource handle with INSPECT (HD4).
     pub const DEBUG_STAT: usize = 4;
     pub const HANDLE_CLOSE: usize = 10;
     pub const HANDLE_DUPLICATE: usize = 11;
@@ -430,6 +453,8 @@ pub mod syscall {
     pub const FUTEX_WAKE: usize = 111;
     pub const FUTEX_LOCK_PI: usize = 112;
     pub const FUTEX_UNLOCK_PI: usize = 113;
+    /// The debug resource (HD4): a privileged process (the one the kernel started) gets the handle that `debug_write` and `debug_stat` now need.
+    pub const DEBUG_ROOT: usize = 114;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }
@@ -506,6 +531,8 @@ pub mod thread_state {
     pub const FP: u64 = 2;
     /// vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each.
     pub const VECTOR: u64 = 3;
+    /// Reserved (HD5): the shadow-stack pointer and the landing-pad expectation. Refused with NOT_SUPPORTED.
+    pub const CFI: u64 = 4;
     /// Words of the GENERAL layout.
     pub const GENERAL_WORDS: usize = 32;
     /// Words of the FP layout.

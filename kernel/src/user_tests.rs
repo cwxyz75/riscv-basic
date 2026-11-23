@@ -8,7 +8,7 @@ use abi::status::Status;
 use alloc::format;
 use alloc::string::String;
 
-type Outcome = Result<(), String>;
+use crate::report::Outcome;
 
 /// The exit code of a process ended by a fault is `-1000 - kind` (SYSCALLS.md, "User address space and process start";
 /// `abi::arch::fault`): every page fault is one kind, whatever the access.
@@ -151,12 +151,7 @@ fn idle_harts_take_no_big_lock_for_their_ticks() -> Outcome {
     Ok(())
 }
 
-pub struct Report {
-    /// (name, outcome) of each kernel-side test.
-    pub tests: alloc::vec::Vec<(String, Outcome)>,
-    /// `##TEST` lines the user suite reported: (pass, fail), already counted by `user`.
-    pub user_reported: (u32, u32),
-}
+pub use crate::report::Report;
 
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn run_all() -> Report {

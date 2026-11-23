@@ -591,7 +591,7 @@ fn thread_and_process_info_report_cpu_time() {
 #[test]
 fn the_root_handles_are_for_privileged_processes_only() {
     let (mut w, _) = world();
-    for n in [nr::JOB_ROOT, nr::RESOURCE_ROOT] {
+    for n in [nr::JOB_ROOT, nr::RESOURCE_ROOT, nr::DEBUG_ROOT] {
         assert_eq!(w.err(n, [0; 6]), Status::AccessDenied);
     }
     w.procs.get_mut(&1).unwrap().privileged = true;
@@ -601,6 +601,33 @@ fn the_root_handles_are_for_privileged_processes_only() {
         JobId::ROOT
     );
     assert!(w.ok(nr::RESOURCE_ROOT, [0; 6]).0.is_some());
+    // HD4: the debug resource, with the rights `debug_write` (WRITE) and `debug_stat` (INSPECT) check
+    let d = w.ok(nr::DEBUG_ROOT, [0; 6]).0.unwrap();
+    let hs = &w.procs[&1].handles;
+    assert_eq!(
+        ipc::debug_of(&w.objs, hs, abi::Handle(d), Rights::WRITE),
+        Ok(())
+    );
+    assert_eq!(
+        ipc::debug_of(&w.objs, hs, abi::Handle(d), Rights::INSPECT),
+        Ok(())
+    );
+    assert_eq!(
+        ipc::debug_of(&w.objs, hs, abi::Handle(d), Rights::MANAGE),
+        Err(Status::AccessDenied),
+        "a right the debug resource does not carry"
+    );
+    assert_eq!(
+        ipc::debug_of(&w.objs, hs, abi::Handle(0x999), Rights::WRITE),
+        Err(Status::BadHandle)
+    );
+    let r = w.ok(nr::RESOURCE_ROOT, [0; 6]).0.unwrap();
+    let hs = &w.procs[&1].handles;
+    assert_eq!(
+        ipc::debug_of(&w.objs, hs, abi::Handle(r), Rights::WRITE),
+        Err(Status::WrongType),
+        "the root resource is not a debug resource"
+    );
 }
 
 #[test]

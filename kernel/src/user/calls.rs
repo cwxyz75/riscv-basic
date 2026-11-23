@@ -18,7 +18,9 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::THREAD_SET_SCHED => thread_set_sched(a),
         nr::THREAD_GET_SCHED => thread_get_sched(a),
         nr::JOB_KILL => job_kill(a),
-        nr::JOB_ROOT | nr::RESOURCE_ROOT | nr::PROCESS_SELF => process_table_call(n, a),
+        nr::JOB_ROOT | nr::RESOURCE_ROOT | nr::DEBUG_ROOT | nr::PROCESS_SELF => {
+            process_table_call(n, a)
+        }
         nr::PROCESS_MAP => process_table_call(n, a),
         nr::PROCESS_UNMAP => process_table_call(n, a),
         nr::PROCESS_PROTECT | nr::PROCESS_MAP_INFO => process_table_call(n, a),
@@ -142,6 +144,7 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
             nr::PROCESS_SELF
                 | nr::JOB_ROOT
                 | nr::RESOURCE_ROOT
+                | nr::DEBUG_ROOT
                 | nr::PROCESS_INFO
                 | nr::THREAD_INFO
         ) {
@@ -474,6 +477,7 @@ pub(super) fn thread_state_call(a: [u64; 6], write: bool) -> Reply {
             Some(n) => (ts::VECTOR_HEADER_WORDS * 8 + 32 * n) as u64,
             None => return bad(Status::NotSupported),
         },
+        ts::CFI => return bad(Status::NotSupported), // (HD5: reserved)
         _ => return bad(Status::InvalidArgs),
     };
     if len != want {

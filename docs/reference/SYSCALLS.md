@@ -140,11 +140,11 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 
 | # | Call | Arguments | Results |
 |---|---|---|---|
-| 0 | debug_write | `a0` ptr, `a1` len | |
+| 0 | debug_write | `a0` debug (WRITE), `a1` ptr, `a2` len | |
 | 1 | process_exit | `a0` code | does not return |
 | 2 | thread_yield | | |
 | 3 | clock_get | | `a1` nanoseconds since boot |
-| 4 | debug_stat | `a0` which | `a1` the kernel counter |
+| 4 | debug_stat | `a0` debug (INSPECT), `a1` which | `a1` the kernel counter |
 | 10 | handle_close | `a0` handle | |
 | 11 | handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
 | 12 | handle_replace | `a0` handle, `a1` rights | `a1` new handle |
@@ -215,6 +215,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
 | 95 | resource_root | | `a1` handle |
+| 114 | debug_root | | `a1` handle |
 | 100 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
 | 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
 | 110 | futex_wait | `a0` address, `a1` expected, `a2` deadline | |
@@ -250,9 +251,9 @@ touches memory, whatever the pointer. A call that fails on a pointer changes not
 `debug_write` is limited to 4096 bytes per call (TOO_BIG beyond). It is a debugging aid for
 the trusted boot-time suite: nothing ties a `##TEST` line to the program that wrote it.
 
-### debug_stat(which) -> value
+### debug_stat(debug, which) -> value
 
-A measuring aid for the boot-time suite (like `debug_write`; no rights, no effect on the system): `a1` is
+A measuring aid for the boot-time suite (like `debug_write`; needs a **debug resource** handle with INSPECT, HD4: BAD_HANDLE, WRONG_TYPE for a handle of another kind, ACCESS_DENIED without the right; no effect on the system): `a1` is
 a kernel counter, `which` 0 the number of times a thread blocked in a wait, 1 how many of those blocks
 were by a thread that had been woken without being satisfied (a *spurious wake*), 2 how many threads
 were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart other than the boot hart, 5 how many on a hart they were not aimed at (always 0). 6 the `time` counter (10 MHz on QEMU `virt`: the benchmarks' clock), 7 whether the kernel command line has `bench=full` (1) or not (0), 13 which part of the suite the kernel line asks for (0 all, 1 `shard=a`, 2 `shard=b`; the smoke tier runs the two as parallel boots, OD121). Any other index reads 0. The counters only grow. They exist to measure the wake path
@@ -263,14 +264,16 @@ nearly every syscall.
 
 `which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
 
-`which` 100 to 105 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
+`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
 
-### debug_write(ptr, len) -> status
+### debug_write(debug, ptr, len) -> status
 
-Sends bytes to the serial console. Rights: none (a debugging aid for the boot-time
-suite; real processes get a console channel in S4). Output is shown a line at a time: every call is flushed when it ends (a call that does not finish with a newline gets one), lines are cut at 512 bytes, and non-printable bytes are shown as `.`. A line that starts with `##` is prefixed `user: ` unless it is a well-formed `##TEST name PASS|FAIL` result (which the boot-time suite uses), so user code cannot forge the kernel's verdict lines.
-Errors: INVALID_ARGS (bad pointer);
-TOO_BIG (len over 4096).
+Sends bytes to the serial console. Rights: WRITE on a **debug resource** handle (HD4: the process the kernel starts gets one from `debug_root`, and hands a duplicate on in its startup message (`Role::Debug`) to the trusted services it starts; the launcher does not pass one to the programs it starts for clients. A program without one is refused (BAD_HANDLE, WRONG_TYPE for another kind, ACCESS_DENIED without WRITE) and prints nothing, so it can no longer forge a `##TEST` line; real processes have a console channel). Output is shown a line at a time: every call is flushed when it ends (a call that does not finish with a newline gets one), lines are cut at 512 bytes, and non-printable bytes are shown as `.`. A line that starts with `##` is prefixed `user: ` unless it is a well-formed `##TEST name PASS|FAIL` result (which the boot-time suite uses), so user code cannot forge the kernel's verdict lines.
+Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG (len over 4096); INVALID_ARGS (bad pointer). Tests: `debug_calls_need_a_debug_resource`, `debug_write_pointer_rules`.
+
+### debug_root() -> debug
+
+The debug resource (HD4): a new object of kind debug, with a handle carrying DUPLICATE, TRANSFER, WRITE and INSPECT. Only a privileged process (the one the kernel starts) may ask: ACCESS_DENIED otherwise; NO_MEMORY. Test: `the_root_handles_are_for_privileged_processes_only` (`ksys/tests/proc_calls.rs`), `debug_calls_need_a_debug_resource`.
 
 ### process_exit(code) -> does not return
 
@@ -535,7 +538,7 @@ neither the caller's nor the target process's must already be committed over the
 otherwise; slice V, INVARIANTS V1): a process cannot be killed, or a stranger charged, by memory it was handed.
 Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
 Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
-process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
+process has ended); NOT_SUPPORTED (a reserved flag bit, HD5: `SHADOW_STACK` 256 and bit 9 (512) are named for mechanisms this kernel does not have; nothing is mapped); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
 `length` 0; unknown flag bits; W with X; the range outside the user half (page zero is never mapped; address 0 is refused unless the flag ANYWHERE is set) or outside the
 VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
 reserved); NO_MEMORY. Mapping into a running process takes effect at once.
@@ -556,7 +559,7 @@ Change the permissions of `[vaddr, vaddr + length)` to `flags` (R = 1, W = 2, X 
 
 Describe the mapping that contains `vaddr`, or the first one above it (MM7): six 64-bit words are written to `buffer` in the caller's memory: base, length in bytes, permissions, the permissions it may be raised to (bit 0 read, bit 1 write, bit 2 execute), the VMO's id, and the byte offset into the VMO. `a1` is the base of the next mapping above this one, or 0. With no mapping at or above `vaddr` the record is all zeros and `a1` is 0. Rights: INSPECT on `process`. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE; INVALID_ARGS (a bad buffer). Tests: `process_protect_*` in `init`.
 
-### process_start(process, entry, sp, bootstrap, arg) -> status
+### process_start(process, entry, sp, bootstrap, arg, features) -> status
 
 Start the process's first thread at `entry` with stack pointer `sp` and `a0 = arg`. The
 channel endpoint `bootstrap` leaves the caller's table and becomes the new process's handle 1
@@ -564,10 +567,10 @@ channel endpoint `bootstrap` leaves the caller's table and becomes the new proce
 not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be
 16-byte aligned and in the user half (what is mapped below it is the caller's business).
 Errors, in order: BAD_HANDLE (process, then bootstrap); WRONG_TYPE (not a process / not a
-channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads, or the process's job or an ancestor
+channel); ACCESS_DENIED; NOT_SUPPORTED (`features`, HD5, the sixth argument, a 64-bit word that must be 0: bit 0 landing pads, bit 1 a shadow stack, bit 2 pointer masking are named for mechanisms this kernel does not have; any other bit is INVALID_ARGS); BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads, or the process's job or an ancestor
 is at its thread limit; the refusal comes before anything changes).
 On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`,
-`a_refused_process_start_changes_nothing_and_can_be_retried`.
+`a_refused_process_start_changes_nothing_and_can_be_retried`, `reserved_abi_space_is_refused`.
 
 ### process_kill(process, code) -> status
 
@@ -1074,7 +1077,7 @@ ACCESS_DENIED.
 
 ### thread_read_state(thread, kind, buffer, length) -> status, thread_write_state(thread, kind, buffer, length) -> status
 
-(EX1.) Read or write the user registers of a thread that has **stopped**: SUSPENDED is up (parked at the return to user mode or blocked in a call), or it was made SUSPENDED and has not run. Rights: MANAGE on a thread handle (0, the caller itself, is BAD_STATE: it is running). `kind` and the layouts (RISC-V; `abi::thread_state`): GENERAL (1) is 32 little-endian words, x1 to x31 then pc (256 bytes); FP (2) is f0 to f31 then fcsr (264 bytes; fcsr's 8 defined bits); VECTOR (3) is vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each (`32 + 32 * vlenb` bytes; NOT_SUPPORTED on a machine without a vector unit). `length` must be exactly the layout's size (INVALID_ARGS). A thread that never used the FP or vector unit reads zeros; a write gives it the state (charged to its job's kernel bytes, NO_MEMORY at the limit) and it runs with the unit on. A write to a thread that has run is **left for the thread to apply to its own frame when it wakes** (a read in between shows the pending value); the layout of every kind is applied before the thread runs another instruction. A write is refused (BAD_STATE) while the thread is **inside a blocking call** (a read is allowed: its user registers are as they were when it entered); a write to a GENERAL pc that is not a user address, or not 2-aligned, is INVALID_ARGS and changes nothing. Errors, in order: INVALID_ARGS (kind, length); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not stopped; a write inside a blocking call; the thread itself); INVALID_ARGS (a bad buffer; the pc). Tests: `a_stopped_thread_can_be_sent_to_a_handler_and_back` (the signal-injection sequence), `a_thread_started_suspended_runs_only_after_resume_with_registers_written_first` (the `fork` child sequence), `fp_and_vector_state_round_trip_through_thread_state`.
+(HD5: `kind` 4, `CFI`, is reserved for the shadow-stack pointer and the landing-pad expectation and is NOT_SUPPORTED on both calls, before any handle is looked at: `reserved_abi_space_is_refused`.) (EX1.) Read or write the user registers of a thread that has **stopped**: SUSPENDED is up (parked at the return to user mode or blocked in a call), or it was made SUSPENDED and has not run. Rights: MANAGE on a thread handle (0, the caller itself, is BAD_STATE: it is running). `kind` and the layouts (RISC-V; `abi::thread_state`): GENERAL (1) is 32 little-endian words, x1 to x31 then pc (256 bytes); FP (2) is f0 to f31 then fcsr (264 bytes; fcsr's 8 defined bits); VECTOR (3) is vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each (`32 + 32 * vlenb` bytes; NOT_SUPPORTED on a machine without a vector unit). `length` must be exactly the layout's size (INVALID_ARGS). A thread that never used the FP or vector unit reads zeros; a write gives it the state (charged to its job's kernel bytes, NO_MEMORY at the limit) and it runs with the unit on. A write to a thread that has run is **left for the thread to apply to its own frame when it wakes** (a read in between shows the pending value); the layout of every kind is applied before the thread runs another instruction. A write is refused (BAD_STATE) while the thread is **inside a blocking call** (a read is allowed: its user registers are as they were when it entered); a write to a GENERAL pc that is not a user address, or not 2-aligned, is INVALID_ARGS and changes nothing. Errors, in order: INVALID_ARGS (kind, length); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not stopped; a write inside a blocking call; the thread itself); INVALID_ARGS (a bad buffer; the pc). Tests: `a_stopped_thread_can_be_sent_to_a_handler_and_back` (the signal-injection sequence), `a_thread_started_suspended_runs_only_after_resume_with_registers_written_first` (the `fork` child sequence), `fp_and_vector_state_round_trip_through_thread_state`.
 
 ### thread_interrupt(thread) -> status   (replaces the reserved entry at task 26)
 

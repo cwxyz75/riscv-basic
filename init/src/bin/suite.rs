@@ -92,7 +92,8 @@ fn unknown_syscalls_are_refused() -> Outcome {
 fn debug_write_pointer_rules() -> Outcome {
     let big = [b'x'; 4097];
     ensure_eq!(st(sys::debug_write(&big)), Some(S::TooBig), "4097 bytes");
-    let bad = |ptr: usize, len: usize| st(rt::syscall(abi_debug(), [ptr, len, 0, 0, 0, 0]));
+    let dbg = rt::debug::handle() as usize;
+    let bad = |ptr: usize, len: usize| st(rt::syscall(abi_debug(), [dbg, ptr, len, 0, 0, 0]));
     ensure_eq!(bad(0, 1), Some(S::InvalidArgs), "null pointer");
     ensure_eq!(
         bad(0, 0),
@@ -130,6 +131,82 @@ fn debug_write_pointer_rules() -> Outcome {
         bad(top - 4, 4),
         Some(S::Ok),
         "the last four bytes of the stack are fine"
+    );
+    Ok(())
+}
+
+/// HD4: `debug_write` and `debug_stat` need a debug resource: no handle, a handle of another kind, or one without the right is refused and prints or
+/// reads nothing (a program without one can no longer forge a `##TEST` line).
+fn debug_calls_need_a_debug_resource() -> Outcome {
+    use rt::abi::syscall as nr;
+    let dbg = rt::debug::handle();
+    ensure!(dbg != 0, "the suite has its debug resource");
+    // (the process-wide handle `sys::debug_write` and `sys::debug_stat` use is switched for each probe and put back)
+    let via = |h: u64| {
+        rt::debug::set(h);
+        let r = st(sys::debug_write(b""));
+        rt::debug::set(dbg);
+        r
+    };
+    let stat = |h: u64| st(rt::syscall(nr::DEBUG_STAT, [h as usize, 0, 0, 0, 0, 0]));
+    ensure_eq!(via(dbg), Some(S::Ok), "the resource itself writes");
+    ensure_eq!(stat(dbg), Some(S::Ok), "and reads a counter");
+    ensure_eq!(via(0), Some(S::BadHandle), "no handle: no write");
+    ensure_eq!(stat(0), Some(S::BadHandle), "no handle: no counter");
+    ensure_eq!(
+        via(0x7777_7777),
+        Some(S::BadHandle),
+        "a handle that is not there"
+    );
+    let e = event()?;
+    ensure_eq!(
+        via(e),
+        Some(S::WrongType),
+        "an event is not a debug resource"
+    );
+    ensure_eq!(
+        stat(e),
+        Some(S::WrongType),
+        "an event is not a debug resource"
+    );
+    let inspect_only = weaker(dbg, Rights::INSPECT.0)?;
+    ensure_eq!(
+        via(inspect_only),
+        Some(S::AccessDenied),
+        "INSPECT alone does not write"
+    );
+    ensure_eq!(stat(inspect_only), Some(S::Ok), "INSPECT reads");
+    let write_only = weaker(dbg, Rights::WRITE.0)?;
+    ensure_eq!(
+        stat(write_only),
+        Some(S::AccessDenied),
+        "WRITE alone does not read a counter"
+    );
+    ensure_eq!(via(write_only), Some(S::Ok), "WRITE writes");
+    for h in [inspect_only, write_only, e] {
+        sys::handle_close(h);
+    }
+    // a second `debug_root` from the privileged suite is another handle to the same kind of authority
+    let again = sys::debug_root();
+    ensure_eq!(again.status, 0, "debug_root again");
+    sys::handle_close(again.a1 as u64);
+    // a refused `debug_stat` reads as 0, not as the selector it was given
+    rt::debug::set(0);
+    let refused = sys::debug_stat(105);
+    rt::debug::set(dbg);
+    ensure_eq!(
+        refused,
+        0,
+        "a process with no debug resource reads no counters"
+    );
+    // a program the suite started with no startup message (so no debug resource, and not privileged) can neither forge a verdict line nor ask for the resource
+    let (p, _mine) = launch(83)?;
+    wait_ended(p, 500)?;
+    let r = sys::process_info(p);
+    ensure_eq!(
+        (r.status, r.a1 as i64),
+        (0, 0),
+        "the confined child's debug_write was BAD_HANDLE and its debug_root ACCESS_DENIED"
     );
     Ok(())
 }
@@ -6694,6 +6771,80 @@ fn backstops_follow_the_ram_of_the_machine() -> Outcome {
     for (which, expect, what) in want {
         ensure_eq!(sys::debug_stat(which), expect, "{what}");
     }
+    Ok(())
+}
+
+/// HD5: the reserved places in the ABI are named and refused with the stated status, and a refusal changes nothing (KERNEL-V1-SPEC 7.5).
+fn reserved_abi_space_is_refused() -> Outcome {
+    use rt::abi::{map_flags, start_features, syscall as nr, thread_state};
+    let p = proc_create()?;
+    let v = vmo(1)?;
+    let at = 0x10_0000_0000u64;
+    for flag in [
+        map_flags::SHADOW_STACK,
+        map_flags::RESERVED_9,
+        map_flags::SHADOW_STACK | map_flags::RESERVED_9,
+    ] {
+        ensure_eq!(
+            st(sys::process_map(p, v, at, 0, 4096, PF_R | flag)),
+            Some(S::NotSupported),
+            "process_map with the reserved flag {flag:#x}"
+        );
+    }
+    ok(
+        sys::process_map(p, v, at, 0, 4096, PF_R),
+        "the same map without the flag: nothing was mapped by the refusals",
+    )?;
+    ensure_eq!(
+        st(sys::thread_read_state(
+            0,
+            thread_state::CFI,
+            core::ptr::null_mut(),
+            0
+        )),
+        Some(S::NotSupported),
+        "the CFI state kind, read"
+    );
+    ensure_eq!(
+        st(sys::thread_write_state(
+            0,
+            thread_state::CFI,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::NotSupported),
+        "the CFI state kind, write"
+    );
+    let (a, _b) = channel()?;
+    let q = proc_create()?;
+    for (features, want) in [
+        (start_features::LANDING_PADS, S::NotSupported),
+        (start_features::SHADOW_STACK, S::NotSupported),
+        (start_features::POINTER_MASKING, S::NotSupported),
+        (start_features::ALL, S::NotSupported),
+        (8, S::InvalidArgs),
+        (1 << 63, S::InvalidArgs),
+        (start_features::LANDING_PADS | 8, S::InvalidArgs),
+    ] {
+        ensure_eq!(
+            st(rt::syscall(
+                nr::PROCESS_START,
+                [q as usize, 0, 0, a as usize, 0, features as usize]
+            )),
+            Some(want),
+            "process_start with features {features:#x}"
+        );
+    }
+    ensure_eq!(
+        st(sys::process_start(q, 0, 0, a, 0)),
+        Some(S::InvalidArgs),
+        "with features 0 the call is the old one: its entry is checked, and refused"
+    );
+    ensure_eq!(
+        sys::handle_duplicate(a, Rights::SAME.0).status,
+        0,
+        "the bootstrap handle is still ours: nothing moved"
+    );
     Ok(())
 }
 
@@ -14873,6 +15024,10 @@ pub fn app_main() -> i32 {
             "child_exit_code_and_terminated_signal",
             child_exit_code_and_terminated_signal,
         ),
+        (
+            "debug_calls_need_a_debug_resource",
+            debug_calls_need_a_debug_resource,
+        ),
         ("child_faults_are_contained", child_faults_are_contained),
         ("parent_and_child_talk", parent_and_child_talk),
         ("kill_a_spinning_child", kill_a_spinning_child),
@@ -15123,6 +15278,10 @@ pub fn app_main() -> i32 {
         (
             "backstops_follow_the_ram_of_the_machine",
             backstops_follow_the_ram_of_the_machine,
+        ),
+        (
+            "reserved_abi_space_is_refused",
+            reserved_abi_space_is_refused,
         ),
         (
             "the_object_cap_is_reached_without_a_kernel_panic",

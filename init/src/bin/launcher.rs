@@ -107,7 +107,7 @@ impl Launcher {
         // Every program gets a job of its own under the launcher's (S4.5): it can make no other
         // process, only a few threads, and a bounded amount of memory, whatever it does.
         let result = match self.jobs {
-            None => spawn::spawn(&image, req.startup, forwarded),
+            None => spawn::spawn_exact(&image, req.startup, forwarded),
             Some(parent) => {
                 let j = sys::job_create(
                     parent,
@@ -129,7 +129,7 @@ impl Launcher {
                 // Policy (SCHED-SMP-SPEC 4.9): a program runs in the normal band and may raise itself only to 20, with no
                 // real-time budget. (Without this every job inherits the root's 63.)
                 let _ = sys::job_set_sched(job, PROGRAM_MAX_PRIO, 0, 1024);
-                let r = spawn::spawn_in(&image, req.startup, forwarded, job);
+                let r = spawn::spawn_in_exact(&image, req.startup, forwarded, job);
                 // (the process holds the job now; ours is not needed, and must not be kept: a
                 // handle to its own job's MANAGE would let the launcher outlive nothing useful)
                 sys::handle_close(job);

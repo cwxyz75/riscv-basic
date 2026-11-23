@@ -293,6 +293,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             // ANYWHERE (MM7): the flag asks the kernel to choose a free place (`vaddr` must be 0), at random among those that fit in the
             // mapping arena. Every other argument is checked first (with the arena's start standing in for the address), so a refused
             // call costs no entropy.
+            // (HD5: the reserved bits are named and refused, before any other argument is looked at beyond the handles)
+            if flags & (abi::map_flags::SHADOW_STACK | abi::map_flags::RESERVED_9) != 0 {
+                return bad(Status::NotSupported);
+            }
             let anywhere = flags & abi::map_flags::ANYWHERE != 0;
             let flags = flags & !abi::map_flags::ANYWHERE;
             if anywhere && vaddr != 0 {
@@ -858,6 +862,24 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             }
             let job = caller.job;
             match ipc::resource_object_create_in(
+                objs,
+                &mut caller.handles,
+                &mut ipc::Quota {
+                    jobs,
+                    job: Some(job),
+                },
+            ) {
+                Ok(h) => Ok((Some(h.0), None)),
+                Err(x) => Err(e(x)),
+            }
+        })(),
+        nr::DEBUG_ROOT => (|| {
+            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
+            if !caller.privileged {
+                return bad(Status::AccessDenied);
+            }
+            let job = caller.job;
+            match ipc::debug_object_create_in(
                 objs,
                 &mut caller.handles,
                 &mut ipc::Quota {

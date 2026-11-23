@@ -33,6 +33,33 @@ pub mod service;
 pub mod spawn;
 #[cfg(feature = "heap")]
 pub mod startup;
+
+/// The debug resource this process holds (HD4): `sys::debug_write` and `sys::debug_stat` use it. A program gets it from its startup message
+/// (`Role::Debug`) or, for the process the kernel started, from `debug_root`; without one the two calls are refused and print nothing.
+pub mod debug {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static HANDLE: AtomicU64 = AtomicU64::new(0);
+
+    /// The handle (0: none).
+    pub fn handle() -> u64 {
+        HANDLE.load(Ordering::Relaxed)
+    }
+
+    pub fn set(h: u64) {
+        HANDLE.store(h, Ordering::Relaxed);
+    }
+
+    /// A kernel-started process takes its debug resource. True if it got one.
+    pub fn init_privileged() -> bool {
+        let r = crate::sys::debug_root();
+        if r.status == 0 {
+            set(r.a1 as u64);
+            true
+        } else {
+            false
+        }
+    }
+}
 pub mod sync;
 
 /// The argument record of `thread_spawn` (SYSCALLS.md): 64 bytes, little endian. Zero a field to take its default.
@@ -103,10 +130,18 @@ pub mod sys {
     use super::{syscall, Ret, SpawnArgs};
     use abi::syscall::*;
 
+    /// Write to the kernel's console with this process's debug resource (HD4): BAD_HANDLE, and nothing printed, when it has none.
     pub fn debug_write(bytes: &[u8]) -> Ret {
         syscall(
             DEBUG_WRITE,
-            [bytes.as_ptr() as usize, bytes.len(), 0, 0, 0, 0],
+            [
+                crate::debug::handle() as usize,
+                bytes.as_ptr() as usize,
+                bytes.len(),
+                0,
+                0,
+                0,
+            ],
         )
     }
     pub fn exit(code: i32) -> ! {
@@ -137,7 +172,20 @@ pub mod sys {
     /// A kernel counter (see SYSCALLS.md `debug_stat`): 0 blocking waits entered, 1 waits that were woken
     /// without being satisfied (spurious wakes), 2 threads woken.
     pub fn debug_stat(which: u64) -> u64 {
-        syscall(DEBUG_STAT, [which as usize, 0, 0, 0, 0, 0]).a1 as u64
+        let r = syscall(
+            DEBUG_STAT,
+            [crate::debug::handle() as usize, which as usize, 0, 0, 0, 0],
+        );
+        // (a refusal leaves `a1` as it was: the selector; 0 for a process with no debug resource)
+        if r.status == 0 {
+            r.a1 as u64
+        } else {
+            0
+        }
+    }
+    /// The debug resource, for a privileged process (the one the kernel started): ACCESS_DENIED for any other (HD4).
+    pub fn debug_root() -> Ret {
+        syscall(DEBUG_ROOT, [0, 0, 0, 0, 0, 0])
     }
     pub fn handle_close(h: u64) -> Ret {
         syscall(HANDLE_CLOSE, [h as usize, 0, 0, 0, 0, 0])
@@ -943,6 +991,8 @@ _start:
 #[no_mangle]
 extern "C" fn rt_start(arg: usize) -> ! {
     START_ARG.store(arg, core::sync::atomic::Ordering::Relaxed);
+    // (HD4: the process the kernel started takes its debug resource; any other gets ACCESS_DENIED here and may be given one in its startup message)
+    let _ = debug::init_privileged();
     // SAFETY: `app_main` is defined by the program being linked, with this signature.
     let code = unsafe { app_main() };
     sys::exit(code)

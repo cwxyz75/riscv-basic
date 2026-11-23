@@ -97,6 +97,9 @@ pub enum Role {
     /// The channel a program receives signals on (S11, OD119): the shell writes one message per signal, the program's libc
     /// reads it where the program waits. Present whenever the program has a spawn grant.
     SignalChannel = 42,
+    /// A debug resource (HD4): the authority to write to the kernel's console and read its counters. Given only to the programs that need it; a
+    /// program without one cannot print through `debug_write` or forge a `##TEST` line.
+    Debug = 43,
 }
 
 impl Role {
@@ -144,6 +147,7 @@ impl Role {
             40 => Role::ServiceTerm,
             41 => Role::ServiceSpawn,
             42 => Role::SignalChannel,
+            43 => Role::Debug,
             _ => return None,
         })
     }
