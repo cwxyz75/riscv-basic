@@ -169,6 +169,60 @@ fn asid_generation() -> u64 {
     unsafe { (*p).load(Ordering::Acquire) }
 }
 
+/// Resolve the VMO handle `h` of the calling thread with `need`, and the address space of its process: the part of the data-moving VMO calls that is
+/// the object domain (one short section).
+#[inline(never)]
+fn vmo_resolve(
+    h: u64,
+    need: Rights,
+) -> Result<(u64, alloc::sync::Arc<klock::aslock::AsCell>), ReplyErr> {
+    with_state(|s| {
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let id = ipc::vmo_of(&s.objs, &p.handles, Handle(h), need).map_err(|e| (e, None, None))?;
+        Ok((id, p.aspace.clone()))
+    })
+}
+
+/// `vmo_read` and `vmo_write` (T215): the handle under the object lock, the copy under the caller's address-space lock and the memory locks only, so the
+/// copy of up to 64 KiB (and a pager's wait for a page) no longer holds the object domain up. The pager-need slot is saved and put back as the quiet fault does.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the pager need the copy may carry); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn vmo_rw_call(writing: bool, a: [u64; 6]) -> Reply {
+    let need = if writing { Rights::WRITE } else { Rights::READ };
+    let (id, aspace) = vmo_resolve(a[0], need)?;
+    let (r, pager) = {
+        let _as = klock::aslock::AsCell::hold(&aspace);
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None);
+        let r = ksys::vmo_rw_resolved(writing, aspace.held_mut(), k.mm, k.vmos, k.jobs, id, a);
+        let pager = k.vmos.swap_need(saved);
+        (r, pager)
+    };
+    if pager.is_some() {
+        kmem::get().vmos.swap_need(pager); // (`pager_after_call` reads it)
+    }
+    r
+}
+
+/// `vmo_commit` (T215): the handle under the object lock, the zeroing of up to `MAX_COMMIT_PAGES` pages under the memory locks only.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the pager need the copy may carry); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn vmo_commit_call(a: [u64; 6]) -> Reply {
+    let (id, _aspace) = vmo_resolve(a[0], Rights::COMMIT)?;
+    let (r, pager) = {
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None);
+        let r = ksys::vmo_commit_resolved(k.mm, k.vmos, k.jobs, id, a[1], a[2]);
+        let pager = k.vmos.swap_need(saved);
+        (r, pager)
+    };
+    if pager.is_some() {
+        kmem::get().vmos.swap_need(pager);
+    }
+    r
+}
+
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 fn debug_stat_call(a: [u64; 6]) -> Reply {
     with_state(|s| -> Reply {
@@ -616,6 +670,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
         nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
+        nr::VMO_READ | nr::VMO_WRITE => reply(frame, vmo_rw_call(n == nr::VMO_WRITE, a)),
+        nr::VMO_COMMIT => reply(frame, vmo_commit_call(a)),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)
