@@ -141,6 +141,8 @@ pub struct Registry<T: Object> {
     scan: Vec<ObjId>,
     /// Objects the current sweep has freed so far.
     swept: usize,
+    /// The roots of the running sweep are still being shaded by the caller, a slice at a time (`sweep_begin_pending`): nothing is freed until it says done.
+    roots_pending: bool,
 }
 
 /// The phases of an incremental sweep (MM10, KERNEL-V1-SPEC 4.6).
@@ -218,6 +220,7 @@ impl<T: Object> Registry<T> {
             cursor: 0,
             scan: Vec::with_capacity(64),
             swept: 0,
+            roots_pending: false,
         }
     }
 
@@ -690,6 +693,27 @@ impl<T: Object> Registry<T> {
         true
     }
 
+    /// Start a sweep whose roots the caller shades itself, a handle table at a time (`shade` for each object of a table, in as many slices as it likes, T206),
+    /// and then `sweep_roots_done`: until then `sweep_step` marks but frees nothing. The barrier of `sweep_begin` holds from this call on, so a handle
+    /// made or moved while the scan runs is a root already; a table that is closed meanwhile has nothing left to shade. Returns false if a sweep runs.
+    pub fn sweep_begin_pending(&mut self) -> bool {
+        if !self.sweep_begin(&[]) {
+            return false;
+        }
+        self.roots_pending = true;
+        true
+    }
+
+    /// Are the roots of the running sweep still being shaded?
+    pub fn roots_are_pending(&self) -> bool {
+        self.roots_pending
+    }
+
+    /// Every root has been shaded: the sweep may free what is unmarked.
+    pub fn sweep_roots_done(&mut self) {
+        self.roots_pending = false;
+    }
+
     /// Mark `id` reachable if a sweep is running and it is not marked yet (the write barrier of the incremental sweep; a no-op when no sweep
     /// runs or `id` is not a live object). Its references are followed in a later slice.
     pub fn shade(&mut self, id: ObjId) {
@@ -741,7 +765,7 @@ impl<T: Object> Registry<T> {
             }
             self.scan = refs;
         }
-        if !self.mark_work.is_empty() {
+        if !self.mark_work.is_empty() || self.roots_pending {
             return SweepStep::More;
         }
         self.phase = Phase::Freeing;

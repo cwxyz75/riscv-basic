@@ -11,6 +11,10 @@ abi = { path = "../abi" }
 # Negative control (L11d): a hart never pulls work from another hart's queue. Off in every real build; the kernel's
 # `fault-skip-pull` turns it on and the test that needs the pull must then fail.
 fault-skip-pull = []
+# SC2's negative control: no hart is ever marked overloaded, so none is pulled from, and the model tests that need a pull must fail.
+fault-skip-overloaded = []
+# PM1's negative control: a hart going offline leaves its blocked threads (and their timers) homed there, and the HT1 and HT2 tests must fail.
+fault-offline-skip-blocked = []
 
 # Concurrency checkers, host only (they are dependencies, not dev-dependencies,
 # because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")

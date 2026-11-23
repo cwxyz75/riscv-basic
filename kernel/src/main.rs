@@ -98,6 +98,9 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     percpu::this()
         .online
         .store(true, core::sync::atomic::Ordering::Release);
+    percpu::this()
+        .hart_state
+        .store(percpu::HART_ONLINE, core::sync::atomic::Ordering::Release);
     let mut out = console::Console;
     if !RELEASE {
         let _ = testlog::boot(&mut out, "kernel", "s3");
