@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 80
     env:
       # the baseline is from a laptop; hosted runners are several times slower (SCHED-SMP-SPEC T75)
-      BENCH_RATIO: "10"
+      BENCH_RATIO: "30"
     strategy:
       fail-fast: false
       matrix:

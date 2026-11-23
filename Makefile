@@ -283,7 +283,7 @@ os-boot-test-smp-neg: kernel os-interactive
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NODECOMMIT_ELF) decommit_while_siblings_touch
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOPROTSHOOT_ELF) protect_while_siblings_write
 	cd kernel && cargo build --features fault-skip-kill-ipi --target-dir ../target/os-fault-killipi
-	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) kill_a_spinner_on_another_hart
+	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) user_threads_run_in_parallel,kill_a_spinner_on_another_hart
 	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave
 	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFPSAVE_ELF) fp_state_is_private_to_each_thread_and_process
 	cd kernel && cargo build --features fault-skip-forced-touch --target-dir ../target/os-fault-forced
@@ -307,7 +307,7 @@ os-boot-test-overflow: kernel-main
 # harts, compared with the checked-in baseline (a 3x slowdown fails). The numbers are QEMU debug-build costs on whatever
 # machine runs them: look at the printed ratios, and update `bench/baseline.tsv` on purpose (and the table in
 # TESTING.md) when a change is meant to move them.
-# (3x on the machine that made the baseline; CI runners are several times slower, so soak.yml sets BENCH_RATIO=10)
+# (3x on the machine that made the baseline; CI runners are several times slower, so soak.yml sets BENCH_RATIO=30: the futex pair numbers swing by 30 times between runs with where the pair is placed, T231, T232)
 BENCH_RATIO ?= 3
 os-bench: kernel-main
 	rm -f target/bench.tsv

@@ -127,8 +127,9 @@ pub fn run() -> crate::report::Report {
     tests.push(("interactive_init_exits_cleanly".into(), verdict));
     // The services `init` started (launcher, filesystem) end when their last client, `init`,
     // is gone; give them a bounded time (a loaded machine needs more than a few ticks).
+    // (a process leaves the table first and gives its job credit back at the end of its chunked teardown (L19), so the wait is for the ledger too: a real leak still fails after the bound)
     for _ in 0..2000 {
-        if user::process_count() == 0 {
+        if user::process_count() == 0 && user::job_ledger() == (1, 0, 0, 0, 0, 0) {
             break;
         }
         thread::sleep_ticks(1);
