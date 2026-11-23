@@ -184,6 +184,92 @@ fn vmo_resolve(
     })
 }
 
+/// The address space of the process this hart is running, for the copies that need only it (the same cell `page_fault_quiet` uses).
+fn current_space() -> Option<&'static klock::aslock::AsCell> {
+    let cell = crate::percpu::this().cur_as.load(Ordering::Acquire);
+    if cell.is_null() {
+        return None;
+    }
+    // SAFETY: the hart runs a thread of the process the cell belongs to, so the cell's `Arc` is alive for as long as the caller runs on this thread
+    // (the cell is only used inside the syscall, and a process is torn down only when its last thread has gone).
+    Some(unsafe { &*cell })
+}
+
+/// The copy-in of a big `channel_write` or `socket_write`, before the object lock is taken (T215): the bytes come under the caller's address-space lock and the
+/// memory locks only. Any failure (a bad pointer, no memory, a page a pager owes) returns `None`, and the call then does its own copy under the lock, in
+/// the order SYSCALLS.md gives its errors, and reports the same error it always did.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
+    let (len, hlen) = match n {
+        nr::SOCKET_WRITE => (a[2] as usize, 0),
+        nr::CHANNEL_WRITE => (a[2] as usize, a[4] as usize),
+        _ => return None,
+    };
+    let limit = if n == nr::SOCKET_WRITE {
+        abi::limits::SOCKET_BUFFER
+    } else {
+        MAX_MSG_BYTES
+    };
+    if len < ksys::OUTSIDE_COPY_MIN || len > limit || hlen > MAX_MSG_HANDLES {
+        return None;
+    }
+    let cell = current_space()?;
+    let _as = cell.lock();
+    let space = cell.held_mut();
+    let k = kmem::mem();
+    // (a pager's page that is missing leaves its need in the slot: the call, run again under the lock, finds it itself)
+    let saved = k.vmos.swap_need(None);
+    let data = copy_from_user(space, k.mm, k.vmos, k.jobs, a[1], len);
+    let raw = if hlen == 0 {
+        Ok(Vec::new())
+    } else {
+        copy_from_user(space, k.mm, k.vmos, k.jobs, a[3], hlen.saturating_mul(8))
+    };
+    let _ = k.vmos.swap_need(saved);
+    Some(ksys::Staged {
+        data: data.ok()?,
+        handles: raw.ok()?,
+    })
+}
+
+/// The copy-out of a big `channel_read` or `socket_read`, after the object lock was let go (T215): the destinations were checked against the message
+/// under it, before the message was taken. A sibling thread that unmaps or decommits the buffer in between makes this copy fail, and the message,
+/// already taken, is lost with the error: the program that does that has no use for the message (SYSCALLS.md).
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
+    let Some(d) = deferred else {
+        return result;
+    };
+    let Some(cell) = current_space() else {
+        return Err((Status::BadState, None, None));
+    };
+    let _as = cell.lock();
+    let space = cell.held_mut();
+    let k = kmem::mem();
+    let saved = k.vmos.swap_need(None);
+    let mut done = kcore::usercopy::copy_to_user(space, k.mm, k.vmos, k.jobs, d.bytes_at, &d.data);
+    for (i, h) in d.handles.iter().enumerate() {
+        if done.is_err() {
+            break;
+        }
+        done = kcore::usercopy::copy_to_user(
+            space,
+            k.mm,
+            k.vmos,
+            k.jobs,
+            d.handles_at.saturating_add((i as u64).saturating_mul(8)),
+            &h.0.to_le_bytes(),
+        );
+    }
+    let _ = k.vmos.swap_need(saved);
+    match done {
+        Ok(()) => result,
+        Err(e) => Err((e, None, None)),
+    }
+}
+
 /// `vmo_read` and `vmo_write` (T215): the handle under the object lock, the copy under the caller's address-space lock and the memory locks only, so the
 /// copy of up to 64 KiB (and a pager's wait for a page) no longer holds the object domain up. The pager-need slot is saved and put back as the quiet fault does.
 #[inline(never)]
@@ -770,7 +856,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         _ => {
             // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
             sweep_before_create(n);
-            let result = irq::without(|| dispatch(n, a));
+            let staged = stage_in(n, a);
+            let mut deferred = None;
+            let result = irq::without(|| dispatch(n, a, staged, &mut deferred));
+            let result = finish_out(result, deferred);
             if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
                 // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
                 lend_to_reader();
@@ -869,15 +958,14 @@ fn sweep_before_create(n: usize) {
     // (MM10) start one if garbage cycles have piled up, and run a few slices of it
     with_state(|s| {
         if !s.objs.sweep_active() {
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots);
+            s.sweep_start();
         }
     });
     for _ in 0..SWEEP_SLICES_PER_CALL {
         if !with_state(|s| {
             s.objs.sweep_active()
                 && !matches!(
-                    s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                    s.sweep_slice(SWEEP_SLICE_BUDGET),
                     kcore::object::SweepStep::Done(_)
                 )
         }) {
@@ -886,18 +974,15 @@ fn sweep_before_create(n: usize) {
     }
     // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
     while with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active()) {
-        with_state(|s| s.objs.sweep_step(SWEEP_SLICE_BUDGET));
+        with_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
     }
     if with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
-        let began = with_state(|s| {
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots)
-        });
+        let began = with_state(|s| s.sweep_start());
         if began {
             while with_state(|s| {
                 s.objs.sweep_active()
                     && !matches!(
-                        s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                        s.sweep_slice(SWEEP_SLICE_BUDGET),
                         kcore::object::SweepStep::Done(_)
                     )
             }) {}
@@ -913,7 +998,12 @@ fn sweep_before_create(n: usize) {
     clippy::indexing_slicing
 )]
 // INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
-pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
+pub(super) fn dispatch(
+    n: usize,
+    a: [u64; 6],
+    staged: Option<ksys::Staged>,
+    deferred: &mut Option<ksys::Deferred>,
+) -> Reply {
     let tid = thread::current();
     let s = state_locked();
     let Some(&pid) = s.thread_pid.get(&tid) else {
@@ -957,8 +1047,12 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             job_sched: crate::thread::job_sched(),
             clock: crate::timer::now_ns,
             windows: crate::kmem::device_windows(),
+            staged,
+            defer_out: true,
+            deferred: None,
         };
         if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
+            *deferred = ctx.deferred.take();
             return r;
         }
         if let Some(r) = ksys::vmo_call(n, a, &mut ctx) {

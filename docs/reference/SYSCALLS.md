@@ -492,7 +492,7 @@ Chooses how a wake picks a hart (PM4, KERNEL-V1-SPEC 5.6): `policy` 0 is **sprea
 running the lowest priority) and 1 is **pack** (the lowest-indexed online hart running something below the thread, so load consolidates and the other harts stay idle; when
 every hart is busy, spread's rule). Threads already placed stay where they are; the next wake uses the new rule; what a hart pulls is the same under both, so the scheduler's
 guarantee (no hart runs a lower priority than a thread waiting for it) holds under both. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE (not a resource);
-ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force, and 126 whether the firmware has the system-suspend extension (1) or not (0).
+ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force, and 126 whether the firmware has the system-suspend extension (1) or not (0). `debug_stat` 127 says 1 on a kernel built with the round-robin class (the suite's priority controls skip themselves there) and 0 otherwise.
 
 ### hart_set_online(resource, index, online) -> status
 
@@ -954,6 +954,11 @@ against the declared capacity: a 5-byte message needs 5 writable bytes however l
 `max_bytes` is (a capacity over the limits counts as the limit). They are checked *after*
 the status above is known (so BUFFER_TOO_SMALL and SHOULD_WAIT win over a bad pointer) and
 *before* the message is dequeued, so a bad pointer is INVALID_ARGS and never loses a message.
+
+A message of 1 KiB or more is copied in (`channel_write`, `socket_write`) before the object lock is taken and out (`channel_read`, `socket_read`) after it is let go (T215). The
+errors and their order are those of a small message; one case differs: a thread of the same process that unmaps or decommits the destination
+between the check and the copy makes the copy fail, and the message, already taken, is lost with the error. A program that does that to its own
+buffer during the call has no use for the message.
 
 ### channel_read_txid(channel, txid, max_bytes, max_handles) -> status, bytes, handles
 

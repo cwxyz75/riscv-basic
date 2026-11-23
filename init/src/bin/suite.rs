@@ -463,6 +463,96 @@ fn channel_sends_handles() -> Outcome {
     Ok(())
 }
 
+fn big_messages_are_copied_outside_the_object_lock() -> Outcome {
+    // T215: a message of 1 KiB or more is copied in before the call takes the object lock and out after it lets go; the answers are the ones of a small message
+    let (a, b) = channel()?;
+    let msg: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            msg.as_ptr(),
+            msg.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "write 4096 bytes"
+    );
+    let mut got = alloc::vec![0u8; 4096];
+    let r = sys::channel_read(b, got.as_mut_ptr(), 4096, core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "read them");
+    ensure_eq!(r.a1, 4096, "the length");
+    ensure!(got == msg, "the bytes arrive as they were sent");
+    // the order of errors is the small message's: a bad handle before a bad pointer, a bad pointer, then the write itself
+    ensure_eq!(
+        st(sys::channel_write(
+            BAD,
+            0x10 as *const u8,
+            4096,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::BadHandle),
+        "bad handle, bad pointer"
+    );
+    let small = st(sys::channel_write(
+        a,
+        0x10 as *const u8,
+        8,
+        core::ptr::null(),
+        0,
+    ));
+    ensure!(small != Some(S::Ok), "a bad pointer is refused: {small:?}");
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            0x10 as *const u8,
+            4096,
+            core::ptr::null(),
+            0
+        )),
+        small,
+        "a big message says what a small one says"
+    );
+    // a bad destination loses no message, and the message is still whole after it
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            msg.as_ptr(),
+            msg.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "write again"
+    );
+    let bad_read = st(sys::channel_read(
+        b,
+        0x10 as *mut u8,
+        4096,
+        core::ptr::null_mut(),
+        0,
+    ));
+    ensure!(
+        bad_read != Some(S::Ok),
+        "a bad destination is refused: {bad_read:?}"
+    );
+    let mut again = alloc::vec![0u8; 4096];
+    let r = sys::channel_read(b, again.as_mut_ptr(), 4096, core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "the message was not lost");
+    ensure!(again == msg, "and it is whole");
+    // a stream is the same
+    let (s, t) = socket()?;
+    let w = sys::socket_write(s, msg.as_ptr(), msg.len());
+    ensure_eq!(st(w), Some(S::Ok), "socket write");
+    let mut sg = alloc::vec![0u8; 8192];
+    let r = sys::socket_read(t, sg.as_mut_ptr(), 8192);
+    ensure_eq!(st(r), Some(S::Ok), "socket read");
+    ensure_eq!(r.a1, 4096, "the stream's length");
+    ensure!(sg[..4096] == msg[..], "the stream's bytes");
+    Ok(())
+}
+
 fn channel_syscall_errors() -> Outcome {
     let (a, b) = channel()?;
     let e = event()?;
@@ -12970,6 +13060,9 @@ fn donation_run(client_prio: u32) -> Result<(u64, u64, u32), Detail> {
 /// A call lends its priority to the thread that reads its request: a server of priority 5 answers a priority-25 caller under hogs of priority 15; a
 /// caller of the server's own priority gets nothing lent and its call times out (the control: the hogs do starve the server).
 fn a_call_lends_its_priority_to_the_server() -> Outcome {
+    if sys::debug_stat(127) == 1 {
+        return Ok(()); // (round-robin starves nobody: the control cannot hold)
+    }
     let (status, _, work) = donation_run(5)?;
     ensure_eq!(
         status as i64,
@@ -12991,6 +13084,9 @@ fn a_call_lends_its_priority_to_the_server() -> Outcome {
 /// The classic three-thread inversion: a low-priority thread owns the lock and a hog of middle priority runs on every hart, so the owner gets no CPU
 /// (checked first: the control); a high-priority thread then waits for the lock, and through the donation the owner runs, finishes and unlocks.
 fn pi_futex_bounds_inversion() -> Outcome {
+    if sys::debug_stat(127) == 1 {
+        return Ok(()); // (round-robin starves nobody: the control cannot hold)
+    }
     if let Some(r) = pi_ids_do_not_fit() {
         return r;
     }
@@ -15148,6 +15244,10 @@ pub fn app_main() -> i32 {
         ("channel_round_trip", channel_round_trip),
         ("channel_sends_handles", channel_sends_handles),
         ("channel_syscall_errors", channel_syscall_errors),
+        (
+            "big_messages_are_copied_outside_the_object_lock",
+            big_messages_are_copied_outside_the_object_lock,
+        ),
         (
             "system_suspend_is_gated_and_not_supported_without_the_firmware",
             system_suspend_is_gated_and_not_supported_without_the_firmware,

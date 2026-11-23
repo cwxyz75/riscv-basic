@@ -206,7 +206,8 @@ mod tests {
         let mut m = PageMap::new();
         let mut model: BTreeMap<u64, u64> = BTreeMap::new();
         let mut x = 12345u64;
-        for _ in 0..5000 {
+        // (Miri runs this about forty times slower: the same operations, fewer of them)
+        for _ in 0..if cfg!(miri) { 300 } else { 5000 } {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;

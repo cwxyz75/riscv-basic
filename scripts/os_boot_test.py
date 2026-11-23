@@ -65,6 +65,7 @@ REQUIRED = [
     "user_mode_runs_and_prints", "clock_advances_in_user_mode", "unknown_syscalls_are_refused",
     "debug_write_pointer_rules", "debug_calls_need_a_debug_resource", "handle_syscalls_reject_bad_values", "a_process_holds_twenty_thousand_handles", "event_syscalls",
     "channel_round_trip", "channel_sends_handles", "channel_syscall_errors",
+    "big_messages_are_copied_outside_the_object_lock",
     "hart_calls_need_the_resource_and_take_harts_offline_and_back",
     "system_suspend_is_gated_and_not_supported_without_the_firmware",
     "system_set_placement_needs_the_resource_and_changes_the_policy",

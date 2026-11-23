@@ -377,6 +377,9 @@ impl HandleTable {
             return Err(Status::AccessDenied);
         }
         let entry = self.remove(slot);
+        // (the deletion barrier of a sliced sweep, T206: the handle is on its way into a message, perhaps of a queue the marker has already passed, and the
+        // table it left may be one whose roots the sweep has not shaded yet)
+        reg.shade(entry.obj);
         reg.touch_forced(entry.obj);
         reg.handle_gone(entry.obj, self.id, h.0);
         Ok(entry)

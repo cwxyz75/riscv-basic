@@ -248,17 +248,16 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
         }
     }
     // 2. anything still alive that nothing can reach (reference cycles): the sweep as the state machine of MM10, a slice per critical section. The roots
-    // are collected, with the kernel's own handles, in the same critical section that begins the sweep (a root made between the two would be missed and its
-    // object destroyed under a live handle); a handle made once it runs marks its object (that is what the machine's barrier is for). A sweep another
+    // are shaded a process table per slice (T206), the kernel's own table last; a handle made or moved once the sweep has begun marks its object (that is
+    // what the machine's barrier is for). A sweep another
     // call started (with older roots) is finished first, a slice at a time.
     loop {
         let began = with_state(|s| {
             if s.objs.sweep_active() {
-                s.objs.sweep_step(TEARDOWN_SWEEP);
+                s.sweep_slice(TEARDOWN_SWEEP);
                 return false;
             }
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots)
+            s.sweep_start()
         });
         if began {
             break;
@@ -267,7 +266,7 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
     while with_state(|s| {
         s.objs.sweep_active()
             && !matches!(
-                s.objs.sweep_step(TEARDOWN_SWEEP),
+                s.sweep_slice(TEARDOWN_SWEEP),
                 kcore::object::SweepStep::Done(_)
             )
     }) {}
