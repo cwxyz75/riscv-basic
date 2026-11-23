@@ -547,6 +547,29 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         external_trap(frame, from_user);
     } else if light {
         trap_body(frame);
+    } else if from_user && cause == 8 && ready {
+        // L20: a syscall runs with **no big kernel lock** across the call: every section of it that touches shared state takes the lock itself
+        // (`irq::without`), and the lock is held again only for the FP save at entry and the tail (the wakes the call made, a switch it asked for, the
+        // address space for the return)
+        crate::bkl::lock();
+        crate::fp::trap_entry(frame);
+        crate::bkl::unlock();
+        let entry_epoch = crate::user::syscall_entry_epoch();
+        trap_body(frame);
+        // The tail takes the lock only when there is something to do under it: a switch a wake asked for, the heap below its mark, or a return that is
+        // not quiet (a kill, a stop or a suspend recorded, the thread's space not installed on this hart). What the call touched was committed to the
+        // waiters at the end of its own critical sections (`irq::without`, W1'), so there is nothing to commit here.
+        if crate::thread::need_resched_pending()
+            || crate::heap::needs_service()
+            || !crate::user::return_to_user_is_quiet(entry_epoch)
+        {
+            crate::bkl::lock();
+            crate::user::commit_wake();
+            crate::thread::preempt_point();
+            crate::user::activate_current(frame);
+            crate::heap::service();
+            crate::bkl::unlock();
+        }
     } else {
         crate::bkl::lock();
         crate::fp::trap_entry(frame);
@@ -666,7 +689,7 @@ fn trap_body(frame: &mut TrapFrame) {
             format_args!("kernel page fault with a memory lock held"),
         );
     }
-    let k = kmem::get();
+    let k = kmem::get_as();
     match k
         .aspace
         .handle_fault_mapped(k.mm, k.vmos, k.jobs, frame.stval, access)

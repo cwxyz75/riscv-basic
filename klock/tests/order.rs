@@ -32,7 +32,12 @@ fn the_run_queue_class_may_be_taken_twice_in_ascending_instance_order() {
     assert!(h.check(Class::Rq, 0).is_err(), "descending");
     // no other class allows two
     for &c in &Class::ALL {
-        if c != Class::Rq && c != Class::As && c != Class::Tt && !c.reentrant() {
+        if c != Class::Rq
+            && c != Class::As
+            && c != Class::Tt
+            && c != Class::Kstack
+            && !c.reentrant()
+        {
             let h = held_with(&[(c, 1)]);
             assert!(h.check(c, 2).is_err(), "{c:?} never two");
         }
@@ -64,8 +69,8 @@ fn a_chain_is_checked_against_everything_held() {
     // the nestings of 3.3: LEGACY, OBJ, JOBS, RQ, HEAP, UART
     let mut h = Held::new();
     for &c in &[
-        Class::Legacy,
         Class::Obj,
+        Class::Procs,
         Class::Jobs,
         Class::Rq,
         Class::Heap,
@@ -85,7 +90,7 @@ fn a_chain_is_checked_against_everything_held() {
         "the console line is reentrant (a panic prints under it)"
     );
     // a recursive take of the legacy lock under a later one is the wrong order (HEAP then BKL)
-    assert!(h.check(Class::Legacy, 0).is_err());
+    assert!(h.check(Class::Obj, 0).is_err());
 }
 
 #[test]
@@ -96,15 +101,15 @@ fn releases_make_room_again() {
     assert!(h.check(Class::Procs, 0).is_ok(), "PROCS after only OBJ");
     h.pop(Class::Obj, 0);
     assert!(h.is_empty());
-    assert!(h.check(Class::Legacy, 0).is_ok());
+    assert!(h.check(Class::Obj, 0).is_ok());
 }
 
 #[test]
 fn a_lock_can_be_released_out_of_order() {
-    let mut h = held_with(&[(Class::Obj, 0), (Class::Futex, 0), (Class::Heap, 0)]);
+    let mut h = held_with(&[(Class::Procs, 0), (Class::Futex, 0), (Class::Heap, 0)]);
     h.pop(Class::Futex, 0); // a guard dropped before the later ones
     assert_eq!(h.len(), 2);
-    assert!(h.holds(Class::Obj) && h.holds(Class::Heap) && !h.holds(Class::Futex));
+    assert!(h.holds(Class::Procs) && h.holds(Class::Heap) && !h.holds(Class::Futex));
     assert!(
         h.check(Class::Futex, 0).is_err(),
         "FUTEX under HEAP is still wrong"
@@ -123,7 +128,7 @@ fn more_than_eight_locks_is_a_bug() {
 
 #[test]
 fn the_class_numbers_are_the_documented_ones() {
-    // SCHED-SMP-SPEC 3.3 numbers them 1 to 13 and the amendment of 2026-11-20 adds ENTROPY (14) before UART (15); the kernel's masks and the INVARIANTS table rely on it
+    // SCHED-SMP-SPEC 3.3 numbers them in order, 1 to 14, since the amendment of 2026-11-23 (the object lock, OBJ, is class 1 and the old LEGACY slot is gone); the kernel's masks and the INVARIANTS table rely on it
     for (i, &c) in Class::ALL.iter().enumerate() {
         assert_eq!(c as usize, i + 1, "{c:?}");
     }
@@ -135,10 +140,10 @@ fn a_held_stack_knows_when_it_is_empty() {
     let mut h = Held::new();
     assert!(h.is_empty());
     assert_eq!(h.len(), 0);
-    h.push(Class::Obj, 0);
+    h.push(Class::Procs, 0);
     assert!(!h.is_empty());
     assert_eq!(h.len(), 1);
-    h.pop(Class::Obj, 0);
+    h.pop(Class::Procs, 0);
     assert!(h.is_empty());
 }
 

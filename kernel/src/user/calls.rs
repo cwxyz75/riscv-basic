@@ -131,8 +131,7 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
     if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
         thread::charge_running(); // (the CPU time of what runs now, the caller included, is brought up to date before it is read: AB6)
     }
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let mut machine = KernelMachine::default();
         if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
@@ -171,8 +170,7 @@ pub(crate) fn cow_sync() {
     if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let _as = AsLocks::all(s); // (every address space: the copy log names pages of any; before the memory locks)
                                    // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB
         let replaced = caller_pid(s)
@@ -196,13 +194,20 @@ pub(super) fn caller_pid(s: &UserState) -> Result<u64, Status> {
 }
 
 pub(super) fn process_create(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let kernel_half_ok = kmem::kernel_half_unchanged(); // (before the memory locks: it takes them itself)
         let k = kmem::get();
-        let handle = ksys::process_create(s, k.mm, k.jobs, k.aspace.table(), kernel_half_ok, me, a)
-            .map_err(|e| (e, None, None))?;
+        let handle = ksys::process_create(
+            s,
+            k.mm,
+            k.jobs,
+            &kmem::kernel_table(),
+            kernel_half_ok,
+            me,
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
         Ok((Some(handle), None))
     })
 }
@@ -211,8 +216,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
     }
-    let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
-        let s = state();
+    let (started, first_prio) = with_state(|s| -> Result<(usize, u8), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let _as = AsLocks::all(s);
         ksys::process_start(s, kmem::jobs().jobs, me, a).map_err(|e| (e, None, None))
@@ -226,8 +230,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
 pub(super) fn process_kill(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0]);
     let code = a[1] as i32;
-    let (tpid, me) = irq::without(|| -> Result<(u64, u64), ReplyErr> {
-        let s = state();
+    let (tpid, me) = with_state(|s| -> Result<(u64, u64), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let tpid = ksys::kill_target(&s.objs, &s.procs, me, ph).map_err(|e| (e, None, None))?;
         Ok((tpid, me))
@@ -244,8 +247,7 @@ pub(super) fn process_kill(a: [u64; 6]) -> Reply {
 /// (BAD_STATE). A process may stop itself: its calling thread parks as it returns.
 pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     let ph = Handle(a[0]);
-    let tpid = irq::without(|| -> Result<u64, ReplyErr> {
-        let s = state();
+    let tpid = with_state(|s| -> Result<u64, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let tpid = ksys::stop_target(&mut s.objs, &mut s.procs, me, ph, stop)
             .map_err(|e| (e, None, None))?;
@@ -268,19 +270,17 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
     }
-    let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
-        let s = state();
+    let spawn = with_state(|s| -> Result<ksys::Spawn, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let creator = creator_prio(s);
         let _as = AsLocks::all(s);
         let k = kmem::get();
         ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a).map_err(|e| (e, None, None))
     })?;
-    // Spawned after the state borrow is gone. The call runs under the big lock with interrupts off and the new thread's first act is to take that
-    // lock, so what follows (the spawner's half of the registration) happens before the thread runs a line of `user_thread_main`.
-    let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    irq::without(|| {
-        let s = state();
+    // Spawned after the state borrow is gone, and in the same critical section as the spawner's half of the registration: the new thread's first act is to
+    // take the object lock, so it cannot run a line of `user_thread_main` (or exit) before that half is done (L20: nothing else makes the two atomic now).
+    let tid = with_state(|s| {
+        let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
         // (EX1) the thread is known to `thread_suspend` and the rest from the moment this call returns; a SUSPENDED one is stopped, with its
         // register image, before the handle that can resume it is handed back
         ksys::thread_registered_by_spawner(s, tid, &spawn);
@@ -289,6 +289,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
             ksys::thread_spawned_suspended(s, tid, &spawn);
             sync_suspends(s);
         }
+        tid
     });
     Ok((Some(spawn.handle), Some(tid)))
 }
@@ -298,8 +299,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
 /// INTERRUPTED and takes the flag; one that is satisfied, or a poll, leaves it. It ends waits, not running code.
 /// Needs MANAGE on a thread handle; a thread that has ended is BAD_STATE.
 pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
-    let tid = irq::without(|| -> Result<Tid, ReplyErr> {
-        let s = state();
+    let tid = with_state(|s| -> Result<Tid, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, _) = thread_target(s, me, a[0], Rights::MANAGE)?;
         s.interrupts.insert(tid);
@@ -313,8 +313,7 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
 
 /// `pager_create() -> (pager, channel)` (MM9).
 pub(super) fn pager_create_call() -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (p, c) =
             ksys::pager::pager_create(s, kmem::jobs().jobs, me).map_err(|e| (e, None, None))?;
@@ -324,14 +323,13 @@ pub(super) fn pager_create_call() -> Reply {
 
 /// Wake the threads whose wait a pager call ended (the answer of the call is what it is: a partly done supply still wakes the pages it moved).
 fn wake_pager_waiters(mut woken: Vec<Tid>) {
-    woken.extend(irq::without(|| core::mem::take(&mut state().pending_wake)));
+    woken.extend(with_state(|s| core::mem::take(&mut s.pending_wake)));
     thread::wake_many(&woken);
 }
 
 /// `pager_supply(pager, vmo, offset, length, source, source_offset)` (MM9).
 pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
-    let r = irq::without(|| -> Result<Vec<Tid>, ReplyErr> {
-        let s = state();
+    let r = with_state(|s| -> Result<Vec<Tid>, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let _as = AsLocks::all(s);
         let k = kmem::get();
@@ -360,8 +358,7 @@ pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
 
 /// `pager_fail(pager, vmo, offset, length, status)` (MM9).
 pub(super) fn pager_fail_call(a: [u64; 6]) -> Reply {
-    let woken = irq::without(|| -> Result<Vec<Tid>, ReplyErr> {
-        let s = state();
+    let woken = with_state(|s| -> Result<Vec<Tid>, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let k = kmem::get();
         ksys::pager::pager_fail(s, k.vmos, me, a).map_err(|e| (e, None, None))
@@ -373,8 +370,7 @@ pub(super) fn pager_fail_call(a: [u64; 6]) -> Reply {
 /// `process_exception_channel(process) -> channel` and `job_exception_channel(job) -> channel` (EX2): the user end of the channel the kernel writes
 /// the exceptions of that process's threads (or of the processes below that job) on.
 pub(super) fn exception_channel_call(a: [u64; 6], job: bool) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let target = if job {
             ksys::exception::Target::Job(a[0])
@@ -392,7 +388,7 @@ pub(super) fn act_on_resolution(r: Option<ksys::exception::Resolved>) {
     use ksys::exception::Resolved;
     match r {
         Some(Resolved::Retry { tid, wake }) => {
-            irq::without(|| sync_suspends(state()));
+            with_state(|s| sync_suspends(s));
             if wake {
                 thread::wake(tid);
             }
@@ -404,8 +400,7 @@ pub(super) fn act_on_resolution(r: Option<ksys::exception::Resolved>) {
 
 /// `exception_resume(exception, how)` (EX2): RETRY, NEXT or KILL.
 pub(super) fn exception_resume_call(a: [u64; 6]) -> Reply {
-    let r = irq::without(|| -> Result<ksys::exception::Resolved, ReplyErr> {
-        let s = state();
+    let r = with_state(|s| -> Result<ksys::exception::Resolved, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         ksys::exception::exception_resume(s, kmem::jobs().jobs, me, a[0], a[1])
             .map_err(|e| (e, None, None))
@@ -417,8 +412,7 @@ pub(super) fn exception_resume_call(a: [u64; 6]) -> Reply {
 /// `thread_suspend(thread)` (EX1): raise the thread's suspend count. It stops at its next return to user mode (a thread running user code on
 /// another hart is reached by the same kick as a kill), or where it is if it is blocked in a call.
 pub(super) fn thread_suspend_call(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         ksys::thread_suspend(s, me, thread::current(), a[0], thread::is_blocked)
             .map_err(|e| (e, None, None))?;
@@ -431,8 +425,7 @@ pub(super) fn thread_suspend_call(a: [u64; 6]) -> Reply {
 
 /// `thread_resume(thread)` (EX1): lower the count; at 0 the thread runs again (a parked one is woken).
 pub(super) fn thread_resume_call(a: [u64; 6]) -> Reply {
-    let (tid, wake) = irq::without(|| -> Result<(Tid, bool), ReplyErr> {
-        let s = state();
+    let (tid, wake) = with_state(|s| -> Result<(Tid, bool), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let r = ksys::thread_resume(s, me, thread::current(), a[0]).map_err(|e| (e, None, None));
         sync_suspends(s);
@@ -483,8 +476,7 @@ pub(super) fn thread_state_call(a: [u64; 6], write: bool) -> Reply {
     if len != want {
         return bad(Status::InvalidArgs);
     }
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, _) = ksys::thread_state_target(s, me, thread::current(), a[0], write)
             .map_err(|e| (e, None, None))?;
@@ -631,8 +623,7 @@ pub(super) fn thread_target(
 /// within its level). Needs MANAGE on the handle (none for 0, the caller), and the priority may not exceed the
 /// thread's job's `max_prio`.
 pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, prio, flags) = ksys::thread_set_sched_target(
             &s.objs,
@@ -652,8 +643,7 @@ pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
 /// `thread_get_sched(thread) -> sched, tid`: `sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and
 /// the effective priority (16 to 23: the base raised by what is donated to the thread, L23). Needs INSPECT (none for 0).
 pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, _) = thread_target(s, me, a[0], Rights::INSPECT)?;
         let prio = u64::from(thread::priority_of(tid).ok_or((Status::BadState, None, None))?);
@@ -667,8 +657,7 @@ pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
 /// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         // (`JOBS` is held only while the ledger is read: `thread::priority_of` takes the big kernel lock, which comes before it)
         let (job, candidates) = {
@@ -706,8 +695,7 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
 /// caller inside the job ends too, last.
 pub(super) fn job_kill(a: [u64; 6]) -> Reply {
     let code = a[1] as i32;
-    let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u64>, bool, u64), ReplyErr> {
-        let s = state();
+    let (victims, me_inside, me) = with_state(|s| -> Result<(Vec<u64>, bool, u64), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (victims, me_inside) =
             ksys::job_kill_victims(&s.objs, &s.procs, kmem::jobs().jobs, me, Handle(a[0]))

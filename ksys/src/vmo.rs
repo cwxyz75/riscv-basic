@@ -181,22 +181,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             // (offset, length) in bytes, page aligned: commit those pages now (slice V)
             let id =
                 ipc::vmo_of(objs, handles, h(0), Rights::COMMIT).map_err(|e| (e, None, None))?;
-            let (offset, len) = (a[1], a[2]);
-            if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
-                return fail(Status::InvalidArgs);
-            }
-            // (bounded: the call zeroes every frame it takes with the big lock held)
-            if len / 4096 > abi::limits::MAX_COMMIT_PAGES {
-                return fail(Status::TooBig);
-            }
-            match vmos.commit(mm, jobs, id, offset / 4096, len / 4096) {
-                Ok(()) => Ok((None, None)),
-                Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
-                Err(kcore::aspace::VmoError::NoMemory) => fail(Status::NoMemory),
-                // (MM9) a page of a pager's VMO that is not there: the kernel asks the pager and waits, then the call says "try again"
-                Err(kcore::aspace::VmoError::NeedPager) => fail(Status::ShouldWait),
-                Err(_) => fail(Status::InvalidArgs),
-            }
+            vmo_commit_resolved(mm, vmos, jobs, id, a[1], a[2])
         }
         nr::VMO_GET_SIZE => {
             let id = ipc::vmo_of(objs, handles, h(0), Rights::NONE).map_err(|e| (e, None, None))?;
@@ -207,42 +192,88 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             let writing = n == nr::VMO_WRITE;
             let need = if writing { Rights::WRITE } else { Rights::READ };
             let id = ipc::vmo_of(objs, handles, h(0), need).map_err(|e| (e, None, None))?;
-            if vmos.kind(id) == Some(kcore::aspace::VmoKind::Device) {
-                // device memory is reached only by mapping it, never through the kernel
-                return fail(Status::NotSupported);
-            }
-            let (offset, buf, len) = (a[1], a[2], a[3]);
-            if len > MAX_MSG_BYTES as u64 {
-                return fail(Status::TooBig);
-            }
-            let len = len as usize;
-            let size = vmos.pages(id).ok_or((Status::BadHandle, None, None))? * 4096;
-            if offset.checked_add(len as u64).is_none_or(|end| end > size) {
-                return fail(Status::InvalidArgs);
-            }
-            if writing {
-                let data = copy_from_user(aspace, mm, vmos, jobs, buf, len)
-                    .map_err(|e| (e, None, None))?;
-                vmos.write(mm, jobs, id, offset, &data)
-                    .map_err(|e| match e {
-                        kcore::aspace::VmoError::NeedPager => (Status::ShouldWait, None, None),
-                        _ => (Status::NoMemory, None, None),
-                    })?;
-            } else {
-                verify_writable(aspace, mm, vmos, jobs, buf, len).map_err(|e| (e, None, None))?;
-                let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                data.try_reserve_exact(len)
-                    .map_err(|_| (Status::NoMemory, None, None))?;
-                data.resize(len, 0);
-                vmos.read(mm, id, offset, &mut data).map_err(|e| match e {
-                    kcore::aspace::VmoError::NeedPager => (Status::ShouldWait, None, None),
-                    _ => (Status::InvalidArgs, None, None),
-                })?;
-                copy_to_user_verified(aspace, mm, buf, &data).map_err(|e| (e, None, None))?;
-            }
-            Ok((None, None))
+            vmo_rw_resolved(writing, aspace, mm, vmos, jobs, id, a)
         }
         _ => fail(Status::BadSyscall),
     })();
     Some(r)
+}
+
+/// `vmo_commit` once the handle is resolved (`id`): the part that touches the VMO store, the job ledger and the frames, so a caller may run it with the memory
+/// locks only (L20, T215: the pages are zeroed outside the object lock).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the length is bounded (commit pages <= MAX_COMMIT_PAGES) before any sum
+pub fn vmo_commit_resolved<M: PhysMem>(
+    mm: &mut kcore::Mm<M>,
+    vmos: &mut kcore::aspace::Vmos,
+    jobs: &mut kcore::job::Jobs,
+    id: u64,
+    offset: u64,
+    len: u64,
+) -> Reply {
+    if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+        return fail(Status::InvalidArgs);
+    }
+    // (bounded: the call zeroes every frame it takes)
+    if len / 4096 > abi::limits::MAX_COMMIT_PAGES {
+        return fail(Status::TooBig);
+    }
+    match vmos.commit(mm, jobs, id, offset / 4096, len / 4096) {
+        Ok(()) => Ok((None, None)),
+        Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
+        Err(kcore::aspace::VmoError::NoMemory) => fail(Status::NoMemory),
+        // (MM9) a page of a pager's VMO that is not there: the kernel asks the pager and waits, then the call says "try again"
+        Err(kcore::aspace::VmoError::NeedPager) => fail(Status::ShouldWait),
+        Err(_) => fail(Status::InvalidArgs),
+    }
+}
+
+/// `vmo_read` and `vmo_write` once the handle is resolved (`id`, with READ or WRITE checked): the copy between the caller's memory (its address space, the
+/// caller holds its lock) and the VMO, with the memory locks only (L20, T215: no object lock for the copy).
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and every index is a constant below 6; len <= MAX_MSG_BYTES before any sum, and `checked_add` guards the VMO range
+pub fn vmo_rw_resolved<M: PhysMem>(
+    writing: bool,
+    aspace: &mut kcore::aspace::AddressSpace,
+    mm: &mut kcore::Mm<M>,
+    vmos: &mut kcore::aspace::Vmos,
+    jobs: &mut kcore::job::Jobs,
+    id: u64,
+    a: [u64; 6],
+) -> Reply {
+    let r: Reply = (|| {
+        if vmos.kind(id) == Some(kcore::aspace::VmoKind::Device) {
+            // device memory is reached only by mapping it, never through the kernel
+            return fail(Status::NotSupported);
+        }
+        let (offset, buf, len) = (a[1], a[2], a[3]);
+        if len > MAX_MSG_BYTES as u64 {
+            return fail(Status::TooBig);
+        }
+        let len = len as usize;
+        let size = vmos.pages(id).ok_or((Status::BadHandle, None, None))? * 4096;
+        if offset.checked_add(len as u64).is_none_or(|end| end > size) {
+            return fail(Status::InvalidArgs);
+        }
+        if writing {
+            let data =
+                copy_from_user(aspace, mm, vmos, jobs, buf, len).map_err(|e| (e, None, None))?;
+            vmos.write(mm, jobs, id, offset, &data)
+                .map_err(|e| match e {
+                    kcore::aspace::VmoError::NeedPager => (Status::ShouldWait, None, None),
+                    _ => (Status::NoMemory, None, None),
+                })?;
+        } else {
+            verify_writable(aspace, mm, vmos, jobs, buf, len).map_err(|e| (e, None, None))?;
+            let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            data.try_reserve_exact(len)
+                .map_err(|_| (Status::NoMemory, None, None))?;
+            data.resize(len, 0);
+            vmos.read(mm, id, offset, &mut data).map_err(|e| match e {
+                kcore::aspace::VmoError::NeedPager => (Status::ShouldWait, None, None),
+                _ => (Status::InvalidArgs, None, None),
+            })?;
+            copy_to_user_verified(aspace, mm, buf, &data).map_err(|e| (e, None, None))?;
+        }
+        Ok((None, None))
+    })();
+    r
 }

@@ -36,7 +36,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kcore::frame::PAGE_SIZE;
-use kcore::pagetable::{PageTable, Perms};
+use kcore::pagetable::Perms;
 use kcore::slab::{self, FrameSource, Slab, SlabMem};
 use linked_list_allocator::Heap;
 
@@ -358,17 +358,18 @@ pub fn frames_held() -> usize {
 }
 
 /// Add `bytes` (rounded up to pages) to the grown heap: take frames from the frame database, map them at the end
-/// of the window, extend the heap. Needs the big kernel lock (frames and the kernel page table). Returns how many
+/// of the window, extend the heap. Takes the kernel page table's lock (`kmem::KPT`) and the frame lock, in that order (T224). Returns how many
 /// bytes were added (0 when the window is full or no frames are left; nothing is left half done).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: `have` is at most HEAP_WINDOW_SIZE (checked into `room`), mapped <= room; the sums are inside the heap window
 pub fn grow(bytes: usize) -> usize {
-    debug_assert!(crate::bkl::held());
+    // (the kernel page table's edits are one at a time, and so is the growth of the window: `have` is read and written under the lock; T224)
+    let _kpt = crate::kmem::KPT.lock();
     let want = bytes.div_ceil(PAGE_SIZE as usize);
     let have = GROWN_BYTES.load(Ordering::Relaxed);
     let room = (HEAP_WINDOW_SIZE as usize - have) / PAGE_SIZE as usize;
     let pages = want.min(room);
-    let k = crate::kmem::get();
-    let mut pt = PageTable::from_root(k.aspace.table().root());
+    let k = crate::kmem::frames();
+    let mut pt = crate::kmem::kernel_table();
     let mut mapped = 0;
     while mapped < pages {
         let Some(f) = k.mm.db.alloc() else { break };
@@ -437,7 +438,6 @@ fn service_pool() {
 /// Bring the pool to `POOL_TARGET`: stock it from this hart's frame cache, or give the surplus back to it.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a frame number is below 2^52, so its address in the direct map (a kernel virtual address) does not overflow, and a pool frame is a direct-map address, so subtracting the base cannot underflow
 fn rebalance_pool() {
-    debug_assert!(crate::bkl::held());
     // (frames come from this hart's cache, which takes `FRAME` only to refill or drain a batch)
     let count = || with_heaps(|h| h.pool_count);
     while count() < POOL_TARGET {

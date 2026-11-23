@@ -5595,15 +5595,38 @@ fn child_with_a_ready_exit_thread() -> Result<(u64, u64, u64), Detail> {
 }
 
 fn a_thread_killed_before_it_ran_runs_no_user_code() -> Outcome {
-    let (p, _m, t) = child_with_a_ready_exit_thread()?;
-    ensure_eq!(
-        st(sys::process_kill(p, 55)),
-        Some(S::Ok),
-        "kill before it ran"
+    // The thread is made on another hart's behalf and can start there as soon as it exists, so whether the kill lands before it runs is a race that only one hart
+    // decides (T226: a deterministic version needs the placement masks of SC2). The property is about the runs the kill does win: such a run must end with the
+    // kill's code for the process and for the thread, and no run may end any other way than the thread having exited first with its own code (42).
+    let mut won = 0;
+    for _ in 0..40 {
+        let (p, _m, t) = child_with_a_ready_exit_thread()?;
+        ensure_eq!(
+            st(sys::process_kill(p, 55)),
+            Some(S::Ok),
+            "kill before it ran"
+        );
+        wait_ended(p, 1000)?;
+        let code = sys::process_info(p).a1 as i64;
+        if code == 55 {
+            thread_ended_with(t, 55)?;
+            won += 1;
+            if won >= 3 {
+                return Ok(());
+            }
+        } else {
+            ensure_eq!(
+                code,
+                42,
+                "the thread ran first and exited with its own code"
+            );
+        }
+    }
+    ensure!(
+        won > 0,
+        "in forty tries the kill never came before the thread ran"
     );
-    wait_ended(p, 1000)?;
-    ensure_eq!(sys::process_info(p).a1 as i64, 55, "the kill's exit code");
-    thread_ended_with(t, 55)
+    Ok(())
 }
 
 fn kill_a_child_whose_threads_never_ran() -> Outcome {

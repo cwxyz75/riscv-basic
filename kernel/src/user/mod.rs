@@ -86,6 +86,24 @@ impl core::ops::DerefMut for QuotaGuard {
 
 static mut USER: Option<UserState> = None;
 
+/// Set once the user state exists (`state()` made it): the commit-on-drop of `irq::without` looks at it before touching the state (L20).
+pub(crate) static USER_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Run `f` on the user state with the object lock held (L20): the only way in. The lock is the outermost-aware critical section of `irq::without` (reentrant:
+/// a helper may take it again), and ending the outermost one commits what `f` touched to the waiters (W1'). The reference does not outlive the closure.
+#[track_caller]
+pub(crate) fn with_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
+    irq::without(|| f(state()))
+}
+
+/// The user state for the few places that run inside a section the caller made (an `irq::without` that returns early with `?` or `return`, which a closure
+/// would change): the object lock is asserted held. Everything else goes through `with_state`.
+#[track_caller]
+fn state_locked() -> &'static mut UserState {
+    state()
+}
+
 #[track_caller]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn state() -> &'static mut UserState {
@@ -126,6 +144,7 @@ fn state() -> &'static mut UserState {
             if let Some(n) = crate::dtb::ff_value("handlegen") {
                 s.first_handle_gen = n;
             }
+            USER_READY.store(true, Ordering::Release);
             s
         })
     }
@@ -133,15 +152,12 @@ fn state() -> &'static mut UserState {
 
 /// The backstops in force (a test hook: `debug_stat` 120 to 124).
 pub fn backstops() -> kcore::limits::Backstops {
-    irq::without(|| state().backstops)
+    with_state(|s| s.backstops)
 }
 
 /// The `##TEST` results user programs have reported so far (pass, fail).
 pub fn reported() -> (u32, u32) {
-    irq::without(|| {
-        let s = state();
-        (s.pass, s.fail)
-    })
+    with_state(|s| (s.pass, s.fail))
 }
 
 /// How many processes exist right now (a leak counter for tests).
@@ -149,8 +165,8 @@ pub fn reported() -> (u32, u32) {
 /// IPC bytes and kernel bytes): `(1, 0, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
 /// J2). Applies the credits of destroyed objects first.
 pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
-    irq::without(|| {
-        ipc::settle(&mut state().objs, kmem::jobs().jobs);
+    with_state(|s| {
+        ipc::settle(&mut s.objs, kmem::jobs().jobs);
         let jobs = &kmem::jobs().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
         (
@@ -165,7 +181,7 @@ pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
 }
 
 pub fn process_count() -> usize {
-    irq::without(|| state().procs.len())
+    with_state(|s| s.procs.len())
 }
 
 /// Threads sleeping on a futex (for leak checks).
@@ -175,17 +191,12 @@ pub fn futex_sleepers() -> usize {
 
 /// Threads waiting for a pager and pagers still alive (for leak checks, PG1).
 pub fn pager_leftovers() -> usize {
-    irq::without(|| {
-        state()
-            .pagers
-            .waits()
-            .saturating_add(state().pager_ends.len())
-    })
+    with_state(|s| s.pagers.waits().saturating_add(s.pager_ends.len()))
 }
 
 /// The number of live kernel objects (for leak checks).
 pub fn live_objects() -> usize {
-    irq::without(|| state().objs.live())
+    with_state(|s| s.objs.live())
 }
 
 /// Why a program could not be started (the detail is shown through `Debug` in test failures).

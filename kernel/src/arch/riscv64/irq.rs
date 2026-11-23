@@ -42,6 +42,23 @@ pub fn enable_timer_interrupt() {
     unsafe { asm!("csrs sie, {}", in(reg) STIE_BIT) };
 }
 
+/// Run `f` with interrupts disabled and **no lock**, restoring the previous state after (L20): for the scheduler's and the thread table's own calls, which take the
+/// locks they need (`RQ`, `TT`, `PI`) and touch none of the object domain. The end of the outermost one (interrupts were on) is a defined point for a switch a
+/// wake asked for (SCHED-SMP-SPEC X7), as the end of a critical section under the object lock is.
+#[track_caller]
+pub fn off<R>(f: impl FnOnce() -> R) -> R {
+    let site = core::panic::Location::caller();
+    let was = save_and_disable();
+    let started = crate::latency::off_begin(was);
+    let r = f();
+    if was {
+        crate::thread::preempt_point();
+    }
+    crate::latency::off_end(started, site);
+    restore(was);
+    r
+}
+
 /// Run `f` with interrupts disabled, restoring the previous state after.
 #[track_caller]
 pub fn without<R>(f: impl FnOnce() -> R) -> R {
@@ -50,8 +67,10 @@ pub fn without<R>(f: impl FnOnce() -> R) -> R {
     let started = crate::latency::off_begin(was);
     crate::bkl::lock();
     let r = f();
-    // the outermost critical section ends here: a defined point for a switch a wake asked for (SCHED-SMP-SPEC X7)
+    // the outermost critical section ends here: what it touched is committed to the waiters before the lock is let go (W1', L20), and it is a defined
+    // point for a switch a wake asked for (SCHED-SMP-SPEC X7)
     if crate::percpu::this().bkl_depth.get() == 1 {
+        crate::user::commit_if_dirty();
         crate::thread::preempt_point();
     }
     crate::bkl::unlock();

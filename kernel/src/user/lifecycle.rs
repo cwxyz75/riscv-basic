@@ -14,64 +14,65 @@ pub(super) fn user_thread_main(token: usize) {
     let _ = irq::save_and_disable();
     crate::bkl::lock();
     let (ts, killed) = {
-        let s = state();
-        let ts = s
-            .starts
-            .remove(&token)
-            .expect("a thread start was registered");
-        // Registered here, by the thread itself, before it can make a syscall: the spawner
-        // cannot be preempted into leaving a window where the thread is unknown.
-        s.thread_pid.insert(thread::current(), ts.pid);
-        thread::pi_register(thread::current()); // (the donation graph, L23)
-                                                // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
-        if let Some(p) = s.procs.get(&ts.pid) {
-            thread::set_job(thread::current(), thread::job_sched().tag(p.job.index()));
-        }
-        // (EX1) the register image the thread will start from, which `thread_read_state` and `thread_write_state` act on until it does; a
-        // SUSPENDED thread's spawner has made it already
-        let tid = thread::current();
-        // (a resume may have come before this thread ever ran: the image the spawner made is the sign that it registered the stopped state, and
-        // then it is not made again)
-        let spawner_done = s.initial_regs.contains_key(&tid);
-        s.initial_regs.entry(tid).or_insert_with(|| {
-            ksys::initial_general(
-                ts.entry,
-                ts.sp,
-                ts.arg,
-                ts.tp,
-                if ts.spawned { tid } else { 0 },
-            )
-        });
-        if ts.suspended && !spawner_done {
-            ksys::thread_start_suspended(s, tid);
-            sync_suspends(s);
-        }
-        let p = s
-            .procs
-            .get_mut(&ts.pid)
-            .expect("a process lives while one of its threads does");
-        p.live_tids.insert(thread::current());
-        if let Some(o) = ts.obj {
-            p.thread_objs.insert(thread::current(), o);
-        }
-        if let Some(st) = ts.stack {
-            p.stacks.insert(thread::current(), st);
-        }
-        if ts.rr {
-            s.sched_flags.insert(thread::current(), 1);
-        }
-        // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
-        // no table yet): clamp it now (PR1; review of task 8).
-        let max = kmem::jobs()
-            .jobs
-            .sched(p.job)
-            .map_or(63, |j| j.max_prio)
-            .max(1);
-        let late_clamp = thread::priority_of(thread::current()).is_some_and(|now| now > max);
-        if late_clamp {
-            thread::set_priority(thread::current(), max);
-        }
-        (ts, p.killed)
+        with_state(|s| {
+            let ts = s
+                .starts
+                .remove(&token)
+                .expect("a thread start was registered");
+            // Registered here, by the thread itself, before it can make a syscall: the spawner
+            // cannot be preempted into leaving a window where the thread is unknown.
+            s.thread_pid.insert(thread::current(), ts.pid);
+            thread::pi_register(thread::current()); // (the donation graph, L23)
+                                                    // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
+            if let Some(p) = s.procs.get(&ts.pid) {
+                thread::set_job(thread::current(), thread::job_sched().tag(p.job.index()));
+            }
+            // (EX1) the register image the thread will start from, which `thread_read_state` and `thread_write_state` act on until it does; a
+            // SUSPENDED thread's spawner has made it already
+            let tid = thread::current();
+            // (a resume may have come before this thread ever ran: the image the spawner made is the sign that it registered the stopped state, and
+            // then it is not made again)
+            let spawner_done = s.initial_regs.contains_key(&tid);
+            s.initial_regs.entry(tid).or_insert_with(|| {
+                ksys::initial_general(
+                    ts.entry,
+                    ts.sp,
+                    ts.arg,
+                    ts.tp,
+                    if ts.spawned { tid } else { 0 },
+                )
+            });
+            if ts.suspended && !spawner_done {
+                ksys::thread_start_suspended(s, tid);
+                sync_suspends(s);
+            }
+            let p = s
+                .procs
+                .get_mut(&ts.pid)
+                .expect("a process lives while one of its threads does");
+            p.live_tids.insert(thread::current());
+            if let Some(o) = ts.obj {
+                p.thread_objs.insert(thread::current(), o);
+            }
+            if let Some(st) = ts.stack {
+                p.stacks.insert(thread::current(), st);
+            }
+            if ts.rr {
+                s.sched_flags.insert(thread::current(), 1);
+            }
+            // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
+            // no table yet): clamp it now (PR1; review of task 8).
+            let max = kmem::jobs()
+                .jobs
+                .sched(p.job)
+                .map_or(63, |j| j.max_prio)
+                .max(1);
+            let late_clamp = thread::priority_of(thread::current()).is_some_and(|now| now > max);
+            if late_clamp {
+                thread::set_priority(thread::current(), max);
+            }
+            (ts, p.killed)
+        })
     };
     // Killed before it ever ran: it never runs user code.
     if let Some(code) = killed {
@@ -99,7 +100,7 @@ pub(super) fn user_thread_main(token: usize) {
     // this and `enter_user`: a tag taken earlier could be stale by now (the thread may have slept in a stopped process or been moved to
     // another hart after a generation turned), and the hart's generation flush belongs to the hart that enters (L18).
     let token = {
-        let UserState { asids, procs, .. } = state();
+        let UserState { asids, procs, .. } = state_locked();
         let p = procs
             .get_mut(&ts.pid)
             .expect("a process lives while one of its threads does");
@@ -120,7 +121,7 @@ pub(super) fn user_thread_main(token: usize) {
                                            // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
                                            // vector state loaded if a write gave it any, in this hart's entry frame
     let entry_frame = {
-        let image = state().initial_regs.remove(&thread::current());
+        let image = with_state(|s| s.initial_regs.remove(&thread::current()));
         let image = image.unwrap_or_else(|| {
             ksys::initial_general(
                 ts.entry,
@@ -160,7 +161,7 @@ static ENTRY_FRAMES: EntryFrames = EntryFrames(core::cell::UnsafeCell::new(
 pub fn finish(pid: u64, tid: Tid) -> i32 {
     thread::join(tid);
     // Other threads of the process may outlive the first one.
-    while irq::without(|| state().procs.get(&pid).map_or(0, |p| p.threads_alive)) > 0 {
+    while with_state(|s| s.procs.get(&pid).map_or(0, |p| p.threads_alive)) > 0 {
         thread::sleep_ticks(1);
     }
     teardown(pid)
@@ -182,8 +183,13 @@ pub(super) fn teardown(pid: u64) -> i32 {
     };
     // A process that vanished without a recorded code is not mistaken for `exit(-1)`.
     let code = process.exit_code.or(process.killed).unwrap_or(i32::MIN);
+    // The process is private to this thread now: let the big lock go **completely** for the two long steps. A thread that comes here from a trap holds it at
+    // depth 1 (and a nested critical section is at depth 2, which never reaches a switch point), so without this the slices below would be slices of
+    // one hold. The slices take it themselves, one at a time (`irq::without` ends in a switch point at depth 1); nothing here holds a borrow of the state.
+    let depth = crate::bkl::release_all();
     teardown_objects(&mut process, code);
     teardown_memory(process);
+    crate::bkl::reacquire(depth);
     kmem::flush_tlb();
     notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
     code
@@ -193,8 +199,7 @@ pub(super) fn teardown(pid: u64) -> i32 {
 
 #[inline(never)]
 pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
         let process = s.procs.remove(&pid);
         if let Some(p) = process.as_ref() {
@@ -215,24 +220,59 @@ pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
     })
 }
 
+/// The handles one slice of a teardown closes, and the objects one slice of its sweep looks at (T206: SCHED-SMP-SPEC X4, no section proportional to
+/// what the process held or to the live objects of the system).
+const TEARDOWN_HANDLES: usize = 256;
+const TEARDOWN_SWEEP: usize = 256;
+
 #[inline(never)]
 pub(super) fn teardown_objects(process: &mut Process, code: i32) {
-    irq::without(|| {
-        let s = state();
-        process.handles.drain(&mut s.objs);
-        if let Some(end) = process.kernel_end.take() {
-            let _ = s.ktable.close(&mut s.objs, end);
+    // 1. the handles, a slice at a time: each slice is its own critical section, so the big lock is let go (and a switch taken) between them
+    loop {
+        let done = with_state(|s| {
+            let done = process.handles.drain_some(&mut s.objs, TEARDOWN_HANDLES);
+            if done {
+                if let Some(end) = process.kernel_end.take() {
+                    let _ = s.ktable.close(&mut s.objs, end);
+                }
+                if let Some(end) = process.exc_channel.take() {
+                    let _ = s.ktable.close(&mut s.objs, end);
+                }
+                // (the process's handles were drained: a job exception channel it held the user end of is reaped now)
+                ksys::exception::reap_closed_job_channels(s);
+            }
+            done
+        });
+        if done {
+            break;
         }
-        if let Some(end) = process.exc_channel.take() {
-            let _ = s.ktable.close(&mut s.objs, end);
+    }
+    // 2. anything still alive that nothing can reach (reference cycles): the sweep as the state machine of MM10, a slice per critical section. The roots
+    // are collected, with the kernel's own handles, in the same critical section that begins the sweep (a root made between the two would be missed and its
+    // object destroyed under a live handle); a handle made once it runs marks its object (that is what the machine's barrier is for). A sweep another
+    // call started (with older roots) is finished first, a slice at a time.
+    loop {
+        let began = with_state(|s| {
+            if s.objs.sweep_active() {
+                s.objs.sweep_step(TEARDOWN_SWEEP);
+                return false;
+            }
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots)
+        });
+        if began {
+            break;
         }
-        // (the process's handles were drained above: a job exception channel it held the user end of is reaped now)
-        ksys::exception::reap_closed_job_channels(s);
-        // Anything still alive that nothing can reach (reference cycles). The roots are
-        // computed here, in the same interrupts-off step as the sweep, and include the
-        // kernel's own handles.
-        let roots = s.roots();
-        s.objs.sweep(&roots);
+    }
+    while with_state(|s| {
+        s.objs.sweep_active()
+            && !matches!(
+                s.objs.sweep_step(TEARDOWN_SWEEP),
+                kcore::object::SweepStep::Done(_)
+            )
+    }) {}
+    // 3. the process is over
+    with_state(|s| {
         if let Some(obj) = process.obj {
             ipc::process_mark_terminated(&mut s.objs, obj, code);
         }
@@ -362,8 +402,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
     if whole {
         LAST_EXIT_CYCLES.store(crate::timer::now(), Ordering::SeqCst);
     }
-    let me = irq::without(|| {
-        let s = state();
+    let me = with_state(|s| {
         let tid = thread::current();
         crate::fp::thread_gone(tid);
         s.sched_flags.remove(&tid);
@@ -425,13 +464,12 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
 
 /// Whether the calling thread has a pending `thread_interrupt` (for wait conditions; interrupts are off or the lock is held).
 pub(super) fn interrupted_now() -> bool {
-    state().interrupts.contains(&thread::current())
+    with_state(|s| s.interrupts.contains(&thread::current()))
 }
 
 /// Take the calling thread's pending interrupt, if any: the blocking call that reports INTERRUPTED does this.
 pub(super) fn take_interrupt() -> bool {
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let had = s.interrupts.remove(&thread::current());
         sync_interrupts(s);
         had
@@ -441,9 +479,10 @@ pub(super) fn take_interrupt() -> bool {
 /// The job the user thread `tid` belongs to (`None` for a kernel thread): who pays for the register state the kernel keeps for it (MM5).
 /// Needs the big kernel lock.
 pub(crate) fn job_of_thread(tid: Tid) -> Option<JobId> {
-    let s = state();
-    let pid = s.thread_pid.get(&tid)?;
-    Some(s.procs.get(pid)?.job)
+    with_state(|s| {
+        let pid = s.thread_pid.get(&tid)?;
+        Some(s.procs.get(pid)?.job)
+    })
 }
 
 /// Charge the growth of the calling thread's handle table to its process's job (MM5; `HandleTable::settle_growth`): a job that cannot pay
@@ -454,8 +493,7 @@ pub(super) fn settle_handle_table(growth_at_entry: u64) {
     if kcore::handle::growth_events() == growth_at_entry && kcore::handle::clamped_tables() == 0 {
         return;
     }
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let Some(&pid) = s.thread_pid.get(&thread::current()) else {
             return;
         };
@@ -477,7 +515,8 @@ pub(super) fn settle_handle_table(growth_at_entry: u64) {
 
 /// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
 pub(super) fn take_interrupt_held() -> bool {
-    let s = state();
+    // (not `with_state`: the caller holds the memory locks, and the object lock comes before them in the order; it holds the object lock too)
+    let s = state_locked();
     let had = s.interrupts.remove(&thread::current());
     sync_interrupts(s);
     had
@@ -485,9 +524,10 @@ pub(super) fn take_interrupt_held() -> bool {
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.
 pub(super) fn killed_now() -> Option<i32> {
-    let s = state();
-    let pid = s.thread_pid.get(&thread::current())?;
-    s.procs.get(pid)?.killed
+    with_state(|s| {
+        let pid = s.thread_pid.get(&thread::current())?;
+        s.procs.get(pid)?.killed
+    })
 }
 
 /// Where a stopped process stops, a suspended thread stops (`thread_suspend`, EX1) and a killed one dies: the calling thread's return to user
@@ -497,8 +537,7 @@ pub(super) fn killed_now() -> Option<i32> {
 pub(super) fn park_while_stopped() {
     loop {
         // (one lookup of the process for all three questions: this runs on every return to user mode)
-        let (killed, stopped, suspended) = irq::without(|| {
-            let s = state();
+        let (killed, stopped, suspended) = with_state(|s| {
             let tid = thread::current();
             let p = s.thread_pid.get(&tid).and_then(|pid| s.procs.get(pid));
             (
@@ -515,36 +554,34 @@ pub(super) fn park_while_stopped() {
         }
         if suspended {
             // (the signal rises, once: the thread has stopped)
-            irq::without(|| {
-                let s = state();
+            with_state(|s| {
                 if let Some(&pid) = s.thread_pid.get(&thread::current()) {
                     ksys::thread_at_return(s, pid, thread::current());
                 }
             });
         }
         commit_wake(); // (wakes this trap made are committed before this thread sleeps, as at every blocking site)
-        irq::without(|| {
-            state().parked_tids.insert(thread::current());
+        with_state(|s| {
+            s.parked_tids.insert(thread::current());
         });
         thread::wait_deadline_private(
             || {
                 killed_now().is_some()
                 || (!stopped_now() && !suspended_now())
                 // (resumed and suspended again before this thread ran: it parks afresh, which raises SUSPENDED)
-                || (suspended_now() && ksys::thread_stop_pending(state(), thread::current()))
+                || (suspended_now() && with_state(|s| ksys::thread_stop_pending(s, thread::current())))
             },
             u64::MAX,
         );
-        irq::without(|| {
-            state().parked_tids.remove(&thread::current());
+        with_state(|s| {
+            s.parked_tids.remove(&thread::current());
         });
     }
 }
 
 /// Is the calling thread suspended (`thread_suspend`: its count is above 0)? One comparison when nothing is.
 pub(super) fn suspended_now() -> bool {
-    let s = state();
-    !s.suspends.is_empty() && ksys::thread_is_suspended(s, thread::current())
+    with_state(|s| !s.suspends.is_empty() && ksys::thread_is_suspended(s, thread::current()))
 }
 
 /// How many threads have suspend state (a copy of `UserState::suspends.len()`, kept by `sync_suspends`): `thread::block` looks here, with no lock,
@@ -572,8 +609,7 @@ pub(crate) fn suspend_blocks() {
     if SUSPEND_STATES.load(Ordering::Acquire) == 0 {
         return;
     }
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         if s.suspends.is_empty() {
             return;
         }
@@ -589,9 +625,10 @@ pub(crate) fn suspend_blocks() {
 
 /// Is the calling thread's process stopped (`process_suspend`)?
 pub(super) fn stopped_now() -> bool {
-    let s = state();
-    s.thread_pid
-        .get(&thread::current())
-        .and_then(|pid| s.procs.get(pid))
-        .is_some_and(|p| p.stopped)
+    with_state(|s| {
+        s.thread_pid
+            .get(&thread::current())
+            .and_then(|pid| s.procs.get(pid))
+            .is_some_and(|p| p.stopped)
+    })
 }
