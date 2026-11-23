@@ -158,21 +158,20 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. Ro
 
 | # | Class | Instances | Protects | IRQ | Nested same-class |
 |---|---|---|---|---|---|
-| 1 | `LEGACY` | one | Everything not yet peeled. Transitional (3.5); absent in the final state | timer, external | reentrant (a depth count) until task 20 |
+| 1 | `OBJ` | one | **What was the big kernel lock** (L20, amendment of 2026-11-23): the object registry, every handle table, the process table, the wait table and dirty log, the pagers and the interrupt objects (`UserState`), port and channel state including pending-call records, the IPC meter; a section ends by committing what it touched to the waiters (W1'). The scheduler and the thread table do not take it (`irq::off`); the kernel's page table, the stack slots and the heap window have locks of their own (T224) | external (interrupt objects) | reentrant (a depth count) until every user is explicit |
 | 2 | `AS` | per process | The region map, the page table, the ASID and the `ran_on` hart mask of one address space | no (page faults are traps, not interrupts) | never two (a syscall touches one address space) |
-| 3 | `OBJ` | one | The object registry, every handle table, the wait table and dirty log, port and channel state including pending-call records, the IPC meter | external (interrupt objects) | no |
-| 4 | `PROCS` | one | The process table and each process's lifecycle state (state, killed, stopped, exit code, thread count) | no | no |
-| 5 | `FUTEX` | 64 buckets, by hash of the key | Futex queues, PI-futex owner and waiter records | no | never two |
-| 6 | `VMO` | one | The VMO store: pages, commit state, mapping references | no | no |
-| 7 | `JOBS` | one | The job ledger, including each job's scheduling limits | no | no |
-| 8 | `PI` | one | The donation graph (4.8) | no | no |
-| 9 | `TT` | two (0: the kernel's thread table, `thread::KERNEL`: contexts, stacks, join and wait queues; 1: the scheduler core's) | The thread tables: `Tid` to the thread's context and stack; the scheduler's records | timer, IPI | two, ascending instance (the kernel's table, then the scheduler's) |
-| 10 | `RQ` | per hart | That hart's run queues (all bands), its current thread, the scheduling records of the threads homed there, its timer queue, its accounting and throttle state, its `resched_pending` flag | timer, IPI | two, ascending hart index (migration, pull) |
-| 11 | `KSTACK` | one | The kernel-stack slot allocator and the kernel page-table entries of the stack window | no | no |
-| 12 | `FRAME` | one | The frame database (the per-hart frame caches need no lock, 3.10) | no | no |
-| 13 | `HEAP` | one | The kernel allocator | yes | no |
-| 14 | `ENTROPY` | one | The kernel entropy pool's generator (HD1): taken only for a draw, never across a call out | no | no |
-| 15 | `UART` | one | The console line | yes | reentrant per hart (a panic breaks it) |
+| 3 | `PROCS` | one | (Merged into `OBJ`, 2026-11-23: the process table is part of `UserState`; the class is unused.) The process table and each process's lifecycle state | no | no |
+| 4 | `FUTEX` | 64 buckets, by hash of the key | Futex queues, PI-futex owner and waiter records | no | never two |
+| 5 | `VMO` | one | The VMO store: pages, commit state, mapping references | no | no |
+| 6 | `JOBS` | one | The job ledger, including each job's scheduling limits | no | no |
+| 7 | `PI` | one | The donation graph (4.8) | no | no |
+| 8 | `TT` | two (0: the kernel's thread table, `thread::KERNEL`: contexts, stacks, join and wait queues; 1: the scheduler core's) | The thread tables: `Tid` to the thread's context and stack; the scheduler's records | timer, IPI | two, ascending instance (the kernel's table, then the scheduler's) |
+| 9 | `RQ` | per hart | That hart's run queues (all bands), its current thread, the scheduling records of the threads homed there, its timer queue, its accounting and throttle state, its `resched_pending` flag | timer, IPI | two, ascending hart index (migration, pull) |
+| 10 | `KSTACK` | three (0: the slot allocator, 1: the kernel page table's edits `kmem::KPT`, 2: the kernel's address-space object, between `JOBS` and `FRAME`: `kmem::get_as`) | The kernel-stack slot allocator and the kernel page-table entries of the stack window | no | no |
+| 11 | `FRAME` | one | The frame database (the per-hart frame caches need no lock, 3.10) | no | no |
+| 12 | `HEAP` | one | The kernel allocator | yes | no |
+| 13 | `ENTROPY` | one | The kernel entropy pool's generator (HD1): taken only for a draw, never across a call out | no | no |
+| 14 | `UART` | one | The console line | yes | reentrant per hart (a panic breaks it) |
 
 | # | Invariant | How checked |
 |---|---|---|

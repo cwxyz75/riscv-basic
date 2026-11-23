@@ -554,13 +554,14 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::bkl::lock();
         crate::fp::trap_entry(frame);
         crate::bkl::unlock();
+        let entry_epoch = crate::user::syscall_entry_epoch();
         trap_body(frame);
         // The tail takes the lock only when there is something to do under it: a switch a wake asked for, the heap below its mark, or a return that is
         // not quiet (a kill, a stop or a suspend recorded, the thread's space not installed on this hart). What the call touched was committed to the
         // waiters at the end of its own critical sections (`irq::without`, W1'), so there is nothing to commit here.
         if crate::thread::need_resched_pending()
             || crate::heap::needs_service()
-            || !crate::user::return_to_user_is_quiet()
+            || !crate::user::return_to_user_is_quiet(entry_epoch)
         {
             crate::bkl::lock();
             crate::user::commit_wake();
@@ -688,7 +689,7 @@ fn trap_body(frame: &mut TrapFrame) {
             format_args!("kernel page fault with a memory lock held"),
         );
     }
-    let k = kmem::get();
+    let k = kmem::get_as();
     match k
         .aspace
         .handle_fault_mapped(k.mm, k.vmos, k.jobs, frame.stval, access)

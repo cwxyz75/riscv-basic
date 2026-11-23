@@ -13,7 +13,7 @@
 use crate::percpu;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-/// The lock classes (`klock`, SCHED-SMP-SPEC 3.3): the big kernel lock is `Legacy`.
+/// The lock classes (`klock`, SCHED-SMP-SPEC 3.3): the big kernel lock is `Obj` (L20).
 pub use klock::Class;
 
 /// Owner of the BKL: hart index + 1, or 0 when free.
@@ -105,7 +105,7 @@ pub fn order_check(held: Class, probe: Class) -> bool {
     me.held.with(|h| h.push(held, 0));
     let before = VIOLATIONS.load(Ordering::SeqCst);
     match probe {
-        Class::Legacy => {
+        Class::Obj => {
             lock();
             unlock();
         }
@@ -151,14 +151,14 @@ pub fn lock() {
     let me = who();
     // the order check applies to a reentrant take too: a path that holds HEAP or UART and then
     // takes a lock the hart already owns is still taking it in the wrong order
-    if violates(Class::Legacy) {
+    if violates(Class::Obj) {
         VIOLATIONS.fetch_add(1, Ordering::SeqCst);
         if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
             panic!("lock order violation: taking the BKL while holding a later lock");
         }
     }
     if !LOCK.held_by(me) {
-        note_acquire(Class::Legacy, 0);
+        note_acquire(Class::Obj, 0);
     }
     let outermost = !LOCK.held_by(me);
     #[cfg(feature = "latency-trace")]
@@ -192,7 +192,7 @@ pub fn try_lock() -> bool {
     let reentrant = LOCK.held_by(me);
     if LOCK.try_lock(me, &percpu::this().bkl_depth) {
         if !reentrant {
-            note_acquire(Class::Legacy, 0);
+            note_acquire(Class::Obj, 0);
         }
         OWNER.store(me as usize + 1, Ordering::Relaxed);
         true
@@ -211,7 +211,7 @@ pub fn unlock() {
     // clear the mirror before the release: another hart may take the lock the moment it is out
     let outermost = percpu::this().bkl_depth.get() == 1;
     if outermost {
-        note_release(Class::Legacy, 0);
+        note_release(Class::Obj, 0);
         OWNER.store(0, Ordering::Relaxed);
         crate::latency::bkl_released();
     }

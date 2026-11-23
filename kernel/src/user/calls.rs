@@ -201,8 +201,16 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let kernel_half_ok = kmem::kernel_half_unchanged(); // (before the memory locks: it takes them itself)
         let k = kmem::get();
-        let handle = ksys::process_create(s, k.mm, k.jobs, k.aspace.table(), kernel_half_ok, me, a)
-            .map_err(|e| (e, None, None))?;
+        let handle = ksys::process_create(
+            s,
+            k.mm,
+            k.jobs,
+            &kmem::kernel_table(),
+            kernel_half_ok,
+            me,
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
         Ok((Some(handle), None))
     })
 }
@@ -276,10 +284,10 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
         let k = kmem::get();
         ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a).map_err(|e| (e, None, None))
     })?;
-    // Spawned after the state borrow is gone. The call runs under the big lock with interrupts off and the new thread's first act is to take that
-    // lock, so what follows (the spawner's half of the registration) happens before the thread runs a line of `user_thread_main`.
-    let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    irq::without(|| {
+    // Spawned after the state borrow is gone, and in the same critical section as the spawner's half of the registration: the new thread's first act is to
+    // take the object lock, so it cannot run a line of `user_thread_main` (or exit) before that half is done (L20: nothing else makes the two atomic now).
+    let tid = irq::without(|| {
+        let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
         let s = state();
         // (EX1) the thread is known to `thread_suspend` and the rest from the moment this call returns; a SUSPENDED one is stopped, with its
         // register image, before the handle that can resume it is handed back
@@ -289,6 +297,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
             ksys::thread_spawned_suspended(s, tid, &spawn);
             sync_suspends(s);
         }
+        tid
     });
     Ok((Some(spawn.handle), Some(tid)))
 }

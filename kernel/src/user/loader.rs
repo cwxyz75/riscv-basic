@@ -34,7 +34,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     // (the caller took the big kernel lock: the closures below run under it, and must not take it again after the memory locks `k` holds)
     let k = kmem::get();
     let table =
-        PageTable::new_with_kernel_half(k.mm, k.aspace.table()).ok_or(LoadError::NoMemory)?;
+        PageTable::new_with_kernel_half(k.mm, &kmem::kernel_table()).ok_or(LoadError::NoMemory)?;
     let mut aspace = AddressSpace::new(table);
     let mut vmo_ids: Vec<u64> = Vec::new();
     let built = (|| -> Result<(), LoadError> {

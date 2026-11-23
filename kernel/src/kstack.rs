@@ -22,7 +22,7 @@ use abi::layout::{KSTACK_BYTES, KSTACK_SLOT_BYTES, KSTACK_WINDOW_BASE, KSTACK_WI
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use kcore::frame::PAGE_SIZE;
-use kcore::pagetable::{PageTable, Perms};
+use kcore::pagetable::Perms;
 
 const PAGES: u64 = KSTACK_BYTES / PAGE_SIZE;
 /// How many slots the window holds.
@@ -35,19 +35,19 @@ struct Slots {
     free: Vec<u32>,
 }
 
-static mut SLOTS: Slots = Slots {
-    next: 0,
-    free: Vec::new(),
-};
+/// The slot allocator, under its own lock (class `KSTACK`, instance 0; the kernel page table's lock, `kmem::KPT`, is instance 1 and comes after it).
+static SLOTS: klock::Spin<Slots, crate::bkl::Machine> = klock::Spin::new(
+    klock::Class::Kstack,
+    0,
+    Slots {
+        next: 0,
+        free: Vec::new(),
+    },
+);
 
-/// The slot state, under the big kernel lock.
-fn slots() -> &'static mut Slots {
-    debug_assert!(
-        crate::bkl::held(),
-        "kernel stack slots touched without the big kernel lock"
-    );
-    // SAFETY: the big kernel lock is held (asserted), so there is no other reference.
-    unsafe { &mut *core::ptr::addr_of_mut!(SLOTS) }
+/// The slot state.
+fn slots() -> klock::Guard<'static, Slots, crate::bkl::Machine> {
+    SLOTS.lock()
 }
 
 /// One kernel stack: a slot of the window. Dereferences to the stack's words (lowest address first).
@@ -97,8 +97,7 @@ impl DerefMut for KStack {
 impl Drop for KStack {
     fn drop(&mut self) {
         let slot = self.slot;
-        // (the lock is re-entrant per thread, so this is fine from a path that already holds it)
-        crate::irq::without(|| slots().free.push(slot));
+        slots().free.push(slot);
     }
 }
 
@@ -108,13 +107,13 @@ impl Drop for KStack {
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 // INVARIANT: i < PAGES indexes the frames array of PAGES entries; the addresses are inside the kernel-stack window; the slot counter is far below u32::MAX
-fn make_slot() -> Option<u32> {
-    let s = slots();
+fn make_slot(s: &mut Slots) -> Option<u32> {
     if s.next >= MAX_SLOTS {
         return None;
     }
     let slot = s.next;
-    let k = crate::kmem::get();
+    let _kpt = crate::kmem::KPT.lock();
+    let k = crate::kmem::frames();
     let mut frames = [0u64; PAGES as usize];
     for i in 0..frames.len() {
         match k.mm.db.alloc() {
@@ -127,7 +126,7 @@ fn make_slot() -> Option<u32> {
             }
         }
     }
-    let mut pt = PageTable::from_root(k.aspace.table().root());
+    let mut pt = crate::kmem::kernel_table();
     let top = slot_base(slot) + KSTACK_SLOT_BYTES;
     for (i, &f) in frames.iter().enumerate() {
         let va = top - (PAGES - i as u64) * PAGE_SIZE;
@@ -151,25 +150,25 @@ fn make_slot() -> Option<u32> {
 
 /// A zeroed kernel stack, or `None` if there is no slot or no memory.
 pub fn alloc() -> Option<KStack> {
-    crate::irq::without(|| {
-        let slot = match slots().free.pop() {
-            Some(s) => s,
-            None => make_slot()?,
-        };
-        let mut stack = KStack { slot };
-        stack.fill(0); // a recycled stack starts clean (and `thread::stack_high_water` relies on it)
-        Some(stack)
-    })
+    let slot = {
+        let mut s = slots();
+        match s.free.pop() {
+            Some(x) => x,
+            None => make_slot(&mut s)?,
+        }
+    };
+    let mut stack = KStack { slot };
+    stack.fill(0); // a recycled stack starts clean (and `thread::stack_high_water` relies on it)
+    Some(stack)
 }
 
 /// Make the first slot now (boot, before the kernel half is snapshotted), so the window's top-level
 /// page-table entry exists; the slot goes on the free list.
 #[allow(clippy::expect_used)] // INVARIANT: boot code: the first slot must exist for the boot thread to get a stack
 pub fn init() {
-    crate::irq::without(|| {
-        let slot = make_slot().expect("memory for the first kernel stack slot");
-        slots().free.push(slot);
-    });
+    let mut s = slots();
+    let slot = make_slot(&mut s).expect("memory for the first kernel stack slot");
+    s.free.push(slot);
 }
 
 /// Frames held by slots (made and kept): leak checks add this to the free count.

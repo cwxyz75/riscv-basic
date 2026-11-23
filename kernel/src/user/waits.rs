@@ -525,8 +525,11 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     // the call is over, whichever way: the priority it lent to the server that read its request goes back, and the record of its wait goes (L22)
     let me = thread::current();
     thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
-    thread::pi_revoke(me);
-    irq::without(|| state().calls.remove(&me));
+    irq::without(|| {
+        // (one section with the server's donation, `lend_to_reader`: after it, no donation for this call can be made)
+        state().calls.remove(&me);
+        thread::pi_revoke(me);
+    });
     r
 }
 

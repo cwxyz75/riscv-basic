@@ -41,7 +41,7 @@ fn balanced(body: impl FnOnce() -> Outcome) -> Outcome {
         before,
         "free frames after the test (leak if smaller)",
     )?;
-    kmem::get()
+    kmem::get_as()
         .mm
         .db
         .audit()
@@ -90,7 +90,7 @@ fn runs_in_the_upper_half() -> Outcome {
 }
 
 fn low_half_is_empty() -> Outcome {
-    let k = kmem::get();
+    let k = kmem::get_as();
     for va in [
         0x1000,
         0x10_0000,
@@ -109,7 +109,7 @@ fn low_half_is_empty() -> Outcome {
 }
 
 fn kernel_mappings_are_w_xor_x() -> Outcome {
-    let k = kmem::get();
+    let k = kmem::get_as();
     let (mut leaves, mut bad) = (0, 0);
     k.aspace.table().for_each_leaf(k.mm, &mut |va, t, level| {
         leaves += 1;
@@ -126,7 +126,7 @@ fn kernel_mappings_are_w_xor_x() -> Outcome {
 
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn kernel_sections_have_the_right_permissions() -> Outcome {
-    let k = kmem::get();
+    let k = kmem::get_as();
     let s = kmem::sections();
     // Every page of every section, not just the first.
     for (name, (start, end), want) in [
@@ -164,7 +164,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
 /// or the firmware's reserved ranges), or is one of the device pages or the tree's own frames.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn direct_map_does_not_alias_the_image() -> Outcome {
-    let k = kmem::get();
+    let k = kmem::get_as();
     let st = kmem::stats();
     // (the whole image, page by page: nothing of it is reachable through the direct map, whatever the leaf sizes. The firmware's own
     // reservation is the tree's business; the RAM between it and the image is ordinary usable memory now)
@@ -394,14 +394,14 @@ fn heap_works() -> Outcome {
 }
 
 fn frame_database_is_sane() -> Outcome {
-    let db = &kmem::get().mm.db;
+    let db = &kmem::get_as().mm.db;
     ensure(db.free_count() > 20_000, "plenty of free frames at boot")?;
     db.audit().map_err(|e| format!("audit: {e}"))
 }
 
 /// Create a VMO of `pages` pages and one region over all of it at `va`.
 fn region(va: u64, pages: u64, perms: Perms) -> u64 {
-    let k = kmem::get();
+    let k = kmem::get_as();
     let id = k.vmos.create(k.jobs, pages);
     k.aspace
         .map_region(k.vmos, va, pages, id, 0, perms)
@@ -410,7 +410,7 @@ fn region(va: u64, pages: u64, perms: Perms) -> u64 {
 }
 
 fn teardown(vmo: u64, starts: &[u64]) {
-    let k = kmem::get();
+    let k = kmem::get_as();
     for &s in starts {
         k.aspace
             .unmap_region(k.mm, k.vmos, k.jobs, s)
@@ -466,7 +466,7 @@ fn unmapped_region_is_gone() -> Outcome {
         write(LAZY_TEST_BASE, 1);
         teardown(vmo, &[LAZY_TEST_BASE]);
         let unmapped = {
-            let k = kmem::get(); // (dropped before the access below: the fault handler takes the same locks)
+            let k = kmem::get_as(); // (dropped before the access below: the fault handler takes the same locks)
             k.aspace.table().translate(k.mm, LAZY_TEST_BASE).is_none()
         };
         ensure(unmapped, "the page is unmapped")?;
@@ -525,7 +525,7 @@ fn shared_vmo_is_one_memory() -> Outcome {
         let b = LAZY_TEST_BASE + MIB2;
         let vmo = region(a, 2, Perms::RW);
         {
-            let k = kmem::get();
+            let k = kmem::get_as();
             k.aspace
                 .map_region(k.vmos, b, 2, vmo, 0, Perms::R)
                 .map_err(|e| format!("map_region b: {e:?}"))?;
@@ -537,7 +537,7 @@ fn shared_vmo_is_one_memory() -> Outcome {
             "the write is visible through the other mapping",
         )?;
         {
-            let k = kmem::get(); // (dropped before `teardown`, which takes the locks again)
+            let k = kmem::get_as(); // (dropped before `teardown`, which takes the locks again)
             let pfn = k.aspace.table().translate(k.mm, a).ok_or("a unmapped")?.pfn;
             ensure_eq(
                 k.mm.db.refs(pfn),

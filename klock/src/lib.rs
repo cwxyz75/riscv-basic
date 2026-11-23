@@ -29,33 +29,31 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use kcore::ticket::{Depth, Ticket};
 
-/// The lock classes in acquisition order (SCHED-SMP-SPEC 3.3). `Legacy` is the big kernel lock.
+/// The lock classes in acquisition order (SCHED-SMP-SPEC 3.3). `Obj` is the object lock (L20: what was the big kernel lock): the object registry, every handle table, the process table, the wait table and the rest of `UserState`; reentrant until its users are all explicit.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum Class {
-    Legacy = 1,
+    Obj = 1,
     As = 2,
-    Obj = 3,
-    Procs = 4,
-    Futex = 5,
-    Vmo = 6,
-    Jobs = 7,
-    Pi = 8,
-    Tt = 9,
-    Rq = 10,
-    Kstack = 11,
-    Frame = 12,
-    Heap = 13,
-    Entropy = 14,
-    Uart = 15,
+    Procs = 3,
+    Futex = 4,
+    Vmo = 5,
+    Jobs = 6,
+    Pi = 7,
+    Tt = 8,
+    Rq = 9,
+    Kstack = 10,
+    Frame = 11,
+    Heap = 12,
+    Entropy = 13,
+    Uart = 14,
 }
 
 impl Class {
     /// Every class, in order.
-    pub const ALL: [Class; 15] = [
-        Class::Legacy,
-        Class::As,
+    pub const ALL: [Class; 14] = [
         Class::Obj,
+        Class::As,
         Class::Procs,
         Class::Futex,
         Class::Vmo,
@@ -73,7 +71,7 @@ impl Class {
     /// May a hart hold two locks of this class at once (in ascending instance order)? The run queues (migration,
     /// pull), the address spaces (a call that names a target process takes the caller's and the target's, ascending by process id); every other class "never two" (3.3).
     pub fn allows_two(self) -> bool {
-        matches!(self, Class::Rq | Class::As | Class::Tt)
+        matches!(self, Class::Rq | Class::As | Class::Tt | Class::Kstack)
     }
 
     /// How many locks of this class one hart may hold at once, when `allows_two`: two run queues, and as many address spaces as there are
@@ -81,6 +79,7 @@ impl Class {
     pub fn most_at_once(self) -> usize {
         match self {
             Class::As => 64,
+            Class::Kstack => 3, // (the slots, the kernel page table's edits, the kernel's address space: T224)
             _ => 2,
         }
     }
@@ -88,7 +87,7 @@ impl Class {
     /// Is a recursive take by the holding hart legal? The legacy lock (a depth count) and the console line (a panic
     /// breaks it); every other class panics on a recursive take.
     pub fn reentrant(self) -> bool {
-        matches!(self, Class::Legacy | Class::Uart)
+        matches!(self, Class::Obj | Class::Uart)
     }
 }
 
@@ -120,7 +119,7 @@ impl Default for Held {
 impl Held {
     pub const fn new() -> Held {
         Held {
-            stack: [(Class::Legacy, 0); MAX_HELD],
+            stack: [(Class::Obj, 0); MAX_HELD],
             len: 0,
         }
     }

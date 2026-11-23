@@ -403,13 +403,22 @@ pub fn user_return_is_quiet() -> bool {
     crate::percpu::this().attention_seen.load(Ordering::SeqCst) == ATTENTION.load(Ordering::SeqCst)
 }
 
-/// The return to user mode of a thread that made a syscall, with **no big lock** (L20): true when nothing has been recorded that the thread must look at
-/// (the hart's attention epoch is the current one) and the thread's own record lets it install its address space on this hart without the allocator
-/// (`activate_current_quiet`: the process, the tag of the current generation, the token). False: the caller takes the full path.
-pub fn return_to_user_is_quiet() -> bool {
+/// The return to user mode of a thread that made a syscall, with **no big lock** (L20): true when the attention epoch has not moved since the call began
+/// (`entry`, from `syscall_entry_epoch`: `Some` only if the thread's return to user mode just before the call was quiet, so nothing was outstanding for it
+/// then) and the thread's own record lets it install its address space on this hart without the allocator (`activate_current_quiet`: the process, the tag
+/// of the current generation, the token). It must not be the hart's `attention_seen` that is compared at the end: a thread that blocked in the call and was
+/// woken by a kill, a stop or a suspend returns on a hart whose last return was somebody else's, which has seen the new epoch. False: the full path.
+pub fn return_to_user_is_quiet(entry: Option<u64>) -> bool {
+    let Some(seen) = entry else {
+        return false;
+    };
+    ATTENTION.load(Ordering::SeqCst) == seen && activate_current_quiet(seen)
+}
+
+/// The attention epoch a syscall begins under, if the thread's return to user mode just before it was quiet (see `return_to_user_is_quiet`).
+pub fn syscall_entry_epoch() -> Option<u64> {
     let seen = ATTENTION.load(Ordering::SeqCst);
-    crate::percpu::this().attention_seen.load(Ordering::SeqCst) == seen
-        && activate_current_quiet(seen)
+    (crate::percpu::this().attention_seen.load(Ordering::SeqCst) == seen).then_some(seen)
 }
 
 /// A trap from user mode (called from the trap handler with interrupts off).
@@ -731,17 +740,17 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
 /// the calling thread, the one that read the request (L22). Skipped for a caller whose call has ended (its request stayed queued after a timeout).
 fn lend_to_reader() {
     let me = thread::current();
-    let calls = irq::without(|| {
+    // (the donation is made in the section that checked the call is still live: the caller's own end of the call, `pi_revoke` and the removal of its record,
+    // is one section too, so a donation cannot outlive the call it was made for: `PI` is after the object lock in the order)
+    irq::without(|| {
         let s = state();
         let read = s.objs.take_dequeued_calls();
-        read.into_iter()
-            .filter(|(caller, call)| s.calls.get(&(*caller as Tid)) == Some(call))
-            .map(|(caller, _)| caller as Tid)
-            .collect::<Vec<Tid>>()
+        for (caller, call) in read {
+            if s.calls.get(&(caller as Tid)) == Some(&call) {
+                thread::pi_donate(caller as Tid, me);
+            }
+        }
     });
-    for caller in calls {
-        thread::pi_donate(caller, me);
-    }
 }
 
 pub(super) fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {
