@@ -31,7 +31,7 @@
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use crate::irq;
-use abi::layout::{DIRECT_BASE, DIRECT_MAP_PHYS_LIMIT, HEAP_WINDOW_BASE, HEAP_WINDOW_SIZE};
+use abi::layout::{DIRECT_MAP_PHYS_LIMIT, HEAP_WINDOW_BASE, HEAP_WINDOW_SIZE};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -118,7 +118,7 @@ impl FrameSource for Pool<'_> {
 /// Is `addr` in the direct map, where the slabs live?
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the direct map's base plus its size is a kernel virtual address, far below usize::MAX
 fn in_direct_map(addr: usize) -> bool {
-    let base = DIRECT_BASE as usize;
+    let base = crate::kmem::direct_base() as usize;
     addr >= base && addr < base + DIRECT_MAP_PHYS_LIMIT as usize
 }
 
@@ -474,7 +474,7 @@ fn rebalance_pool() {
             POOL_STARVED.store(true, Ordering::Relaxed);
             break;
         };
-        let frame = (DIRECT_BASE + (pfn << 12)) as usize;
+        let frame = (crate::kmem::direct_base() + (pfn << 12)) as usize;
         with_heaps(|h| {
             Pool {
                 head: &mut h.pool_head,
@@ -495,7 +495,7 @@ fn rebalance_pool() {
             f
         });
         let Some(frame) = frame else { break };
-        let pfn = (frame as u64 - DIRECT_BASE) >> 12;
+        let pfn = (frame as u64 - crate::kmem::direct_base()) >> 12;
         crate::kmem::frame_free_sole(pfn);
     }
 }

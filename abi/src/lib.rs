@@ -555,14 +555,15 @@ pub mod layout {
     /// found at boot (`arch::kernel_delta`: virtual minus physical).
     pub const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8020_0000;
     /// Start of the direct map: physical address `pa` is at `DIRECT_BASE + pa`
-    /// (RAM outside the kernel image, plus the device pages the kernel uses).
+    /// (RAM outside the kernel image, plus the device pages the kernel uses). This is the **first** slot's address: the kernel moves the map up by a random
+    /// 0 to 64 GiB at boot (HD3, `kmem::direct_base`).
     pub const DIRECT_BASE: u64 = 0xffff_ffc0_0000_0000;
-    /// The direct map reaches physical addresses below this (64 GiB: top-level slots 256 to 319); the slots above it belong to other
-    /// kernel windows (the self-test region at 320, the stacks at 384, the heap at 416, the image at 510). RAM above it is not used.
+    /// The direct map reaches physical addresses below this (64 GiB: 64 top-level slots from 256 + k, k = 0 to 64 chosen at boot, HD3); the slots above
+    /// 384 belong to other kernel windows (the stacks at 384, the heap at 416, the self-test region at 448, the image at 510). RAM above it is not used.
     pub const DIRECT_MAP_PHYS_LIMIT: u64 = 64 << 30;
     /// First virtual address of the region the self-tests use for lazily
     /// committed memory (an otherwise empty top-level slot in the upper half).
-    pub const LAZY_TEST_BASE: u64 = 0xffff_ffd0_0000_0000;
+    pub const LAZY_TEST_BASE: u64 = 0xffff_fff0_0000_0000;
     /// The kernel-stack window (slice T): one top-level slot (1 GiB) of its own, carved into slots of
     /// `KSTACK_SLOT_BYTES`. In each slot the lower half is **unmapped** (the guard: a stack that
     /// overflows runs into it and faults) and the upper half is the stack. The trap entry recognises
@@ -598,9 +599,12 @@ mod tests {
         let slot = |va: u64| (va >> 30) & 0x1ff;
         assert_eq!(slot(DIRECT_BASE), 256);
         assert_eq!(slot(KERNEL_VIRT_BASE), 510);
-        assert_eq!(slot(LAZY_TEST_BASE), 320);
-        // the direct map's span ends where the next window begins, and the early table's loop (`boot.rs`) maps exactly that span
-        assert_eq!(DIRECT_BASE + DIRECT_MAP_PHYS_LIMIT, LAZY_TEST_BASE);
+        assert_eq!(slot(LAZY_TEST_BASE), 448);
+        // the direct map's span, moved up by the most (64 GiB: `boot.rs` chooses k = 0 to 64), still ends where the stack window begins
+        assert_eq!(
+            DIRECT_BASE + (64 << 30) + DIRECT_MAP_PHYS_LIMIT,
+            KSTACK_WINDOW_BASE
+        );
         assert_eq!(slot(KSTACK_WINDOW_BASE), 384);
         assert_eq!(slot(HEAP_WINDOW_BASE), 416);
         assert_eq!((HEAP_WINDOW_BASE as i64) >> 38, -1);

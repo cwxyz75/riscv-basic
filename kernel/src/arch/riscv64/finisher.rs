@@ -2,7 +2,6 @@
 //! status), otherwise the firmware's system reset (SBI SRST: a shutdown, with a reason for failure).
 
 use abi::finisher::{fail, PASS};
-use abi::layout::DIRECT_BASE;
 use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -29,7 +28,7 @@ pub fn exit(ok: bool) -> ! {
         let value = if ok { PASS } else { fail(1) };
         // SAFETY: the SiFive test device the tree names is mapped through the direct map by the early boot table (all physical space below
         // 64 GiB) and by `kmem::init`; a 32-bit write of one of its documented values ends the run.
-        unsafe { write_volatile((DIRECT_BASE + base) as *mut u32, value) };
+        unsafe { write_volatile((crate::kmem::direct_base() + base) as *mut u32, value) };
     } else {
         crate::arch::system_reset(false, !ok);
     }

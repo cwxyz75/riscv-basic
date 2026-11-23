@@ -121,20 +121,20 @@ secondary_entry:                 # a0 = hart id, a1 = dense hart index; paging o
     mv   s1, a1
     # The kernel's own table has no identity mapping, so first use the early boot table (still
     # intact in .bss: identity for RAM, plus the upper-half image), then jump to the upper half.
-    la   t1, KERNEL_DELTA        # where the image is linked minus where it is, worked out by the boot hart's `_start`
+    lla   t1, KERNEL_DELTA        # where the image is linked minus where it is, worked out by the boot hart's `_start`
     ld   s2, 0(t1)               # (read with paging off: no mapping is needed to see it, wherever the image is)
-    la   t2, EARLY_ROOT
+    lla   t2, EARLY_ROOT
     srli t3, t2, 12
     li   t4, 8
     slli t4, t4, 60              # satp.MODE = 8 (Sv39)
     or   t3, t3, t4
     csrw satp, t3
     sfence.vma zero, zero
-    la   t0, 3f
+    lla   t0, 3f
     add  t0, t0, s2
     jr   t0
 3:
-    la   t0, SECONDARY_STACK_TOPS
+    lla   t0, SECONDARY_STACK_TOPS
     slli t1, s1, 3
     add  t0, t0, t1
     ld   sp, 0(t0)

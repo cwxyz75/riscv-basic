@@ -272,6 +272,15 @@ pub fn system_reset(reboot: bool, failure: bool) {
 }
 
 /// Virtual minus physical for the kernel image.
+/// (HD3 is RISC-V only for now: no slide, the direct map where `abi::layout` puts it.)
+pub fn slide() -> u64 {
+    0
+}
+
+pub fn direct_shift() -> u64 {
+    0
+}
+
 pub fn kernel_delta() -> u64 {
     unimplemented!()
 }

@@ -16,7 +16,7 @@ pub fn locate(dtb: usize) -> Option<(u64, usize)> {
     if dtb == 0 || (dtb as u64).saturating_add(8) > abi::layout::DIRECT_MAP_PHYS_LIMIT {
         return None;
     }
-    let head = (abi::layout::DIRECT_BASE + dtb as u64) as *const u8;
+    let head = (crate::kmem::direct_base() + dtb as u64) as *const u8;
     // SAFETY: the early table maps physical addresses below 64 GiB through the direct map; a firmware pointer is a physical address inside
     // RAM, so the 8 header bytes are readable. The length is bounded before anything else reads further.
     let (magic, total) = unsafe {
@@ -42,7 +42,7 @@ pub fn dtb_blob() -> Option<&'static [u8]> {
     if len == 0 {
         return None;
     }
-    let head = (abi::layout::DIRECT_BASE + DTB.load(Ordering::Relaxed) as u64) as *const u8;
+    let head = (crate::kmem::direct_base() + DTB.load(Ordering::Relaxed) as u64) as *const u8;
     // SAFETY: `locate` checked the header and bounded `len`; the tree's frames are direct-mapped read-only and never freed (they are not
     // in the frame allocator).
     Some(unsafe { core::slice::from_raw_parts(head, len) })

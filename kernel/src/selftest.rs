@@ -4,7 +4,7 @@
 //! allocation counts to baseline" (the old roadmap, S1).
 
 use crate::{kmem, trap};
-use abi::layout::{DIRECT_BASE, LAZY_TEST_BASE};
+use abi::layout::LAZY_TEST_BASE;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -115,7 +115,8 @@ fn kernel_mappings_are_w_xor_x() -> Outcome {
         leaves += 1;
         // a large leaf is legal only in the direct map (MM3) and only as plain data: read-write, never executable, never user
         let large_ok = level == 0
-            || ((DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) && t.perms == Perms::RW);
+            || ((crate::kmem::direct_base()..crate::kmem::direct_base() + (1 << 36)).contains(&va)
+                && t.perms == Perms::RW);
         if (t.perms.write && t.perms.exec) || !large_ok || t.perms.user {
             bad += 1;
         }
@@ -172,7 +173,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         ensure(
             k.aspace
                 .table()
-                .translate(k.mm, DIRECT_BASE + (pfn << 12))
+                .translate(k.mm, crate::kmem::direct_base() + (pfn << 12))
                 .is_none(),
             "a page of the kernel image or firmware is reachable through the direct map",
         )?;
@@ -181,7 +182,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
     let (mut in_map, mut aliases, mut devices, mut outside) = (0, 0, 0, 0);
     let (mut leaves, mut level1) = (0u64, 0u64);
     k.aspace.table().for_each_leaf(k.mm, &mut |va, t, level| {
-        if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
+        if (crate::kmem::direct_base()..crate::kmem::direct_base() + (1 << 36)).contains(&va) {
             let pages = 1u64 << (9 * level);
             in_map += pages; // pages, whatever the leaf's size
             leaves += 1;
@@ -194,7 +195,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
             if t.pfn < st.ram_first {
                 devices += 1;
             }
-            if va - DIRECT_BASE != t.pfn << 12 {
+            if va - crate::kmem::direct_base() != t.pfn << 12 {
                 aliases += 1; // not the direct map's own formula
             }
             // a read-write leaf lies wholly inside a usable range; anything else is a device page (below RAM) or one of the tree's
@@ -341,13 +342,53 @@ fn the_entropy_pool_is_seeded_as_the_tree_says() -> Outcome {
     )
 }
 
+/// HD3: the slide and the direct map's move that the early boot code (assembly, reading the tree itself) chose are what `kcore::kaslr` says the tree's seed gives, or
+/// nothing under `kaslr=off` or with no seed; the slide is a multiple of 2 MiB and the image still lies inside its slot; and the direct map starts where the
+/// move says.
+#[allow(clippy::large_stack_frames)] // (a boot self-test on the boot stack: the tree parse and the failure messages)
+fn kaslr_choice_follows_the_seed() -> Outcome {
+    let blob = crate::dtb::dtb_blob().ok_or("no device tree")?;
+    let seeds = kcore::fdt::chosen_seeds(blob).ok_or("the tree has no /chosen")?;
+    let part = |r: Option<(usize, usize)>| -> Option<&[u8]> {
+        r.and_then(|(o, l)| blob.get(o..o.checked_add(l)?))
+    };
+    let seed = kcore::kaslr::seed(part(seeds.kaslr_seed), part(seeds.rng_seed));
+    let sec = kmem::sections();
+    let pages = (sec.data.1 - sec.text.0).div_ceil(2 << 20);
+    let off = crate::dtb::boot_arg_value("kaslr=").as_deref() == Some("off");
+    let (s, k) = if off {
+        (0, 0)
+    } else {
+        kcore::kaslr::choose(seed, pages)
+    };
+    ensure_eq(crate::arch::slide() >> 21, s, "the slide, in 2 MiB pages")?;
+    ensure(
+        crate::arch::slide().is_multiple_of(2 << 20),
+        "the slide is a multiple of 2 MiB",
+    )?;
+    ensure_eq(
+        crate::arch::direct_shift(),
+        k,
+        "the direct map's move, in GiB",
+    )?;
+    ensure_eq(
+        crate::kmem::direct_base(),
+        abi::layout::DIRECT_BASE + (k << 30),
+        "the direct map starts where the move says",
+    )?;
+    ensure(
+        sec.text.0 >= abi::layout::KERNEL_VIRT_BASE && sec.data.1 <= 0xffff_ffff_c000_0000,
+        "the image lies inside its top-level slot",
+    )
+}
+
 fn the_image_is_where_the_loader_put_it() -> Outcome {
     let st = kmem::stats();
     let delta = crate::arch::kernel_delta();
     ensure_eq(
-        abi::layout::KERNEL_VIRT_BASE - delta,
+        abi::layout::KERNEL_VIRT_BASE + crate::arch::slide() - delta,
         st.image_first << 12,
-        "the image's physical start is its link address minus the delta",
+        "the image's physical start is its link address plus the slide minus the delta",
     )?;
     ensure(
         (st.image_first << 12).is_multiple_of(2 << 20),
@@ -688,8 +729,8 @@ fn slab_serves_small_objects_and_everything_comes_back() -> Outcome {
     irq_service(); // (the pool stocked, the magazines settled)
     let frames_before = crate::kmem::free_frames_accounted();
     let bytes_before = crate::thread::heap_free();
-    let direct = abi::layout::DIRECT_BASE as usize
-        ..(abi::layout::DIRECT_BASE + abi::layout::DIRECT_MAP_PHYS_LIMIT) as usize;
+    let direct = crate::kmem::direct_base() as usize
+        ..(crate::kmem::direct_base() + abi::layout::DIRECT_MAP_PHYS_LIMIT) as usize;
     // many objects of every size class, written with a pattern
     let mut held: Vec<(Box<[u8]>, u8)> = Vec::new();
     for round in 0..6000usize {
@@ -792,6 +833,10 @@ pub const TESTS: &[Test] = &[
     (
         "the_image_is_where_the_loader_put_it",
         the_image_is_where_the_loader_put_it,
+    ),
+    (
+        "kaslr_choice_follows_the_seed",
+        kaslr_choice_follows_the_seed,
     ),
     ("heap_works", heap_works),
     ("frame_database_is_sane", frame_database_is_sane),

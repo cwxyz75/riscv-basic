@@ -41,6 +41,7 @@ pub mod ipc;
 pub mod isa;
 pub mod job;
 pub mod jobsched;
+pub mod kaslr;
 pub mod latch;
 pub mod limits;
 pub mod linestate;

@@ -95,7 +95,7 @@ pub fn send_ipi(hart_id: usize) {
     // register and writing an id to it only sets that id pending.
     unsafe {
         write_volatile(
-            (abi::layout::DIRECT_BASE + i.imsic_base + index as u64 * 0x1000) as *mut u32,
+            (crate::kmem::direct_base() + i.imsic_base + index as u64 * 0x1000) as *mut u32,
             IPI_ID,
         );
     }
@@ -149,7 +149,7 @@ const SM_LEVEL_HIGH: u32 = 6;
 
 fn reg(off: u64) -> *mut u32 {
     let base = info().map_or(0, |i| i.aplic_base);
-    (abi::layout::DIRECT_BASE + base + off) as *mut u32
+    (crate::kmem::direct_base() + base + off) as *mut u32
 }
 
 pub fn present() -> bool {

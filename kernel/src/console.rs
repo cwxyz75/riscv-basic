@@ -1,7 +1,6 @@
 //! The serial port: the NS16550A the device tree names (`/chosen/stdout-path`, PL5b), output only, polled, reached through the direct map;
 //! the firmware's debug console (SBI DBCN) when the tree names none.
 
-use abi::layout::DIRECT_BASE;
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -40,7 +39,7 @@ pub fn init_from_tree() -> Option<u64> {
         // (an address the early table does not map would fault with no handler: a tree naming one has no usable console)
         .filter(|&pa| pa != 0 && pa.saturating_add(0x1000) <= abi::layout::DIRECT_MAP_PHYS_LIMIT)?;
     UART_BASE.store(
-        (DIRECT_BASE + pa) as usize,
+        (crate::kmem::direct_base() + pa) as usize,
         core::sync::atomic::Ordering::Relaxed,
     );
     Some(pa)
@@ -50,7 +49,7 @@ pub fn init_from_tree() -> Option<u64> {
 pub fn base() -> Option<u64> {
     Some(UART_BASE.load(core::sync::atomic::Ordering::Relaxed))
         .filter(|&b| b != 0)
-        .map(|b| b as u64 - DIRECT_BASE)
+        .map(|b| b as u64 - crate::kmem::direct_base())
 }
 
 /// `(bytes sent through the firmware's debug console, bytes it refused)`.
