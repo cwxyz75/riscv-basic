@@ -228,3 +228,82 @@ fn random_walks_with_harts_going_offline_and_online_keep_ht1_and_ht2() {
         }
     }
 }
+
+/// Mutex-backed run queues, so that two real threads can drive the scheduler.
+struct StdRqs {
+    rq: Vec<std::sync::Mutex<kcore::sched2::HartRq<FixedPrio>>>,
+    table: std::sync::Mutex<kcore::sched_smp::Table>,
+}
+
+impl kcore::sched_smp::Rqs<FixedPrio> for StdRqs {
+    type Guard<'a> = std::sync::MutexGuard<'a, kcore::sched2::HartRq<FixedPrio>>;
+    type TableGuard<'a> = std::sync::MutexGuard<'a, kcore::sched_smp::Table>;
+    fn len(&self) -> usize {
+        self.rq.len()
+    }
+    fn lock(&self, x: usize) -> Self::Guard<'_> {
+        self.rq[x].lock().unwrap()
+    }
+    fn table(&self) -> Self::TableGuard<'_> {
+        self.table.lock().unwrap()
+    }
+}
+
+/// Review of PM1: two calls taking each other's hart offline cannot both pass the last-hart check.
+#[test]
+fn two_harts_cannot_take_each_other_offline() {
+    for _ in 0..300 {
+        let rqs = StdRqs {
+            rq: (0..2)
+                .map(|_| std::sync::Mutex::new(kcore::sched2::HartRq::new(FixedPrio::new())))
+                .collect(),
+            table: Default::default(),
+        };
+        let s = std::sync::Arc::new(Sched2::over(rqs));
+        s.adopt_current_on(0, attr(20), None).unwrap();
+        let (a, b) = (s.clone(), s.clone());
+        let t0 = std::thread::spawn(move || a.begin_offline(1).is_ok());
+        let t1 = std::thread::spawn(move || b.begin_offline(0).is_ok());
+        let (r0, r1) = (t0.join().unwrap(), t1.join().unwrap());
+        assert!(r0 != r1, "exactly one of the two went offline ({r0} {r1})");
+    }
+}
+
+/// Review of PM1: an exited thread nobody has joined yet moves with the rest, and the hart drains.
+#[test]
+fn an_exited_unjoined_record_moves_away_too() {
+    let s = Sched2::new(2, FixedPrio::new);
+    s.adopt_current_on(0, attr(20), None).unwrap();
+    let t = s.spawn_on(1, attr(10), Some(1)).unwrap();
+    let off = [false; 2];
+    settle(&s, 2, &off);
+    assert_eq!(s.current_on(1), t);
+    s.exit_on(1).unwrap();
+    settle(&s, 2, &off);
+    assert_eq!(s.state(t), Some(State::Exited));
+    // (pinned records that exited do not hold the hart)
+    s.begin_offline(1).unwrap();
+    let off = [false, true];
+    settle(&s, 2, &off);
+    assert_eq!(s.evacuate(1), 0, "the exited record left");
+    assert_eq!(s.home(t), Some(0));
+}
+
+/// Review of PM1: an offline hart's tick pulls nothing in.
+#[test]
+fn an_offline_hart_pulls_nothing() {
+    let s = Sched2::new(2, FixedPrio::new);
+    s.adopt_current_on(0, attr(20), None).unwrap();
+    for _ in 0..3 {
+        s.spawn_on(0, attr(10), Some(0)).unwrap();
+    }
+    s.begin_offline(1).unwrap();
+    let off = [false, true];
+    settle(&s, 2, &off);
+    s.tick_on(1, MS);
+    settle(&s, 2, &off);
+    assert!(
+        homed_on(&s, 1).is_empty(),
+        "nothing was pulled onto the offline hart"
+    );
+}

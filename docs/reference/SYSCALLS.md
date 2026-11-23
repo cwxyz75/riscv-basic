@@ -500,7 +500,7 @@ powered and parks in its idle loop (the firmware's hart-stop is not used; see ti
 was running is displaced and every thread and timer homed on it moves to online harts; its per-hart frame cache and heap magazines go back to the shared pools; device sources aimed at
 it are re-aimed at another online hart. Coming back: its clock is reset, its TLB flushed, and placement may choose it again. Idempotent when the hart is already in the requested
 state. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such hart, `online` above 1); BAD_STATE (it is the last online hart, a thread is pinned to it,
-or another call is changing it); TIMED_OUT (the hart did not get there within two seconds: a kernel bug, the state is left as it is).
+or another call is changing it); TIMED_OUT (the hart did not get there within two seconds: a kernel bug; the hart goes on towards the requested state, so the call can be repeated and answers OK once it is there). Hart 0 never goes offline today: the boot thread and the default affinity of kernel threads are pinned to it (BAD_STATE).
 
 ### hart_info(resource, index) -> state
 

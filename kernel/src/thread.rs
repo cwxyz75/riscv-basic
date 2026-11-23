@@ -420,14 +420,15 @@ fn hart_idle_step() -> bool {
     let me = crate::percpu::this();
     match me.hart_state.load(Ordering::Acquire) {
         HART_DRAINING => {
-            if sched().evacuate(hart()) != 0 {
-                return true;
+            if sched().is_scheduler_online(hart()) {
+                return false; // (the call has published Draining but `begin_offline` has not finished, or was refused: nothing to drain yet)
             }
-            // (timers that moved here from this hart are in other harts' queues now: a hart asleep with nothing armed would never see them, so each looks again and re-arms)
-            for i in 0..crate::smp::started() {
-                if i != hart() && crate::percpu::hart(i).online.load(Ordering::Acquire) {
-                    crate::smp::send_ipi(i, crate::percpu::IPI_RESCHED);
-                }
+            let left = sched().evacuate(hart());
+            // (what moved away may be a sleeper whose timer is now on a hart asleep with nothing armed, or a thread queued there: those harts are marked and must look)
+            let pokes = sched().take_pokes();
+            send_pokes(pokes, hart());
+            if left != 0 {
+                return true;
             }
             crate::kmem::flush_frame_cache();
             crate::heap::return_magazines();
@@ -438,6 +439,7 @@ fn hart_idle_step() -> bool {
         }
         HART_STARTING => {
             crate::arch::tlb_flush_all();
+            crate::arch::icache_flush_local(); // (code may have changed while this hart was out of the `fence.i` set)
             sched().finish_online(hart(), now_ns());
             me.online.store(true, Ordering::SeqCst);
             me.hart_state.store(HART_ONLINE, Ordering::Release);

@@ -1569,7 +1569,8 @@ impl<N: Class> HartRq<N> {
                     && Some(t.tid) != self.cur
                     && !skip(t.tid)
                     && ((t.state == State::Runnable && self.is_queued(t.tid))
-                        || t.state == State::Blocked)
+                        || t.state == State::Blocked
+                        || t.state == State::Exited)
             })
             .map(|t| (t.tid, t.state))
             .collect()
@@ -1578,8 +1579,8 @@ impl<N: Class> HartRq<N> {
     /// Take a blocked thread's record, timers cancelled, to move it to another hart (PM1); the deadline stays in the record.
     pub(crate) fn detach_blocked(&mut self, tid: Tid) -> Option<ThreadSched> {
         let t = self.threads.get(&tid)?;
-        if t.state != State::Blocked {
-            return None;
+        if t.state != State::Blocked && t.state != State::Exited {
+            return None; // (an exited record waiting to be reaped moves like a blocked one, with no timer)
         }
         if let Some(d) = t.deadline {
             self.timers.remove(&(d, tid));
@@ -1598,6 +1599,11 @@ impl<N: Class> HartRq<N> {
             self.hard_timers.insert((rec.timer_hard, tid));
         }
         self.threads.insert(tid, rec);
+    }
+
+    /// Is this hart offline (PM1)? Read under the run-queue lock by everything that is about to put a record here.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.offline
     }
 
     pub(crate) fn set_offline(&mut self, offline: bool) {

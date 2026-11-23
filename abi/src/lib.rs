@@ -161,7 +161,7 @@ pub mod rights {
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
         /// A job: create children and processes in it, set limits (MANAGE), end everything in it
-        /// (KILL), read usage (INSPECT).
+        /// (KILL), read usage (MANAGE).
         pub const JOB: Rights = Rights(
             Self::DUPLICATE.0
                 | Self::TRANSFER.0
