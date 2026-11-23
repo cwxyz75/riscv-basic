@@ -1160,6 +1160,7 @@ rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-
 
 * **The boundary moves.** Programs call the functions of the system library the kernel maps into every process
   (`sys_<name>`); syscall numbers and registers become private, and this file becomes the reference of that library.
+  (Built: AB7 maps it; AB8 refuses an `ecall` from anywhere else, with an illegal-instruction exception, and a build with `ABI_SHUFFLE_SEED` renumbers every call.)
 * **Handles are 64 bits** (24 slot bits, 40 generation bits); handle arrays are 8 bytes per handle. (Built: AB1.)
 * **Times are nanoseconds**; `clock_get` is computed in user mode by the system library.
 * **Identifiers** (koid, thread id) are 64-bit and never reused; no counter wraps.

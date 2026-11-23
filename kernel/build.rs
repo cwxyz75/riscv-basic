@@ -52,6 +52,7 @@ fn main() {
     std::fs::write(out.join("libsys.so"), lib).expect("write libsys.so");
     // The user programs come from the dev build unless the release boot test asks otherwise.
     println!("cargo:rerun-if-env-changed=OS_USER_PROFILE");
+    println!("cargo:rerun-if-env-changed=ABI_SHUFFLE_SEED");
     let profile = std::env::var("OS_USER_PROFILE").unwrap_or_else(|_| "debug".into());
     let built = PathBuf::from(&dir).join(format!("../target/riscv64gc-unknown-none-elf/{profile}"));
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();

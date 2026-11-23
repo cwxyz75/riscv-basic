@@ -110,6 +110,12 @@ pub(super) fn user_thread_main(token: usize) {
             alloc::sync::Arc::as_ptr(&p.aspace).cast_mut(),
             Ordering::Release,
         );
+        crate::percpu::this()
+            .cur_lib_start
+            .store(p.libsys.text_start, Ordering::Relaxed);
+        crate::percpu::this()
+            .cur_lib_end
+            .store(p.libsys.text_end, Ordering::Relaxed);
         install_token_of(asids, p)
     };
     crate::percpu::this()

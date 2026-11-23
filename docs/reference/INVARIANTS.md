@@ -267,3 +267,9 @@ Each becomes a row above, with its check, in the change that builds its mechanis
 - No `unsafe` outside the hardware-facing kernel binary; each block has a
   `// SAFETY:` comment. The pure crates `forbid(unsafe_code)`.
 - Every change leaves the system booting and the suite green.
+- **ABI1 (entry, AB8).** A system call enters the kernel only from the text of the system library mapped into the calling process. The trap handler compares the
+  `sepc` of every user `ecall` with the library's text range of the process the hart is running (kept per hart beside `cur_pid`) before it dispatches, on the
+  quiet paths as well as the full one; a call from anywhere else is an illegal-instruction exception (the exception channel, else the process ends with
+  -1002) and is not carried out. The kernel-started first process is held to it too; only a process with no library range (none is started that way) is not.
+  The syscall numbers are private to `abi` and the library: a build with `ABI_SHUFFLE_SEED` permutes them, and the whole suite runs on it. Tests:
+  `child_faults_are_contained` (variant 84: an `ecall` in the program's own text), negative control `fault-skip-entry-check`, `make os-ktest-shuffle`.

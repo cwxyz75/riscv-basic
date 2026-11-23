@@ -187,7 +187,7 @@ pub mod library {
     }
 
     /// Where to call for `number`: its wrapper, else the raw entry. Without a library there is nothing to call: the program stops (`unimp` traps).
-    pub(crate) fn entry(number: usize) -> usize {
+    pub fn entry(number: usize) -> usize {
         let f = ENTRIES.get(number).map_or(0, |e| e.load(Ordering::Relaxed));
         let f = if f != 0 {
             f

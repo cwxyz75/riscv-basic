@@ -83,6 +83,11 @@ impl TrapFrame {
         self.sepc += 4;
     }
 
+    /// The address of the instruction that trapped.
+    pub fn pc(&self) -> u64 {
+        self.sepc
+    }
+
     /// The user's register `x{n}` (a0 is 10, a7 is 17).
     #[allow(clippy::indexing_slicing)] // INVARIANT: n < 32, the register count of the trap frame (callers pass constants)
     pub fn arg(&self, n: usize) -> u64 {
@@ -440,6 +445,7 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD && n != nr::FUTEX_WAKE && n != nr::FUTEX_WAIT)
         || !crate::fp::light_save(frame)
         || !crate::user::user_return_is_quiet()
+        || !crate::user::call_from_library(frame.pc())
     {
         return false;
     }

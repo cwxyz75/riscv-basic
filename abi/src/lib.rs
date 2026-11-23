@@ -342,11 +342,38 @@ pub mod time {
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers"). One table (AB7): it makes the constants and `TABLE`, which `libsys` turns into one
 /// `sys_<name>` wrapper per call (the name is the constant's, in lower case).
 pub mod syscall {
+    /// AB8: the number a call has in this build. Normally the number written in the table; when `ABI_SHUFFLE_SEED` is set in the environment at build time,
+    /// every number below [`LIMIT`] is mapped by a bijection (`n * mult + add` modulo `LIMIT`, `mult` odd) chosen by the seed, so that code that
+    /// writes a number of its own instead of using the table (or the library) fails the whole suite. Numbers at or above `LIMIT` are not calls and stay.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < bytes.len(); n < LIMIT = 128 and mult, add < 128, so the sum is small
+    pub const fn number(n: usize) -> usize {
+        match option_env!("ABI_SHUFFLE_SEED") {
+            Some(seed) if n < LIMIT => {
+                // FNV-1a of the seed text
+                let bytes = seed.as_bytes();
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                let mut i = 0;
+                while i < bytes.len() {
+                    h ^= bytes[i] as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                    i += 1;
+                }
+                let mut mult = (((h >> 8) as usize) & (LIMIT - 1)) | 1;
+                let add = (h as usize) & (LIMIT - 1);
+                if mult == 1 && add == 0 {
+                    mult = 3; // (never the identity: a seed means a shuffle)
+                }
+                (n * mult + add) % LIMIT
+            }
+            _ => n,
+        }
+    }
+
     macro_rules! syscalls {
         ($($(#[$m:meta])* $name:ident = $n:expr,)*) => {
-            $($(#[$m])* pub const $name: usize = $n;)*
+            $($(#[$m])* pub const $name: usize = number($n);)*
             /// Every call: the constant's name and its number.
-            pub const TABLE: &[(&str, usize)] = &[$((stringify!($name), $n)),*];
+            pub const TABLE: &[(&str, usize)] = &[$((stringify!($name), number($n))),*];
         };
     }
     syscalls! {
@@ -650,5 +677,9 @@ mod syscall_table_tests {
         }
         assert!(TABLE.contains(&("DEBUG_WRITE", DEBUG_WRITE)));
         assert!(TABLE.len() >= 80);
+        // the numbers that are not calls stay not calls, shuffled or not
+        assert!(TABLE
+            .iter()
+            .all(|&(_, n)| n != number(5) && n != number(60)));
     }
 }

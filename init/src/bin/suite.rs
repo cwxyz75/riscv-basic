@@ -93,7 +93,7 @@ fn unknown_syscalls_are_refused() -> Outcome {
         "syscall 999"
     );
     ensure_eq!(
-        st(rt::syscall(5, [0; 6])),
+        st(rt::syscall(rt::abi::syscall::number(5), [0; 6])),
         Some(S::BadSyscall),
         "unassigned number 5"
     );
@@ -2203,7 +2203,7 @@ fn child_exit_code_and_terminated_signal() -> Outcome {
 }
 
 fn child_faults_are_contained() -> Outcome {
-    for (variant, want) in [(1u64, -1001i64), (7, -1001), (5, -1002)] {
+    for (variant, want) in [(1u64, -1001i64), (7, -1001), (5, -1002), (84, -1002)] {
         let (p, _mine) = launch(variant)?;
         wait_ended(p, 500)?;
         let r = sys::process_info(p);
@@ -3514,14 +3514,16 @@ ex1_spin_a1:                    # spins until a1 holds 0x5a5a5a, then ends with 
 1:  beq  a1, t1, 2f
     j    1b
 2:  li   a0, 77
-    li   a7, 61
-    ecall
+    la   t4, EX1_EXIT
+    ld   t4, 0(t4)
+    jr   t4
     .globl ex1_exit_55
     .balign 4
 ex1_exit_55:                    # ends with exit code 55
     li   a0, 55
-    li   a7, 61
-    ecall
+    la   t4, EX1_EXIT
+    ld   t4, 0(t4)
+    jr   t4
     .globl ex1_handler
     .balign 4
 ex1_handler:                    # a "signal handler": counts a hit, returns to the address the debugger left in t6
@@ -3537,8 +3539,9 @@ ex1_spin_f1:                    # spins until f1 holds 0x1234567, then ends with
     beq  t0, t1, 2f
     j    1b
 2:  li   a0, 66
-    li   a7, 61
-    ecall
+    la   t4, EX1_EXIT
+    ld   t4, 0(t4)
+    jr   t4
 "#
 );
 
@@ -3551,6 +3554,9 @@ extern "C" {
 
 #[no_mangle]
 static EX1_HITS: AtomicU32 = AtomicU32::new(0);
+/// The library's `thread_exit` entry, which the routines above end in (AB8: no program makes a call of its own; they have no registers to spare for it).
+#[no_mangle]
+static EX1_EXIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 const EX1_MAGIC: u64 = 0x5a5a5a;
 const GENERAL: u64 = rt::abi::thread_state::GENERAL;
@@ -3559,6 +3565,10 @@ const VECK: u64 = rt::abi::thread_state::VECTOR;
 
 /// Start a thread at `entry` on a stack of its own; `flags` are extra `thread_spawn` flags. Returns (handle, tid).
 fn ex1_spawn(entry: unsafe extern "C" fn(), flags: u32) -> Result<(u64, u64), Detail> {
+    EX1_EXIT.store(
+        rt::library::entry(rt::abi::syscall::THREAD_EXIT),
+        Ordering::Relaxed,
+    );
     let top = own_stack()?;
     let rec = rt::SpawnArgs {
         entry: entry as usize as u64,
@@ -9476,12 +9486,13 @@ fn registers_survive_a_syscall() -> Outcome {
         (0x11usize, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77);
     let (mut a3, mut a4, mut a5, mut a6) = (0x88usize, 0x99, 0xaa, 0xbb);
     let (mut s2, mut s3, mut s4, mut s5) = (0xc1usize, 0xc2, 0xc3, 0xc4);
-    // SAFETY: a CLOCK_GET syscall; the registers named are inputs and outputs, a0-a2 are
+    // SAFETY: a THREAD_YIELD syscall (one the kernel answers: `clock_get` is user-mode code in the library and would use the temporaries); the registers named are inputs and outputs, a0-a2 are
     // clobbered by the results as the ABI says.
     unsafe {
         core::arch::asm!(
-            "ecall",
-            in("a7") rt::abi::syscall::CLOCK_GET,
+            "jalr {lib}",
+            lib = in(reg) rt::library::entry(rt::abi::syscall::THREAD_YIELD),
+            out("ra") _, out("a7") _,
             inout("t0") t0, inout("t1") t1, inout("t2") t2, inout("t3") t3, inout("t4") t4,
             inout("t5") t5, inout("t6") t6,
             inout("a3") a3, inout("a4") a4, inout("a5") a5, inout("a6") a6,

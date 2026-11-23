@@ -194,6 +194,9 @@ pub mod trap {
         pub fn skip_trap_instruction(&mut self) {
             unimplemented!()
         }
+        pub fn pc(&self) -> u64 {
+            unimplemented!()
+        }
         pub fn arg(&self, n: usize) -> u64 {
             unimplemented!()
         }

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """AB7 build check: no user program makes a system call of its own. Every call goes through the system library (`libsys.so`), so the only `ecall`
-instructions in a program's code are the ones the test programs plant on purpose: `crash` (it misbehaves deliberately) and `suite` (it checks what the kernel
-does with raw registers). Usage: check_ecall.py DIR [--self-test]; DIR holds the built programs."""
+instructions in a program's code are the ones the test programs plant on purpose: `crash` (it misbehaves deliberately: a call from outside the library must end the process, AB8). Usage: check_ecall.py DIR [--self-test]; DIR holds the built programs."""
 import os
 import re
 import subprocess
@@ -9,7 +8,7 @@ import sys
 
 SKIP = {"build", "deps", "examples", "incremental"}
 # programs that contain `ecall` on purpose
-ALLOWED = {"crash", "suite"}
+ALLOWED = {"crash"}
 
 
 def objdump():

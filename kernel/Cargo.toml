@@ -70,6 +70,7 @@ fault-skip-forced-touch = []
 # (L11d) the scheduler's negative controls: pokes are dropped (and an idle hart takes no tick, as in tickless idle, so the poke is its only
 # wake), a hart never pulls, an exiting detached thread's stack is freed before its switch completes.
 fault-skip-poke = []
+fault-skip-entry-check = []
 fault-skip-pull = ["kcore/fault-skip-pull"]
 fault-early-reap = []
 # Negative control for the AIA: an acknowledged source is never unmasked again (needs the AIA machine).

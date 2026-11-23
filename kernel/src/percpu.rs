@@ -84,6 +84,10 @@ pub struct PerHart {
     /// so true for every return to user mode: the calls that run without the big kernel lock (`futex_wake`, L14) read it instead of the
     /// thread-to-process map.
     pub cur_pid: AtomicU64,
+    /// The text range of that process's system library (AB8: zero when it has none): an `ecall` from user mode is allowed only from inside it.
+    /// Written beside `cur_pid`.
+    pub cur_lib_start: AtomicU64,
+    pub cur_lib_end: AtomicU64,
     /// The address-space lock of that process (null: none): the page-fault path without the big lock reaches the space through it (L17 part c).
     /// Valid while this hart runs a thread of the process, which keeps the process (and its `Arc`) alive.
     pub cur_as: core::sync::atomic::AtomicPtr<klock::aslock::AsCell>,
@@ -269,6 +273,8 @@ impl PerHart {
             work_done: AtomicBool::new(false),
             active_aspace: AtomicU64::new(0),
             cur_pid: AtomicU64::new(0),
+            cur_lib_start: AtomicU64::new(0),
+            cur_lib_end: AtomicU64::new(0),
             cur_as: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             bkl_takes: AtomicU64::new(0),
             running: AtomicU64::new(0),
