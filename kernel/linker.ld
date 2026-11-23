@@ -30,14 +30,27 @@ SECTIONS
         __rodata_start = .;
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
+    }
+
+    /* HD3: the image is a static-PIE; `_start` applies these R_RISCV_RELATIVE entries (adding the slide) before paging goes on */
+    .rela.dyn : AT(ADDR(.rela.dyn) - KERNEL_VIRT + KERNEL_LMA) ALIGN(8) {
+        __rela_start = .;
+        *(.rela.dyn)
+        *(.rela.*)
+        __rela_end = .;
         . = ALIGN(4K);
-        __rodata_end = .;
+        __rodata_end = .; /* (the relocation table is read-only data of the image) */
     }
 
     .data : AT(ADDR(.data) - KERNEL_VIRT + KERNEL_LMA) ALIGN(4K) {
         __data_start = .;
         *(.data .data.*)
         *(.sdata .sdata.*)
+        *(.got .got.*)
+    }
+
+    .dynamic : AT(ADDR(.dynamic) - KERNEL_VIRT + KERNEL_LMA) ALIGN(8) {
+        *(.dynamic)
     }
 
     .bss : AT(ADDR(.bss) - KERNEL_VIRT + KERNEL_LMA) ALIGN(4K) {
@@ -59,6 +72,6 @@ SECTIONS
     __kernel_end = .;
 
     /DISCARD/ : {
-        *(.eh_frame .eh_frame_hdr)
+        *(.eh_frame .eh_frame_hdr .dynsym .dynstr .hash .gnu.hash .interp)
     }
 }

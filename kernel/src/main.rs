@@ -134,6 +134,14 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     dtb::init_timebase(); // (the clock's rate: before anything reads the time)
     entropy::init(hart_id); // (HD1: the pool is seeded before any address is chosen)
     kmem::init();
+    if !RELEASE {
+        let _ = writeln!(
+            out,
+            "kaslr: image slid {:#x} bytes, direct map at {:#x}",
+            arch::slide(),
+            kmem::direct_base()
+        );
+    }
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
     dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
     if let Some(line) = dtb::ff_report() {

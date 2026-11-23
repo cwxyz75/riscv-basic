@@ -30,6 +30,11 @@ fn main() {
     // We never initialise the global pointer register, so stop the linker from
     // relaxing accesses into gp-relative form.
     println!("cargo:rustc-link-arg=--no-relax");
+    // HD3: a static-PIE (`_start` relocates the image by the slide it chose); no interpreter, and no read-only relocation protection (nothing could apply it)
+    println!("cargo:rustc-link-arg=-pie");
+    println!("cargo:rustc-link-arg=--no-dynamic-linker");
+    println!("cargo:rustc-link-arg=-znotext");
+    println!("cargo:rustc-link-arg=-znorelro");
     println!("cargo:rerun-if-env-changed=KERNEL_LMA");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=build.rs");

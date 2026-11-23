@@ -10,7 +10,11 @@
     clippy::unreachable
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
-use abi::layout::DIRECT_BASE;
+/// Where physical address 0 is in the direct map: the first slot's address plus the gigabytes `_start` moved it up (HD3: random, from the device tree's seed).
+pub fn direct_base() -> u64 {
+    abi::layout::DIRECT_BASE.wrapping_add(crate::arch::direct_shift() << 30)
+}
+
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::buddy::{Meta, META_BYTES};
@@ -22,18 +26,18 @@ use kcore::Mm;
 pub struct DirectMap;
 
 impl PhysMem for DirectMap {
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: DIRECT_BASE + pa: pa is a physical address inside RAM, which the direct map covers
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: crate::kmem::direct_base() + pa: pa is a physical address inside RAM, which the direct map covers
     fn read_u64(&self, pa: u64) -> u64 {
         // SAFETY: callers pass the address of a frame the frame database manages
         // (page tables and VMO pages), which `init` direct-maps read-write; the
         // address is 8-byte aligned by construction.
-        unsafe { read_volatile((DIRECT_BASE + pa) as *const u64) }
+        unsafe { read_volatile((crate::kmem::direct_base() + pa) as *const u64) }
     }
 
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: DIRECT_BASE + pa: pa is a physical address inside RAM, which the direct map covers
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: crate::kmem::direct_base() + pa: pa is a physical address inside RAM, which the direct map covers
     fn write_u64(&mut self, pa: u64, value: u64) {
         // SAFETY: as for `read_u64`.
-        unsafe { write_volatile((DIRECT_BASE + pa) as *mut u64, value) }
+        unsafe { write_volatile((crate::kmem::direct_base() + pa) as *mut u64, value) }
     }
 }
 
@@ -42,23 +46,31 @@ impl PhysMem for DirectMap {
 pub struct PhysWord(pub u64);
 
 impl kcore::pifutex::Word for PhysWord {
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: DIRECT_BASE + pa: pa is a physical address inside RAM, which the direct map covers
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: crate::kmem::direct_base() + pa: pa is a physical address inside RAM, which the direct map covers
     fn load(&self) -> u32 {
         // SAFETY: `self.0` is the physical address of a resident, 4-aligned user word that the caller keeps from going (the big kernel lock and
         // the address-space lock were held when it was resolved, and the caller holds the big lock still); the direct map covers it.
-        unsafe { core::sync::atomic::AtomicU32::from_ptr((DIRECT_BASE + self.0) as *mut u32) }
-            .load(core::sync::atomic::Ordering::SeqCst)
+        unsafe {
+            core::sync::atomic::AtomicU32::from_ptr(
+                (crate::kmem::direct_base() + self.0) as *mut u32,
+            )
+        }
+        .load(core::sync::atomic::Ordering::SeqCst)
     }
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `load`
     fn cas(&self, old: u32, new: u32) -> Result<u32, u32> {
         // SAFETY: as in `load`.
-        unsafe { core::sync::atomic::AtomicU32::from_ptr((DIRECT_BASE + self.0) as *mut u32) }
-            .compare_exchange(
-                old,
-                new,
-                core::sync::atomic::Ordering::SeqCst,
-                core::sync::atomic::Ordering::SeqCst,
+        unsafe {
+            core::sync::atomic::AtomicU32::from_ptr(
+                (crate::kmem::direct_base() + self.0) as *mut u32,
             )
+        }
+        .compare_exchange(
+            old,
+            new,
+            core::sync::atomic::Ordering::SeqCst,
+            core::sync::atomic::Ordering::SeqCst,
+        )
     }
 }
 
@@ -410,8 +422,9 @@ pub fn init() {
     // SAFETY: boot code, one hart, before anything reads it.
     unsafe { *addr_of_mut!(USABLE) = usable.clone() };
     let storage: &'static mut [Meta] = {
-        let at =
-            (DIRECT_BASE + usable.get(host).expect("the host range").0 * PAGE_SIZE) as *mut Meta;
+        let at = (crate::kmem::direct_base()
+            + usable.get(host).expect("the host range").0 * PAGE_SIZE)
+            as *mut Meta;
         // SAFETY: the first `meta_frames` frames of a usable range are RAM that nothing else uses and the database will not hand out;
         // the early boot table direct-maps all physical space below 64 GiB; `managed` entries fit in `meta_frames` frames (sized from
         // the larger `usable_total`); an all-zero `Meta` is a valid value and the slice is cleared before it is formed; it is the only
@@ -477,7 +490,7 @@ pub fn init() {
         for (pfn, level) in kcore::pagetable::plan_range(first, count as u64, 2) {
             pt.map_large(
                 &mut mm,
-                DIRECT_BASE + pfn * PAGE_SIZE,
+                crate::kmem::direct_base() + pfn * PAGE_SIZE,
                 pfn,
                 level,
                 Perms::RW,
@@ -504,8 +517,13 @@ pub fn init() {
             .any(|&(b, s)| pfn * PAGE_SIZE >= b && (pfn + 1) * PAGE_SIZE <= b.saturating_add(s))
     };
     for pfn in tree.filter(|&p| in_ram(p)) {
-        pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::R)
-            .expect("device tree map");
+        pt.map(
+            &mut mm,
+            crate::kmem::direct_base() + pfn * PAGE_SIZE,
+            pfn,
+            Perms::R,
+        )
+        .expect("device tree map");
     }
     // the devices the kernel drives, found in the tree: the console, the test device, the interrupt controller's pages. Each page once (the
     // console and the test device may share one, and a page may not be mapped twice).
@@ -518,8 +536,13 @@ pub fn init() {
     pages.sort_unstable();
     pages.dedup();
     for page in pages {
-        pt.map(&mut mm, DIRECT_BASE + page, page / PAGE_SIZE, Perms::RW)
-            .expect("device page");
+        pt.map(
+            &mut mm,
+            crate::kmem::direct_base() + page,
+            page / PAGE_SIZE,
+            Perms::RW,
+        )
+        .expect("device page");
     }
     let root = pt.root();
     *KASPACE.lock() = Some(AddressSpace::new(PageTable::from_root(root)));
