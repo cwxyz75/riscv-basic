@@ -223,6 +223,14 @@ pub fn run_all() -> Report {
             Err(e) => Err(e.clone()),
         },
     );
+    // (frames in flight settle: a dead thread's stack goes back as its hart switches away, a heap service moves frames between the terms; a leak does not
+    // settle, so the check waits a bounded time for the count to come back before it fails; T227)
+    for _ in 0..200 {
+        if free_frames() == frames {
+            break;
+        }
+        thread::sleep_ticks(1);
+    }
     push(
         "process_teardown_returns_every_frame",
         if free_frames() == frames {
