@@ -25,4 +25,5 @@ debts in `TIDY-UP.md`, plans in `ROADMAP.md`.
 | `2026-11-16-doofs-slice.md` | Fable review of the doofs slice (FS steps 1 to 6; fixes in PR 177) | 2026-11-16 |
 | `2026-11-16-l11b-scheduler.md` | Fable review of L11b-1, per-hart run queues (PR 167) | 2026-11-16 |
 | `2026-11-16-l12-step1.md` | Fable review of L12 step one, the scheduler behind its own lock (PR 168) | 2026-11-16 |
+| `2026-11-23-kt14-unsafe-audit.md` | KT14: Fable audit of every `unsafe` in the kernel binary (162 blocks; one isolation bug fixed, T239 to T242); the rows are `kt14-unsafe-audit.tsv` | 2026-11-23 |
 | `../review-dispositions-2026-11-18.md` | What became of every finding above: fixed (where), tracked (which work item), or not recorded | 2026-11-18 |
