@@ -555,3 +555,11 @@ counter's value at the clock's zero. `sys_clock_get` is code in the library that
 no longer enters the kernel (`debug_stat` 131 counts the calls the kernel still answers). `rt` reads the library's `.dynsym` once in `_start`; every call goes
 through the table that gives, so a program has no `ecall` of its own (`scripts/check_ecall.py`; `crash` and `suite` plant theirs on purpose). The kernel's own `clock_get`,
 `port_wait` and the other old shapes stay until AB8 takes the numbers private.
+
+## Amendment 2026-11-23 (AB8): entry enforcement and private numbers
+
+The trap handler admits a user `ecall` only when its `sepc` lies in the library's text range of the process the hart runs (INVARIANTS ABI1); any other is an
+illegal-instruction exception at that pc. The check is two compares against per-hart words written where the hart's current process is, and it also guards the
+calls handled with no big kernel lock. Programs no longer contain an `ecall` at all except `crash`'s deliberate one (`check_ecall.py`). The call numbers are
+produced by `abi::syscall::number`, which is the identity unless `ABI_SHUFFLE_SEED` is set when the workspace is built, and then a seed-chosen bijection on
+`0..LIMIT`: `libsys`, the kernel's dispatch and `rt` all take their numbers from it, and a program that wrote a literal number fails the suite.

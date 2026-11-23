@@ -232,6 +232,8 @@ jobs:
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-release
       - run: make os-ktest-release-content
+      - run: make os-ktest-entry-neg
+      - run: make os-ktest-shuffle
 
   # KT5: the instruction counts of the main syscall paths, at one hart under `-icount shift=0` (deterministic), against bench/counts.tsv (a rise of
   # more than 5 % fails).

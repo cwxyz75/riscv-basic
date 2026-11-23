@@ -65,6 +65,15 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
         let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
         crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
         let p = procs.get_mut(&pid);
+        let (ls, le) = p
+            .as_ref()
+            .map_or((0, 0), |p| (p.libsys.text_start, p.libsys.text_end));
+        crate::percpu::this()
+            .cur_lib_start
+            .store(ls, Ordering::Relaxed);
+        crate::percpu::this()
+            .cur_lib_end
+            .store(le, Ordering::Relaxed);
         crate::percpu::this().cur_as.store(
             p.as_ref().map_or(core::ptr::null_mut(), |p| {
                 alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
@@ -90,6 +99,7 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
                     tag: p.tag,
                     token,
                     aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
+                    lib: (p.libsys.text_start, p.libsys.text_end),
                 },
             );
             me.bound_tid.store(tid, Ordering::Relaxed);
@@ -136,6 +146,8 @@ pub fn activate_current_quiet(seen: u64) -> bool {
     }
     me.attention_seen.store(seen, Ordering::SeqCst);
     me.cur_pid.store(b.pid, Ordering::Relaxed);
+    me.cur_lib_start.store(b.lib.0, Ordering::Relaxed);
+    me.cur_lib_end.store(b.lib.1, Ordering::Relaxed);
     me.cur_as
         .store(b.aspace as *mut klock::aslock::AsCell, Ordering::Release);
     if me.active_aspace.swap(b.token, Ordering::SeqCst) != b.token
@@ -558,6 +570,17 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     true
 }
 
+/// AB8: is `pc`, the address of a system call instruction from user mode, inside the text of the running process's system library? A process with no library
+/// (its range is zero) is not held to it. The `fault-skip-entry-check` build lets every call through (the negative control of the test).
+pub fn call_from_library(pc: u64) -> bool {
+    let me = crate::percpu::this();
+    let (s, e) = (
+        me.cur_lib_start.load(Ordering::Relaxed),
+        me.cur_lib_end.load(Ordering::Relaxed),
+    );
+    cfg!(feature = "fault-skip-entry-check") || e == 0 || (s <= pc && pc < e)
+}
+
 /// `futex_wake` from user mode with **no big kernel lock** (L14): the trap handler's quiet path calls this with the frame past the call
 /// instruction. The process is the one `activate_current` recorded for this hart's running thread; the rest takes only the key's bucket lock
 /// and the scheduler's own locks. A wake that outranks this thread leaves `need_resched` set: the caller takes the lock for the switch.
@@ -610,6 +633,17 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
 pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     use crate::arch::{FaultKind, UserTrap};
     if frame.is_syscall() {
+        // AB8: the system call instruction is allowed only inside the system library; anywhere else it is an illegal instruction, and the
+        // process ends (or its exception port hears of it)
+        if !call_from_library(frame.pc()) {
+            raise_fault(ksys::exception::Fault {
+                kind: abi::arch::fault::ILLEGAL,
+                pc: frame.pc(),
+                address: frame.pc(),
+                cause: 8,
+            });
+            return;
+        }
         frame.skip_trap_instruction(); // past the call instruction
         syscall(frame);
         // (MM9) a kernel copy found a page of a pager's VMO missing: wait for it here, with no lock held

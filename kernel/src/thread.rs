@@ -88,6 +88,8 @@ pub struct UserBinding {
     pub tag: kcore::asid::AsTag,
     pub token: u64,
     pub aspace: usize,
+    /// The library text range of the process (AB8).
+    pub lib: (u64, u64),
 }
 
 struct KThread {
