@@ -307,7 +307,7 @@ os-boot-test-overflow: kernel-main
 # harts, compared with the checked-in baseline (a 3x slowdown fails). The numbers are QEMU debug-build costs on whatever
 # machine runs them: look at the printed ratios, and update `bench/baseline.tsv` on purpose (and the table in
 # TESTING.md) when a change is meant to move them.
-# (3x on the machine that made the baseline; CI runners are several times slower, so soak.yml sets BENCH_RATIO=10)
+# (3x on the machine that made the baseline; CI runners are several times slower, so soak.yml sets BENCH_RATIO=30: the futex pair numbers swing by 30 times between runs with where the pair is placed, T231, T232)
 BENCH_RATIO ?= 3
 os-bench: kernel-main
 	rm -f target/bench.tsv
