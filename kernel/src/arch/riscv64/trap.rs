@@ -492,7 +492,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::user::user_mode_left();
         // The kernel runs with the FP unit off (INVARIANTS FP3) on every path, including the light
         // IPI one that saves nothing: the frame keeps the user's FS for the return.
-        // SAFETY: clears sstatus.FS only.
+        // SAFETY: clears sstatus.FS and sstatus.VS (bits 14:13 and 10:9) only, turning the FP and vector units off for the kernel; the user's values stay in the frame.
         unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     }
     // Every trap holds the big kernel lock while the kernel handles it (S5, K2), except the quiet ones of L12b and L12c (INVARIANTS K6); interrupts are

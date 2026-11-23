@@ -145,16 +145,26 @@ pub(super) fn user_thread_main(token: usize) {
         crate::fp::mark_present(thread::current(), &mut frame);
         crate::fp::return_to_user_held(&mut frame);
         let hart = crate::percpu::this().index.load(Ordering::Relaxed);
-        // SAFETY: interrupts are off and the big lock is held; this hart's element is used by this hart only.
-        let slot = unsafe { (*ENTRY_FRAMES.0.get()).get_mut(hart) }
-            .expect("an entry frame for every hart");
-        *slot = frame;
-        slot as *const crate::trap::TrapFrame
+        // SAFETY: the pointer is to this hart's one element, made without a reference to the array (the others' elements may be read by their harts
+        // meanwhile: a hart reads its own in `enter_user_frame`, after it dropped the lock), and the hart index is below the array's length (one element per hart). This hart alone writes it:
+        // the object lock is held and interrupts are off, the hart index was read after the last switch point of this thread, and the element is read
+        // again only by this hart's own `enter_user_frame` (T242).
+        unsafe {
+            let slot = ENTRY_FRAMES
+                .0
+                .get()
+                .cast::<crate::trap::TrapFrame>()
+                .add(hart);
+            *slot = frame;
+            slot as *const crate::trap::TrapFrame
+        }
     };
     crate::bkl::unlock();
     user_mode_entered();
-    // SAFETY: `enter_user_frame` switches to the process's address space and drops to U-mode from the register image prepared above (in this hart's
-    // entry frame, which only this hart uses and only with interrupts off); it never returns.
+    // SAFETY: the contract of `enter_user_frame`: `entry_frame` is this hart's static entry frame (it does not overlap the stack), `token` was taken under the
+    // object lock above, with no switch point after it, and names the live root of this thread's own process (upper half the kernel's), `top` is the top of this
+    // thread's own kernel stack, interrupts are off and no lock is held (the object lock was dropped just above); the call switches to that space and drops to
+    // U-mode with the image, and never returns (T242).
     unsafe { crate::arch::enter_user_frame(entry_frame, token, top) }
 }
 

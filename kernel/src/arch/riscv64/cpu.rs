@@ -34,7 +34,7 @@ pub unsafe fn aspace_install(token: u64) {
 pub fn asid_bits() -> u32 {
     let old: u64;
     let back: u64;
-    // SAFETY: reads `satp`, writes the same mode and table with every ASID bit set, reads it back and restores the old value: the table is
+    // SAFETY: the caller has interrupts off (nothing can trap while the probe value is installed) and a table is installed (the one caller, user/mod.rs, runs after paging is on). Reads `satp`, writes the same mode and table with every ASID bit set, reads it back and restores the old value: the table is
     // the one already installed, so nothing the hart executes from or touches changes; the flush drops entries cached under the probe.
     unsafe {
         asm!("csrr {old}, satp", old = out(reg) old);

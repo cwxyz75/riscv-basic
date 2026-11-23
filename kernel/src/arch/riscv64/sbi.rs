@@ -56,7 +56,8 @@ pub fn sbi5(eid: usize, fid: usize, a: [usize; 5]) -> SbiRet {
     }
     let (error, value): (isize, usize);
     // SAFETY: `ecall` from S-mode into OpenSBI with the standard calling convention (a7 =
-    // extension, a6 = function, a0-a2 arguments, results in a0/a1); it changes no kernel state.
+    // extension, a6 = function, a0-a4 arguments, results in a0/a1). Callers pass fixed extension and function ids and arguments the kernel derived
+    // itself (hart ids, addresses it owns), so firmware sees only requests the kernel means to make; no kernel memory is written through the call.
     unsafe {
         asm!(
             "ecall",
