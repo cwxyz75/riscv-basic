@@ -90,6 +90,26 @@ impl<N: Class> Rqs<N> for Local<N> {
     }
 }
 
+/// How a wake picks a hart (KERNEL-V1-SPEC 5.6, PM4). `Spread` is the default: the thread's last hart if it would run there, else an idle hart, else the hart with the
+/// lowest running priority. `Pack` consolidates load so that other harts stay idle: the lowest-indexed online hart that runs something below the thread, else the
+/// `Spread` rule. Both keep GP1: only the choice of hart differs, never what a hart pulls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    Spread = 0,
+    Pack = 1,
+}
+
+impl Policy {
+    /// The policy a user-mode number names (`system_set_placement`): 0 spread, 1 pack.
+    pub fn from_code(code: u64) -> Option<Policy> {
+        match code {
+            0 => Some(Policy::Spread),
+            1 => Some(Policy::Pack),
+            _ => None,
+        }
+    }
+}
+
 /// The three global masks of KERNEL-V1-SPEC 5.2 (bit `h` is hart `h`): `online` (the harts that are part of the scheduler), `idle` (online, nothing running but the idle
 /// thread, nothing queued) and `overloaded` (a thread queued there that the hart is not running). `idle` and `overloaded` are published when a hart's lock is released
 /// after a change, like the hints, and are **read only as hints**: every use is re-checked under the locks, so a stale bit costs a wasted look, never a wrong move.
@@ -188,6 +208,8 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// yet is skipped by placement and by push). Every hart starts online; the kernel clears the others until they join.
     online: Vec<AtomicBool>,
     masks: Masks,
+    /// The placement policy (`Policy`), read at each wake.
+    policy: AtomicU8,
     /// How many times a hart looked into another hart's queue under its lock to pull (SC2: zero while no hart is overloaded).
     pull_looks: AtomicU64,
     hint: Vec<Hint>,
@@ -241,6 +263,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                     overloaded: AtomicU64::new(0),
                 }
             },
+            policy: AtomicU8::new(Policy::Spread as u8),
             pull_looks: AtomicU64::new(0),
             hint: (0..harts).map(|_| Hint::new()).collect(),
             transit: (0..harts).map(|_| AtomicU64::new(0)).collect(),
@@ -348,6 +371,18 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 .online
                 .fetch_and(!(1u64 << hart), Ordering::AcqRel);
         }
+    }
+    /// The placement policy in force.
+    pub fn policy(&self) -> Policy {
+        if self.policy.load(Ordering::Relaxed) == Policy::Pack as u8 {
+            Policy::Pack
+        } else {
+            Policy::Spread
+        }
+    }
+    /// Change the placement policy (PM4): threads already placed stay where they are; the next wake uses the new rule.
+    pub fn set_policy(&self, policy: Policy) {
+        self.policy.store(policy as u8, Ordering::Relaxed);
     }
     /// How many times a settle looked into another hart's queue under its lock (SC2).
     pub fn pull_looks(&self) -> u64 {
@@ -562,7 +597,29 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if !self.is_online(last) {
             last = (0..self.harts()).find(|&x| self.is_online(x)).unwrap_or(0);
         }
-        if self.view_cur(last) < rec.eff {
+        match self.policy() {
+            Policy::Spread => self.select_spread(last, rec.eff),
+            Policy::Pack => self.select_pack(last, rec.eff),
+        }
+    }
+
+    /// `Pack`: the lowest-indexed online hart that runs something below `eff` (idle ones included), found from the masks and the running-priority hints; when every
+    /// hart is busy with something at least as good, the `Spread` rule (which then leaves the thread queued where it was).
+    fn select_pack(&self, last: usize, eff: Prio) -> usize {
+        let mut cand = self.masks.online.load(Ordering::Acquire);
+        while cand != 0 {
+            let h = cand.trailing_zeros() as usize;
+            cand &= cand.saturating_sub(1);
+            if self.view_cur(h) < eff {
+                return h;
+            }
+        }
+        self.select_spread(last, eff)
+    }
+
+    /// `Spread`: the thread's last hart if it would run there, else an idle hart, else the hart with the lowest running priority.
+    fn select_spread(&self, last: usize, eff: Prio) -> usize {
+        if self.view_cur(last) < eff {
             return last;
         }
         // an idle hart from the mask (the lowest one with nothing running and nothing queued), without looking at the others
@@ -570,7 +627,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             self.masks.idle.load(Ordering::Acquire) & self.masks.online.load(Ordering::Acquire);
         if idle != 0 {
             let x = idle.trailing_zeros() as usize;
-            if self.view_cur(x) < rec.eff {
+            if self.view_cur(x) < eff {
                 return x;
             }
         }
@@ -578,7 +635,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             .filter(|&h| self.is_online(h))
             .min_by_key(|&h| (self.view_cur(h), h))
             .unwrap_or(last);
-        if self.view_cur(best) < rec.eff {
+        if self.view_cur(best) < eff {
             best
         } else {
             last

@@ -79,3 +79,59 @@ fn only_the_hart_with_a_waiting_thread_is_looked_at() {
     );
     s.audit(true).unwrap();
 }
+
+#[test]
+fn pack_consolidates_onto_low_harts_and_spread_spreads() {
+    use kcore::sched_smp::Policy;
+    // PM4: two light periodic threads on four harts, never running together. Each wakes, runs and sleeps again. Under `pack` they share the lowest hart that is
+    // free of a better thread, under `spread` each goes back to the hart it last ran on (the `spread` side of the comparison is the QEMU test's).
+    for policy in [Policy::Pack, Policy::Spread] {
+        let s = Sched2::new(4, FixedPrio::new);
+        s.set_policy(policy);
+        assert_eq!(s.policy(), policy);
+        // hart 0 keeps a thread of 20 (so it is never the place for a thread of 10)
+        s.adopt_current_on(0, attr(20), None).unwrap();
+        let a = s.spawn_on(0, attr(10), None).unwrap();
+        for h in 0..4 {
+            s.reschedule_on(h);
+        }
+        let b = s.spawn_on(0, attr(10), None).unwrap();
+        for h in 0..4 {
+            s.reschedule_on(h);
+        }
+        let running = |t| (0..4).find(|&h| s.current_on(h) == t);
+        let sleep = |t| {
+            if let Some(h) = running(t) {
+                s.prepare_block_on(h).unwrap();
+                assert!(s.block_on(h).unwrap());
+                s.reschedule_on(h);
+                s.switched(h); // (the kernel does this when the thread's context is saved: until then a blocked thread is in transit and stays where it is)
+            }
+        };
+        sleep(a);
+        sleep(b);
+        let mut seen = std::collections::BTreeSet::new();
+        for round in 0..21 {
+            for t in [a, b] {
+                s.wake_on(0, t).unwrap();
+                for h in 0..4 {
+                    s.reschedule_on(h);
+                }
+                let on = running(t).expect("a woken thread runs: a hart is free");
+                if round > 0 {
+                    seen.insert(on); // (the first round starts from where the threads were first placed)
+                }
+                sleep(t);
+            }
+        }
+        s.audit(true).unwrap();
+        match policy {
+            Policy::Pack => assert_eq!(seen.len(), 1, "pack: one hart for both: {seen:?}"),
+            Policy::Spread => assert!(
+                !seen.is_empty(),
+                "spread: a woken thread always ran somewhere"
+            ), // (spread returns a thread to its last hart; which hart that is depends on where it first ran)
+        }
+        assert!(!seen.contains(&0));
+    }
+}
