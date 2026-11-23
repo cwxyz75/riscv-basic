@@ -2001,6 +2001,41 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
     Ok(())
 }
 
+/// `wait_ended` that says what the process and its threads look like when the wait runs out (T243: a failure seen only on the CI runners).
+fn wait_ended_or_say(proc: u64, threads: &[u64], ticks: u64) -> Outcome {
+    let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
+    if r.status == 0 {
+        return Ok(());
+    }
+    let mut d = Detail::new();
+    let pi = sys::process_info(proc);
+    let _ = core::fmt::Write::write_fmt(
+        &mut d,
+        format_args!(
+            "the process did not end (status {}): signals {:#x}, info status {} a1 {} a2 {}",
+            r.status,
+            sys::object_signals(proc).a1,
+            pi.status,
+            pi.a1 as i64,
+            pi.a2
+        ),
+    );
+    for &t in threads {
+        let ti = sys::thread_info(t);
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "; thread {t:#x}: signals {:#x}, info status {} a1 {} a2 {}",
+                sys::object_signals(t).a1,
+                ti.status,
+                ti.a1 as i64,
+                ti.a2
+            ),
+        );
+    }
+    Err(d)
+}
+
 /// HD2: where the kernel puts a child's code, its stack and an ANYWHERE mapping differs from launch to launch (ten launches: at least eight distinct values of each) when
 /// the kernel randomises, and is the same every time under `aslr=off`. Each address is read from the child's own address space before it runs.
 fn programs_are_placed_at_random() -> Outcome {
@@ -5997,7 +6032,7 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     let b = child_thread(p, 0, 16)?;
     nap(3)?;
     let t = child_thread(p, 1, 7)?; // null load
-    wait_ended(p, 1000)?;
+    wait_ended_or_say(p, &[b, t], 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, -1001, "the fault code");
     thread_ended_with(t, -1001)?;
     thread_ended_with(b, -1001)?;
@@ -6006,7 +6041,7 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     let b = child_thread(p, 0, 16)?;
     nap(3)?;
     let t = child_thread(p, 1, 8)?; // exit(42)
-    wait_ended(p, 1000)?;
+    wait_ended_or_say(p, &[b, t], 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, 42, "exit(42) from a thread");
     thread_ended_with(t, 42)?;
     thread_ended_with(b, 42)?;
@@ -14402,7 +14437,16 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     let v = vmo(4)?;
     let base = map_child_stack(p, v)?;
     sys::handle_close(v);
-    let (used, _) = job_use(j, 2)?;
+    // (the child may still be starting up, and every page it touches is charged: read the use again until it has stopped moving, T238)
+    let mut used = job_use(j, 2)?.0;
+    for _ in 0..50 {
+        nap(5)?;
+        let now = job_use(j, 2)?.0;
+        if now == used {
+            break;
+        }
+        used = now;
+    }
     let limits = |pages: u64| [u64::MAX, u64::MAX, pages, u64::MAX, u64::MAX, u64::MAX];
     // three pages of room: the four-page stack does not fit, and nothing changes
     ensure_eq!(

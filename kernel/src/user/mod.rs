@@ -97,6 +97,22 @@ pub(crate) static USER_READY: core::sync::atomic::AtomicBool =
 /// a helper may take it again), and ending the outermost one commits what `f` touched to the waiters (W1'). The reference does not outlive the closure.
 #[track_caller]
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
+    f(state())
+}
+
+/// `with_state` for a helper that is reached both with the object lock held and without it (see `bkl::ensure`).
+#[track_caller]
+pub(crate) fn any_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
+    if crate::bkl::holds() {
+        with_state(f)
+    } else {
+        locked_state(f)
+    }
+}
+
+/// `with_state` for the code that does not hold the object lock yet (a kernel thread, a boot-time check): it takes the lock for the closure.
+#[track_caller]
+pub(crate) fn locked_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
     irq::without(|| f(state()))
 }
 
@@ -160,7 +176,7 @@ pub fn backstops() -> kcore::limits::Backstops {
 
 /// The `##TEST` results user programs have reported so far (pass, fail).
 pub fn reported() -> (u32, u32) {
-    with_state(|s| (s.pass, s.fail))
+    locked_state(|s| (s.pass, s.fail))
 }
 
 /// How many processes exist right now (a leak counter for tests).
@@ -168,7 +184,7 @@ pub fn reported() -> (u32, u32) {
 /// IPC bytes and kernel bytes): `(1, 0, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
 /// J2). Applies the credits of destroyed objects first.
 pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
-    with_state(|s| {
+    locked_state(|s| {
         ipc::settle(&mut s.objs, kmem::jobs().jobs);
         let jobs = &kmem::jobs().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
@@ -184,7 +200,7 @@ pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
 }
 
 pub fn process_count() -> usize {
-    with_state(|s| s.procs.len())
+    locked_state(|s| s.procs.len())
 }
 
 /// Threads sleeping on a futex (for leak checks).
@@ -194,12 +210,12 @@ pub fn futex_sleepers() -> usize {
 
 /// Threads waiting for a pager and pagers still alive (for leak checks, PG1).
 pub fn pager_leftovers() -> usize {
-    with_state(|s| s.pagers.waits().saturating_add(s.pager_ends.len()))
+    locked_state(|s| s.pagers.waits().saturating_add(s.pager_ends.len()))
 }
 
 /// The number of live kernel objects (for leak checks).
 pub fn live_objects() -> usize {
-    with_state(|s| s.objs.live())
+    locked_state(|s| s.objs.live())
 }
 
 /// Why a program could not be started (the detail is shown through `Debug` in test failures).

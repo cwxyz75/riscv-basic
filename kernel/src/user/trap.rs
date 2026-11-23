@@ -24,7 +24,7 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
 /// Register writes (`thread_write_state`) that were left for this thread while it was parked: applied here, by the thread to its own frame (the
 /// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
 fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
-    let pending = with_state(|s| {
+    let pending = any_state(|s| {
         if s.pending_regs.is_empty() {
             return None;
         }
@@ -55,7 +55,7 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
     // where it would otherwise return to user mode.
     park_while_stopped();
     apply_pending_regs(frame);
-    let token = with_state(|s| {
+    let token = any_state(|s| {
         let UserState {
             asids,
             procs,
@@ -188,7 +188,7 @@ fn vmo_resolve(
     h: u64,
     need: Rights,
 ) -> Result<(u64, alloc::sync::Arc<klock::aslock::AsCell>), ReplyErr> {
-    with_state(|s| {
+    locked_state(|s| {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         let id = ipc::vmo_of(&s.objs, &p.handles, Handle(h), need).map_err(|e| (e, None, None))?;
@@ -369,7 +369,7 @@ fn vmo_commit_call(a: [u64; 6]) -> Reply {
 /// `hart_set_online(resource, index, online)` and `hart_info(resource, index)` (PM1): the resource is checked under the object lock, which is dropped before the call waits
 /// for the hart (its displaced threads need the object domain to switch).
 fn hart_call(n: usize, a: [u64; 6]) -> Reply {
-    with_state(|s| -> Reply {
+    locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::resource_of(&s.objs, &p.handles, Handle(a[0])).map_err(|e| (e, None, None))?;
@@ -396,7 +396,7 @@ fn hart_call(n: usize, a: [u64; 6]) -> Reply {
 
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 fn debug_stat_call(a: [u64; 6]) -> Reply {
-    with_state(|s| -> Reply {
+    locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
@@ -837,7 +837,7 @@ fn fault_or_exit(fault: &crate::arch::Fault) {
 
 /// `fault_or_exit` for a fault already described (a PAGER fault, MM9, has the pager's status as its cause).
 fn raise_fault(f: ksys::exception::Fault) {
-    let delivered = with_state(|s| {
+    let delivered = any_state(|s| {
         let tid = thread::current();
         let Some(&pid) = s.thread_pid.get(&tid) else {
             return false;
@@ -910,7 +910,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::FUTEX_UNLOCK_PI => reply(frame, futex_unlock_pi(a)),
         nr::FUTEX_WAKE => {
             // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
-            let pid = with_state(|s| caller_pid(s).unwrap_or(0));
+            let pid = locked_state(|s| caller_pid(s).unwrap_or(0));
             reply(frame, futex_wake(pid, a));
         }
         nr::PROCESS_CREATE
@@ -996,7 +996,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 if n == nr::HANDLE_CLOSE {
                     // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
-                    with_state(ksys::exception::reap_closed_job_channels);
+                    locked_state(ksys::exception::reap_closed_job_channels);
                 }
                 notify();
             }
@@ -1019,7 +1019,7 @@ fn lend_to_reader() {
     let me = thread::current();
     // (the donation is made in the section that checked the call is still live: the caller's own end of the call, `pi_revoke` and the removal of its record,
     // is one section too, so a donation cannot outlive the call it was made for: `PI` is after the object lock in the order)
-    with_state(|s| {
+    locked_state(|s| {
         let read = s.objs.take_dequeued_calls();
         for (caller, call) in read {
             if s.calls.get(&(caller as Tid)) == Some(&call) {
@@ -1058,17 +1058,17 @@ fn sweep_before_create(n: usize) {
     ) {
         return;
     }
-    if !with_state(|s| s.objs.sweep_active() || s.objs.needs_sweep()) {
+    if !locked_state(|s| s.objs.sweep_active() || s.objs.needs_sweep()) {
         return;
     }
     // (MM10) start one if garbage cycles have piled up, and run a few slices of it
-    with_state(|s| {
+    locked_state(|s| {
         if !s.objs.sweep_active() {
             s.sweep_start();
         }
     });
     for _ in 0..SWEEP_SLICES_PER_CALL {
-        if !with_state(|s| {
+        if !locked_state(|s| {
             s.objs.sweep_active()
                 && !matches!(
                     s.sweep_slice(SWEEP_SLICE_BUDGET),
@@ -1079,10 +1079,11 @@ fn sweep_before_create(n: usize) {
         }
     }
     // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
-    while with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active()) {
+    while locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active())
+    {
         with_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
     }
-    if with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
+    if locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
         let began = with_state(|s| s.sweep_start());
         if began {
             while with_state(|s| {
@@ -1172,7 +1173,7 @@ pub(super) fn dispatch(
         // (`DEBUG_WRITE` is answered in `syscall`, before this table: it holds the big lock only for the handle and the tally)
         nr::SYSTEM_SET_PLACEMENT => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            if irq::without(|| thread::set_placement(a[1])) {
+            if thread::set_placement(a[1]) {
                 Ok((None, None))
             } else {
                 fail(Status::InvalidArgs)
@@ -1387,7 +1388,7 @@ fn tally_verdicts(lines: &[String]) {
         }
     }
     if pass > 0 || fail > 0 {
-        with_state(|s| {
+        locked_state(|s| {
             s.pass = s.pass.saturating_add(pass);
             s.fail = s.fail.saturating_add(fail);
         });
@@ -1400,7 +1401,7 @@ fn tally_verdicts(lines: &[String]) {
 fn debug_write_check(
     a: [u64; 6],
 ) -> Result<(alloc::sync::Arc<klock::aslock::AsCell>, u64, usize), ReplyErr> {
-    with_state(|s| -> Result<_, ReplyErr> {
+    locked_state(|s| -> Result<_, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::WRITE)

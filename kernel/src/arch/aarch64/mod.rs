@@ -78,6 +78,9 @@ pub mod fp {
     pub fn trap_entry(frame: &mut TrapFrame) {
         unimplemented!()
     }
+    pub fn return_to_user_held(frame: &mut TrapFrame) {
+        unimplemented!()
+    }
     pub fn return_to_user(frame: &mut TrapFrame) {
         unimplemented!()
     }

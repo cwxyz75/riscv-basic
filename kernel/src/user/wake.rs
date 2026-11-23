@@ -39,6 +39,10 @@ pub fn commit_if_dirty() {
 
 /// `commit_wake`, with the wakes placed on this hart as a direct hand-off when `sync` is true (a `channel_call` about to block, L24).
 fn commit_wake_with(sync: bool) {
+    crate::bkl::ensure(|| commit_wake_held(sync));
+}
+
+fn commit_wake_held(sync: bool) {
     // (the wakes are made in the same critical section as the commit, and as one batch: every woken thread
     // is runnable before any of them runs, T62)
     with_state(|s| {
@@ -80,6 +84,10 @@ pub fn notify_sync() {
 }
 
 fn notify_with(sync: bool) {
+    crate::bkl::ensure(|| notify_held(sync));
+}
+
+fn notify_held(sync: bool) {
     cleanup_dead();
     // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
     let woken = with_state(ksys::pager::reap_closed_channels);
@@ -88,7 +96,7 @@ fn notify_with(sync: bool) {
     }
     commit_wake_with(sync);
     // the safe point where the kernel heap may grow (heap.rs)
-    irq::without(crate::heap::service);
+    crate::heap::service();
 }
 
 /// Do the kernel work that destroying objects calls for: free the pages of a VMO that has
@@ -101,6 +109,11 @@ fn notify_with(sync: bool) {
 /// to be one global flag, so while a cleaner was preempted every other hart skipped the cleanup).
 #[allow(clippy::indexing_slicing)] // INVARIANT: the irq slot comes from an interrupt object the kernel made, below the table size; the time counter is far below u64::MAX
 pub(super) fn cleanup_dead() {
+    crate::bkl::ensure(cleanup_dead_held);
+}
+
+#[allow(clippy::indexing_slicing)] // INVARIANT: as above
+fn cleanup_dead_held() {
     let me = thread::current();
     if !with_state(|s| s.cleaning.insert(me)) {
         return; // a cleanup is already running further up this thread's stack; it will see our work
@@ -114,14 +127,14 @@ pub(super) fn cleanup_dead() {
         for obj in dead.drain(..) {
             match obj {
                 // the object's reference on its VMO goes; a region that still maps it keeps it alive (L15)
-                ipc::KObj::Vmo(id) => irq::without(|| {
+                ipc::KObj::Vmo(id) => {
                     let k = kmem::get();
                     let _ = k.vmos.release(k.mm, k.jobs, id);
-                }),
+                }
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
                     request_kill(p.pid, -2000)
                 }
-                ipc::KObj::Job(id) => irq::without(|| kmem::jobs().jobs.release(id)),
+                ipc::KObj::Job(id) => kmem::jobs().jobs.release(id),
                 // the last handle to an exception was closed without a decision: it is NEXT (EX2)
                 ipc::KObj::Exception(e) => act_on_resolution(with_state(|s| {
                     ksys::exception::exception_dropped(s, kmem::jobs().jobs, &e)
@@ -193,6 +206,10 @@ pub fn end_process(pid: u64, code: i32) {
 /// Wake every blocked thread of process `pid` by id (a kill must reach sleepers that are on no
 /// queue: futex sleepers).
 pub(super) fn wake_threads_of(pid: u64) {
+    crate::bkl::ensure(|| wake_threads_of_held(pid));
+}
+
+fn wake_threads_of_held(pid: u64) {
     // (the process's own set of live threads: not a walk of every thread in the system, T191)
     let tids: Vec<Tid> = with_state(|s| {
         s.procs
@@ -204,6 +221,10 @@ pub(super) fn wake_threads_of(pid: u64) {
 }
 
 pub(super) fn request_kill(pid: u64, code: i32) {
+    crate::bkl::ensure(|| request_kill_held(pid, code));
+}
+
+fn request_kill_held(pid: u64, code: i32) {
     let direct = with_state(|s| {
         let r = match s.procs.get_mut(&pid) {
             Some(p) if p.state == ProcState::Created => {
