@@ -515,11 +515,11 @@ pub(super) fn settle_handle_table(growth_at_entry: u64) {
 
 /// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
 pub(super) fn take_interrupt_held() -> bool {
-    with_state(|s| {
-        let had = s.interrupts.remove(&thread::current());
-        sync_interrupts(s);
-        had
-    })
+    // (not `with_state`: the caller holds the memory locks, and the object lock comes before them in the order; it holds the object lock too)
+    let s = state_locked();
+    let had = s.interrupts.remove(&thread::current());
+    sync_interrupts(s);
+    had
 }
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.
