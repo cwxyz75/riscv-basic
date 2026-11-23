@@ -18,6 +18,16 @@ fn free_frames() -> usize {
     crate::irq::without(kmem::free_frames_accounted)
 }
 
+/// The four terms of `free_frames_accounted`, for a leak report: (database, per-hart caches, kernel stacks, heap).
+fn frame_terms() -> (usize, usize, usize, usize) {
+    (
+        crate::irq::without(|| kmem::get().mm.db.free_count()),
+        kmem::cached_frames(),
+        crate::kstack::frames_held(),
+        crate::heap::frames_held(),
+    )
+}
+
 fn run(image: &[u8], arg: u64) -> Result<i32, String> {
     let (pid, tid) =
         user::start(image, arg).map_err(|e| format!("could not start the program: {e:?}"))?;
@@ -177,6 +187,7 @@ pub fn run_all() -> Report {
 
     // The user-level suite, as a process.
     let frames = free_frames();
+    let frames_terms = frame_terms();
     let vmos_before = crate::irq::without(|| kmem::get().vmos.count());
     let threads_before = thread::thread_count();
     let code = (|| -> Result<i32, String> {
@@ -217,7 +228,13 @@ pub fn run_all() -> Report {
         if free_frames() == frames {
             Ok(())
         } else {
-            Err(format!("free frames {} -> {}", frames, free_frames()))
+            Err(format!(
+                "free frames {} -> {} (database, caches, stacks, heap: {:?} -> {:?})",
+                frames,
+                free_frames(),
+                frames_terms,
+                frame_terms()
+            ))
         },
     );
     push(
