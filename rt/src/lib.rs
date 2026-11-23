@@ -388,6 +388,13 @@ pub mod sys {
     pub fn vmo_phys_addr(vmo: u64) -> Ret {
         syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
     }
+    /// Choose how a wake picks a hart (PM4): 0 spread (the default), 1 pack (consolidate load on the low harts, so the others idle).
+    pub fn system_set_placement(resource: u64, policy: u64) -> Ret {
+        syscall(
+            SYSTEM_SET_PLACEMENT,
+            [resource as usize, policy as usize, 0, 0, 0, 0],
+        )
+    }
     /// A read-only VMO holding the device tree; `a2` is its length in bytes.
     pub fn resource_dtb(resource: u64) -> Ret {
         syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])

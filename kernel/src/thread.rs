@@ -189,6 +189,15 @@ pub fn set_job(tid: Tid, job: u32) {
     let _ = sched().set_job(tid, job);
 }
 
+/// The placement policy of wakes (PM4): 0 spread, 1 pack. `false`: the code names no policy.
+pub fn set_placement(code: u64) -> bool {
+    let Some(policy) = kcore::sched_smp::Policy::from_code(code) else {
+        return false;
+    };
+    sched().set_policy(policy);
+    true
+}
+
 /// The scheduler (every method takes `&self`; interrupts must be off).
 #[allow(clippy::expect_used)] // INVARIANT: SCHED is set by `init` before any other hart starts or any scheduler call is made
 fn sched() -> &'static KSched {
@@ -1440,6 +1449,8 @@ pub fn wake_stat(which: u64) -> u64 {
         122 => crate::user::backstops().processes as u64,
         123 => crate::user::backstops().user_threads as u64,
         124 => crate::user::backstops().dma_total_pages,
+        // 125: the placement policy in force (PM4): 0 spread, 1 pack
+        125 => irq::without(|| sched().policy() as u64),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
