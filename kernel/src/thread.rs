@@ -3,7 +3,7 @@
 //! (OS-ARCHITECTURE.md, 8).
 //!
 //! All scheduler state lives in one `Kernel` value that is only touched with
-//! interrupts disabled and the big kernel lock held (`irq::without`). The core decides
+//! interrupts disabled (`irq::off`; `irq::without` adds the object lock for the few that read user state). The core decides
 //! which thread *should* run; [`reschedule`] compares that with the thread that *is*
 //! running and switches stacks if they differ. A switch can happen
 //!   * voluntarily (block, sleep, yield, exit, or waking something better), from
@@ -1362,11 +1362,13 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
     let mut slept = false;
     loop {
         let go = irq::without(|| {
+            // (the check and the queueing are one step with respect to the wakers, which take the same lock: `ready` is evaluated under the thread table's lock, so it
+            // may read atomics and its own state but must take no lock of an earlier class)
+            let mut k = kernel();
             if ready() {
                 return true;
             }
             count_sleep(&mut slept);
-            let mut k = kernel();
             let blocked = {
                 let sc = sched();
                 k.queues[q].wait_on(sc, hart()).expect("running thread")

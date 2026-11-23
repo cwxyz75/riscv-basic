@@ -358,7 +358,7 @@ pub fn frames_held() -> usize {
 }
 
 /// Add `bytes` (rounded up to pages) to the grown heap: take frames from the frame database, map them at the end
-/// of the window, extend the heap. Needs the big kernel lock (frames and the kernel page table). Returns how many
+/// of the window, extend the heap. Takes the kernel page table's lock (`kmem::KPT`) and the frame lock, in that order (T224). Returns how many
 /// bytes were added (0 when the window is full or no frames are left; nothing is left half done).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: `have` is at most HEAP_WINDOW_SIZE (checked into `room`), mapped <= room; the sums are inside the heap window
 pub fn grow(bytes: usize) -> usize {

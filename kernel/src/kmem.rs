@@ -660,9 +660,21 @@ pub fn kernel_half_unchanged() -> bool {
 
 /// Free frames, plus the frames held by kernel stack slots (which keep theirs for ever once made, so
 /// a leak check that compares before and after must not count a slot made in between as a leak).
-/// Must be called with the big kernel lock held, like `get`.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a sum of three frame counts, each at most the number of frames
 pub fn free_frames_accounted() -> usize {
-    let free = get().mm.db.free_count(); // (the locks are released before the two calls below)
-    free + cached_frames() + crate::kstack::frames_held() + crate::heap::frames_held()
+    // (the four counts are read one after another, and an idle hart's heap service moves frames between them with no common lock: the sum is read until two
+    // reads agree)
+    let read = || {
+        let free = get().mm.db.free_count(); // (the locks are released before the calls below)
+        free + cached_frames() + crate::kstack::frames_held() + crate::heap::frames_held()
+    };
+    let mut last = read();
+    for _ in 0..1000 {
+        let now = read();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
 }
