@@ -14465,6 +14465,7 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         }
         used = now;
     }
+    let used0 = used;
     let limits = |pages: u64| [u64::MAX, u64::MAX, pages, u64::MAX, u64::MAX, u64::MAX];
     // three pages of room: the four-page stack does not fit, and nothing changes
     ensure_eq!(
@@ -14511,11 +14512,23 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         return Err(d);
     }
     let t = r.a1 as u64;
-    ensure_eq!(
-        job_use(j, 2)?.0,
-        used + 4,
-        "the stack's four pages are charged"
-    );
+    let got = job_use(j, 2)?.0;
+    if got != used + 4 {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "the stack's four pages are charged: got {got}, want {} (before the refusal {used0}, after {after}); thread signals {:#x}, info status {}, cpu_ns {}, process signals {:#x}, use now {}",
+                used + 4,
+                sys::object_signals(t).a1,
+                sys::thread_info(t).status,
+                sys::thread_cpu_ns(t).a1,
+                sys::object_signals(p).a1,
+                job_use(j, 2)?.0
+            ),
+        );
+        return Err(d);
+    }
     // ending the process credits the stack back (everything settles to zero)
     ensure_eq!(st(sys::process_kill(p, 3)), Some(S::Ok), "kill");
     wait_ended(p, 1000)?;
