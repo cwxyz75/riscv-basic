@@ -396,3 +396,47 @@ fn a_handle_value_keeps_its_forty_bit_generation_in_the_high_bits() {
     );
     t.drain(&mut reg);
 }
+
+#[test]
+fn a_table_drained_in_slices_gives_back_what_a_whole_drain_does() {
+    // T206: a process's teardown closes its handles a slice at a time, with the big lock let go between slices. Any slice size ends with every object
+    // released, every slice closes at most its budget, and a drained table is done at once.
+    for budget in [1usize, 2, 3, 7, 64, 1000] {
+        let mut reg = Kobjs::new();
+        let mut t = HandleTable::new(500);
+        let all: Vec<Handle> = (0..300)
+            .map(|_| event_create(&mut reg, &mut t).unwrap())
+            .collect();
+        // some slots are free holes (closed handles), so a slice cannot count slots
+        for h in all.iter().step_by(3) {
+            let _ = t.close(&mut reg, *h);
+        }
+        let before = t.len();
+        assert!(
+            before > 150 && reg.live() == before,
+            "{} {}",
+            before,
+            reg.live()
+        );
+        let mut slices = 0;
+        loop {
+            let live_before = t.len();
+            let done = t.drain_some(&mut reg, budget);
+            assert!(
+                live_before - t.len() <= budget,
+                "a slice closed more than its budget"
+            );
+            slices += 1;
+            if done {
+                break;
+            }
+            assert!(slices < 100_000, "never finishes");
+        }
+        assert_eq!(t.len(), 0, "budget {budget}: handles left");
+        assert_eq!(reg.live(), 0, "budget {budget}: objects left");
+        assert!(t.drain_some(&mut reg, budget), "a drained table stays done");
+        if budget == 1 {
+            assert!(slices >= before, "one at a time takes a slice per handle");
+        }
+    }
+}

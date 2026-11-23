@@ -215,24 +215,63 @@ pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
     })
 }
 
+/// The handles one slice of a teardown closes, and the objects one slice of its sweep looks at (T206: SCHED-SMP-SPEC X4, no section proportional to
+/// what the process held or to the live objects of the system).
+const TEARDOWN_HANDLES: usize = 256;
+const TEARDOWN_SWEEP: usize = 256;
+
 #[inline(never)]
 pub(super) fn teardown_objects(process: &mut Process, code: i32) {
+    // 1. the handles, a slice at a time: each slice is its own critical section, so the big lock is let go (and a switch taken) between them
+    loop {
+        let done = irq::without(|| {
+            let s = state();
+            let done = process.handles.drain_some(&mut s.objs, TEARDOWN_HANDLES);
+            if done {
+                if let Some(end) = process.kernel_end.take() {
+                    let _ = s.ktable.close(&mut s.objs, end);
+                }
+                if let Some(end) = process.exc_channel.take() {
+                    let _ = s.ktable.close(&mut s.objs, end);
+                }
+                // (the process's handles were drained: a job exception channel it held the user end of is reaped now)
+                ksys::exception::reap_closed_job_channels(s);
+            }
+            done
+        });
+        if done {
+            break;
+        }
+    }
+    // 2. anything still alive that nothing can reach (reference cycles): the sweep as the state machine of MM10, a slice per critical section. The roots
+    // are collected, with the kernel's own handles, in the same critical section that begins the sweep (a root made between the two would be missed and its
+    // object destroyed under a live handle); a handle made once it runs marks its object (that is what the machine's barrier is for). A sweep another
+    // call started (with older roots) is finished first, a slice at a time.
+    loop {
+        let began = irq::without(|| {
+            let s = state();
+            if s.objs.sweep_active() {
+                s.objs.sweep_step(TEARDOWN_SWEEP);
+                return false;
+            }
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots)
+        });
+        if began {
+            break;
+        }
+    }
+    while irq::without(|| {
+        let s = state();
+        s.objs.sweep_active()
+            && !matches!(
+                s.objs.sweep_step(TEARDOWN_SWEEP),
+                kcore::object::SweepStep::Done(_)
+            )
+    }) {}
+    // 3. the process is over
     irq::without(|| {
         let s = state();
-        process.handles.drain(&mut s.objs);
-        if let Some(end) = process.kernel_end.take() {
-            let _ = s.ktable.close(&mut s.objs, end);
-        }
-        if let Some(end) = process.exc_channel.take() {
-            let _ = s.ktable.close(&mut s.objs, end);
-        }
-        // (the process's handles were drained above: a job exception channel it held the user end of is reaped now)
-        ksys::exception::reap_closed_job_channels(s);
-        // Anything still alive that nothing can reach (reference cycles). The roots are
-        // computed here, in the same interrupts-off step as the sweep, and include the
-        // kernel's own handles.
-        let roots = s.roots();
-        s.objs.sweep(&roots);
         if let Some(obj) = process.obj {
             ipc::process_mark_terminated(&mut s.objs, obj, code);
         }
