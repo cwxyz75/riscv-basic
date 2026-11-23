@@ -7343,6 +7343,56 @@ fn fetch_the_hello_image() -> Outcome {
     Ok(())
 }
 
+static ABI_CONFORMANCE_IMAGE: AtomicU64 = AtomicU64::new(0);
+
+fn fetch_the_conformance_image() -> Outcome {
+    let (m, n) = request(24, b'A', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u64; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the image");
+    ABI_CONFORMANCE_IMAGE.store(got[0], Ordering::Relaxed);
+    Ok(())
+}
+
+/// AB9: the conformance program (built against `libsys` alone) runs to the end with no check failed; each failure it found comes back as a message.
+fn abi_conformance_passes() -> Outcome {
+    let (p, mine) = launch_image(ABI_CONFORMANCE_IMAGE.load(Ordering::Relaxed), 0)?;
+    wait_ended(p, 3000)?;
+    let code = sys::process_info(p).a1 as i64;
+    let mut said = Detail::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let r = sys::channel_read(mine, buf.as_mut_ptr(), 256, core::ptr::null_mut(), 0);
+        if r.status != 0 {
+            break;
+        }
+        let n = (r.a1 as usize).min(256);
+        let _ = core::fmt::Write::write_fmt(
+            &mut said,
+            format_args!("[{}] ", core::str::from_utf8(&buf[..n]).unwrap_or("?")),
+        );
+    }
+    ensure_eq!(
+        code,
+        0,
+        "checks failed in the conformance program: {}",
+        core::str::from_utf8(said.as_bytes()).unwrap_or("?")
+    );
+    Ok(())
+}
+
 fn send_startup(mine: u64, s: &Startup, handles: &[u64]) -> Outcome {
     let bytes = s.encode().map_err(|e| {
         let mut d = Detail::new();
@@ -15800,6 +15850,11 @@ pub fn app_main() -> i32 {
             kill_needs_the_kill_right_and_nothing_else,
         ),
         ("fetch_the_hello_image", fetch_the_hello_image),
+        (
+            "fetch_the_conformance_image",
+            fetch_the_conformance_image,
+        ),
+        ("abi_conformance_passes", abi_conformance_passes),
         (
             "runtime_startup_heap_and_stdio",
             runtime_startup_heap_and_stdio,

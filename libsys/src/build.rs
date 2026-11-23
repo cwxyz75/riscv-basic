@@ -51,6 +51,11 @@ pub fn source() -> String {
             "    .globl {sym}\n    .type {sym},@function\n{sym}:\n    li a7, {number}\n    ecall\n    ret\n    .size {sym}, .-{sym}\n"
         ));
     }
+    // AB9: the version of the ABI, read from the data page in user mode (no trap): `a0 = 0`, `a1 = version`. Features are probed by calling, not by this number
+    s.push_str(&std::format!(
+        "    .globl sys_abi_version\n    .type sys_abi_version,@function\nsys_abi_version:\n    lla t0, .Ldata\n    ld a1, {off}(t0)\n    li a0, 0\n    ret\n    .size sys_abi_version, .-sys_abi_version\n",
+        off = page::ABI_VERSION * 8,
+    ));
     // the raw entry: the number in a6, for a call this table does not name (the boot-time suite's bad-number tests)
     s.push_str("    .globl sys_raw\n    .type sys_raw,@function\nsys_raw:\n    mv a7, a6\n    ecall\n    ret\n    .size sys_raw, .-sys_raw\n");
     s.push_str("\"#);\n");
@@ -135,6 +140,8 @@ pub fn check(bytes: &[u8]) -> Result<(), String> {
         }
     }
     img.lookup("sys_raw").ok_or("no symbol sys_raw")?;
+    img.lookup("sys_abi_version")
+        .ok_or("no symbol sys_abi_version")?;
     let data = img.lookup("libsys_data").ok_or("no symbol libsys_data")?;
     if data.value % page::SIZE as u64 != 0
         || data.size != page::SIZE as u64

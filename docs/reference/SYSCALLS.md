@@ -4,17 +4,18 @@ The contract between the kernel and userland, and the one kernel artifact meant 
 be readable. Syscalls are specified here *before* they are implemented; the target is
 about 50. Each entry has the form below, and every error listed has a test.
 
-Status of this file: **S3a** specifies the ABI, status codes, rights, signals and the
-handle and channel/event calls (their pure logic is built and model-tested in
-`kcore`). The rest of the S3 calls are listed in the index as *planned* and get full
-entries before their implementation (S3b, S3c).
+**What this file is (AB9).** The reference of the system library, `libsys.so`, which the kernel maps into every process: one function `sys_<name>` per call below,
+plus `sys_abi_version`. A program calls those functions; it never writes a syscall instruction, and the numbers the kernel uses inside are private (a build can
+renumber them, `ABI_SHUFFLE_SEED`). `abi-conformance` (`init/src/bin/abi_conformance.rs`, run by the boot-time suite as `abi_conformance_passes`) is a program
+written against the library alone that checks this reference; `syscall-tests.tsv` names the test of every error listed here.
 
 ## ABI (decision OD36)
 
-- A syscall is `ecall` from user mode (U-mode). The number is in `a7`; arguments are in
-  `a0` to `a5`; nothing else is read. On return `a0` is a **status** (0 or a negative
-  code, below) and `a1` onwards carry results where an entry says so. All other
-  registers are preserved.
+- A call is a function of the system library, named `sys_` and the call's name (`sys_vmo_create`). Arguments are in `a0` to `a5`; nothing else is read. On
+  return `a0` is a **status** (0 or a negative code, below) and `a1`, `a2` carry results where an entry says so. Every other register is preserved except
+  `ra` and `a7` (the function is called with `jalr`). A program finds the functions in the library's `.dynsym`, starting from the base the kernel passes in
+  `a2` of every thread's first instruction; `sys_raw` takes a call number in `a6` and is for a number no function names. The `ecall` inside the library is the
+  only place the kernel accepts one (INVARIANTS ABI1).
 - A **handle** is a 64-bit value (AB1). 0 is never valid. The low 24 bits are the table slot
   plus 1 (at most 2^24 - 1 slots; the table grows on demand); the high 40 bits are a generation that changes every time the slot is freed,
   so a stale value fails (INVARIANTS H2). A slot that has used all 2^40 generations is retired. Values are meaningful only in the process
@@ -26,7 +27,7 @@ entries before their implementation (S3b, S3c).
 - There is **no errno** and no partial success: a call either does everything it says
   or changes nothing (the exception, `channel_read` with a too-small buffer, is
   stated where it happens).
-- Unknown syscall numbers return `BAD_SYSCALL`.
+- A number no call has returns `BAD_SYSCALL` (only through `sys_raw`).
 
 ### Status codes
 
@@ -46,7 +47,7 @@ entries before their implementation (S3b, S3c).
 | INTERRUPTED | -14 | a blocking call that `thread_interrupt` told to stop (`object_wait`, `port_wait`, `futex_wait`, `channel_call`) |
 | NOT_SUPPORTED | -11 | valid request the kernel will not do (e.g. a channel endpoint sent over itself) |
 | TIMED_OUT | -12 | a wait reached its deadline |
-| BAD_SYSCALL | -13 | no such syscall number |
+| BAD_SYSCALL | -13 | no such call number (through `sys_raw`) |
 
 ### Rights
 
@@ -134,99 +135,100 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 `-1000 - kind`, where `kind` is one of `abi::arch::fault`: 1 PAGE_FAULT, 2 ILLEGAL, 3 BREAKPOINT, 4 MISALIGNED,
 5 ACCESS, 6 PAGER; every page fault is kind 1 whatever the access); the kernel never trusts a user fault.
 
-## Syscall numbers and registers (S3b)
+## The functions: arguments and results
 
-`a7` = number, `a0`..`a5` = arguments, results: `a0` = status, `a1`, `a2` = values.
+`sys_<call>(a0..a5)`: results `a0` = status, `a1`, `a2` = values. The calls below the table that are not in it (`clock_get` and `abi_version` are computed in user mode, no kernel entry) are in the library all the same.
 
-| # | Call | Arguments | Results |
-|---|---|---|---|
-| 0 | debug_write | `a0` debug (WRITE), `a1` ptr, `a2` len | |
-| 1 | process_exit | `a0` code | does not return |
-| 2 | thread_yield | | |
-| 3 | clock_get | | `a1` nanoseconds since boot |
-| 4 | debug_stat | `a0` debug (INSPECT), `a1` which | `a1` the kernel counter |
-| 10 | handle_close | `a0` handle | |
-| 11 | handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
-| 12 | handle_replace | `a0` handle, `a1` rights | `a1` new handle |
-| 20 | channel_create | | `a1`, `a2` the two handles |
-| 21 | channel_write | `a0` channel, `a1` bytes, `a2` nbytes, `a3` handles, `a4` nhandles | |
-| 22 | channel_read | `a0` channel, `a1` bytes buf, `a2` max_bytes, `a3` handles buf, `a4` max_handles | `a1` nbytes, `a2` nhandles (set on OK and on BUFFER_TOO_SMALL) |
-| 23 | channel_read_txid | `a0` channel, `a1` txid, `a2` bytes buf, `a3` max_bytes, `a4` handles buf, `a5` max_handles | `a1`, `a2` as 22 |
-| 30 | event_create | | `a1` handle |
-| 31 | event_signal | `a0` event, `a1` clear, `a2` set | |
-| 32 | object_signals | `a0` handle | `a1` the signal word |
-| 33 | object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
-| 34 | object_info | `a0` handle | `a1` koid, `a2` peer koid |
-| 40 | vmo_create | `a0` bytes, `a1` job (0: the caller's), `a2` flags | `a1` handle |
-| 41 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
-| 42 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
-| 43 | vmo_get_size | `a0` vmo | `a1` bytes |
-| 44 | vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
-| 45 | vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
-| 46 | vmo_phys_addr | `a0` vmo | `a1` physical address |
-| 47 | vmo_commit | `a0` vmo, `a1` offset, `a2` length | |
-| 48 | vmo_decommit | `a0` vmo, `a1` offset, `a2` length | |
-| 49 | vmo_set_size | `a0` vmo, `a1` bytes | |
-| 50 | process_create | | `a1` handle |
-| 51 | process_self | | `a1` handle |
-| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr (0 with ANYWHERE), `a3` vmo_offset, `a4` length, `a5` flags (R 1, W 2, X 4, ANYWHERE 8) | `a1` the address, for ANYWHERE |
-| 53 | process_unmap | `a0` process, `a1` vaddr, `a2` length | |
-| 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
-| 55 | process_kill | `a0` process, `a1` code | |
-| 56 | process_info | `a0` process, `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
-| 57 | process_suspend | `a0` process | |
-| 59 | process_protect | `a0` process, `a1` vaddr, `a2` length, `a3` flags | |
-| 58 | process_resume | `a0` process | |
-| 67 | process_map_info | `a0` process, `a1` vaddr, `a2` buffer | `a1` the next region's base, or 0 |
-| 68 | vmo_create_child | `a0` vmo, `a1` offset, `a2` bytes, `a3` job (0: the caller's), `a4` flags | `a1` handle |
-| 69 | process_clone_region | `a0` source process, `a1` target process, `a2` vaddr, `a3` mode | |
-| 70 | socket_create | | `a1`, `a2` the two handles |
-| 71 | socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
-| 72 | socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
-| 80 | port_create | | `a1` handle |
-| 81 | port_bind | `a0` port, `a1` object, `a2` mask, `a3` key, `a4` flags | |
-| 82 | port_unbind | `a0` port, `a1` key | |
-| 83 | port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
-| 84 | port_rearm | `a0` port, `a1` key | |
-| 85 | port_wait_many | `a0` port, `a1` buffer, `a2` capacity, `a3` deadline | `a1` count |
-| 61 | thread_exit | `a0` code | does not return |
-| 62 | thread_info | `a0` thread (0: the caller, for `which` 1), `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
-| 63 | thread_interrupt | `a0` thread (MANAGE) | |
-| 74 | thread_suspend | `a0` thread (MANAGE) | |
-| 75 | thread_resume | `a0` thread (MANAGE) | |
-| 76 | thread_read_state | `a0` thread (MANAGE), `a1` kind, `a2` buffer, `a3` length | |
-| 78 | process_exception_channel | `a0` process (MANAGE) | `a1` channel |
-| 79 | job_exception_channel | `a0` job (MANAGE) | `a1` channel |
-| 97 | exception_resume | `a0` exception (MANAGE), `a1` how | |
-| 103 | pager_create | | `a1` pager, `a2` the user end of its request channel |
-| 104 | pager_create_vmo | `a0` pager (MANAGE), `a1` key, `a2` bytes | `a1` VMO |
-| 105 | pager_supply | `a0` pager (MANAGE), `a1` VMO, `a2` offset, `a3` length, `a4` source VMO (WRITE), `a5` source offset | |
-| 106 | pager_fail | `a0` pager (MANAGE), `a1` VMO, `a2` offset, `a3` length, `a4` status | |
-| 107 | pager_query_dirty | | NOT_SUPPORTED (reserved) |
-| 108 | pager_writeback_done | | NOT_SUPPORTED (reserved) |
-| 77 | thread_write_state | `a0` thread (MANAGE), `a1` kind, `a2` buffer, `a3` length | |
-| 65 | thread_set_sched | `a0` thread (0: the caller), `a1` priority 1-63, `a2` flags | |
-| 66 | thread_get_sched | `a0` thread (0: the caller) | `a1` packed priorities, `a2` tid |
-| 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
-| 90 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
-| 91 | job_set_limits | `a0` job, `a1` pointer to the limits | |
-| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors, 8 kernel bytes, 9 real-time time, 10 CPU time) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
-| 96 | job_set_sched | `a0` job, `a1` max_prio 0-63, `a2` rt_budget ns per 100 ms, `a3` cpu_weight 1-65536 | |
-| 93 | job_kill | `a0` job, `a1` exit code | |
-| 94 | job_root | | `a1` handle |
-| 95 | resource_root | | `a1` handle |
-| 114 | debug_root | | `a1` handle |
-| 100 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
-| 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
-| 110 | futex_wait | `a0` address, `a1` expected, `a2` deadline | |
-| 111 | futex_wake | `a0` address, `a1` count | `a1` woken |
-| 112 | futex_lock_pi | `a0` address, `a1` deadline | |
-| 113 | futex_unlock_pi | `a0` address | |
-| 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
-| 115 | system_set_placement | `a0` resource, `a1` policy | |
-| 116 | hart_set_online | `a0` resource, `a1` hart index, `a2` 1 online or 0 offline | |
-| 117 | hart_info | `a0` resource, `a1` hart index | `a1` state |
-| 118 | system_suspend | `a0` resource | |
+| Call | Arguments | Results |
+|---|---|---|
+| channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
+| channel_create |  | `a1`, `a2` the two handles |
+| channel_read | `a0` channel, `a1` bytes buf, `a2` max_bytes, `a3` handles buf, `a4` max_handles | `a1` nbytes, `a2` nhandles (set on OK and on BUFFER_TOO_SMALL) |
+| channel_read_txid | `a0` channel, `a1` txid, `a2` bytes buf, `a3` max_bytes, `a4` handles buf, `a5` max_handles | `a1`, `a2` as 22 |
+| channel_write | `a0` channel, `a1` bytes, `a2` nbytes, `a3` handles, `a4` nhandles |  |
+| clock_get |  | `a1` nanoseconds since boot |
+| debug_root |  | `a1` handle |
+| debug_stat | `a0` debug (INSPECT), `a1` which | `a1` the kernel counter |
+| debug_write | `a0` debug (WRITE), `a1` ptr, `a2` len |  |
+| event_create |  | `a1` handle |
+| event_signal | `a0` event, `a1` clear, `a2` set |  |
+| exception_resume | `a0` exception (MANAGE), `a1` how |  |
+| futex_lock_pi | `a0` address, `a1` deadline |  |
+| futex_unlock_pi | `a0` address |  |
+| futex_wait | `a0` address, `a1` expected, `a2` deadline |  |
+| futex_wake | `a0` address, `a1` count | `a1` woken |
+| handle_close | `a0` handle |  |
+| handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
+| handle_replace | `a0` handle, `a1` rights | `a1` new handle |
+| hart_info | `a0` resource, `a1` hart index | `a1` state |
+| hart_set_online | `a0` resource, `a1` hart index, `a2` 1 online or 0 offline |  |
+| interrupt_ack | `a0` interrupt | `a1` claims so far |
+| interrupt_create | `a0` resource, `a1` source | `a1` handle |
+| job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
+| job_exception_channel | `a0` job (MANAGE) | `a1` channel |
+| job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors, 8 kernel bytes, 9 real-time time, 10 CPU time) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
+| job_kill | `a0` job, `a1` exit code |  |
+| job_root |  | `a1` handle |
+| job_set_limits | `a0` job, `a1` pointer to the limits |  |
+| job_set_sched | `a0` job, `a1` max_prio 0-63, `a2` rt_budget ns per 100 ms, `a3` cpu_weight 1-65536 |  |
+| object_info | `a0` handle | `a1` koid, `a2` peer koid |
+| object_signals | `a0` handle | `a1` the signal word |
+| object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
+| pager_create |  | `a1` pager, `a2` the user end of its request channel |
+| pager_create_vmo | `a0` pager (MANAGE), `a1` key, `a2` bytes | `a1` VMO |
+| pager_fail | `a0` pager (MANAGE), `a1` VMO, `a2` offset, `a3` length, `a4` status |  |
+| pager_query_dirty |  | NOT_SUPPORTED (reserved) |
+| pager_supply | `a0` pager (MANAGE), `a1` VMO, `a2` offset, `a3` length, `a4` source VMO (WRITE), `a5` source offset |  |
+| pager_writeback_done |  | NOT_SUPPORTED (reserved) |
+| port_bind | `a0` port, `a1` object, `a2` mask, `a3` key, `a4` flags |  |
+| port_create |  | `a1` handle |
+| port_rearm | `a0` port, `a1` key |  |
+| port_unbind | `a0` port, `a1` key |  |
+| port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
+| port_wait_many | `a0` port, `a1` buffer, `a2` capacity, `a3` deadline | `a1` count |
+| process_clone_region | `a0` source process, `a1` target process, `a2` vaddr, `a3` mode |  |
+| process_create |  | `a1` handle |
+| process_exception_channel | `a0` process (MANAGE) | `a1` channel |
+| process_exit | `a0` code | does not return |
+| process_info | `a0` process, `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
+| process_kill | `a0` process, `a1` code |  |
+| process_map | `a0` process, `a1` vmo, `a2` vaddr (0 with ANYWHERE), `a3` vmo_offset, `a4` length, `a5` flags (R 1, W 2, X 4, ANYWHERE 8) | `a1` the address, for ANYWHERE |
+| process_map_info | `a0` process, `a1` vaddr, `a2` buffer | `a1` the next region's base, or 0 |
+| process_protect | `a0` process, `a1` vaddr, `a2` length, `a3` flags |  |
+| process_resume | `a0` process |  |
+| process_self |  | `a1` handle |
+| process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg |  |
+| process_suspend | `a0` process |  |
+| process_unmap | `a0` process, `a1` vaddr, `a2` length |  |
+| resource_dtb | `a0` resource | `a1` handle, `a2` length |
+| resource_root |  | `a1` handle |
+| socket_create |  | `a1`, `a2` the two handles |
+| socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
+| socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
+| system_set_placement | `a0` resource, `a1` policy |  |
+| system_suspend | `a0` resource |  |
+| thread_exit | `a0` code | does not return |
+| thread_get_sched | `a0` thread (0: the caller) | `a1` packed priorities, `a2` tid |
+| thread_info | `a0` thread (0: the caller, for `which` 1), `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
+| thread_interrupt | `a0` thread (MANAGE) |  |
+| thread_read_state | `a0` thread (MANAGE), `a1` kind, `a2` buffer, `a3` length |  |
+| thread_resume | `a0` thread (MANAGE) |  |
+| thread_set_sched | `a0` thread (0: the caller), `a1` priority 1-63, `a2` flags |  |
+| thread_suspend | `a0` thread (MANAGE) |  |
+| thread_write_state | `a0` thread (MANAGE), `a1` kind, `a2` buffer, `a3` length |  |
+| thread_yield |  |  |
+| vmo_commit | `a0` vmo, `a1` offset, `a2` length |  |
+| vmo_create | `a0` bytes, `a1` job (0: the caller's), `a2` flags | `a1` handle |
+| vmo_create_child | `a0` vmo, `a1` offset, `a2` bytes, `a3` job (0: the caller's), `a4` flags | `a1` handle |
+| vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
+| vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
+| vmo_decommit | `a0` vmo, `a1` offset, `a2` length |  |
+| vmo_get_size | `a0` vmo | `a1` bytes |
+| vmo_phys_addr | `a0` vmo | `a1` physical address |
+| vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length |  |
+| vmo_set_size | `a0` vmo, `a1` bytes |  |
+| vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length |  |
+| abi_version | | `a1` the ABI version (1), read from the data page |
 
 A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
 
@@ -716,14 +718,6 @@ does (a caller inside the job ends too, last). Errors: BAD_HANDLE; WRONG_TYPE; A
 A handle with every job right to the root job. Only a process started by the kernel may ask
 (`init`); everything else gets ACCESS_DENIED. Tests: `job_*` in `init`.
 
-### Retired numbers
-
-A retired number is never reused: a call to it is BAD_SYSCALL.
-
-| number | was | retired |
-|---|---|---|
-| 60 | `thread_create` (replaced by `thread_spawn` with CALLER_STACK) | AB5 |
-
 ## Threads (S3c-2b)
 
 A process runs one or more user threads, all sharing its address space and handle table.
@@ -1174,3 +1168,13 @@ rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-
 * **Harts and power** (root resource): `system_suspend`.
 * **Debug calls** need a debug resource handle.
 * **Limits:** the system-wide caps become backstops computed from RAM; per-process ceilings are job quotas.
+
+## Versioning (AB9)
+
+- `sys_abi_version()` returns the ABI version, now 1 (it is a word of the library's data page, read with no trap). The version changes only when a call is added
+  or a limit is raised, never when something is removed or made stricter.
+- **Additive only.** A released function keeps its name, its argument registers and its results. A call is added as a new function; a changed one is a new function
+  beside the old. A capability that is taken away stays as a function that returns `NOT_SUPPORTED`.
+- **Features are probed by calling.** A program asks whether the kernel does something by making the call and reading the status (`NOT_SUPPORTED`, `BAD_SYSCALL`
+  from `sys_raw`), not by comparing versions.
+- The list of the released symbols is `libsys/symbols-v1.txt`; `cargo test -p libsys` fails when one of them is missing from the built library.
