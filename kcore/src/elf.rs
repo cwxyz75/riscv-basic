@@ -4,8 +4,9 @@
 //!
 //! * `ET_EXEC` or `ET_DYN`, 64-bit little-endian, `EM_RISCV`, version 1; no interpreter. An `ET_EXEC` has no dynamic section. An `ET_DYN` is a
 //!   **static-PIE** (HD2): link addresses start at 0, the image is placed at a base the loader chooses, and its dynamic section may hold only the
-//!   `DT_RELA` family, whose entries are all `R_RISCV_RELATIVE` and name 8-byte words inside the image's writable segments: the program's own
-//!   startup applies them (the loader maps, it does not relocate). No `DT_NEEDED`, no symbol relocations, no `DT_REL`/`DT_JMPREL`.
+//!   `DT_RELA` family, whose entries are all `R_RISCV_RELATIVE` and name 8-byte words inside the file bytes of the image's segments, whichever the
+//!   permissions: **the loader applies them** (`Image::relocate`) to its copy of the bytes before it maps them, so read-only data stays read-only and
+//!   the program needs no startup code of its own (KERNEL-V1-SPEC amendment 2026-11-23). No `DT_NEEDED`, no symbol relocations, no `DT_REL`/`DT_JMPREL`.
 //! * only `PT_LOAD` segments produce mappings; `PT_GNU_STACK` may not ask for an
 //!   executable stack; other program headers are ignored.
 //! * a segment must lie inside the user half, inside the file, with
@@ -46,7 +47,7 @@ pub enum ElfError {
     BadProgramHeaders,
     TooManySegments,
     Dynamic,
-    /// A static-PIE's relocation table is malformed, or holds a relocation that is not `R_RISCV_RELATIVE` on a word of a writable segment.
+    /// A static-PIE's relocation table is malformed, or holds a relocation that is not `R_RISCV_RELATIVE` on a word inside a segment's file bytes.
     Relocation,
     ExecStack,
     SegmentOutsideFile,
@@ -93,6 +94,31 @@ pub struct Image {
     pub pie: bool,
     /// For a static-PIE, the bytes from the base to the end of its last segment, rounded up to a page (what one reservation must cover); 0 for `ET_EXEC`.
     pub span: u64,
+    /// For a static-PIE, its `R_RISCV_RELATIVE` relocations (checked: each word lies inside one segment's file bytes).
+    pub relocs: Vec<Reloc>,
+}
+
+/// One `R_RISCV_RELATIVE` relocation: the 8-byte word at link address `offset` becomes `base + addend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reloc {
+    pub offset: u64,
+    pub addend: u64,
+}
+
+impl Image {
+    /// Apply the relocations that fall in segment `seg`'s file bytes to `buf`, a copy of those `seg.filesz` bytes, for an image placed at `base`.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: `parse` checked every word (8 bytes, offset..offset+8) to lie inside one segment's `vaddr..vaddr + filesz`; the slice is checked to be that long
+    pub fn relocate(&self, seg: &Segment, buf: &mut [u8], base: u64) {
+        if buf.len() as u64 != seg.filesz {
+            return;
+        }
+        for r in &self.relocs {
+            if r.offset >= seg.vaddr && r.offset + 8 <= seg.vaddr + seg.filesz {
+                let at = (r.offset - seg.vaddr) as usize;
+                buf[at..at + 8].copy_from_slice(&base.wrapping_add(r.addend).to_le_bytes());
+            }
+        }
+    }
 }
 
 const DT_NULL: u64 = 0;
@@ -104,6 +130,8 @@ const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
 const DT_STRSZ: u64 = 10;
 const DT_SYMENT: u64 = 11;
+const DT_DEBUG: u64 = 21;
+const DT_TEXTREL: u64 = 22;
 const DT_FLAGS: u64 = 30;
 const DT_GNU_HASH: u64 = 0x6fff_fef5;
 const DT_FLAGS_1: u64 = 0x6fff_fffb;
@@ -277,14 +305,16 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     } else {
         0
     };
-    if let Some((doff, dsz)) = dynamic {
-        check_relocations(bytes, &segments, doff, dsz)?;
-    }
+    let relocs = match dynamic {
+        Some((doff, dsz)) => check_relocations(bytes, &segments, doff, dsz, span)?,
+        None => Vec::new(),
+    };
     Ok(Image {
         entry,
         segments,
         pie,
         span,
+        relocs,
     })
 }
 
@@ -296,7 +326,8 @@ fn check_relocations(
     segments: &[Segment],
     doff: u64,
     dsz: u64,
-) -> Result<(), ElfError> {
+    span: u64,
+) -> Result<Vec<Reloc>, ElfError> {
     let end = doff.checked_add(dsz).ok_or(ElfError::Dynamic)?;
     if end > bytes.len() as u64 || !dsz.is_multiple_of(16) {
         return Err(ElfError::Dynamic);
@@ -314,9 +345,9 @@ fn check_relocations(
             DT_RELA => rela = Some(val),
             DT_RELASZ => relasz = val,
             DT_RELAENT => relaent = val,
-            // (tolerated and ignored: a static link may leave an empty symbol table and its hash, the flags and the count of relative relocations)
+            // (tolerated and ignored: a static link may leave an empty symbol table and its hash, the flags, the count of relative relocations, an empty `DT_DEBUG` and `DT_TEXTREL`, which only says the loader writes relocations into read-only segments, as it does)
             DT_HASH | DT_GNU_HASH | DT_STRTAB | DT_SYMTAB | DT_STRSZ | DT_SYMENT | DT_FLAGS
-            | DT_FLAGS_1 | DT_RELACOUNT => {}
+            | DT_FLAGS_1 | DT_RELACOUNT | DT_DEBUG | DT_TEXTREL => {}
             _ => return Err(ElfError::Dynamic),
         }
     }
@@ -324,7 +355,7 @@ fn check_relocations(
         return Err(ElfError::Dynamic);
     }
     let Some(rela) = rela.filter(|_| relasz > 0) else {
-        return Ok(()); // no relocations at all: a position-independent program that needs none
+        return Ok(Vec::new()); // no relocations at all: a position-independent program that needs none
     };
     // the table lies in the file bytes of one loaded segment (its address is a link address: a vaddr)
     let table_end = rela.checked_add(relasz).ok_or(ElfError::Relocation)?;
@@ -333,20 +364,30 @@ fn check_relocations(
         .find(|s| s.vaddr <= rela && table_end <= s.vaddr.saturating_add(s.filesz))
         .ok_or(ElfError::Relocation)?;
     let at0 = (seg.offset + (rela - seg.vaddr)) as usize; // (inside the file: the segment's file range was checked)
+    let mut out = Vec::new();
     for i in 0..(relasz / 24) as usize {
         let at = at0 + i * 24;
-        let (r_off, info) = (u64_at(bytes, at), u64_at(bytes, at + 8));
+        let (r_off, info, addend) = (
+            u64_at(bytes, at),
+            u64_at(bytes, at + 8),
+            u64_at(bytes, at + 16),
+        );
         if info != R_RISCV_RELATIVE {
             return Err(ElfError::Relocation); // (type 3 in the low word, symbol 0 in the high)
         }
         let word_end = r_off.checked_add(8).ok_or(ElfError::Relocation)?;
-        let in_writable = r_off.is_multiple_of(8)
+        // (the word must be copied from the file, so that the loader can patch its copy; the target must be inside the image)
+        let in_file = r_off.is_multiple_of(8)
             && segments
                 .iter()
-                .any(|s| s.perms.write && s.vaddr <= r_off && word_end <= s.vaddr + s.memsz);
-        if !in_writable {
+                .any(|s| s.vaddr <= r_off && word_end <= s.vaddr + s.filesz);
+        if !in_file || addend > span {
             return Err(ElfError::Relocation);
         }
+        out.push(Reloc {
+            offset: r_off,
+            addend,
+        });
     }
-    Ok(())
+    Ok(out)
 }

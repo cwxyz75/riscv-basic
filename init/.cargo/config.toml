@@ -7,4 +7,4 @@
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
-rustflags = ["-C", "target-feature=+v,+zvbb,+zba,+zbb,+zbs,+zicond,+zcb,+zfa,+zicbom,+zicboz,+zihintpause,+zkt,+zimop,+zcmop,+zawrs"]
+rustflags = ["-C", "target-feature=+v,+zvbb,+zba,+zbb,+zbs,+zicond,+zcb,+zfa,+zicbom,+zicboz,+zihintpause,+zkt,+zimop,+zcmop,+zawrs", "-C", "relocation-model=pic"]

@@ -112,7 +112,7 @@ fn build_c_archive(name: &str, sources: &[PathBuf], extra: &[String]) -> Option<
                 "-mabi=lp64d",
                 "-ffreestanding",
                 "-nostdlibinc",
-                "-fno-pic",
+                "-fPIE",
                 "-fno-stack-protector",
                 "-O2",
             ])
@@ -325,7 +325,18 @@ fn build_busybox(dir: &str) -> Option<PathBuf> {
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    println!("cargo:rustc-link-arg=-T{dir}/link.ld");
+    // HD2: every program is a static-PIE (`OS_PIE=0` links the old fixed-address layout, for comparison) (`link-pie.ld`, with `-pie` and text relocations allowed: the loader relocates the bytes it
+    // copies, so the prebuilt `core` library's absolute words need no startup code); the build also needs `-C relocation-model=pic` (`init/.cargo/config.toml`).
+    if std::env::var("OS_PIE").as_deref() != Ok("0") {
+        println!("cargo:rustc-link-arg=-T{dir}/link-pie.ld");
+        println!("cargo:rustc-link-arg=-pie");
+        println!("cargo:rustc-link-arg=-znotext");
+        println!("cargo:rustc-link-arg=--no-dynamic-linker");
+        println!("cargo:rerun-if-changed=link-pie.ld");
+    } else {
+        println!("cargo:rustc-link-arg=-T{dir}/link.ld");
+    }
+    println!("cargo:rerun-if-env-changed=OS_PIE");
     println!("cargo:rustc-link-arg=--no-relax");
     // The programs are embedded in the boot image: leave out the debug info of the standard
     // library that would otherwise make each one over a megabyte.
