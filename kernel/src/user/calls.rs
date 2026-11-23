@@ -122,7 +122,7 @@ impl ksys::Machine for KernelMachine {
     }
     fn random_below(&mut self, n: u64) -> u64 {
         // (a pool that is not seeded yet gives nothing: the placement is then the first fit, which is still a valid place)
-        crate::entropy::below(n).unwrap_or(0)
+        crate::entropy::placement_below(n)
     }
 }
 
@@ -205,6 +205,7 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
             &kmem::kernel_table(),
             kernel_half_ok,
             me,
+            random_stack_hint(),
             a,
         )
         .map_err(|e| (e, None, None))?;
@@ -710,4 +711,12 @@ pub(super) fn job_kill(a: [u64; 6]) -> Reply {
         exit_process(code);
     }
     Ok((None, None))
+}
+
+/// Where a new process's `thread_spawn` stacks start looking for a gap (HD2): a random page in the lower half of the stack arena (first fit from its
+/// base when the kernel does not randomise).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the draw is below half the arena's pages, so the sum stays inside the arena
+pub(super) fn random_stack_hint() -> u64 {
+    let half = (abi::user::STACK_ARENA_END - abi::user::STACK_ARENA_BASE) / 4096 / 2;
+    abi::user::STACK_ARENA_BASE + crate::entropy::placement_below(half) * 4096
 }

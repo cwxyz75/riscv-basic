@@ -136,7 +136,13 @@ impl TrapFrame {
 #[no_mangle]
 #[allow(clippy::panic)] // INVARIANT: a kernel stack overflow is fatal by design: this is the panic that reports it
 extern "C" fn stack_overflow(sepc: u64, stval: u64, sp: u64) -> ! {
-    panic!("kernel stack overflow: sp {sp:#x} in a guard page (sepc {sepc:#x}, stval {stval:#x})")
+    if cfg!(all(feature = "release", not(feature = "release-suite"))) {
+        panic!("kernel stack overflow in a guard page")
+    }
+    panic!(
+        "kernel stack overflow: sp {sp:#x} in a guard page (sepc {:#x} minus the slide, stval {stval:#x})",
+        sepc.wrapping_sub(super::boot::slide())
+    )
 }
 
 global_asm!(
@@ -343,7 +349,7 @@ pub fn init() {
     unsafe { core::arch::asm!("csrw stvec, {}", "csrw sscratch, zero", in(reg) entry) };
     // KT5: test builds let user mode read the retired-instruction counter (`rdinstret`, bit 2 of `scounteren`) so the suite can count the
     // instructions of a syscall path. The release build leaves it closed: a program has no use for it and it is a timing channel.
-    #[cfg(not(feature = "release"))]
+    #[cfg(any(not(feature = "release"), feature = "release-suite"))]
     // SAFETY: `scounteren` only selects which counters user mode may read; no memory is touched.
     unsafe {
         core::arch::asm!("csrs scounteren, {}", in(reg) 4usize);
@@ -734,14 +740,29 @@ fn instruction_length(pc: u64) -> u64 {
     }
 }
 
+/// What a fatal trap prints of the registers (HD3): a test build prints `sepc` minus the image's slide (so a log is comparable between boots and
+/// `scripts/resolve_trace.py`-style tools can use the link addresses) and `stval`; a release build prints the cause only, nothing that is an address.
+struct FatalRegs<'a>(&'a TrapFrame);
+
+impl core::fmt::Display for FatalRegs<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if cfg!(all(feature = "release", not(feature = "release-suite"))) {
+            write!(f, "scause={:#x}", self.0.scause)
+        } else {
+            write!(
+                f,
+                "scause={:#x} sepc={:#x} (slide {:#x}) stval={:#x}",
+                self.0.scause,
+                self.0.sepc.wrapping_sub(super::boot::slide()),
+                super::boot::slide(),
+                self.0.stval
+            )
+        }
+    }
+}
+
 fn fatal(frame: &TrapFrame, what: core::fmt::Arguments) -> ! {
     crate::console::break_lock();
-    let _ = testlog::panic(
-        &mut Console,
-        &format_args!(
-            "{what}: scause={:#x} sepc={:#x} stval={:#x}",
-            frame.scause, frame.sepc, frame.stval
-        ),
-    );
+    let _ = testlog::panic(&mut Console, &format_args!("{what}: {}", FatalRegs(frame)));
     finisher::exit(false)
 }

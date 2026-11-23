@@ -25,9 +25,6 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         return Err(LoadError::NoProgram);
     }
     let parsed = elf::parse(image).map_err(LoadError::Elf)?;
-    if parsed.pie {
-        return Err(LoadError::Elf(elf::ElfError::BadType)); // (placement of a static-PIE is HD2 part b)
-    }
     if !kmem::kernel_half_unchanged() {
         return Err(LoadError::KernelHalfChanged);
     }
@@ -37,12 +34,37 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         PageTable::new_with_kernel_half(k.mm, &kmem::kernel_table()).ok_or(LoadError::NoMemory)?;
     let mut aspace = AddressSpace::new(table);
     let mut vmo_ids: Vec<u64> = Vec::new();
+    // HD2: a static-PIE is placed at a random base in the mapping arena (the span reserved by the first fit among random tries), its stack at a random
+    // place in the stack arena (a guard page below and above), and its relocations applied to the copy of each segment before it is mapped. An `ET_EXEC` image
+    // goes where it was linked, its stack below `STACK_TOP`.
+    let mut base = 0u64;
+    let mut stack_top = STACK_TOP;
     let built = (|| -> Result<(), LoadError> {
+        let mut random = |n: u64| crate::entropy::placement_below(n);
+        if parsed.pie {
+            base = ksys::place_anywhere(&mut random, &aspace, parsed.span)
+                .ok_or(LoadError::NoMemory)?;
+            let total = (STACK_PAGES + 2) * 4096;
+            let slots =
+                (abi::user::STACK_ARENA_END - abi::user::STACK_ARENA_BASE - total) / 4096 + 1;
+            let at = abi::user::STACK_ARENA_BASE + random(slots) * 4096;
+            stack_top = at + 4096 + STACK_PAGES * 4096;
+        }
         for seg in &parsed.segments {
             let (first, end) = seg.pages();
+            let (first, end) = (first + base / 4096, end + base / 4096);
             let id = k.vmos.create(k.jobs, end - first);
             vmo_ids.push(id);
             let bytes = &image[seg.offset as usize..(seg.offset + seg.filesz) as usize];
+            let relocated;
+            let bytes = if parsed.pie && !parsed.relocs.is_empty() {
+                let mut copy = bytes.to_vec();
+                parsed.relocate(seg, &mut copy, base);
+                relocated = copy;
+                &relocated[..]
+            } else {
+                bytes
+            };
             k.vmos
                 .write(k.mm, k.jobs, id, seg.vaddr % 4096, bytes)
                 .map_err(|_| LoadError::NoMemory)?;
@@ -55,7 +77,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         aspace
             .map_region(
                 k.vmos,
-                STACK_TOP - STACK_PAGES * 4096,
+                stack_top - STACK_PAGES * 4096,
                 STACK_PAGES,
                 stack,
                 0,
@@ -90,7 +112,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         handles: HandleTable::new(MAX_HANDLES),
         tag,
         vmos: vmo_ids,
-        entry: parsed.entry,
+        entry: base + parsed.entry,
         arg,
         exit_code: None,
         kernel_end: None,
@@ -107,7 +129,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         table_charge: BTreeMap::new(),
         charge_end: BTreeMap::new(),
         stacks: BTreeMap::new(),
-        stack_hint: abi::user::STACK_ARENA_BASE,
+        stack_hint: super::calls::random_stack_hint(),
         privileged: true,
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
@@ -158,7 +180,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
             let _ = charge_thread(jobs, JobId::ROOT);
             s.procs.insert(pid, Box::new(process));
-            new_start(s, pid, entry, STACK_TOP, arg, None)
+            new_start(s, pid, entry, stack_top, arg, None)
         }
     })();
     // (the thread's stack comes from the same locks)

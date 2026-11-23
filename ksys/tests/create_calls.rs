@@ -31,7 +31,7 @@ fn world(frames: usize) -> W {
     let mut vmos = Vmos::new();
     let mut jobs = kcore::job::Jobs::new();
     let _ = &mut vmos;
-    let first = ksys::process_create(&mut us, &mut mm, &mut jobs, &kernel, true, 0, [0; 6]);
+    let first = ksys::process_create(&mut us, &mut mm, &mut jobs, &kernel, true, 0, 0, [0; 6]);
     // (no creator yet: process 0 does not exist)
     assert_eq!(first, Err(Status::BadState));
     us.procs
@@ -85,6 +85,7 @@ impl W {
             &self.kernel,
             ok,
             1,
+            abi::user::STACK_ARENA_BASE,
             a,
         )
     }

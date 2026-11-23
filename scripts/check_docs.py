@@ -200,7 +200,7 @@ ATOMICS = {
     "kernel/src/user/waits.rs": (2, "the flag that says a PI futex has had a waiter, so a thread's exit looks for owned PI futexes only then (L23)"),
     "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
     "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),
-    "kernel/src/entropy.rs": (6, "whether the pool was keyed from a real seed, and its first output for the boot tests (HD1)"),
+    "kernel/src/entropy.rs": (8, "whether the pool was keyed from a real seed, its first output for the boot tests (HD1), and the test-build flag `aslr=off` (HD2)"),
     "kernel/src/arch/riscv64/sbi.rs": (4, "whether the firmware has the debug console extension, probed once; the count of calls to the IPI extension (stays 0, PL6)"),
     "kernel/src/console.rs": (10, "the console's panic flag and line state, and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),

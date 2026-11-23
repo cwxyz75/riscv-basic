@@ -24,8 +24,11 @@ const PROT_RW: u64 = 1 | 2;
 
 struct State {
     heap: Heap,
-    /// Bytes mapped so far (from `HEAP_BASE`).
+    /// Bytes mapped so far (from `base`).
     mapped: usize,
+    /// Where the range starts (0 until the first growth): `HEAP_BASE` for a program linked at a fixed address, else a place in the 4 GiB window that
+    /// starts there, derived from where the kernel put this process's stack and image (HD2).
+    base: u64,
     /// Our `process_self` handle, once fetched (0: not yet).
     me: u64,
 }
@@ -45,6 +48,7 @@ impl UserHeap {
             state: UnsafeCell::new(State {
                 heap: Heap::empty(),
                 mapped: 0,
+                base: 0,
                 me: 0,
             }),
         }
@@ -75,6 +79,25 @@ impl Default for UserHeap {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The heap's start (HD2). A fixed-address program (its stack is the kernel's default one, just below `STACK_TOP`) keeps `HEAP_BASE`. A position-independent one has
+/// a stack and an image the kernel placed at random, so the heap starts at a page of the 4 GiB window above `HEAP_BASE` chosen by a hash of those two addresses:
+/// the window lies below the mapping arena, so nothing the kernel places ANYWHERE can fall into the range the heap grows through.
+fn pick_base() -> u64 {
+    let probe = 0u8;
+    let sp = core::ptr::addr_of!(probe) as u64;
+    let top = abi::user::STACK_TOP;
+    if sp <= top && sp >= top - (abi::user::STACK_PAGES + 1) * 4096 {
+        return HEAP_BASE;
+    }
+    let image = core::ptr::addr_of!(HEAP) as u64;
+    let mut x = (sp >> 12) ^ (image >> 12).rotate_left(23);
+    x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 32)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    let slots = (0x1_0000_0000u64 - HEAP_LIMIT as u64) / 4096;
+    HEAP_BASE + (x % slots) * 4096
 }
 
 impl State {
@@ -110,7 +133,10 @@ impl State {
             }
             done += n;
         }
-        let at = HEAP_BASE + self.mapped as u64;
+        if self.base == 0 {
+            self.base = pick_base();
+        }
+        let at = self.base + self.mapped as u64;
         let m = sys::process_map(self.me, vmo, at, 0, by as u64, PROT_RW);
         // The mapping holds the memory; our handle is not needed any more.
         sys::handle_close(vmo);

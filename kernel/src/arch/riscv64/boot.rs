@@ -9,8 +9,15 @@
 //!
 //!   root[0]            phys 0 (devices)       RW   identity   (UART, test finisher)
 //!   root[image / 1 GiB] the gigabyte the image runs in   RWX  identity   (keeps these instructions running across `satp`)
-//!   root[256 + i]      phys i GiB, i = 0..63  RW   the direct map of the physical space below 64 GiB (RAM is wherever the tree says)
-//!   root[510]          EARLY_L1               the kernel image at its linked address, as 2 MiB RWX pages from the image's physical start
+//!   root[256 + k + i]  phys i GiB, i = 0..63  RW   the direct map of the physical space below 64 GiB (RAM is wherever the tree says), `k` a random
+//!                      number of gigabytes from 0 to 64 (HD3)
+//!   root[510]          EARLY_L1               the kernel image at its slid address, as 2 MiB RWX pages from the image's physical start: it starts
+//!                      `s` pages above where it is linked, `s` random (HD3), so that it stays inside the slot
+//!
+//! HD3: the kernel is linked as a static-PIE. Before paging goes on `_start` reads `/chosen/kaslr-seed` (else `/chosen/rng-seed`) from the device
+//! tree with a small scanner of its own, chooses `s` and `k` (the formula is `kcore::kaslr`, which the boot self-test checks the choice against), and
+//! applies the image's `R_RISCV_RELATIVE` relocations (`slide` added to each addend) to the image where it stands in memory. A test build's
+//! `kaslr=off` on the kernel line (read by the same scanner) makes both zero.
 
 use core::arch::global_asm;
 
@@ -29,6 +36,26 @@ pub static mut EARLY_L1: EarlyRoot = EarlyRoot([0; 512]);
 #[no_mangle]
 pub static mut KERNEL_DELTA: u64 = 0;
 
+/// The bytes the image is slid up from where it is linked (a multiple of 2 MiB; HD3), stored by `_start`.
+#[no_mangle]
+pub static mut KASLR_SLIDE: u64 = 0;
+
+/// How many gigabytes the direct map is moved up from its first slot (0 to 64; HD3), stored by `_start`.
+#[no_mangle]
+pub static mut KASLR_DIRECT: u64 = 0;
+
+/// The bytes the image is slid up from where it is linked.
+pub fn slide() -> u64 {
+    // SAFETY: written once by `_start` before the kernel runs; read-only afterwards.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(KASLR_SLIDE)) }
+}
+
+/// The gigabytes the direct map is moved up.
+pub fn direct_shift() -> u64 {
+    // SAFETY: as for `slide`.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(KASLR_DIRECT)) }
+}
+
 /// The difference between the image's virtual and physical addresses (`virtual - delta = physical`, for any address inside the image).
 pub fn kernel_delta() -> u64 {
     // SAFETY: written once by `_start` before the kernel runs; read-only afterwards.
@@ -37,10 +64,17 @@ pub fn kernel_delta() -> u64 {
 
 /// Where `early_trap` ends the run in a test build: QEMU's `virt` test finisher, at its fixed address (the tree is not read this early). A release
 /// build writes nothing there and ends through the firmware.
-const EARLY_FINISHER: u64 = if cfg!(feature = "release") {
+const EARLY_FINISHER: u64 = if cfg!(all(feature = "release", not(feature = "release-suite"))) {
     0
 } else {
     0x10_0000
+};
+
+/// Does `_start` look for `kaslr=off`? Test builds only: a release kernel does not even carry the string.
+const KASLR_OFF_CHECK: u64 = if cfg!(all(feature = "release", not(feature = "release-suite"))) {
+    0
+} else {
+    1
 };
 
 /// The failure code `early_trap` writes to the test finisher (`abi::finisher::fail(1)`).
@@ -55,34 +89,186 @@ _start:
     # in any function, the device-tree reader included; on a CPU without the profile the first such instruction traps, long before
     # `dtb::require_extensions` could say so. `early_trap` (base ISA only) says it. It runs at its physical address, which the early table
     # identity-maps; `trap::init` replaces it.
-    la   t0, early_trap
+    lla   t0, early_trap
     csrw stvec, t0
     mv   s0, a0                  # hart id
     mv   s1, a1                  # device tree pointer
     # zero .bss (these are physical addresses: PC-relative `la`)
-    la   t0, __bss_start
-    la   t1, __bss_end
+    lla   t0, __bss_start
+    lla   t1, __bss_end
 1:
     bgeu t0, t1, 2f
     sd   zero, 0(t0)
     addi t0, t0, 8
     j    1b
 2:
-    # Where is the image? `la` is PC-relative and paging is off, so this is its real, physical address, wherever the loader put it
-    # (a multiple of 2 MiB: the early table maps it with 2 MiB pages). delta = where it is linked minus where it is, for the whole image.
-    la   t0, __text_start
+    lla   t0, __text_start        # the image's real, physical address (a multiple of 2 MiB: the early table maps it with 2 MiB pages)
+    # HD3: scan the device tree (big-endian, at its physical address) for the seeds: s7 = the first eight bytes of `kaslr-seed` (0: none), s8 = the
+    # first eight bytes of `rng-seed` xor the next eight (0: none), s5 = 1 when the kernel line holds `kaslr=off` (test builds).
+    li   s5, 0
+    li   s7, 0
+    li   s8, 0
+    beqz s1, 49f                 # no tree pointer: no seed
+    mv   a0, s1
+    jal  t5, 60f
+    li   a2, 0xd00dfeed
+    bne  a1, a2, 49f             # not a tree
+    addi a0, s1, 8
+    jal  t5, 60f
+    add  s9, s1, a1              # the structure block
+    addi a0, s1, 12
+    jal  t5, 60f
+    add  s10, s1, a1             # the strings block
+    addi a0, s1, 36
+    jal  t5, 60f
+    add  s11, s9, a1             # the end of the structure block
+41:
+    bgeu s9, s11, 49f
+    mv   a0, s9
+    jal  t5, 60f                 # a1 = the token
+    addi s9, s9, 4
+    li   a2, 1
+    beq  a1, a2, 42f             # FDT_BEGIN_NODE: skip its name
+    li   a2, 3
+    beq  a1, a2, 43f             # FDT_PROP
+    li   a2, 2
+    beq  a1, a2, 41b             # FDT_END_NODE
+    li   a2, 4
+    beq  a1, a2, 41b             # FDT_NOP
+    j    49f                     # FDT_END (or anything else)
+42:
+    lbu  a1, 0(s9)
+    addi s9, s9, 1
+    bnez a1, 42b
+    addi s9, s9, 3
+    andi s9, s9, -4
+    j    41b
+43:
+    mv   a0, s9
+    jal  t5, 60f
+    mv   a3, a1                  # the property's length
+    addi a0, s9, 4
+    jal  t5, 60f
+    add  a4, s10, a1             # its name, in the strings block
+    addi s9, s9, 8               # its data
+    mv   a5, s9
+    add  s9, s9, a3
+    addi s9, s9, 3
+    andi s9, s9, -4              # the next token
+    lla   a1, 181f                # "kaslr-seed"
+    mv   a0, a4
+    jal  t4, 61f
+    bnez a2, 44f
+    li   a2, 8
+    bltu a3, a2, 41b
+    lwu  a1, 0(a5)
+    lwu  a2, 4(a5)
+    slli a2, a2, 32
+    or   s7, a1, a2
+    j    41b
+44:
+    lla   a1, 182f                # "rng-seed"
+    mv   a0, a4
+    jal  t4, 61f
+    bnez a2, 45f
+    li   a2, 8
+    bltu a3, a2, 41b
+    lwu  a1, 0(a5)
+    lwu  a2, 4(a5)
+    slli a2, a2, 32
+    or   s8, a1, a2
+    li   a2, 16
+    bltu a3, a2, 41b
+    lwu  a1, 8(a5)
+    lwu  a2, 12(a5)
+    slli a2, a2, 32
+    or   a1, a1, a2
+    xor  s8, s8, a1
+    j    41b
+45:
+    .if {off_check}
+    lla   a1, 183f                # "bootargs"
+    mv   a0, a4
+    jal  t4, 61f
+    bnez a2, 41b
+    # look for "kaslr=off" anywhere in the property's data (a5, a3 bytes)
+    li   a6, 9
+46:
+    bltu a3, a6, 41b
+    lla   a1, 184f
+    mv   a0, a5
+    jal  t4, 62f                 # a2 = 0 when the nine bytes at a0 are "kaslr=off"
+    bnez a2, 47f
+    li   s5, 1
+    j    41b
+47:
+    addi a5, a5, 1
+    addi a3, a3, -1
+    j    46b
+    .else
+    j    41b
+    .endif
+49:
+    # choose: the seed is `kaslr-seed`, else `rng-seed`, else nothing (no slide)
+    mv   t6, s7
+    bnez t6, 50f
+    mv   t6, s8
+50:
+    li   s7, 0                   # the slide in bytes
+    li   s8, 0                   # the direct map's move in gigabytes
+    beqz t6, 54f
+    bnez s5, 54f                 # kaslr=off
+    # the number of 2 MiB pages the image needs: choices for the slide = 511 - pages (the image stays below index 512 of EARLY_L1, from index 1 + s)
+    lla   t4, __kernel_end
+    sub  t4, t4, t0
+    li   a2, 0x1fffff
+    add  t4, t4, a2
+    srli t4, t4, 21
+    li   a2, 511
+    bgeu t4, a2, 51f             # no room: no slide (the image is refused below if it does not fit)
+    sub  a2, a2, t4              # choices
+    slli a3, t6, 32
+    srli a3, a3, 32              # the low 32 bits of the seed
+    remu a3, a3, a2              # s
+    slli s7, a3, 21
+51:
+    srli a3, t6, 32              # the high 32 bits
+    li   a2, 65
+    remu s8, a3, a2              # k
+54:
+    # relocate the image where it stands: every R_RISCV_RELATIVE entry (offset, info, addend) becomes `addend + slide` at the entry's offset
+    lla   a2, __rela_start
+    lla   a3, __rela_end
+    li   a4, 0xffffffff80200000  # where the image is linked (KERNEL_VIRT_BASE)
+55:
+    bgeu a2, a3, 56f
+    ld   a5, 0(a2)               # offset (a link address)
+    ld   a6, 16(a2)              # addend
+    sub  a5, a5, a4
+    add  a5, a5, t0              # its physical address
+    add  a6, a6, s7
+    sd   a6, 0(a5)
+    addi a2, a2, 24
+    j    55b
+56:
+    # Where is the image? delta = where it is (linked + slide) minus where it is loaded (`t0`), for the whole image.
     li   t1, 0xffffffff80200000  # KERNEL_VIRT_BASE
+    add  t1, t1, s7
     sub  s2, t1, t0
-    la   t2, KERNEL_DELTA
+    lla   t2, KERNEL_DELTA
     sd   s2, 0(t2)               # the kernel reads it back (`kernel_delta`)
-    la   t2, EARLY_ROOT
+    lla   t2, KASLR_SLIDE
+    sd   s7, 0(t2)
+    lla   t2, KASLR_DIRECT
+    sd   s8, 0(t2)
+    lla   t2, EARLY_ROOT
     li   t3, 0xC7                # V R W A D
     sd   t3, 0(t2)               # root[0] = phys 0, RW (the devices, until `kmem::init`)
     # identity: the gigabytes the image runs from (its first and its last byte may be in different ones), RWX (keeps these instructions
     # running across `satp`, and lets a secondary hart read what it needs). An image that starts at 64 GiB or beyond is refused (`9:`).
     srli a4, t0, 36
     bnez a4, 9f
-    la   a5, __kernel_end
+    lla   a5, __kernel_end
     addi a5, a5, -1              # the image's last byte
     srli a5, a5, 30              # its gigabyte number
     srli t4, t0, 30              # the first byte's gigabyte number
@@ -100,6 +286,8 @@ _start:
     # `kmem::init` can write page tables into frames wherever the device tree puts RAM: root[256 + i] = phys i GiB, RW, for i = 0 to 63
     li   t5, 2048
     add  t5, t2, t5              # t5 = &root[256]
+    slli a7, s8, 3
+    add  a7, t5, a7              # a7 = &root[256 + k]: HD3 moves the direct map up by k gigabytes
     li   t6, 0
     li   a2, 64
 5:
@@ -107,19 +295,19 @@ _start:
     slli t3, t6, 28
     ori  t3, t3, 0xC7            # V R W A D
     slli t4, t6, 3
-    add  t4, t5, t4              # &root[256 + i]
+    add  t4, a7, t4              # &root[256 + k + i]
     sd   t3, 0(t4)
     addi t6, t6, 1
     j    5b
 6:
     # PL4c: the image at its linked address: root[510] points at EARLY_L1, whose entries (from index 1, where KERNEL_VIRT_BASE falls) are
     # 2 MiB read-write-execute pages over the image's physical frames, as many as the image needs
-    la   a3, EARLY_L1
+    lla   a3, EARLY_L1
     srli t3, a3, 12
     slli t3, t3, 10
     ori  t3, t3, 1               # V only: a pointer to the next level
     sd   t3, 2032(t5)            # root[510]
-    la   t4, __kernel_end
+    lla   t4, __kernel_end
     sub  t4, t4, t0              # the image's size
     li   t6, 0x1fffff
     add  t4, t4, t6
@@ -135,7 +323,9 @@ _start:
     add  a6, a4, a5
     slli a6, a6, 19              # (pa >> 21) << 9 is the frame number; << 10 puts it in the entry
     ori  a6, a6, 0xCF            # V R W X A D
-    addi a7, a5, 1               # L1 index: 1 + k
+    srli t6, s7, 21              # (HD3: the image sits `s` pages above where it is linked)
+    add  a7, a5, t6
+    addi a7, a7, 1               # L1 index: 1 + s + k
     slli a7, a7, 3
     add  a7, a3, a7
     sd   a6, 0(a7)
@@ -153,11 +343,11 @@ _start:
     sfence.vma zero, zero
     # Paging is on; we still run at the identity-mapped physical address. Jump to
     # the same code at its upper-half address.
-    la   t0, 3f
+    lla   t0, 3f
     add  t0, t0, s2              # + delta: the same code at its linked address
     jr   t0
 3:
-    la   sp, __stack_top         # now PC-relative to an upper-half PC
+    lla   sp, __stack_top         # now PC-relative to an upper-half PC
     mv   a0, s0
     mv   a1, s1
     call kmain
@@ -172,19 +362,19 @@ _start:
 early_trap:
     csrr s3, scause
     csrr s4, sepc
-    la   t0, 91f                 # the missing-extension line for an illegal instruction, the early-trap line otherwise
+    lla   t0, 91f                 # the missing-extension line for an illegal instruction, the early-trap line otherwise
     li   t1, 2
     beq  s3, t1, 81f
-    la   t0, 92f
+    lla   t0, 92f
 81:
     jal  t6, 70f                 # print the string at t0
     mv   t2, s3
     jal  t6, 72f                 # scause
-    la   t0, 93f
+    lla   t0, 93f
     jal  t6, 70f
     mv   t2, s4
     jal  t6, 72f                 # sepc
-    la   t0, 94f
+    lla   t0, 94f
     jal  t6, 70f
     li   t0, {finisher}
     beqz t0, 85f
@@ -225,6 +415,59 @@ early_trap:
     addi t3, t3, -4
     bgez t3, 73b
     jr   t6
+    # (HD3) helpers of the seed scan, base ISA only, no stack: 60 = the big-endian word at a0 in a1 (return through t5, clobbers t3); 61 = a2 = 0 when
+    # the NUL-terminated strings at a0 and a1 are equal (return through t4, clobbers t1 and t2); 62 = a2 = 0 when the nine bytes at a0 are those at a1
+    .balign 4
+60:
+    lbu  a1, 0(a0)
+    slli a1, a1, 8
+    lbu  t3, 1(a0)
+    or   a1, a1, t3
+    slli a1, a1, 8
+    lbu  t3, 2(a0)
+    or   a1, a1, t3
+    slli a1, a1, 8
+    lbu  t3, 3(a0)
+    or   a1, a1, t3
+    jr   t5
+61:
+    lbu  t1, 0(a0)
+    lbu  t2, 0(a1)
+    bne  t1, t2, 63f
+    beqz t1, 64f
+    addi a0, a0, 1
+    addi a1, a1, 1
+    j    61b
+63:
+    li   a2, 1
+    jr   t4
+64:
+    li   a2, 0
+    jr   t4
+    .if {off_check}
+62:
+    li   t3, 9
+65:
+    lbu  t1, 0(a0)
+    lbu  t2, 0(a1)
+    bne  t1, t2, 63b
+    addi a0, a0, 1
+    addi a1, a1, 1
+    addi t3, t3, -1
+    bnez t3, 65b
+    li   a2, 0
+    jr   t4
+    .endif
+181:
+    .asciz "kaslr-seed"
+182:
+    .asciz "rng-seed"
+    .if {off_check}
+183:
+    .asciz "bootargs"
+184:
+    .asciz "kaslr=off"
+    .endif
 91:
     .asciz "\n##PANIC missing extension: an instruction this CPU lacks ran before the profile check (RVA23S64 and the AIA, OD127); scause 0x"
 92:
@@ -235,5 +478,6 @@ early_trap:
     .asciz "\n"
 "##,
     finisher = const EARLY_FINISHER,
+    off_check = const KASLR_OFF_CHECK,
     fail = const EARLY_FAIL,
 );

@@ -120,10 +120,6 @@ pub fn spawn_in_exact(
     let Ok(parsed) = elf::parse(image) else {
         return early(handles, SpawnError::BadElf);
     };
-    // (a static-PIE is placed by a loader that chooses its base: not yet, HD2 part b; its link addresses are offsets, not addresses to map)
-    if parsed.pie {
-        return early(handles, SpawnError::BadElf);
-    }
     if parsed.segments.len() > MAX_SEGMENTS {
         return early(handles, SpawnError::BadElf);
     }
@@ -168,17 +164,37 @@ pub fn spawn_in_exact(
     }
 }
 
-fn build_and_start(
+/// Map `parsed` (the ELF in `image`) and a stack into `proc`, which has not started, charged to `job` (0: the caller's own); returns the entry point and the initial
+/// stack pointer to start it with. `rt::spawn` and the suite's hand-built children (which start theirs with their own arguments) share it.
+pub fn map_image(
     proc: u64,
     parsed: &elf::Image,
     image: &[u8],
-    startup: &[u8],
-    handles: &[u64],
     job: u64,
-    moved: &mut bool,
-) -> Result<(), SpawnError> {
+) -> Result<(u64, u64), SpawnError> {
+    // HD2: a static-PIE's base is where the kernel put a reservation of its span (made and given back at once: the child has not run, nothing else
+    // maps into it); its stack is placed the same way, a guard page below and above. An `ET_EXEC` image and stack are where they were linked.
+    let mut base = 0u64;
+    let mut stack_top = STACK_TOP;
+    if parsed.pie {
+        // (both reservations stay until both are made, so that the stack cannot be given the image's place; then both go)
+        let Ok(b) = reserve(proc, parsed.span, job) else {
+            return Err(SpawnError::TooBig);
+        };
+        let st = reserve(proc, (STACK_PAGES + 2) * 4096, job);
+        let given = sys::process_unmap_range(proc, b, parsed.span).status;
+        let Ok(st) = st else {
+            return Err(SpawnError::TooBig);
+        };
+        if given != 0 || sys::process_unmap_range(proc, st, (STACK_PAGES + 2) * 4096).status != 0 {
+            return Err(SpawnError::TooBig);
+        }
+        base = b;
+        stack_top = st + 4096 + STACK_PAGES * 4096;
+    }
     for seg in &parsed.segments {
         let (first, end) = seg.pages();
+        let (first, end) = (first + base / 4096, end + base / 4096);
         let pages = end - first;
         let v = sys::vmo_create_in(pages, job);
         if v.status != 0 {
@@ -189,6 +205,20 @@ fn build_and_start(
         let Some(bytes) = image.get(seg.offset as usize..(seg.offset + seg.filesz) as usize) else {
             sys::handle_close(vmo);
             return Err(SpawnError::BadElf);
+        };
+        let relocated;
+        let bytes = if parsed.pie && !parsed.relocs.is_empty() {
+            let mut copy = Vec::new();
+            if copy.try_reserve_exact(bytes.len()).is_err() {
+                sys::handle_close(vmo);
+                return Err(SpawnError::TooBig);
+            }
+            copy.extend_from_slice(bytes);
+            parsed.relocate(seg, &mut copy, base);
+            relocated = copy;
+            &relocated[..]
+        } else {
+            bytes
         };
         let mut done = 0usize;
         while done < bytes.len() {
@@ -221,7 +251,7 @@ fn build_and_start(
     let m = sys::process_map(
         proc,
         stack,
-        STACK_TOP - STACK_PAGES * 4096,
+        stack_top - STACK_PAGES * 4096,
         0,
         STACK_PAGES * 4096,
         PF_R | PF_W,
@@ -230,6 +260,19 @@ fn build_and_start(
     if m.status != 0 {
         return Err(sys_err(m.status));
     }
+    Ok((base + parsed.entry, stack_top))
+}
+
+fn build_and_start(
+    proc: u64,
+    parsed: &elf::Image,
+    image: &[u8],
+    startup: &[u8],
+    handles: &[u64],
+    job: u64,
+    moved: &mut bool,
+) -> Result<(), SpawnError> {
+    let (entry, stack_top) = map_image(proc, parsed, image, job)?;
     let c = sys::channel_create();
     if c.status != 0 {
         return Err(sys_err(c.status));
@@ -250,12 +293,28 @@ fn build_and_start(
         sys::handle_close(theirs);
         return Err(sys_err(w.status));
     }
-    let started = sys::process_start(proc, parsed.entry, STACK_TOP, theirs, 0);
+    let started = sys::process_start(proc, entry, stack_top, theirs, 0);
     if started.status != 0 {
         sys::handle_close(theirs);
         return Err(sys_err(started.status));
     }
     Ok(())
+}
+
+/// Where the kernel would put `bytes` of address space in `proc`: map a lazy VMO ANYWHERE and note the address; the caller unmaps it (the reservation stands
+/// until then). Only for a process that has not started (nobody else maps into it between this and the mappings that follow).
+fn reserve(proc: u64, bytes: u64, job: u64) -> Result<u64, ()> {
+    let v = sys::vmo_create_in(bytes / 4096, job);
+    if v.status != 0 {
+        return Err(());
+    }
+    let vmo = v.a1 as u64;
+    let m = sys::process_map_anywhere(proc, vmo, 0, bytes, PF_R);
+    sys::handle_close(vmo);
+    if m.status != 0 {
+        return Err(());
+    }
+    Ok(m.a1 as u64)
 }
 
 /// Read `len` bytes at `offset` from a VMO into memory (for an image). `None` if the extent is

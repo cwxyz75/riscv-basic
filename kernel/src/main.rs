@@ -22,7 +22,7 @@ mod console;
 mod dtb;
 mod entropy;
 mod heap;
-#[cfg(feature = "interactive")]
+#[cfg(all(feature = "interactive", not(feature = "release-suite")))]
 mod interactive;
 mod kmem;
 mod kstack;
@@ -38,7 +38,7 @@ mod smp;
 mod smp_tests;
 mod thread;
 mod user;
-#[cfg(not(feature = "release"))]
+#[cfg(any(not(feature = "release"), feature = "release-suite"))]
 mod user_tests;
 
 use core::fmt::Write;
@@ -52,7 +52,7 @@ use kcore::testlog;
 /// The boot thread's priority (the test modules build theirs from it).
 const MAIN_PRIO: u8 = 40;
 
-const RELEASE: bool = cfg!(feature = "release");
+const RELEASE: bool = cfg!(all(feature = "release", not(feature = "release-suite")));
 
 /// A zero-initialised static: it lives in .bss, so this checks `_start` cleared it.
 static BSS_PROBE: [u64; 64] = [0; 64];
@@ -134,6 +134,14 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     dtb::init_timebase(); // (the clock's rate: before anything reads the time)
     entropy::init(hart_id); // (HD1: the pool is seeded before any address is chosen)
     kmem::init();
+    if !RELEASE {
+        let _ = writeln!(
+            out,
+            "kaslr: image slid {:#x} bytes, direct map at {:#x}",
+            arch::slide(),
+            kmem::direct_base()
+        );
+    }
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
     dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
     if let Some(line) = dtb::ff_report() {
@@ -230,9 +238,9 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         }
     }
     let before = user::reported();
-    #[cfg(feature = "interactive")]
+    #[cfg(all(feature = "interactive", not(feature = "release-suite")))]
     let report = interactive::run();
-    #[cfg(not(feature = "interactive"))]
+    #[cfg(not(all(feature = "interactive", not(feature = "release-suite"))))]
     let report = user_tests::run_all();
     let _ = before;
     tally.add(report.user_reported.0, report.user_reported.1);

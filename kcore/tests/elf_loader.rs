@@ -466,6 +466,32 @@ fn a_static_pie_with_relative_relocations_is_accepted_and_reports_its_span() {
     assert!((!e.pie, e.span) == (true, 0));
 }
 
+/// The loader applies the relocations to its copy of the bytes: in the writable data and in the read-only text alike (a prebuilt library's absolute words).
+#[test]
+fn the_loader_applies_relocations_to_its_copy_of_each_segment() {
+    let b = pie(&good_dyn(), &[(0x2200, 3, 0x40), (0x100, 3, 0x1000)]);
+    let img = parse(&b).unwrap();
+    let base = 0x40_0000_0000u64;
+    for seg in &img.segments {
+        let mut buf = b[seg.offset as usize..(seg.offset + seg.filesz) as usize].to_vec();
+        img.relocate(seg, &mut buf, base);
+        let word = |off: u64| {
+            u64::from_le_bytes(buf[(off - seg.vaddr) as usize..][..8].try_into().unwrap())
+        };
+        if seg.vaddr == 0 {
+            assert_eq!(word(0x100), base + 0x1000);
+        } else {
+            assert_eq!(word(0x2200), base + 0x40);
+            // a word that is no relocation stays as the file had it
+            assert_eq!(word(0x2208), 0);
+        }
+        // a buffer that is not the segment's bytes is left alone
+        let mut short = vec![0u8; 3];
+        img.relocate(seg, &mut short, base);
+        assert_eq!(short, vec![0u8; 3]);
+    }
+}
+
 #[test]
 fn a_static_pie_with_no_relocations_is_accepted() {
     let b = pie(&[(DT_NULL, 0)], &[]);
@@ -521,8 +547,8 @@ fn every_static_pie_rule_has_a_rejection() {
             ElfError::Relocation,
         );
     }
-    // a word outside every writable segment (in the text, past the image, unaligned, straddling the end)
-    for off in [0x100u64, 0x5000, 0x2201, 0x4ffc, u64::MAX - 3] {
+    // a word outside the file bytes of every segment (in the zero-filled tail, past the image, unaligned, straddling the end of the file bytes)
+    for off in [0x2400u64, 0x5000, 0x2201, 0x23fc, 0x4ffc, u64::MAX - 3] {
         bad(
             &[
                 (DT_RELA, 0x2100),
@@ -534,6 +560,17 @@ fn every_static_pie_rule_has_a_rejection() {
             ElfError::Relocation,
         );
     }
+    // an addend that points beyond the image
+    bad(
+        &[
+            (DT_RELA, 0x2100),
+            (DT_RELASZ, 24),
+            (DT_RELAENT, 24),
+            (DT_NULL, 0),
+        ],
+        &[(0x2200, 3, 0x5001)],
+        ElfError::Relocation,
+    );
     // a table that is not in the file bytes of a loaded segment
     bad(
         &[

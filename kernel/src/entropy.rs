@@ -11,6 +11,9 @@ use rngcore::Drbg;
 static POOL: klock::Spin<Option<Drbg>, crate::bkl::Machine> =
     klock::Spin::new(klock::Class::Entropy, 0, None);
 static SEEDED: AtomicBool = AtomicBool::new(false);
+/// Test builds only (`aslr=off` on the kernel line, HD2): every placement the kernel makes at random is first-fit instead, so a test can see
+/// that the randomisation is what moves an address.
+static ASLR_OFF: AtomicBool = AtomicBool::new(false);
 /// The first eight bytes the pool produced after it was keyed, for the boot tests (`debug_stat` 107).
 static FIRST: AtomicU64 = AtomicU64::new(0);
 
@@ -83,6 +86,9 @@ pub fn init(boot_hart_id: usize) {
     }
     FIRST.store(u64::from_le_bytes(first), Ordering::Relaxed);
     SEEDED.store(seeded, Ordering::Release);
+    if !crate::RELEASE && crate::dtb::boot_arg_value("aslr=").as_deref() == Some("off") {
+        ASLR_OFF.store(true, Ordering::Relaxed);
+    }
     rngcore::drbg::wipe(&mut key);
     rngcore::drbg::wipe(&mut zkr);
     if seeded {
@@ -113,6 +119,19 @@ pub fn seeded() -> bool {
 /// Fill `out` from the pool (at most 64 KiB; false if the pool is not keyed yet or the request is too long).
 pub fn fill(out: &mut [u8]) -> bool {
     POOL.lock().as_mut().is_some_and(|d| d.fill(out))
+}
+
+/// A number below `n` for the placement of a mapping: 0 (the first fit) when the pool is not seeded or `aslr=off` was given.
+pub fn placement_below(n: u64) -> u64 {
+    if ASLR_OFF.load(Ordering::Relaxed) {
+        return 0;
+    }
+    below(n).unwrap_or(0)
+}
+
+/// Is `aslr=off` in force (test builds)?
+pub fn aslr_off() -> bool {
+    ASLR_OFF.load(Ordering::Relaxed)
 }
 
 /// A uniform number below `n` (`None` for 0, or while the pool is not keyed).
