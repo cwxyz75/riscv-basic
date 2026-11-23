@@ -202,9 +202,9 @@ holds the big lock longest, reorder on that evidence and record it below.
 ### Phase 10: scale and power
 
 - [ ] **SC2** (first step built, phase 10: the masks, `select_hart` and the pull through them, a counter and the host acceptance; the measurements at 16 and 32 harts are left) placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
-- [ ] **PM1** (built, phase 10; ticks at the epic gate) harts offline and online
-- [ ] **PM4** (built, phase 10: `Policy`, `system_set_placement`, the GP1 walks and a QEMU test under both; ticks at the epic's gate; `rt_latency` under pack is the soak's) the placement policy (`spread`, `pack`)
-- [ ] **PM3** (built, phase 10, the firmware path not: T229; ticks at the epic gate) `system_suspend`
+- [x] **PM1** (#462; the acceptance gaps are T230) harts offline and online
+- [x] **PM4** (#461, #462; phase 10: `Policy`, `system_set_placement`, the GP1 walks and a QEMU test under both; ticks at the epic's gate; `rt_latency` under pack is the soak's) the placement policy (`spread`, `pack`)
+- [x] **PM3** (#462; built to the item's fallback acceptance, the firmware path is T229) `system_suspend`
 
 ### Phase 11: hardening
 
