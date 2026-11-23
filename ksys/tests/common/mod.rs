@@ -96,6 +96,16 @@ pub fn world() -> World {
 
 impl World {
     pub fn call(&mut self, n: usize, a: [u64; 6]) -> Option<Reply> {
+        self.call_split(n, a, None, false).0
+    }
+    /// The call as the kernel runs a big message call: its bytes copied in beforehand (`staged`), its copy-out left to the caller (`defer_out`).
+    pub fn call_split(
+        &mut self,
+        n: usize,
+        a: [u64; 6],
+        staged: Option<ksys::Staged>,
+        defer_out: bool,
+    ) -> (Option<Reply>, Option<ksys::Deferred>) {
         let mut c = Ctx {
             objs: &mut self.objs,
             handles: &mut self.handles,
@@ -109,10 +119,14 @@ impl World {
             job_sched: &self.job_sched,
             clock: || 0,
             windows: &WINDOWS,
+            staged,
+            defer_out,
+            deferred: None,
         };
-        ipc_call(n, a, &mut c)
+        let r = ipc_call(n, a, &mut c)
             .or_else(|| vmo_call(n, a, &mut c))
-            .or_else(|| job_call(n, a, &mut c))
+            .or_else(|| job_call(n, a, &mut c));
+        (r, c.deferred.take())
     }
     pub fn ok(&mut self, n: usize, a: [u64; 6]) -> (Option<u64>, Option<u64>) {
         self.call(n, a).expect("handled").expect("succeeds")

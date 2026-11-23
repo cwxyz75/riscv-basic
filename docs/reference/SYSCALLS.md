@@ -924,6 +924,11 @@ against the declared capacity: a 5-byte message needs 5 writable bytes however l
 the status above is known (so BUFFER_TOO_SMALL and SHOULD_WAIT win over a bad pointer) and
 *before* the message is dequeued, so a bad pointer is INVALID_ARGS and never loses a message.
 
+A message of 1 KiB or more is copied in (`channel_write`, `socket_write`) before the object lock is taken and out (`channel_read`, `socket_read`) after it is let go (T215). The
+errors and their order are those of a small message; one case differs: a thread of the same process that unmaps or decommits the destination
+between the check and the copy makes the copy fail, and the message, already taken, is lost with the error. A program that does that to its own
+buffer during the call has no use for the message.
+
 ### channel_read_txid(channel, txid, max_bytes, max_handles) -> status, bytes, handles
 
 As `channel_read` but takes the oldest message whose first 4 bytes (little endian) equal
