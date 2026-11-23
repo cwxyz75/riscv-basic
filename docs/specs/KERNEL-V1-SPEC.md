@@ -563,3 +563,11 @@ illegal-instruction exception at that pc. The check is two compares against per-
 calls handled with no big kernel lock. Programs no longer contain an `ecall` at all except `crash`'s deliberate one (`check_ecall.py`). The call numbers are
 produced by `abi::syscall::number`, which is the identity unless `ABI_SHUFFLE_SEED` is set when the workspace is built, and then a seed-chosen bijection on
 `0..LIMIT`: `libsys`, the kernel's dispatch and `rt` all take their numbers from it, and a program that wrote a literal number fails the suite.
+
+## Amendment 2026-11-23 (MM4): the allocator keeps its frame pool
+
+Section 4.2 had the allocator take slab frames and large runs from the frame database inline, and the free-list heaps and their dependency go. That is not what the kernel does, and
+the end state of 4.2 is this instead: small objects (up to 2048 bytes) come from slabs behind per-hart magazines; the slabs' frames come from a pool that is stocked at
+safe points; a request the slabs cannot serve (larger than a slab object, or the pool empty, or before the frame database exists) is served by the free-list heaps (a boot
+region and a grown window). Reason: the memory operations hold `VMO`, `JOBS` and `FRAME` together while code that allocates runs under them, so an inline frame take by
+the allocator would be a self-deadlock on that hart. The decision log of `WORK-PLAN.md` has the alternative.
