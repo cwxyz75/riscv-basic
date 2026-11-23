@@ -163,7 +163,11 @@ fn in_user_range(vaddr: u64, length: u64) -> bool {
 /// Where an ANYWHERE mapping of `bytes` goes (MM7): the mapping arena `[MAP_ARENA_BASE, the stack arena)`, at a random page-aligned place: eight
 /// random positions are tried, then the first gap that fits from a random start, wrapping once; `None` when nothing fits.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the arena bounds are constants below the canonical limit; the chosen start is below `span`
-fn place_anywhere<X: Machine>(machine: &mut X, aspace: &AddressSpace, bytes: u64) -> Option<u64> {
+pub fn place_anywhere(
+    random_below: &mut dyn FnMut(u64) -> u64,
+    aspace: &AddressSpace,
+    bytes: u64,
+) -> Option<u64> {
     const LO: u64 = abi::user::MAP_ARENA_BASE;
     let hi = abi::user::STACK_ARENA_BASE;
     if bytes > hi - LO {
@@ -172,12 +176,12 @@ fn place_anywhere<X: Machine>(machine: &mut X, aspace: &AddressSpace, bytes: u64
     let slots = (hi - LO - bytes) / 4096 + 1;
     // eight random positions first; then the first gap that fits from a random start, wrapping once
     for _ in 0..8 {
-        let at = LO + machine.random_below(slots) * 4096;
+        let at = LO + random_below(slots) * 4096;
         if !aspace.has_region_in(at, at + bytes) {
             return Some(at);
         }
     }
-    let from = LO + machine.random_below(slots) * 4096;
+    let from = LO + random_below(slots) * 4096;
     aspace
         .find_gap(LO, hi, bytes, from)
         .or_else(|| aspace.find_gap(LO, hi, bytes, LO))
@@ -323,7 +327,11 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::InvalidArgs);
             }
             let vaddr = if anywhere {
-                match place_anywhere(&mut **machine, target.aspace.held_ref(), length) {
+                match place_anywhere(
+                    &mut |n| machine.random_below(n),
+                    target.aspace.held_ref(),
+                    length,
+                ) {
                     Some(at) => at,
                     None => return bad(Status::NoMemory),
                 }

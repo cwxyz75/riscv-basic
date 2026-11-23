@@ -17,8 +17,10 @@ use kcore::pagetable::{PageTable, PhysMem};
 use kcore::Mm;
 
 /// `process_create(job_handle) -> handle` (SYSCALLS.md): `a[0]` names the job the process is charged to (MANAGE), or 0 for the caller's own.
+/// `stack_hint` is where this process's `thread_spawn` stacks start looking for a gap (HD2: a random page of the stack arena's lower half, or its base).
 /// `kernel_half_ok` is whether the kernel's page-table half is still as snapshotted; `kernel` its table.
-#[allow(clippy::arithmetic_side_effects)]
+#[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)]
+// (the machine's parts, as the other calls take them)
 // INVARIANT: the new process's handle was made with room checked
 #[inline(never)]
 pub fn process_create<M: PhysMem>(
@@ -28,6 +30,7 @@ pub fn process_create<M: PhysMem>(
     kernel: &PageTable,
     kernel_half_ok: bool,
     me: u64,
+    stack_hint: u64,
     a: [u64; 6],
 ) -> Result<u64, Status> {
     if us.procs.len() >= us.backstops.processes || !kernel_half_ok {
@@ -117,7 +120,7 @@ pub fn process_create<M: PhysMem>(
             table_charge: BTreeMap::from([(u64::MAX, 1)]),
             charge_end: BTreeMap::new(),
             stacks: BTreeMap::new(),
-            stack_hint: abi::user::STACK_ARENA_BASE,
+            stack_hint,
             privileged: false,
         }),
     );
