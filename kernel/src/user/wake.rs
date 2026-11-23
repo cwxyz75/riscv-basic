@@ -4,7 +4,7 @@ use super::*;
 
 /// An interrupt source fired (trap context, BKL held): hand it to the interrupt object that owns it.
 pub fn irq_fired(irq: u32) -> bool {
-    let s = state();
+    let s = state_locked();
     let Some(&Some(obj)) = s.irq_objs.get(irq as usize) else {
         return false;
     };
@@ -31,7 +31,7 @@ pub fn commit_if_dirty() {
     if !super::USER_READY.load(Ordering::Acquire) {
         return;
     }
-    if state().objs.has_pending() {
+    if with_state(|s| s.objs.has_pending()) {
         commit_wake_with(false);
     }
 }
@@ -40,8 +40,7 @@ pub fn commit_if_dirty() {
 fn commit_wake_with(sync: bool) {
     // (the wakes are made in the same critical section as the commit, and as one batch: every woken thread
     // is runnable before any of them runs, T62)
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let UserState { objs, waits, .. } = s;
         // bindings made through a handle that was just removed end (L21c); the ports they leave are touched, so the commit below looks at them
         let gone = objs.take_gone();
@@ -82,7 +81,7 @@ pub fn notify_sync() {
 fn notify_with(sync: bool) {
     cleanup_dead();
     // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
-    let woken = irq::without(|| ksys::pager::reap_closed_channels(state()));
+    let woken = with_state(ksys::pager::reap_closed_channels);
     if !woken.is_empty() {
         thread::wake_many(&woken);
     }
@@ -102,13 +101,13 @@ fn notify_with(sync: bool) {
 #[allow(clippy::indexing_slicing)] // INVARIANT: the irq slot comes from an interrupt object the kernel made, below the table size; the time counter is far below u64::MAX
 pub(super) fn cleanup_dead() {
     let me = thread::current();
-    if !irq::without(|| state().cleaning.insert(me)) {
+    if !with_state(|s| s.cleaning.insert(me)) {
         return; // a cleanup is already running further up this thread's stack; it will see our work
     }
     loop {
-        let mut dead = irq::without(|| state().objs.drain_dead());
+        let mut dead = with_state(|s| s.objs.drain_dead());
         if dead.is_empty() {
-            irq::without(|| state().cleaning.remove(&me));
+            with_state(|s| s.cleaning.remove(&me));
             return;
         }
         for obj in dead.drain(..) {
@@ -123,18 +122,16 @@ pub(super) fn cleanup_dead() {
                 }
                 ipc::KObj::Job(id) => irq::without(|| kmem::jobs().jobs.release(id)),
                 // the last handle to an exception was closed without a decision: it is NEXT (EX2)
-                ipc::KObj::Exception(e) => act_on_resolution(irq::without(|| {
-                    let s = state();
+                ipc::KObj::Exception(e) => act_on_resolution(with_state(|s| {
                     ksys::exception::exception_dropped(s, kmem::jobs().jobs, &e)
                 })),
                 // the last handle to a pager: every wait for its pages fails, and the kernel's end of its channel goes (MM9)
                 ipc::KObj::Pager(id) => {
-                    let woken = irq::without(|| ksys::pager::pager_destroyed(state(), id));
+                    let woken = with_state(|s| ksys::pager::pager_destroyed(s, id));
                     thread::wake_many(&woken);
                 }
-                ipc::KObj::Interrupt(i) => irq::without(|| {
+                ipc::KObj::Interrupt(i) => with_state(|s| {
                     // mask the source unless a newer object already owns it
-                    let s = state();
                     let owned = matches!(s.irq_objs.get(i.irq as usize), Some(Some(o))
                         if matches!(s.objs.get(*o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
                     if !owned {
@@ -147,7 +144,7 @@ pub(super) fn cleanup_dead() {
                 _ => {}
             }
         }
-        irq::without(|| state().objs.recycle(dead)); // (the emptied vector goes back, so the next destruction does not allocate: KT9)
+        with_state(|s| s.objs.recycle(dead)); // (the emptied vector goes back, so the next destruction does not allocate: KT9)
     }
 }
 
@@ -196,9 +193,8 @@ pub fn end_process(pid: u64, code: i32) {
 /// queue: futex sleepers).
 pub(super) fn wake_threads_of(pid: u64) {
     // (the process's own set of live threads: not a walk of every thread in the system, T191)
-    let tids: Vec<Tid> = irq::without(|| {
-        state()
-            .procs
+    let tids: Vec<Tid> = with_state(|s| {
+        s.procs
             .get(&pid)
             .map(|p| p.live_tids.iter().copied().collect())
             .unwrap_or_default()
@@ -207,8 +203,7 @@ pub(super) fn wake_threads_of(pid: u64) {
 }
 
 pub(super) fn request_kill(pid: u64, code: i32) {
-    let direct = irq::without(|| {
-        let s = state();
+    let direct = with_state(|s| {
         let r = match s.procs.get_mut(&pid) {
             Some(p) if p.state == ProcState::Created => {
                 p.exit_code = Some(code);

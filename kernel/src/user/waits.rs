@@ -4,7 +4,7 @@ use super::*;
 
 /// The signal word of `h` in the calling process (0 if it names nothing). Interrupts off.
 pub(super) fn signals_now(h: Handle) -> Result<u32, Status> {
-    let s = state();
+    let s = state_locked();
     let pid = s
         .thread_pid
         .get(&thread::current())
@@ -29,8 +29,7 @@ pub(super) fn register_poll_wait(thread: Tid, h: Handle) {
 /// The port the calling process's handle `h` names, touched (logged) so that the commit after a wait looks at it again: a thread woken by the baton
 /// that cannot poll (a bad buffer, a handle that went) must still pass it on (L21b).
 pub(super) fn touch_port_of(h: Handle) {
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let Ok(pid) = caller_pid(s) else { return };
         if let Some(entry) = s.procs.get(&pid).and_then(|p| p.handles.get(h).ok()) {
             if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
@@ -41,7 +40,7 @@ pub(super) fn touch_port_of(h: Handle) {
 }
 
 fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
-    let s = state();
+    let s = state_locked();
     let Some(pid) = s.thread_pid.get(&thread).copied() else {
         return;
     };
@@ -65,7 +64,7 @@ fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
 
 /// Register `thread` to wait for the reply with `txid` on the channel end the calling process's handle `h` names (a `channel_call`, L21d).
 pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
-    let s = state();
+    let s = state_locked();
     let Some(pid) = s.thread_pid.get(&thread).copied() else {
         return;
     };
@@ -81,8 +80,7 @@ pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
 fn in_process<R>(
     f: impl FnOnce(&mut UserState, &mut kmem::Kmem, u64) -> Result<R, Status>,
 ) -> Result<R, ReplyErr> {
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let me = caller_pid(s)?;
         let _as = AsLocks::of(s, &[me]); // (the caller's address space, before the memory locks)
         f(s, &mut kmem::get(), me)
@@ -109,7 +107,7 @@ pub(super) fn object_wait(a: [u64; 6]) -> Reply {
             || register_wait(me, h, mask),
             deadline,
         );
-        irq::without(|| state().waits.forget(me));
+        with_state(|s| s.waits.forget(me));
     }
     // The handle may have gone while we slept: BAD_HANDLE, not a wait that quietly times out.
     let seen = irq::without(|| signals_now(h));
@@ -146,8 +144,7 @@ pub(super) fn futex_table() -> kcore::futex::FutexTable<&'static KBuckets> {
 pub(super) fn futex_wait(a: [u64; 6]) -> Reply {
     let who = thread::current() as u64;
     let deadline = a[2];
-    let (me, addr) = match irq::without(|| -> Result<(u64, u64, ksys::FutexCheck), Status> {
-        let s = state();
+    let (me, addr) = match with_state(|s| -> Result<(u64, u64, ksys::FutexCheck), Status> {
         let me = caller_pid(s)?;
         let _as = AsLocks::of(s, &[me]);
         let w = {
@@ -189,8 +186,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
     let (addr, deadline) = (a[0], a[1]);
     // under the big lock: translate the word (for writing), then, under its bucket lock and the donation graph's, take it, queue, or (a poll)
     // find it held. A poll is decided here and nothing is queued, so a hand-over cannot land between a queue and a cancel.
-    let step = irq::without(|| -> Result<(u64, Option<bool>), Status> {
-        let s = state();
+    let step = with_state(|s| -> Result<(u64, Option<bool>), Status> {
         let me = caller_pid(s)?;
         let _as = AsLocks::of(s, &[me]);
         let w = {
@@ -265,8 +261,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
 pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
     let who = thread::current();
     let addr = a[0];
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let _as = AsLocks::of(s, &[me]);
         let w = {
@@ -304,8 +299,7 @@ pub(super) fn pi_thread_gone(tid: Tid, pid: u64) {
         // the PI futexes with waiters that it owns, and what their words say now (read outside the bucket locks: the memory locks are after them)
         let mut keys: Vec<kcore::pifutex::Key> = Vec::new();
         irq::without(|| futex_table().for_each_bucket(|f| keys.extend(f.pi.owned_keys(tid))));
-        let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = irq::without(|| {
-            let s = state();
+        let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = with_state(|s| {
             let _as = AsLocks::of(s, &[pid]);
             let k = kmem::get();
             let mut out = alloc::collections::BTreeMap::new();
@@ -335,8 +329,7 @@ pub(super) fn pi_thread_gone(tid: Tid, pid: u64) {
         for (key, woken) in dead {
             // poison the word (if its page is still there), then wake the waiters
             if words.contains_key(&key) {
-                irq::without(|| {
-                    let s = state();
+                with_state(|s| {
                     let _as = AsLocks::of(s, &[pid]);
                     let w = {
                         let k = kmem::get();
@@ -372,24 +365,24 @@ pub fn futex_wake(pid: u64, a: [u64; 6]) -> Reply {
 /// tried again); `Err` with the pager's status when the page cannot be had.
 pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Result<(), Status> {
     let me = thread::current();
-    let begun = irq::without(|| {
+    let begun = with_state(|s| {
         let k = kmem::get();
-        ksys::pager::pager_wait_begin(state(), k.vmos, k.jobs, me, need)
+        ksys::pager::pager_wait_begin(s, k.vmos, k.jobs, me, need)
     });
     // (a pager found dead while registering wakes the others through `pending_wake`)
-    let mut woken = irq::without(|| core::mem::take(&mut state().pending_wake));
+    let mut woken = with_state(|s| core::mem::take(&mut s.pending_wake));
     woken.extend(begun.as_ref().map(|w| w.as_slice()).unwrap_or(&[]));
     thread::wake_many(&woken);
     begun?;
     // (the page came in since the call found it missing: nothing was registered)
-    if !irq::without(|| state().pagers.waiting(me)) {
+    if !with_state(|s| s.pagers.waiting(me)) {
         return Ok(());
     }
     // (the request is in the pager's channel: its reader must see it)
     commit_wake();
     loop {
         // a request that did not fit in a full channel is tried again every 10 ms, by the waiters of that pager
-        let unsent = irq::without(|| state().pagers.has_unsent(need.pager));
+        let unsent = with_state(|s| s.pagers.has_unsent(need.pager));
         let deadline = if unsent {
             thread::now_ns().saturating_add(10_000_000)
         } else {
@@ -399,21 +392,21 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
             || {
                 killed_now().is_some()
                     || (in_call && interrupted_now())
-                    || ksys::pager::pager_wait_done(state(), me)
+                    || with_state(|s| ksys::pager::pager_wait_done(s, me))
             },
             deadline,
         );
-        let ended = irq::without(|| {
-            ksys::pager::pager_wait_done(state(), me)
+        let ended = with_state(|s| {
+            ksys::pager::pager_wait_done(s, me)
                 || killed_now().is_some()
                 || (in_call && interrupted_now())
         });
         if ended {
             break;
         }
-        let woken = irq::without(|| {
+        let woken = with_state(|s| {
             let k = kmem::get();
-            ksys::pager::pager_flush(state(), k.vmos, k.jobs, need.pager)
+            ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager)
         });
         thread::wake_many(&woken);
         commit_wake();
@@ -421,7 +414,7 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
     // a fault ignores `thread_interrupt` (the flag stays for the next blocking call); a call that was interrupted or killed while it waited
     // reports INTERRUPTED and takes the flag
     let stopped = in_call && (irq::without(|| killed_now().is_some()) || take_interrupt());
-    match irq::without(|| ksys::pager::pager_wait_end(state(), me)) {
+    match with_state(|s| ksys::pager::pager_wait_end(s, me)) {
         Some(Err(e)) => Err(e),
         Some(Ok(())) => Ok(()),
         None if stopped => Err(Status::Interrupted),
@@ -479,7 +472,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
             || register_poll_wait(me, h),
             deadline,
         );
-        irq::without(|| state().waits.forget(me));
+        with_state(|s| s.waits.forget(me));
         touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
         got = poll()?;
     }
@@ -511,7 +504,7 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
             || register_poll_wait(me, h),
             deadline,
         );
-        irq::without(|| state().waits.forget(me));
+        with_state(|s| s.waits.forget(me));
         touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
         got = poll()?;
     }
@@ -525,9 +518,9 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     // the call is over, whichever way: the priority it lent to the server that read its request goes back, and the record of its wait goes (L22)
     let me = thread::current();
     thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
-    irq::without(|| {
+    with_state(|s| {
         // (one section with the server's donation, `lend_to_reader`: after it, no donation for this call can be made)
-        state().calls.remove(&me);
+        s.calls.remove(&me);
         thread::pi_revoke(me);
     });
     r
@@ -553,7 +546,7 @@ fn channel_call_inner(a: [u64; 6]) -> Reply {
                    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
     let me = thread::current();
     let ready = || {
-        let s = state();
+        let s = state_locked();
         let Some(&pid) = s.thread_pid.get(&thread::current()) else {
             return true;
         };
@@ -566,11 +559,10 @@ fn channel_call_inner(a: [u64; 6]) -> Reply {
         || register_call_wait(me, call.ch, call.txid),
         call.deadline,
     );
-    irq::without(|| state().waits.forget(me));
+    with_state(|s| s.waits.forget(me));
     // the reply (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
     loop {
-        let r = irq::without(|| {
-            let s = state();
+        let r = with_state(|s| {
             let _as = AsLocks::caller(s);
             let k = kmem::get();
             match caller_pid(s) {

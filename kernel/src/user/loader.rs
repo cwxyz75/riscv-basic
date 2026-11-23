@@ -65,13 +65,14 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         Ok(())
     })();
     let (pid, tag, first_gen) = (|| {
-        let s = state();
-        let pid = s.next_pid;
-        // (CNT1: the counter never wraps or repeats: at its end no process is started)
-        // (the process backstop: the syscall layer checks it, and so does this)
-        let ok = s.procs.len() < s.backstops.processes
-            && pid.checked_add(1).map(|n| s.next_pid = n).is_some();
-        (ok.then_some(pid), s.asids.alloc(), s.first_handle_gen)
+        with_state(|s| {
+            let pid = s.next_pid;
+            // (CNT1: the counter never wraps or repeats: at its end no process is started)
+            // (the process backstop: the syscall layer checks it, and so does this)
+            let ok = s.procs.len() < s.backstops.processes
+                && pid.checked_add(1).map(|n| s.next_pid = n).is_some();
+            (ok.then_some(pid), s.asids.alloc(), s.first_handle_gen)
+        })
     })();
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
@@ -111,7 +112,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
     let made = (|| -> bool {
-        let s = state();
+        let s = state_locked();
         let Ok((kernel_end, process_end)) = ipc::channel_create_in(
             &mut s.objs,
             &mut s.ktable,
@@ -148,14 +149,15 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         return Err(LoadError::NoMemory);
     }
     let token = (|| {
-        let s = state();
-        let (entry, arg) = (process.entry, process.arg);
-        // (the root job has no limits: these charges only keep its usage honest)
-        let jobs = &mut *k.jobs;
-        let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
-        let _ = charge_thread(jobs, JobId::ROOT);
-        s.procs.insert(pid, Box::new(process));
-        new_start(s, pid, entry, STACK_TOP, arg, None)
+        with_state(|s| {
+            let (entry, arg) = (process.entry, process.arg);
+            // (the root job has no limits: these charges only keep its usage honest)
+            let jobs = &mut *k.jobs;
+            let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
+            let _ = charge_thread(jobs, JobId::ROOT);
+            s.procs.insert(pid, Box::new(process));
+            new_start(s, pid, entry, STACK_TOP, arg, None)
+        })
     })();
     // (the thread's stack comes from the same locks)
     drop(k);
