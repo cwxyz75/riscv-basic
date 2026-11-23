@@ -51,7 +51,7 @@ REQUIRED = [
     "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
     "shared_vmo_is_one_memory", "churn_does_not_leak",
     # S2: threads, timer, scheduler
-    "timer_ticks_advance", "heap_grows_at_a_safe_point", "frame_cache_serves_and_accounts", "slab_serves_small_objects_and_everything_comes_back", "wfi_returns_with_interrupts_masked", "rt_threads_take_the_harts", "long_idle_suspends_and_a_short_sleeper_does_not", "user_mode_ticks_take_no_big_lock", "user_clock_get_and_yield_take_no_big_lock", "threads_start_run_and_finish", "many_threads_do_not_leak",
+    "timer_ticks_advance", "heap_grows_at_a_safe_point", "frame_cache_serves_and_accounts", "slab_serves_small_objects_and_everything_comes_back", "wfi_returns_with_interrupts_masked", "rt_threads_take_the_harts", "long_idle_suspends_and_a_short_sleeper_does_not", "pack_keeps_light_threads_on_few_harts", "user_mode_ticks_take_no_big_lock", "user_clock_get_and_yield_take_no_big_lock", "threads_start_run_and_finish", "many_threads_do_not_leak",
     "sleep_wakes_on_time", "idle_runs_when_nothing_else_does",
     "wake_before_block_is_not_lost", "producer_consumer_loses_no_wakeup",
     "equal_priority_hogs_share_the_cpu", "two_waiters_on_one_queue_wake_in_order",
