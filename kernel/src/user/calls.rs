@@ -412,7 +412,8 @@ pub(crate) fn drain_dying() {
 }
 
 fn cow_sync_held() {
-    with_state(|s| {
+    // (reached from `block` and the futex wait with the object lock not held, when another hart's copy set the flag: take the lock then)
+    any_state(|s| {
         // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB. This part takes the
         // caller's space only (no allocation), so it is done even when there is no memory for the list below
         {
