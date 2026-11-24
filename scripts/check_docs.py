@@ -181,7 +181,7 @@ ATOMICS = {
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
-    "kernel/src/percpu.rs": (91, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1, and the library text range of the running process, AB8)"),
+    "kernel/src/percpu.rs": (93, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1, and the library text range of the running process, AB8, and the depth inside heap::nofail of KT9)"),
     "klock/src/aslock.rs": (3, "the installed machine hooks of the address-space lock: one pointer, stored once at boot and read with acquire (L17)"),
     "kernel/src/bkl.rs": (13, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
@@ -195,7 +195,8 @@ ATOMICS = {
     "kernel/src/user/mod.rs": (7, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot); `STATE_OPEN` (debug builds: the open-closure flag of T239); `USER_READY`: the user state exists, read by the commit-on-drop of `irq::without` before it touches the state (L20)"),
     "kernel/src/user/trap.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch); the pointer to the allocator's published generation (L19), set once at boot; the count of `clock_get` calls the kernel answers (AB7: a test reads it to see that the library's clock does not enter the kernel)"),
     "kernel/src/arch/riscv64/trap.rs": (12, "the expected-fault test hook and its log words, and the per-hart stale-page retry word (T241)"),
-    "kernel/src/heap.rs": (26, "heap statistics, the growth guard, the frame pool's readiness, size mirror, starvation flag and refused-free counter, and the fault-alloc test hook (armed thread, fail-at, count, fired, exempt thread: test builds only)"),
+    "kernel/src/kstack.rs": (2, "the count of kernel stacks in use, which sizes the allocator's reserve for the allocations that cannot fail (KT9)"),
+    "kernel/src/heap.rs": (30, "heap statistics, the growth guard, the frame pool's readiness, size mirror, starvation flag and refused-free counter, and the fault-alloc test hook (armed thread, fail-at, count, fired, exempt thread, persistent mode: test builds only), and the reserve's switch (RESERVE_ON, KT9)"),
     "kernel/src/kmem.rs": (6, "the active-table bookkeeping counters, and the PI futex's lock word read and compare-and-swapped through the direct map (L23); the kernel page table's root, set once at boot (T224)"),
     "kernel/src/user/waits.rs": (2, "the flag that says a PI futex has had a waiter, so a thread's exit looks for owned PI futexes only then (L23)"),
     "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
@@ -231,6 +232,39 @@ def check_atomics():
                     out.append(f"C5: {rel} uses {n} atomic type(s) and is not in the audited allow-list (scripts/check_docs.py ATOMICS)")
                 elif n > allowed[0]:
                     out.append(f"C5: {rel} uses {n} atomic types, the audited count is {allowed[0]} ({allowed[1]}): add them to the audited layer or raise the count with a reason")
+    return out
+
+
+# KT9 (T177, T246): class N, the allocations that cannot be refused because nobody could be told, run in `heap::nofail(..)`. The class cannot grow
+# silently: a new use is a new row here, with the reason.
+NOFAIL = {
+    "kernel/src/thread.rs": (2, "the scheduler's spawn tail and the kernel thread registration"),
+    "kernel/src/user/calls.rs": (1, "the donation graph's node of a user thread, after its spawn"),
+    "kernel/src/user/kobjects.rs": (1, "a kernel thread's admission to the wait table"),
+    "kernel/src/user/loader.rs": (1, "the donation graph's node of a boot thread"),
+    "kernel/src/user/wake.rs": (7, "the epilogue's wakes, kills, teardown arms and the pager reap: a wake or a teardown cannot be refused"),
+}
+
+
+def check_nofail():
+    """T177: the number of `heap::nofail(` sites per file is the audited one."""
+    out = []
+    seen = {}
+    for d, _, files in os.walk(os.path.join(ROOT, "kernel", "src")):
+        for f in files:
+            if not f.endswith(".rs"):
+                continue
+            rel = os.path.relpath(os.path.join(d, f), ROOT)
+            n = sum(l.split("//")[0].count("heap::nofail(") for l in open(os.path.join(d, f)) if not l.lstrip().startswith("//"))
+            if n:
+                seen[rel] = n
+    for rel, n in sorted(seen.items()):
+        want = NOFAIL.get(rel)
+        if want is None or want[0] != n:
+            out.append(f"T177: {rel} has {n} heap::nofail site(s), the audited count is {want[0] if want else 0} (scripts/check_docs.py NOFAIL): a new class-N allocation needs a row and a reason")
+    for rel in NOFAIL:
+        if rel not in seen:
+            out.append(f"T177: {rel} is in NOFAIL but has no heap::nofail site")
     return out
 
 
@@ -434,7 +468,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

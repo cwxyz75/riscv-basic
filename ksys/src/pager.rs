@@ -268,13 +268,13 @@ pub fn reap_closed_channels(us: &mut UserState) -> Vec<Tid> {
         pagers,
         ..
     } = us;
-    let dead: Vec<u64> = pager_ends
-        .iter()
-        .filter(|(p, h)| pagers.exists(**p) && ipc::channel_peer_closed(objs, ktable, **h))
-        .map(|(p, _)| *p)
-        .collect();
+    // (one at a time, so that nothing is allocated unless a pager is dead: the list of the woken then is the teardown's, class N)
     let mut woken = Vec::new();
-    for p in dead {
+    while let Some(p) = pager_ends
+        .iter()
+        .find(|(p, h)| pagers.exists(**p) && ipc::channel_peer_closed(objs, ktable, **h))
+        .map(|(p, _)| *p)
+    {
         woken.extend(pagers.destroy(p));
     }
     woken

@@ -5813,6 +5813,32 @@ fn kernel_allocation_failure_sweep() -> Outcome {
             n > 1,
             "the scenario {name} made no kernel allocation to fail"
         );
+        // the persistent pass: every class-R allocation from the first on fails, as it does with the heap at its reserve; nothing may panic or leak. (A
+        // scenario that touches a lazily committed page is left out: the fault that finds no memory ends the process, which is what it must do, and
+        // this process is the one running the scenario)
+        if name == "map and touch" {
+            continue;
+        }
+        let mut line = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut line,
+            format_args!("alloc sweep: {name} persistent\n"),
+        );
+        let _ = sys::debug_write(line.as_bytes());
+        stat(208, 1);
+        run();
+        stat(201, 0);
+        stat(205, 0);
+        ensure_eq!(
+            stat(204, 0),
+            vmos_before,
+            "scenario {name} with every allocation failing left a VMO behind"
+        );
+        ensure_eq!(
+            stat(206, 0),
+            objs_before,
+            "scenario {name} with every allocation failing left a kernel object behind"
+        );
     }
     Ok(())
 }

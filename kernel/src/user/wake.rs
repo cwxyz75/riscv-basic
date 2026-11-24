@@ -39,7 +39,7 @@ pub fn commit_if_dirty() {
 
 /// `commit_wake`, with the wakes placed on this hart as a direct hand-off when `sync` is true (a `channel_call` about to block, L24).
 fn commit_wake_with(sync: bool) {
-    crate::bkl::ensure(|| crate::heap::epilogue(|| commit_wake_held(sync)));
+    crate::bkl::ensure(|| commit_wake_held(sync));
 }
 
 fn commit_wake_held(sync: bool) {
@@ -51,7 +51,7 @@ fn commit_wake_held(sync: bool) {
         let gone = objs.take_gone();
         if !gone.is_empty() {
             let j = kmem::jobs();
-            ipc::end_bindings_made_through(objs, j.jobs, &gone);
+            crate::heap::nofail(|| ipc::end_bindings_made_through(objs, j.jobs, &gone));
         }
         let dirty = objs.take_dirty();
         if dirty.items.is_empty() && !dirty.overflow {
@@ -64,11 +64,14 @@ fn commit_wake_held(sync: bool) {
             &dirty,
         );
         objs.recycle_dirty(dirty);
-        if sync {
-            thread::wake_many_sync(&woken);
-        } else {
-            thread::wake_many(&woken);
-        }
+        // (the scheduler's queues: class N, a wake cannot be refused)
+        crate::heap::nofail(|| {
+            if sync {
+                thread::wake_many_sync(&woken);
+            } else {
+                thread::wake_many(&woken);
+            }
+        });
         waits.recycle(woken);
     });
 }
@@ -85,15 +88,15 @@ pub fn notify_sync() {
 }
 
 fn notify_with(sync: bool) {
-    crate::bkl::ensure(|| crate::heap::epilogue(|| notify_held(sync)));
+    crate::bkl::ensure(|| notify_held(sync));
 }
 
 fn notify_held(sync: bool) {
     cleanup_dead();
     // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
-    let woken = with_state(ksys::pager::reap_closed_channels);
+    let woken = with_state(|s| crate::heap::nofail(|| ksys::pager::reap_closed_channels(s)));
     if !woken.is_empty() {
-        thread::wake_many(&woken);
+        crate::heap::nofail(|| thread::wake_many(&woken));
     }
     commit_wake_with(sync);
     // the safe point where the kernel heap may grow (heap.rs)
@@ -137,17 +140,21 @@ fn cleanup_dead_held() {
                     let _ = k.vmos.release(k.mm, k.jobs, id);
                 }
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
-                    request_kill(p.pid, -2000)
+                    crate::heap::nofail(|| request_kill(p.pid, -2000))
                 }
                 ipc::KObj::Job(id) => kmem::jobs().jobs.release(id),
                 // the last handle to an exception was closed without a decision: it is NEXT (EX2)
-                ipc::KObj::Exception(e) => act_on_resolution(with_state(|s| {
-                    ksys::exception::exception_dropped(s, kmem::jobs().jobs, &e)
-                })),
+                ipc::KObj::Exception(e) => crate::heap::nofail(|| {
+                    act_on_resolution(with_state(|s| {
+                        ksys::exception::exception_dropped(s, kmem::jobs().jobs, &e)
+                    }))
+                }),
                 // the last handle to a pager: every wait for its pages fails, and the kernel's end of its channel goes (MM9)
                 ipc::KObj::Pager(id) => {
-                    let woken = with_state(|s| ksys::pager::pager_destroyed(s, id));
-                    thread::wake_many(&woken);
+                    crate::heap::nofail(|| {
+                        let woken = with_state(|s| ksys::pager::pager_destroyed(s, id));
+                        thread::wake_many(&woken);
+                    });
                 }
                 ipc::KObj::Interrupt(i) => with_state(|s| {
                     // mask the source unless a newer object already owns it

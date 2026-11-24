@@ -93,6 +93,8 @@ pub struct PerHart {
     pub cur_as: core::sync::atomic::AtomicPtr<klock::aslock::AsCell>,
     /// Times this hart took the big kernel lock from free (outermost takes): the measure of how often a hart needs it.
     pub bkl_takes: AtomicU64,
+    /// How deep this hart is inside `heap::nofail` (class N: the allocator's reserve may be used, KT9). Touched with interrupts off.
+    pub nofail_depth: AtomicU32,
     /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
     pub running: AtomicU64,
     /// The thread this hart is switching away from (set just before the switch, taken by the `finish_switch` that completes it; 0:
@@ -277,6 +279,7 @@ impl PerHart {
             cur_lib_end: AtomicU64::new(0),
             cur_as: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             bkl_takes: AtomicU64::new(0),
+            nofail_depth: AtomicU32::new(0),
             running: AtomicU64::new(0),
             prev: AtomicU64::new(0),
             need_resched: AtomicBool::new(false),

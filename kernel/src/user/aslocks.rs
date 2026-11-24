@@ -9,6 +9,39 @@
 use super::*;
 use klock::aslock::{AsCell, AsHold};
 
+/// The vector `AsLocks::all` fills, made once at boot with room for the most processes there can be (`AS_HELD_MOST`), so that taking every address
+/// space allocates nothing and cannot fail (KT9, T246: the copy-on-write sync after every call needs it). The big lock is held whenever it is taken or
+/// put back, so there is one user at a time.
+struct Scratch(core::cell::UnsafeCell<Vec<AsHold>>);
+
+// SAFETY: touched only with the big (object) lock held (`AsLocks::all` and `Drop` run inside `locked_state` or `with_state`), so no two harts use it at
+// once; a held address space is released by the hart that took it, before the lock is.
+unsafe impl Sync for Scratch {}
+
+static SCRATCH: Scratch = Scratch(core::cell::UnsafeCell::new(Vec::new()));
+
+/// Make the scratch (once, at boot; an allocation failure there is a boot failure by design).
+pub fn reserve_scratch() {
+    // SAFETY: boot, one hart running, nothing holds the scratch.
+    let v = unsafe { &mut *SCRATCH.0.get() };
+    v.reserve_exact(kcore::limits::AS_HELD_MOST);
+}
+
+/// Take the scratch out (an empty vector, with no room, when it is already out: the caller then reserves with a fallible call).
+fn take_scratch() -> Vec<AsHold> {
+    // SAFETY: the big lock is held, see `Scratch`.
+    core::mem::take(unsafe { &mut *SCRATCH.0.get() })
+}
+
+/// Put the (empty) vector back, keeping the larger room.
+fn put_scratch(v: Vec<AsHold>) {
+    // SAFETY: the big lock is held, see `Scratch`.
+    let slot = unsafe { &mut *SCRATCH.0.get() };
+    if v.capacity() >= slot.capacity() {
+        *slot = v;
+    }
+}
+
 /// Address spaces held until this is dropped (released last taken first, the order the checker and the saved interrupt state expect). One space is held
 /// inline (no allocation: the common call); many are in a vector that is reserved with a fallible call (KT9: a failing allocation is `NoMemory`).
 pub(super) struct AsLocks {
@@ -22,6 +55,7 @@ impl Drop for AsLocks {
             drop(h);
         }
         drop(self.one.take());
+        put_scratch(core::mem::take(&mut self.many));
     }
 }
 
@@ -55,12 +89,12 @@ impl AsLocks {
     /// list cannot be made.
     pub(super) fn all(s: &UserState) -> Result<AsLocks, Status> {
         let n = s.procs.len();
-        let mut cells: Vec<alloc::sync::Arc<AsCell>> = Vec::new();
-        cells.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
-        cells.extend(s.procs.values().map(|p| p.aspace.clone()));
-        let mut many: Vec<AsHold> = Vec::new();
-        many.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
-        many.extend(cells.iter().map(AsCell::hold));
+        let mut many = take_scratch();
+        if many.try_reserve_exact(n).is_err() {
+            put_scratch(many);
+            return Err(Status::NoMemory);
+        }
+        many.extend(s.procs.values().map(|p| AsCell::hold(&p.aspace)));
         Ok(AsLocks { one: None, many })
     }
 }
