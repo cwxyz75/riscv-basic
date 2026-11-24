@@ -404,6 +404,30 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
             .map_err(|e| (e, None, None))?;
+        #[cfg(feature = "fault-alloc")]
+        match a[1] {
+            // KT9 (guest half): 200 arms the calling thread (`a2` = N), 201 disarms and says whether the failure was injected, 202 counts
+            200 => {
+                crate::heap::faultalloc::arm(a[2]);
+                return Ok((Some(0), None));
+            }
+            201 => return Ok((Some(u64::from(crate::heap::faultalloc::disarm())), None)),
+            202 => return Ok((Some(crate::heap::faultalloc::count()), None)),
+            // 205: run a whole reachability sweep now (a destruction that found no memory leaks its objects until one runs: KT9)
+            205 => {
+                s.sweep_start();
+                while s.objs.sweep_active()
+                    && !matches!(
+                        s.sweep_slice(SWEEP_SLICE_BUDGET),
+                        kcore::object::SweepStep::Done(_)
+                    )
+                {}
+                return Ok((Some(0), None));
+            }
+            // 204: the VMOs that exist, so a sweep can check a scenario leaves none behind
+            204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
+            _ => {}
+        }
         Ok((Some(thread::wake_stat(a[1])), None))
     })
 }

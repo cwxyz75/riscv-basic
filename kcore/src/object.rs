@@ -631,6 +631,10 @@ impl<T: Object> Registry<T> {
             core::mem::swap(&mut self.graveyard, &mut v);
             self.graveyard.append(&mut v);
         }
+        // (the twin: `drain_dead` leaves it empty, and a later drain would swap that empty vector in as the graveyard, so burying would allocate: KT9)
+        if v.capacity() > self.spare.capacity() {
+            self.spare = v;
+        }
     }
 
     /// Is any destroyed object waiting in the graveyard?

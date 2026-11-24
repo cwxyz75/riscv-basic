@@ -754,13 +754,15 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             machine.shootdown();
             // the page-table charge of a `process_map` is credited when no region is left in the span it covered (a mapping that was split
             // keeps the charge for what stays: its tables are still there)
-            let gone: alloc::vec::Vec<u64> = target
+            // (a cursor over the keys, not a list of them: nothing is allocated, so the call cannot fail after the unmap has been done: KT9)
+            let mut from = 0u64;
+            while let Some(k) = target
                 .charge_end
-                .iter()
-                .filter(|&(&k, &end)| !target.aspace.held_ref().has_region_in(k, end))
+                .range(from..)
+                .find(|&(&k, &end)| !target.aspace.held_ref().has_region_in(k, end))
                 .map(|(&k, _)| k)
-                .collect();
-            for k in gone {
+            {
+                from = k.saturating_add(1);
                 target.charge_end.remove(&k);
                 if let Some(tables) = target.table_charge.remove(&k) {
                     jobs.credit(target.job, Resource::Pages, tables);

@@ -2115,11 +2115,12 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         self.split_at(vmos, start)?;
         self.split_at(vmos, end)?;
-        let starts: alloc::vec::Vec<u64> =
-            self.regions.range(start..end).map(|(&s, _)| s).collect();
-        let n = starts.len() as u64;
-        for s in starts {
+        // (a cursor, not a list of the keys: nothing is allocated, so the call cannot fail halfway for want of memory)
+        let (mut n, mut from) = (0u64, start);
+        while let Some(s) = self.regions.range(from..end).next().map(|(&s, _)| s) {
             let _ = self.unmap_region(mm, vmos, jobs, s);
+            n = n.saturating_add(1);
+            from = s.saturating_add(1);
         }
         Ok(n)
     }
@@ -2183,9 +2184,9 @@ impl<F: PageTableFormat> AddressSpace<F> {
         self.split_at(vmos, end)
             .map_err(|_| ProtectError::TooMany)?;
         let mut stats = ProtectStats::default();
-        let starts: alloc::vec::Vec<u64> =
-            self.regions.range(start..end).map(|(&s, _)| s).collect();
-        for s in starts {
+        let mut from = start;
+        while let Some(s) = self.regions.range(from..end).next().map(|(&s, _)| s) {
+            from = s.saturating_add(1);
             let gen = self.next_gen;
             self.next_gen = self.next_gen.saturating_add(1);
             let Some(r) = self.regions.get_mut(&s) else {
@@ -2236,7 +2237,15 @@ impl<F: PageTableFormat> AddressSpace<F> {
             .next_back()
             .map(|(&s, _)| s)
             .unwrap_or(lo);
-        let keys: alloc::vec::Vec<u64> = self.regions.range(first..=hi).map(|(&s, _)| s).collect();
+        // (merging only saves regions: with no memory for the list nothing is merged, which leaves the map valid)
+        let mut keys: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        if keys
+            .try_reserve_exact(self.regions.range(first..=hi).count())
+            .is_err()
+        {
+            return;
+        }
+        keys.extend(self.regions.range(first..=hi).map(|(&s, _)| s));
         let Some((&first_key, rest)) = keys.split_first() else {
             return;
         };

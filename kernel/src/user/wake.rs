@@ -39,7 +39,7 @@ pub fn commit_if_dirty() {
 
 /// `commit_wake`, with the wakes placed on this hart as a direct hand-off when `sync` is true (a `channel_call` about to block, L24).
 fn commit_wake_with(sync: bool) {
-    crate::bkl::ensure(|| commit_wake_held(sync));
+    crate::bkl::ensure(|| crate::heap::epilogue(|| commit_wake_held(sync)));
 }
 
 fn commit_wake_held(sync: bool) {
@@ -84,7 +84,7 @@ pub fn notify_sync() {
 }
 
 fn notify_with(sync: bool) {
-    crate::bkl::ensure(|| notify_held(sync));
+    crate::bkl::ensure(|| crate::heap::epilogue(|| notify_held(sync)));
 }
 
 fn notify_held(sync: bool) {
@@ -121,7 +121,11 @@ fn cleanup_dead_held() {
     loop {
         let mut dead = with_state(|s| s.objs.drain_dead());
         if dead.is_empty() {
-            with_state(|s| s.cleaning.remove(&me));
+            // (the empty vector goes back too: a drain leaves the twin without capacity until it does, and the next burial would allocate: KT9)
+            with_state(|s| {
+                s.objs.recycle(dead);
+                s.cleaning.remove(&me)
+            });
             return;
         }
         for obj in dead.drain(..) {

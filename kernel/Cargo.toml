@@ -73,6 +73,8 @@ fault-skip-poke = []
 fault-skip-entry-check = []
 fault-skip-pull = ["kcore/fault-skip-pull"]
 fault-early-reap = []
+# KT9 (guest half): the kernel heap fails the Nth allocation made by an armed thread (`debug_stat` 200 to 202); only for `make os-allocfail-guest`
+fault-alloc = []
 # Negative control for the AIA: an acknowledged source is never unmasked again (needs the AIA machine).
 fault-aia-no-unmask = []
 # Negative control for the AIA: an acknowledged source whose line is still high is not re-pended.

@@ -300,6 +300,10 @@ fn small_free(addr: usize) {
 // objects come from the slab allocator behind this hart's magazines (interrupts off), and go back there.
 unsafe impl GlobalAlloc for IrqSafeHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "fault-alloc")]
+        if faultalloc::should_fail() {
+            return core::ptr::null_mut();
+        }
         if let Some(class) = slab::class_for(layout.size(), layout.align()) {
             if let Some(p) = small_alloc(class) {
                 return p;
@@ -341,6 +345,84 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
             note_free(h);
         });
     }
+}
+
+/// KT9, the guest half: fail the Nth allocation that one armed thread makes (once), so a program can sweep N over a scenario. An infallible allocation
+/// on the path ends in the allocation-error handler, a panic the harness reports with the scenario that was running.
+#[cfg(feature = "fault-alloc")]
+pub mod faultalloc {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static ARMED: AtomicU64 = AtomicU64::new(0); // the armed thread's id plus one
+    static FAIL_AT: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static FIRED: AtomicBool = AtomicBool::new(false);
+
+    /// Arm for the calling thread: its `n`th allocation from now fails.
+    pub fn arm(n: u64) {
+        COUNT.store(0, Relaxed);
+        FIRED.store(false, Relaxed);
+        FAIL_AT.store(n, Relaxed);
+        ARMED.store(crate::thread::current().saturating_add(1), Relaxed);
+    }
+
+    /// Disarm; whether the failure was injected.
+    pub fn disarm() -> bool {
+        ARMED.store(0, Relaxed);
+        FIRED.load(Relaxed)
+    }
+
+    /// Allocations the armed thread has made since `arm`.
+    pub fn count() -> u64 {
+        COUNT.load(Relaxed)
+    }
+
+    static EXEMPT: AtomicU64 = AtomicU64::new(0); // the thread inside `exempt`, plus one
+
+    /// Run `f` with the armed thread's allocations not counted: the epilogue that must not fail (the commit that wakes waiters, T246).
+    pub fn exempt<R>(f: impl FnOnce() -> R) -> R {
+        let me = crate::thread::current().saturating_add(1);
+        let before = EXEMPT.swap(me, Relaxed);
+        let r = f();
+        EXEMPT.store(before, Relaxed);
+        r
+    }
+
+    pub(super) fn should_fail() -> bool {
+        let armed = ARMED.load(Relaxed);
+        if armed == 0 || crate::thread::current().saturating_add(1) != armed {
+            return false;
+        }
+        if EXEMPT.load(Relaxed) == armed {
+            return false;
+        }
+        let c = COUNT.fetch_add(1, Relaxed).saturating_add(1);
+        if c == FAIL_AT.load(Relaxed) {
+            FIRED.store(true, Relaxed);
+            // (where the failure was injected: `scripts/resolve_trace.py` turns the words into the call chain, so a panic that follows can be placed)
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    crate::console::PanicConsole::new(),
+                    "alloc fail: n={c}{}",
+                    crate::Trace
+                );
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Run `f` (a syscall epilogue whose allocations cannot fail yet: T246) outside the allocation-failure sweep; just `f()` in every other build.
+#[cfg(feature = "fault-alloc")]
+pub fn epilogue<R>(f: impl FnOnce() -> R) -> R {
+    faultalloc::exempt(f)
+}
+/// See the `fault-alloc` version.
+#[cfg(not(feature = "fault-alloc"))]
+#[inline(always)]
+pub fn epilogue<R>(f: impl FnOnce() -> R) -> R {
+    f()
 }
 
 #[global_allocator]
