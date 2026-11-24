@@ -566,8 +566,11 @@ os-fuzz-host:
 
 # KT9: the allocation-failure sweep of the syscall layer in both modes (one allocation fails; every allocation from the N-th on fails). `cargo test`
 # runs the first mode only. A failing case replays with `KALLOC_CHILD=<scenario>:<n>[:persist] cargo test -p ksys --test allocfail child_entry -- --exact --nocapture`.
-os-allocfail:
+os-allocfail: os-user
 	KALLOC_PERSIST=1 cargo test --profile release-checked -p ksys --test allocfail every -- --nocapture
+	# the guest half: a kernel whose heap fails the N-th allocation of an armed thread, and the suite's `kernel_allocation_failure_sweep` over six scenarios
+	cd kernel && cargo build --features fault-alloc --target-dir ../target/os-fault-alloc
+	OS_BOOT_ARGS="kaslr=off aslr=off" OS_SHARD=k OS_SMP=1 OS_BOOT_TIMEOUT=300 python3 scripts/os_boot_test.py target/os-fault-alloc/$(KERNEL_TARGET)/debug/kernel
 
 # `check` is the epic gate, tiers 0 and 1.
 check: smoke

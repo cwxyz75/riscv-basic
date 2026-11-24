@@ -85,7 +85,7 @@ fn in_process<R>(
 ) -> Result<R, ReplyErr> {
     locked_state(|s| {
         let me = caller_pid(s)?;
-        let _as = AsLocks::of(s, &[me]); // (the caller's address space, before the memory locks)
+        let _as = AsLocks::one(s, me); // (the caller's address space, before the memory locks)
         f(s, &mut kmem::get(), me)
     })
     .map_err(|e| (e, None, None))
@@ -149,7 +149,7 @@ pub(super) fn futex_wait(a: [u64; 6]) -> Reply {
     let deadline = a[2];
     let (me, addr) = match locked_state(|s| -> Result<(u64, u64, ksys::FutexCheck), Status> {
         let me = caller_pid(s)?;
-        let _as = AsLocks::of(s, &[me]);
+        let _as = AsLocks::one(s, me);
         let w = {
             let k = kmem::get();
             ksys::futex_wait_resolve(s, k.mm, k.vmos, k.jobs, me, a)?
@@ -191,7 +191,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
     // find it held. A poll is decided here and nothing is queued, so a hand-over cannot land between a queue and a cancel.
     let step = locked_state(|s| -> Result<(u64, Option<bool>), Status> {
         let me = caller_pid(s)?;
-        let _as = AsLocks::of(s, &[me]);
+        let _as = AsLocks::one(s, me);
         let w = {
             let k = kmem::get();
             ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, me, addr)?
@@ -266,7 +266,7 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
     let addr = a[0];
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let _as = AsLocks::of(s, &[me]);
+        let _as = AsLocks::one(s, me);
         let w = {
             let k = kmem::get();
             ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, me, addr)
@@ -304,7 +304,7 @@ pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
         let mut keys: Vec<kcore::pifutex::Key> = Vec::new();
         futex_table().for_each_bucket(|f| keys.extend(f.pi.owned_keys(tid)));
         let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = {
-            let _as = AsLocks::of(s, &[pid]);
+            let _as = AsLocks::one(s, pid);
             let k = kmem::get();
             let mut out = alloc::collections::BTreeMap::new();
             for key in &keys {
@@ -331,7 +331,7 @@ pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
             // poison the word (if its page is still there), then wake the waiters
             if words.contains_key(&key) {
                 {
-                    let _as = AsLocks::of(s, &[pid]);
+                    let _as = AsLocks::one(s, pid);
                     let w = {
                         let k = kmem::get();
                         ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, pid, key.1).ok()

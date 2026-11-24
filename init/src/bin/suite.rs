@@ -5614,6 +5614,171 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
     Ok(())
 }
 
+/// KT9, the guest half: with the kernel built with `fault-alloc` (`make os-allocfail-guest`), fail the Nth kernel heap allocation of each scenario, for N = 1, 2, ...
+/// until the scenario completes with no failure injected. Every call must return (an error or success); an infallible allocation on the path is a kernel panic,
+/// and the line printed before each run names the scenario and N. Without the feature the test passes at once.
+/// What the last run of the sweep's map scenario saw (statuses packed by the scenario: printing inside it would add allocations to the count).
+static TRACE: AtomicU64 = AtomicU64::new(0);
+
+fn kernel_allocation_failure_sweep() -> Outcome {
+    use rt::abi::syscall as nr;
+    let stat = |which: u64, arg: u64| {
+        let r = rt::syscall(
+            nr::DEBUG_STAT,
+            [
+                rt::debug::handle() as usize,
+                which as usize,
+                arg as usize,
+                0,
+                0,
+                0,
+            ],
+        );
+        r.a1 as u64
+    };
+    if stat(203, 0) == 0 {
+        return Ok(());
+    }
+    let scenarios: [(&str, fn()); 6] = [
+        ("channel", || {
+            let r = sys::channel_create();
+            if r.status != 0 {
+                return;
+            }
+            let (a, b) = (r.a1 as u64, r.a2 as u64);
+            let msg = [7u8; 64];
+            let _ = sys::channel_write(a, msg.as_ptr(), msg.len(), core::ptr::null(), 0);
+            let mut buf = [0u8; 64];
+            let _ = sys::channel_read(b, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+            sys::handle_close(a);
+            sys::handle_close(b);
+        }),
+        ("channel with a handle", || {
+            let c = sys::channel_create();
+            let e = sys::event_create();
+            if c.status == 0 && e.status == 0 {
+                let (a, b, ev) = (c.a1 as u64, c.a2 as u64, e.a1 as u64);
+                let hs = [ev];
+                let w = sys::channel_write(a, [1u8].as_ptr(), 1, hs.as_ptr(), 1);
+                let mut buf = [0u8; 8];
+                let mut got = [0u64; 2];
+                let r = sys::channel_read(b, buf.as_mut_ptr(), 8, got.as_mut_ptr(), 2);
+                if w.status == 0 && r.status == 0 {
+                    sys::handle_close(got[0]);
+                } else {
+                    sys::handle_close(ev);
+                }
+                sys::handle_close(a);
+                sys::handle_close(b);
+            } else {
+                for r in [c, e] {
+                    if r.status == 0 {
+                        sys::handle_close(r.a1 as u64);
+                        if r.a2 != 0 {
+                            sys::handle_close(r.a2 as u64);
+                        }
+                    }
+                }
+            }
+        }),
+        ("vmo write", || {
+            let v = sys::vmo_create(4);
+            if v.status == 0 {
+                let data = [3u8; 100];
+                let _ = sys::vmo_write(v.a1 as u64, 0, data.as_ptr(), data.len());
+                sys::handle_close(v.a1 as u64);
+            }
+        }),
+        ("port bind", || {
+            let p = sys::port_create();
+            let e = sys::event_create();
+            if p.status == 0 && e.status == 0 {
+                let _ = sys::port_bind(p.a1 as u64, e.a1 as u64, 1, 9);
+            }
+            for r in [p, e] {
+                if r.status == 0 {
+                    sys::handle_close(r.a1 as u64);
+                }
+            }
+        }),
+        ("job and socket", || {
+            let root = sys::job_root();
+            if root.status == 0 {
+                let j = sys::job_create(root.a1 as u64, &[u64::MAX; 6]);
+                if j.status == 0 {
+                    sys::handle_close(j.a1 as u64);
+                }
+                sys::handle_close(root.a1 as u64);
+            }
+            let s = sys::socket_create();
+            if s.status == 0 {
+                sys::handle_close(s.a1 as u64);
+                if s.a2 != 0 {
+                    sys::handle_close(s.a2 as u64);
+                }
+            }
+        }),
+        ("map and touch", || {
+            let me = sys::process_self();
+            let v = sys::vmo_create(4);
+            if me.status == 0 && v.status == 0 {
+                let m =
+                    sys::process_map_anywhere(me.a1 as u64, v.a1 as u64, 0, 4 * 4096, PF_R | PF_W);
+                TRACE.store(m.status as u64 & 0xff, Ordering::Relaxed);
+                if m.status == 0 {
+                    // SAFETY: the mapping was just made (4 pages, read-write) and `a1` is its base
+                    unsafe { core::ptr::write_volatile((m.a1 as usize + 4096) as *mut u8, 1) };
+                    // (an unmap that failed for want of memory left the mapping, and with it the VMO: the failure is injected once, so it is retried)
+                    let u = sys::process_unmap(me.a1 as u64, m.a1 as u64).status;
+                    TRACE.fetch_or((u as u64 & 0xff) << 8, Ordering::Relaxed);
+                    if u != 0 {
+                        let _ = sys::process_unmap(me.a1 as u64, m.a1 as u64);
+                    }
+                }
+            }
+            for r in [me, v] {
+                if r.status == 0 {
+                    sys::handle_close(r.a1 as u64);
+                }
+            }
+        }),
+    ];
+    for (name, run) in scenarios {
+        let vmos_before = stat(204, 0);
+        let mut n = 1u64;
+        loop {
+            let mut line = Detail::new();
+            let _ =
+                core::fmt::Write::write_fmt(&mut line, format_args!("alloc sweep: {name} n={n}\n"));
+            let _ = sys::debug_write(line.as_bytes());
+            stat(200, n);
+            run();
+            let fired = stat(201, 0) != 0;
+            // (a destruction that found no memory leaks its objects until a sweep reclaims them)
+            stat(205, 0);
+            ensure_eq!(
+                stat(204, 0),
+                vmos_before,
+                "scenario {name} with the allocation {n} failing left a VMO behind (trace {:#x})",
+                TRACE.load(Ordering::Relaxed)
+            );
+            if !fired {
+                break;
+            }
+            n += 1;
+            ensure!(
+                n < 2000,
+                "the scenario {name} never completed: allocations without end"
+            );
+        }
+        ensure!(
+            n > 1,
+            "the scenario {name} made no kernel allocation to fail"
+        );
+    }
+    Ok(())
+}
+
 /// PL8: a job's region quota bounds the regions of one address space of its processes (the quota replaces the constant): mapping one more VMO than it allows is
 /// NO_MEMORY, an unmap makes room, a lowered quota leaves what is mapped and refuses more, and `job_info` 11 reports the effective value.
 fn a_jobs_region_quota_bounds_its_processes() -> Outcome {
@@ -16357,6 +16522,10 @@ pub fn app_main() -> i32 {
         (
             "a_jobs_region_quota_bounds_its_processes",
             a_jobs_region_quota_bounds_its_processes,
+        ),
+        (
+            "kernel_allocation_failure_sweep",
+            kernel_allocation_failure_sweep,
         ),
         (
             "a_bad_stream_handle_is_refused",

@@ -9,55 +9,59 @@
 use super::*;
 use klock::aslock::{AsCell, AsHold};
 
-/// Address spaces held until this is dropped (released last taken first, the order the checker and the saved interrupt state expect).
-pub(super) struct AsLocks(Vec<AsHold>);
+/// Address spaces held until this is dropped (released last taken first, the order the checker and the saved interrupt state expect). One space is held
+/// inline (no allocation: the common call); many are in a vector that is reserved with a fallible call (KT9: a failing allocation is `NoMemory`).
+pub(super) struct AsLocks {
+    one: Option<AsHold>,
+    many: Vec<AsHold>,
+}
 
 impl Drop for AsLocks {
     fn drop(&mut self) {
-        while let Some(h) = self.0.pop() {
+        while let Some(h) = self.many.pop() {
             drop(h);
         }
+        drop(self.one.take());
     }
 }
 
 impl AsLocks {
-    /// The address spaces of the processes `pids` (any order, repeats and absent ones are fine), in ascending order. The big lock is held.
-    pub(super) fn of(s: &UserState, pids: &[u64]) -> AsLocks {
-        if let [me] = pids {
-            return match s.procs.get(me) {
-                Some(p) => AsLocks(alloc::vec![AsCell::hold(&p.aspace)]),
-                None => AsLocks::none(),
-            };
+    /// The address space of process `pid` (nothing when it is absent). The big lock is held. Allocates nothing.
+    pub(super) fn one(s: &UserState, pid: u64) -> AsLocks {
+        AsLocks {
+            one: s.procs.get(&pid).map(|p| AsCell::hold(&p.aspace)),
+            many: Vec::new(),
         }
-        let mut ids: Vec<u64> = pids.to_vec();
-        ids.sort_unstable();
-        ids.dedup();
-        let cells: Vec<alloc::sync::Arc<AsCell>> = ids
-            .iter()
-            .filter_map(|pid| s.procs.get(pid).map(|p| p.aspace.clone()))
-            .collect();
-        AsLocks(cells.iter().map(AsCell::hold).collect())
     }
 
     /// No address space (a call that touches none).
     pub(super) fn none() -> AsLocks {
-        AsLocks(Vec::new())
+        AsLocks {
+            one: None,
+            many: Vec::new(),
+        }
     }
 
-    /// The calling process's address space (one allocation).
+    /// The calling process's address space.
     pub(super) fn caller(s: &UserState) -> AsLocks {
-        match caller_pid(s).ok().and_then(|me| s.procs.get(&me)) {
-            Some(p) => AsLocks(alloc::vec![AsCell::hold(&p.aspace)]),
-            None => AsLocks::none(),
+        match caller_pid(s) {
+            Ok(me) => AsLocks::one(s, me),
+            Err(_) => AsLocks::none(),
         }
     }
 
     /// Every process's address space, ascending: for the calls that look at or change all of them (a decommit, a snapshot, a pager's
-    /// supply) and for the calls that name a process by a handle (resolving it first would repeat the call's own checks).
-    pub(super) fn all(s: &UserState) -> AsLocks {
-        let cells: Vec<alloc::sync::Arc<AsCell>> =
-            s.procs.values().map(|p| p.aspace.clone()).collect();
-        AsLocks(cells.iter().map(AsCell::hold).collect())
+    /// supply) and for the calls that name a process by a handle (resolving it first would repeat the call's own checks). `NoMemory` when the
+    /// list cannot be made.
+    pub(super) fn all(s: &UserState) -> Result<AsLocks, Status> {
+        let n = s.procs.len();
+        let mut cells: Vec<alloc::sync::Arc<AsCell>> = Vec::new();
+        cells.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
+        cells.extend(s.procs.values().map(|p| p.aspace.clone()));
+        let mut many: Vec<AsHold> = Vec::new();
+        many.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
+        many.extend(cells.iter().map(AsCell::hold));
+        Ok(AsLocks { one: None, many })
     }
 }
 

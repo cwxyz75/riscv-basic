@@ -1605,6 +1605,8 @@ pub fn wake_stat(which: u64) -> u64 {
         // (HD2: is `aslr=off` in force?)
         128 => u64::from(crate::entropy::aslr_off()),
         131 => crate::user::clock_traps(),
+        // (KT9: 1 when this kernel has the allocation-failure hooks, `debug_stat` 200 to 202)
+        203 => u64::from(cfg!(feature = "fault-alloc")),
         // (T243, debug builds: print every hart's scheduler state and the record of every thread that is not idle, for a test that timed out)
         132 => {
             #[cfg(debug_assertions)]
