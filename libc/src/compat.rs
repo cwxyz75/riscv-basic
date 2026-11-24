@@ -476,7 +476,7 @@ pub unsafe extern "C" fn fseeko(f: *mut c_void, off: i64, whence: c_int) -> c_in
 /// and `ENOSYS` (S11-MMAP). `PROT_NONE` is not available (the kernel's mappings always read; guard pages: ENOSYS), nor is writable
 /// with executable (`EINVAL`: M2). Memory is committed lazily, as on Linux (a touch can fail when the job's page limit is reached, which
 /// ends the program: use the heap for memory that must not), and a partial `munmap` frees the pages only when the whole mapping has gone
-/// (the VMO is not kept). A mapping is at most `MAX_VMO_PAGES` pages (64 MiB) until the caps go (PL8): larger is `ENOMEM`. `MAP_FIXED`
+/// (the VMO is not kept). A mapping is as large as the user half allows (the VMO is sparse: only touched pages cost memory); a size the kernel refuses is `ENOMEM`. `MAP_FIXED`
 /// unmaps what is in the range before it maps, so a mapping that then fails for want of memory has lost the range (POSIX allows that for
 /// errors other than `EINVAL`); every argument error is found before anything is unmapped.
 const PAGE: usize = 4096;

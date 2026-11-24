@@ -366,8 +366,8 @@ impl Gen {
             }
             nr::VMO_CREATE => {
                 let pages = match self.below(10) {
-                    0 => abi::limits::MAX_VMO_PAGES,
-                    1 => abi::limits::MAX_VMO_PAGES + 1,
+                    0 => abi::user::TOP / 4096,
+                    1 => abi::user::TOP / 4096 + 1,
                     _ => 1 + self.below(8),
                 };
                 // charged to a job the process holds (three times in ten), else to its own

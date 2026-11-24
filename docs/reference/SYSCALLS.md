@@ -369,8 +369,8 @@ the default channel rights. Everything else a program is given arrives as a mess
 
 ### Objects
 
-A **VMO** (memory object) is a lazily committed run of pages (1 to `MAX_VMO_PAGES`, 16384 =
-64 MiB), zero until written, that can be read and written by handle and mapped into
+A **VMO** (memory object) is a lazily committed run of pages (1 page up to the user half, `abi::user::TOP` bytes: the
+limits are the job's page quota and the memory there is, not a constant), zero until written, that can be read and written by handle and mapped into
 processes. Rights: DUPLICATE, TRANSFER, READ, WRITE, EXECUTE, MAP. A **process** object
 is a handle to an address space, a handle table and (once started) a thread. Rights:
 DUPLICATE, TRANSFER, MANAGE (map, start, create threads), KILL, INSPECT (exit code), WAIT. A process raises
@@ -382,7 +382,7 @@ closing the last handle to a VMO frees it once nothing maps it.
 
 New zero-filled VMO whose pages are charged to a job as they are first touched (S4.5): `job` is
 a job handle with MANAGE, or 0 for the caller's own job. `flags` (MM6): bit 0 `RESIZABLE` makes the VMO's size changeable (`vmo_set_size`); any other bit is INVALID_ARGS. The size is in bytes, rounded up to whole pages (`vmo_get_size` returns the rounded size). Errors: INVALID_ARGS (`bytes` is 0 or
-over the limit); BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (object cap or kernel
+above `abi::user::TOP`); BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (object cap or kernel
 memory). A page that cannot be charged is refused when it is first touched, with NO_MEMORY from
 `vmo_write`, or as a fault that ends the process. Tests: `vmo_*` in `init`.
 
@@ -400,7 +400,7 @@ Give back the pages `[offset, offset + length)` of a VMO (MM6): every mapping of
 
 ### vmo_set_size(vmo, bytes) -> status
 
-Change the size of a VMO made with `RESIZABLE` (MM6); `bytes` must be a whole number of pages, not 0, and at most the VMO limit (INVALID_ARGS). Growing changes the size and nothing else (no page is committed). Shrinking decommits the pages past the new end exactly as `vmo_decommit` does (mappings and translations first, then the frames) and the size follows; a mapping that reaches past the new end keeps its length, and **touching its part past the end is a page fault that ends the process** (the address is in no backed region). Rights: WRITE. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no WRITE, or the VMO was not made RESIZABLE: every device and DMA VMO is not, and is refused here, before the size is looked at); INVALID_ARGS; BAD_STATE (a shrink, when a process of another job than the VMO's maps part of the tail: as for `vmo_decommit`; or the VMO has children, MM8); SHOULD_WAIT (the VMO is busy, see `vmo_decommit`); NO_MEMORY (the locks for a later batch could not be made: the size is the old one again, the pages already taken stay gone, and a repeat finishes the shrink). Growing never fails on a mapping. Sizes are whole pages until the byte-sized VMOs of MM6's full text (work/T207.md). Tests: `vmo_decommit_and_resize_from_user_mode`, `touching_past_a_shrunk_vmo_ends_the_process_cleanly`.
+Change the size of a VMO made with `RESIZABLE` (MM6); `bytes` must be a whole number of pages, not 0, and at most `abi::user::TOP` bytes (INVALID_ARGS). Growing changes the size and nothing else (no page is committed). Shrinking decommits the pages past the new end exactly as `vmo_decommit` does (mappings and translations first, then the frames) and the size follows; a mapping that reaches past the new end keeps its length, and **touching its part past the end is a page fault that ends the process** (the address is in no backed region). Rights: WRITE. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no WRITE, or the VMO was not made RESIZABLE: every device and DMA VMO is not, and is refused here, before the size is looked at); INVALID_ARGS; BAD_STATE (a shrink, when a process of another job than the VMO's maps part of the tail: as for `vmo_decommit`; or the VMO has children, MM8); SHOULD_WAIT (the VMO is busy, see `vmo_decommit`); NO_MEMORY (the locks for a later batch could not be made: the size is the old one again, the pages already taken stay gone, and a repeat finishes the shrink). Growing never fails on a mapping. Sizes are whole pages until the byte-sized VMOs of MM6's full text (work/T207.md). Tests: `vmo_decommit_and_resize_from_user_mode`, `touching_past_a_shrunk_vmo_ends_the_process_cleanly`.
 
 ### vmo_create_child(vmo, offset, bytes, job, flags) -> status, handle
 
@@ -429,7 +429,7 @@ WRONG_TYPE; ACCESS_DENIED (no COMMIT); INVALID_ARGS; TOO_BIG; NO_MEMORY.
 
 ### pager_create_vmo(pager, key, bytes) -> status, handle
 
-A VMO of `bytes` bytes (page aligned, not 0, at most `MAX_VMO_PAGES`) whose pages the pager supplies: none is committed, and a touch of a page nobody has supplied (a fault in a mapping, a `vmo_read`, a `vmo_write`, a kernel copy to or from a mapping) **asks the pager and waits**; the VMO reads as zeros nowhere. The handle has every VMO right but COMMIT (a commit would put zeros where the pager's data belongs). The VMO is charged to the caller's job as its pages arrive; `key` is the number the requests for it carry (the pager's own name for the file or object). It can be mapped, read, written, decommitted (its pages are asked for again), and given PRIVATE children (a child asks the parent's pager for the pages it inherits; its own writes copy as for any PRIVATE child); a SNAPSHOT of it is NOT_SUPPORTED. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (MANAGE on the pager); INVALID_ARGS (`bytes`); NO_MEMORY.
+A VMO of `bytes` bytes (page aligned, not 0, at most `abi::user::TOP`) whose pages the pager supplies: none is committed, and a touch of a page nobody has supplied (a fault in a mapping, a `vmo_read`, a `vmo_write`, a kernel copy to or from a mapping) **asks the pager and waits**; the VMO reads as zeros nowhere. The handle has every VMO right but COMMIT (a commit would put zeros where the pager's data belongs). The VMO is charged to the caller's job as its pages arrive; `key` is the number the requests for it carry (the pager's own name for the file or object). It can be mapped, read, written, decommitted (its pages are asked for again), and given PRIVATE children (a child asks the parent's pager for the pages it inherits; its own writes copy as for any PRIVATE child); a SNAPSHOT of it is NOT_SUPPORTED. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (MANAGE on the pager); INVALID_ARGS (`bytes`); NO_MEMORY.
 
 ### pager_supply(pager, vmo, offset, length, source, source_offset) -> status
 
