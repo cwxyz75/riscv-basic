@@ -436,37 +436,25 @@ pub mod faultalloc {
         COUNT.load(Relaxed)
     }
 
-    static EXEMPT: AtomicU64 = AtomicU64::new(0); // the thread inside `exempt`, plus one
-
-    /// Run `f` with the armed thread's allocations not counted: an allocation that must not fail (class N).
-    pub fn exempt<R>(f: impl FnOnce() -> R) -> R {
-        // (only the armed thread has anything to be exempt from; any other thread must not touch the slot, or it could leave the armed one exempt for good)
-        let me = crate::thread::current().saturating_add(1);
-        if ARMED.load(Relaxed) != me {
-            return f();
-        }
-        EXEMPT.store(me, Relaxed);
-        let r = f();
-        EXEMPT.store(0, Relaxed);
-        r
-    }
-
     pub(super) fn should_fail() -> bool {
         let armed = ARMED.load(Relaxed);
         if armed == 0 || crate::thread::current().saturating_add(1) != armed {
             return false;
         }
-        if EXEMPT.load(Relaxed) == armed {
-            return false;
-        }
-        let c = COUNT.fetch_add(1, Relaxed).saturating_add(1);
-        if PERSIST.load(Relaxed) && c > FAIL_AT.load(Relaxed) {
-            // (class N is not refused by the reserve, so it is not refused here either: the scheduler's locks held, or inside `nofail`)
+        // (class N is not refused by the reserve, so it is not failed here either: inside `nofail`, or with a scheduler lock held; not counted either, so
+        // that N does not move with what the scheduler does)
+        {
             let was = crate::irq::save_and_disable();
             let n = super::is_class_n();
             crate::irq::restore(was);
+            if n {
+                return false;
+            }
+        }
+        let c = COUNT.fetch_add(1, Relaxed).saturating_add(1);
+        if PERSIST.load(Relaxed) && c >= FAIL_AT.load(Relaxed) {
             FIRED.store(true, Relaxed);
-            return !n;
+            return true;
         }
         if c == FAIL_AT.load(Relaxed) {
             FIRED.store(true, Relaxed);
@@ -495,9 +483,6 @@ pub fn nofail<R>(f: impl FnOnce() -> R) -> R {
     // it started on, which is the lenient side)
     let me = crate::percpu::this();
     me.nofail_depth.fetch_add(1, Ordering::Relaxed);
-    #[cfg(feature = "fault-alloc")]
-    let r = faultalloc::exempt(f);
-    #[cfg(not(feature = "fault-alloc"))]
     let r = f();
     me.nofail_depth.fetch_sub(1, Ordering::Relaxed);
     r

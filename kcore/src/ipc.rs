@@ -735,6 +735,30 @@ pub fn signals_of_object(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     object_signals(reg, obj)
 }
 
+/// Audit (KT9, T177): the index of which ports bind which objects (`Registry::bound_by`) holds, for every live port, at least the multiplicity of each of its
+/// bindings (a pair for a dead bound object may linger until the port prunes it), and no insert into it ever found no reserved room.
+pub fn audit_bound_index(reg: &Kobjs) -> Result<(), alloc::string::String> {
+    if reg.bound_short_inserts() != 0 {
+        return Err("the bound index took an insert with no room reserved".into());
+    }
+    for port in reg.live_ids() {
+        let Some(KObj::Port(p)) = reg.get(port) else {
+            continue;
+        };
+        for b in p.bindings.iter() {
+            let n = p.bindings.iter().filter(|c| c.obj == b.obj).count();
+            if (reg.bound_count(b.obj, port) as usize) < n {
+                return Err(alloc::format!(
+                    "port {port:?} binds {:?} {n} time(s), the index says {}",
+                    b.obj,
+                    reg.bound_count(b.obj, port)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The objects a port binds (empty for anything that is not a live port).
 pub fn port_bound_objects(reg: &Kobjs, port: ObjId) -> Vec<ObjId> {
     match reg.get(port) {
