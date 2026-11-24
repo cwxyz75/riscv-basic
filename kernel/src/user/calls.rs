@@ -132,6 +132,7 @@ impl ksys::Machine for KernelMachine {
 /// There is a switch point between batches. The VMO is busy from the first part to the last (`Vmos::range_end`, always run); a failure in the middle
 /// leaves the batches before it done.
 #[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`: the batch of frames is on this frame
+#[inline(never)] // (KT13: its batch of frames must not sit in the frame of a caller on every call's path)
 fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
     // one part under the locks the part needs: `own` is the address space to hold (none for A and C); `f` gets the call's context
     fn section<R>(
@@ -217,6 +218,7 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
 /// time, each batch under the target's address-space lock and the memory locks with a shootdown before they are let go, and the switch point between
 /// two batches. A sibling that touches the range meanwhile takes an exception (a dying region is no region).
 #[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
+#[inline(never)] // (KT13: its batch of frames must not sit in the frame of a caller on every call's path)
 fn process_unmap_call(a: [u64; 6]) -> Reply {
     // the first part: `AsLocks::all` (the handle names the target)
     let call = locked_state(|s| -> Result<ksys::UnmapCall, Status> {
@@ -280,6 +282,7 @@ fn process_unmap_call(a: [u64; 6]) -> Reply {
 /// entries follow a batch at a time under the target's address-space lock, with the switch point between batches; the shootdown and the
 /// instruction-cache sync come before the call returns (M9).
 #[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
+#[inline(never)] // (KT13: its batch of frames must not sit in the frame of a caller on every call's path)
 fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
     let call = locked_state(|s| -> Result<ksys::ProtectCall, Status> {
         let me = caller_pid(s)?;
