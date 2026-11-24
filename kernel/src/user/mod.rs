@@ -151,13 +151,6 @@ pub(crate) fn locked_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
     irq::without(|| f(state()))
 }
 
-/// The user state for the few places that run inside a section the caller made (an `irq::without` that returns early with `?` or `return`, which a closure
-/// would change): the object lock is asserted held. Everything else goes through `with_state`.
-#[track_caller]
-fn state_locked() -> &'static mut UserState {
-    state()
-}
-
 #[track_caller]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn state() -> &'static mut UserState {
