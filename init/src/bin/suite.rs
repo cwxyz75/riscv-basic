@@ -3195,15 +3195,25 @@ fn a_decommit_under_way_refuses_the_calls_that_would_race_it() -> Outcome {
             if RANGE_SEEN.load(Ordering::SeqCst) != 0 {
                 break;
             }
+            // (the prober's own calls make the VMO busy for a moment, so the main side is refused now and then too: it asks again)
+            let again = |f: &dyn Fn() -> Option<S>| {
+                for _ in 0..100_000 {
+                    match f() {
+                        Some(S::ShouldWait) => sys::thread_yield(),
+                        other => return other,
+                    };
+                }
+                Some(S::ShouldWait)
+            };
             for k in 0..16u64 {
                 ensure_eq!(
-                    st(sys::vmo_commit(v, k * 1024 * 4096, 1024 * 4096)),
+                    again(&|| st(sys::vmo_commit(v, k * 1024 * 4096, 1024 * 4096))),
                     Some(S::Ok),
                     "commit the VMO"
                 );
             }
             ensure_eq!(
-                st(sys::vmo_decommit(v, 0, 16384 * 4096)),
+                again(&|| st(sys::vmo_decommit(v, 0, 16384 * 4096))),
                 Some(S::Ok),
                 "decommit all of it"
             );
@@ -7865,7 +7875,11 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
     let scale = (sys::debug_stat(121) as usize / (2 << 20)).max(1);
     let mut chans = vec![0u64; 40 * scale];
     let mut nch = 0;
-    'outer: for _ in 0..20 * scale {
+    'outer: for pair in 0..20 * scale {
+        if scale > 1 && pair % 8 == 0 {
+            // (with a big RAM the budget is big and this takes minutes: the boot test judges progress by output)
+            println!("queued handles: pair {pair} of {}", 20 * scale);
+        }
         let (a, b) = channel()?;
         chans[nch] = a;
         chans[nch + 1] = b;

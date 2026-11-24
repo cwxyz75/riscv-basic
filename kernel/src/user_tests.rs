@@ -234,7 +234,10 @@ pub fn run_all() -> Report {
     );
     // (frames in flight settle: a dead thread's stack goes back as its hart switches away, a heap service moves frames between the terms; a leak does not
     // settle, so the check waits a bounded time for the count to come back before it fails; T227)
+    // (T207: a dying VMO's pages go back at the tail of the next call, and a system that has stopped calling has nothing to run it: the check is that
+    // memory is returned once something does)
     for _ in 0..200 {
+        crate::user::drain_dying();
         if free_frames() == frames {
             break;
         }
@@ -245,12 +248,16 @@ pub fn run_all() -> Report {
         if free_frames() == frames {
             Ok(())
         } else {
+            let pending = kcore::aspace::DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire);
+            let at = free_frames();
+            crate::user::drain_dying();
             Err(format!(
-                "free frames {} -> {} (database, caches, stacks, heap: {:?} -> {:?})",
+                "free frames {} -> {} (database, caches, stacks, heap: {:?} -> {:?}; a dying VMO still to drain: {pending}; after one more drain: {})",
                 frames,
-                free_frames(),
+                at,
                 frames_terms,
-                frame_terms()
+                frame_terms(),
+                free_frames()
             ))
         },
     );
