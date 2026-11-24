@@ -530,13 +530,25 @@ pub(super) fn thread_state_call(a: [u64; 6], write: bool) -> Reply {
     })
 }
 
-/// The little-endian words of `b` (a layout of whole words).
-fn le_words(b: &[u8]) -> alloc::vec::Vec<u64> {
-    b.as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| u64::from_le_bytes(*c))
-        .collect()
+/// The first `N` little-endian words of `b` (a layout of whole words; the caller checked its length): on the stack, nothing allocated.
+fn le_array<const N: usize>(b: &[u8]) -> [u64; N] {
+    let mut out = [0u64; N];
+    for (o, c) in out.iter_mut().zip(b.as_chunks::<8>().0) {
+        *o = u64::from_le_bytes(*c);
+    }
+    out
+}
+
+/// `words` as little-endian bytes in a buffer reserved first: NO_MEMORY, with nothing done, when there is no room (T248).
+fn words_to_bytes(words: &[u64]) -> Result<alloc::vec::Vec<u8>, ReplyErr> {
+    let mut bytes = alloc::vec::Vec::new();
+    bytes
+        .try_reserve_exact(words.len().saturating_mul(8))
+        .map_err(|_| (Status::NoMemory, None, None))?;
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 #[inline(never)]
@@ -560,19 +572,13 @@ fn state_write(
             .map_err(|e| (e, None, None))?
     };
     // (the two fixed layouts become words; the vector layout is written as bytes: it can be large and its allocation was the copy's)
-    let w = if kind == ts::VECTOR {
-        alloc::vec::Vec::new()
-    } else {
-        le_words(&data)
-    };
     // A thread that has not run is written through its starting image. One that has is parked at the return to user mode holding a `&mut` to its
     // own frame, so nobody else writes the frame: the write is left for it (`pending_regs`) and it applies it itself when it wakes.
     let ran = !s.thread(tid).is_some_and(|t| t.initial_regs.is_some());
     let _ = frame_ptr;
     match kind {
         ts::GENERAL => {
-            let mut g = [0u64; 32];
-            g.copy_from_slice(&w);
+            let g: [u64; 32] = le_array(&data);
             // the pc is a user address, on a 2-byte boundary
             if !(abi::user::BASE..abi::user::TOP).contains(&g[31]) || g[31] & 1 != 0 {
                 return bad(Status::InvalidArgs);
@@ -591,8 +597,7 @@ fn state_write(
             }
         }
         ts::FP => {
-            let mut g = [0u64; 33];
-            g.copy_from_slice(&w);
+            let g: [u64; 33] = le_array(&data);
             if ran {
                 if let Err(e) = s.pending_regs_entry(tid) {
                     return bad(e);
@@ -640,12 +645,9 @@ fn state_read(
     let bytes: alloc::vec::Vec<u8> = match kind {
         ts::GENERAL => {
             let g = general_of(s, tid, frame_ptr).ok_or((Status::BadState, None, None))?;
-            g.iter().flat_map(|w| w.to_le_bytes()).collect()
+            words_to_bytes(&g)?
         }
-        ts::FP => crate::fp::read_fp(tid)
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect(),
+        ts::FP => words_to_bytes(&crate::fp::read_fp(tid))?,
         _ => crate::fp::read_vec(tid).ok_or((Status::NoMemory, None, None))?,
     };
     let _as = AsLocks::one(s, me);
@@ -723,32 +725,32 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         // (`JOBS` is held only while the ledger is read: `thread::priority_of` takes the big kernel lock, which comes before it)
-        let (job, candidates) = {
+        let job = {
             let jobs = kmem::jobs();
             let job = ksys::job_set_sched(&s.objs, &s.procs, jobs.jobs, me, a)
                 .map_err(|e| (e, None, None))?;
             thread::job_sched().sync_budgets(jobs.jobs); // (the scheduler's mirror of every job's RT budget)
-                                                         // PR1: the threads of the job and everything below it, with the maximum their own job now allows
-            let candidates: Vec<(Tid, u8)> = s
-                .threads
-                .iter()
-                .filter_map(|(&tid, t)| {
-                    let pj = s.procs.get(&t.pid)?.job;
-                    let max = jobs.jobs.sched(pj)?.max_prio;
-                    jobs.jobs.is_within(pj, job).then_some((tid, max))
-                })
-                .collect();
-            (job, candidates)
+            job
         };
-        let _ = job;
-        let clamp: Vec<(Tid, u8)> = candidates
-            .into_iter()
-            .filter_map(|(tid, max)| {
-                let now = thread::priority_of(tid)?;
-                (now > max).then_some((tid, max.max(1)))
-            })
-            .collect();
-        thread::set_priorities(&clamp);
+        // PR1: the threads of the job and everything below it are held to the maximum their own job now allows. One thread at a time, in the same
+        // critical section: nothing is collected, so the call cannot fail for want of memory (T248)
+        let mut after = 0u64;
+        while let Some((&tid, t)) = s.threads.range(after.saturating_add(1)..).next() {
+            after = tid;
+            let max = {
+                let jobs = kmem::jobs();
+                let Some(pj) = s.procs.get(&t.pid).map(|p| p.job) else {
+                    continue;
+                };
+                match jobs.jobs.sched(pj) {
+                    Some(l) if jobs.jobs.is_within(pj, job) => l.max_prio,
+                    _ => continue,
+                }
+            };
+            if thread::priority_of(tid).is_some_and(|now| now > max) {
+                thread::set_priorities(&[(tid, max.max(1))]);
+            }
+        }
         Ok((None, None))
     })
 }
@@ -758,18 +760,22 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
 /// caller inside the job ends too, last.
 pub(super) fn job_kill(a: [u64; 6]) -> Reply {
     let code = a[1] as i32;
-    let (victims, me_inside, me) = locked_state(|s| -> Result<(Vec<u64>, bool, u64), ReplyErr> {
+    let (job, me_inside, me) = locked_state(|s| -> Result<(_, bool, u64), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let (victims, me_inside) =
-            ksys::job_kill_victims(&s.objs, &s.procs, kmem::jobs().jobs, me, Handle(a[0]))
+        let (job, me_inside) =
+            ksys::job_kill_begin(&s.objs, &s.procs, kmem::jobs().jobs, me, Handle(a[0]))
                 .map_err(|e| (e, None, None))?;
-        Ok((victims, me_inside, me))
+        Ok((job, me_inside, me))
     })?;
-    for pid in victims {
+    // (a cursor by process id, one victim per step: no list is made, so nothing here can be refused for want of memory)
+    let mut after = 0u64;
+    while let Some(pid) =
+        locked_state(|s| ksys::job_kill_next(&s.procs, kmem::jobs().jobs, job, me, after))
+    {
+        after = pid;
         request_kill(pid, code);
     }
     if me_inside {
-        let _ = me;
         exit_process(code);
     }
     Ok((None, None))

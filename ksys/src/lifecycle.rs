@@ -5,7 +5,6 @@
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
-use alloc::vec::Vec;
 use kcore::ipc::{self, Kobjs};
 use kcore::job::{JobId, Jobs, SchedError, SchedLimits};
 use kcore::sched::Tid;
@@ -47,28 +46,39 @@ pub fn stop_target(
     Ok(tpid)
 }
 
-/// `job_kill`: forbid new processes and threads in the job (their limits become 0) and name the processes inside it other than the
-/// caller; the flag says whether the caller is inside too (and so ends last).
-pub fn job_kill_victims(
+/// `job_kill`, the first step: forbid new processes and threads in the job (their limits become 0). Returns the job and whether the caller is inside
+/// it (and so ends last). The victims are then taken one at a time with `job_kill_next`: nothing is collected, so the call cannot fail for want of
+/// memory (T248).
+pub fn job_kill_begin(
     objs: &Kobjs,
     procs: &crate::ProcTable,
     jobs: &mut Jobs,
     me: u64,
     jh: Handle,
-) -> Result<(Vec<u64>, bool), Status> {
+) -> Result<(JobId, bool), Status> {
     let caller = procs.get(&me).ok_or(Status::BadState)?;
     let job = ipc::job_of(objs, &caller.handles, jh, Rights::KILL)?;
     let mut limits = jobs.limits(job).ok_or(Status::BadState)?;
     limits.processes = 0;
     limits.threads = 0;
     let _ = jobs.set_limits(job, limits);
-    let inside: Vec<u64> = procs
-        .iter()
-        .filter(|(_, p)| jobs.is_within(p.job, job))
+    let me_inside = procs.get(&me).is_some_and(|p| jobs.is_within(p.job, job));
+    Ok((job, me_inside))
+}
+
+/// The next process inside `job` (and below it) other than `me`, after process id `after` (ids are never reused: a cursor by id survives the
+/// teardown each kill may start).
+pub fn job_kill_next(
+    procs: &crate::ProcTable,
+    jobs: &Jobs,
+    job: JobId,
+    me: u64,
+    after: u64,
+) -> Option<u64> {
+    procs
+        .range(after.saturating_add(1)..)
+        .find(|(&pid, p)| pid != me && jobs.is_within(p.job, job))
         .map(|(&pid, _)| pid)
-        .collect();
-    let me_inside = inside.contains(&me);
-    Ok((inside.into_iter().filter(|&p| p != me).collect(), me_inside))
 }
 
 /// The kernel thread behind a thread handle with `need`, and the process it belongs to. Handle 0 is the calling thread.

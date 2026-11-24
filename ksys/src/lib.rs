@@ -33,8 +33,8 @@ pub use create::process_create;
 pub mod exception;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
-    job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,
-    thread_target,
+    job_kill_begin, job_kill_next, job_set_sched, kill_target, stop_target,
+    thread_set_sched_target, thread_target,
 };
 pub use proc::{
     cow_sync, place_anywhere, proc_call, put_process, LibRange, Machine, NoMap, PCtx, ProcState,

@@ -731,6 +731,17 @@ fn kill_and_stop_name_their_target_and_refuse_the_ended() {
     );
 }
 
+/// `job_kill` as the kernel runs it: the begin step, then the victims one at a time by process id.
+fn job_kill_victims(w: &mut W, me: u64, jh: abi::Handle) -> Result<(Vec<u64>, bool), Status> {
+    let (job, inside) = ksys::job_kill_begin(&w.objs, &w.procs, &mut w.jobs, me, jh)?;
+    let (mut v, mut after) = (Vec::new(), 0);
+    while let Some(p) = ksys::job_kill_next(&w.procs, &w.jobs, job, me, after) {
+        v.push(p);
+        after = p;
+    }
+    Ok((v, inside))
+}
+
 #[test]
 fn job_kill_closes_the_job_and_names_the_victims() {
     let (mut w, _) = world();
@@ -739,8 +750,7 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     w.procs.get_mut(&2).unwrap().job = deeper;
     let jh = job_handle(&mut w, sub);
     // the caller (1) is outside the job: it is not a victim and not inside
-    let (v, inside) =
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(jh)).unwrap();
+    let (v, inside) = job_kill_victims(&mut w, 1, abi::Handle(jh)).unwrap();
     assert_eq!(
         (v, inside),
         (vec![2], false),
@@ -754,16 +764,12 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     );
     // the caller inside: ends last, not named
     w.procs.get_mut(&1).unwrap().job = sub;
-    let (v, inside) =
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(jh)).unwrap();
+    let (v, inside) = job_kill_victims(&mut w, 1, abi::Handle(jh)).unwrap();
     assert_eq!((v, inside), (vec![2], true));
     let weak = narrow(&mut w, jh, Rights::MANAGE);
+    assert_eq!(job_kill_victims(&mut w, 1, weak), Err(Status::AccessDenied));
     assert_eq!(
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, weak),
-        Err(Status::AccessDenied)
-    );
-    assert_eq!(
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(0x999)),
+        job_kill_victims(&mut w, 1, abi::Handle(0x999)),
         Err(Status::BadHandle)
     );
 }
