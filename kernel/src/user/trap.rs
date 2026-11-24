@@ -212,6 +212,44 @@ fn current_space() -> Option<&'static klock::aslock::AsCell> {
     Some(unsafe { &*cell })
 }
 
+/// The bytes one chunk of a big copy moves under one hold of the address-space and memory locks (T206 L4; 3.10: 16 KiB).
+const COPY_CHUNK: usize = 16 * 1024;
+
+/// `copy_from_user` of `len` bytes in `COPY_CHUNK` pieces: the address-space lock and the memory locks are taken and let go per piece, with an interrupts
+/// window between (T206), so no hold is proportional to the length. The destination is reserved first; any failure (a bad pointer, no memory, a page a
+/// pager owes, a sibling that unmapped the buffer between pieces) returns `None`, and the caller's own copy under the lock reports the error as always.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `stage_in`
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: done < len, so len - done and done + n (n <= len - done) cannot overflow
+fn copy_in_chunked(cell: &klock::aslock::AsCell, ptr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    let mut done = 0usize;
+    while done < len {
+        let n = COPY_CHUNK.min(len - done);
+        {
+            let _as = cell.lock();
+            let k = kmem::mem();
+            let saved = k.vmos.swap_need(None);
+            let r = copy_from_user(
+                cell.held_mut(),
+                k.mm,
+                k.vmos,
+                k.jobs,
+                ptr.checked_add(done as u64)?,
+                n,
+            );
+            let _ = k.vmos.swap_need(saved);
+            out.extend_from_slice(&r.ok()?);
+        }
+        done += n;
+        if done < len {
+            crate::irq::window();
+        }
+    }
+    Some(out)
+}
+
 /// The copy-in of a big `channel_write` or `socket_write`, before the object lock is taken (T215): the bytes come under the caller's address-space lock and the
 /// memory locks only. Any failure (a bad pointer, no memory, a page a pager owes) returns `None`, and the call then does its own copy under the lock, in
 /// the order SYSCALLS.md gives its errors, and reports the same error it always did.
@@ -232,22 +270,13 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
         return None;
     }
     let cell = current_space()?;
-    let _as = cell.lock();
-    let space = cell.held_mut();
-    let k = kmem::mem();
-    // (a pager's page that is missing leaves its need in the slot: the call, run again under the lock, finds it itself)
-    let saved = k.vmos.swap_need(None);
-    let data = copy_from_user(space, k.mm, k.vmos, k.jobs, a[1], len);
-    let raw = if hlen == 0 {
-        Ok(Vec::new())
+    let data = copy_in_chunked(cell, a[1], len)?;
+    let handles = if hlen == 0 {
+        Vec::new()
     } else {
-        copy_from_user(space, k.mm, k.vmos, k.jobs, a[3], hlen.saturating_mul(8))
+        copy_in_chunked(cell, a[3], hlen.saturating_mul(8))?
     };
-    let _ = k.vmos.swap_need(saved);
-    Some(ksys::Staged {
-        data: data.ok()?,
-        handles: raw.ok()?,
-    })
+    Some(ksys::Staged { data, handles })
 }
 
 /// The copy-in of a big `channel_call` request (T215), before the object lock is taken: the record is read, and if the request carries `OUTSIDE_COPY_MIN` bytes or
@@ -259,45 +288,30 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the record is CHANNEL_CALL_ARGS_BYTES (56) long and the offsets read are below it; nhandles <= MAX_MSG_HANDLES was checked, so nhandles * 8 is small
 pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
     let cell = current_space()?;
-    let _as = cell.lock();
-    let space = cell.held_mut();
-    let k = kmem::mem();
-    let saved = k.vmos.swap_need(None);
-    let staged = (|| {
-        let rec = copy_from_user(
-            space,
-            k.mm,
-            k.vmos,
-            k.jobs,
-            a[1],
-            abi::CHANNEL_CALL_ARGS_BYTES,
-        )
-        .ok()?;
-        let le64 = |at: usize| u64::from_le_bytes(rec[at..at + 8].try_into().unwrap_or([0; 8]));
-        let le32 = |at: usize| u32::from_le_bytes(rec[at..at + 4].try_into().unwrap_or([0; 4]));
-        let (req_bytes, req_handles) = (le64(0), le64(8));
-        let (nbytes, nhandles) = (le32(16) as usize, le32(20) as usize);
-        if !(ksys::OUTSIDE_COPY_MIN..=MAX_MSG_BYTES).contains(&nbytes) || nhandles > MAX_MSG_HANDLES
-        {
-            return None;
-        }
-        let data = copy_from_user(space, k.mm, k.vmos, k.jobs, req_bytes, nbytes).ok()?;
-        let handles = if nhandles == 0 {
-            Vec::new()
-        } else {
-            copy_from_user(space, k.mm, k.vmos, k.jobs, req_handles, nhandles * 8).ok()?
-        };
-        Some(ksys::Staged { data, handles })
-    })();
-    let _ = k.vmos.swap_need(saved);
-    staged
+    let rec = copy_in_chunked(cell, a[1], abi::CHANNEL_CALL_ARGS_BYTES)?;
+    let le64 = |at: usize| u64::from_le_bytes(rec[at..at + 8].try_into().unwrap_or([0; 8]));
+    let le32 = |at: usize| u32::from_le_bytes(rec[at..at + 4].try_into().unwrap_or([0; 4]));
+    let (req_bytes, req_handles) = (le64(0), le64(8));
+    let (nbytes, nhandles) = (le32(16) as usize, le32(20) as usize);
+    if !(ksys::OUTSIDE_COPY_MIN..=MAX_MSG_BYTES).contains(&nbytes) || nhandles > MAX_MSG_HANDLES {
+        return None;
+    }
+    let data = copy_in_chunked(cell, req_bytes, nbytes)?;
+    let handles = if nhandles == 0 {
+        Vec::new()
+    } else {
+        copy_in_chunked(cell, req_handles, nhandles * 8)?
+    };
+    Some(ksys::Staged { data, handles })
 }
 
 /// The copy-out of a big `channel_read` or `socket_read`, after the object lock was let go (T215): the destinations were checked against the message
 /// under it, before the message was taken. A sibling thread that unmaps or decommits the buffer in between makes this copy fail, and the message,
 /// already taken, is lost with the error: the program that does that has no use for the message (SYSCALLS.md).
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: at < d.data.len() in the loop, n <= len - at, so at + n <= len
 pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
     let Some(d) = deferred else {
         return result;
@@ -305,25 +319,48 @@ pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Rep
     let Some(cell) = current_space() else {
         return Err((Status::BadState, None, None));
     };
-    let _as = cell.lock();
-    let space = cell.held_mut();
-    let k = kmem::mem();
-    let saved = k.vmos.swap_need(None);
-    let mut done = kcore::usercopy::copy_to_user(space, k.mm, k.vmos, k.jobs, d.bytes_at, &d.data);
-    for (i, h) in d.handles.iter().enumerate() {
-        if done.is_err() {
-            break;
+    let mut done: Result<(), Status> = Ok(());
+    let mut at = 0usize;
+    while at < d.data.len() && done.is_ok() {
+        let n = COPY_CHUNK.min(d.data.len() - at);
+        {
+            let _as = cell.lock();
+            let k = kmem::mem();
+            let saved = k.vmos.swap_need(None);
+            done = kcore::usercopy::copy_to_user(
+                cell.held_mut(),
+                k.mm,
+                k.vmos,
+                k.jobs,
+                d.bytes_at.saturating_add(at as u64),
+                &d.data[at..at + n],
+            );
+            let _ = k.vmos.swap_need(saved);
         }
-        done = kcore::usercopy::copy_to_user(
-            space,
-            k.mm,
-            k.vmos,
-            k.jobs,
-            d.handles_at.saturating_add((i as u64).saturating_mul(8)),
-            &h.0.to_le_bytes(),
-        );
+        at += n;
+        if at < d.data.len() {
+            crate::irq::window();
+        }
     }
-    let _ = k.vmos.swap_need(saved);
+    if done.is_ok() && !d.handles.is_empty() {
+        let _as = cell.lock();
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None);
+        for (i, h) in d.handles.iter().enumerate() {
+            if done.is_err() {
+                break;
+            }
+            done = kcore::usercopy::copy_to_user(
+                cell.held_mut(),
+                k.mm,
+                k.vmos,
+                k.jobs,
+                d.handles_at.saturating_add((i as u64).saturating_mul(8)),
+                &h.0.to_le_bytes(),
+            );
+        }
+        let _ = k.vmos.swap_need(saved);
+    }
     match done {
         Ok(()) => result,
         Err(e) => Err((e, None, None)),
