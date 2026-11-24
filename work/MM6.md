@@ -12,3 +12,5 @@ refs: [KERNEL-V1-SPEC, OD133]
 **Acceptance, written first.** `kcore/tests/vmo_ops_model.rs`: random create, map, touch, decommit, resize, unmap against a byte-level reference (decommitted ranges read zero; frame count by formula; ledger exact), mutation-checked. QEMU: a 2 GiB VMO mapped and sparsely touched at `-m 4G`; decommit while a sibling thread touches the range (reads see old data or zeros, never another frame: a negative control `fault-decommit-no-shootdown` must fail); shrink then touch is a clean process end. The C library's `malloc` returns memory with decommit (a `##BENCH`-free check: a program that allocates and frees 64 MiB ends with its job's page usage near its start).
 
 **Review.** Fable, soak.
+
+**Precondition (2026-11-24, owner's decision):** before building the rest of this item, have Fable write a design plan and append it here (a section "Plan (Fable, date)"): the VMO size cap and per-VMO mapping lists, what they change in the frame accounting guarantees, the committed-page map's sparse cost and the VMO id generation wrap, and the order of the PRs.
