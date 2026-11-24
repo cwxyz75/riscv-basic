@@ -263,6 +263,8 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
 
   - 2026-11-23, PM4: `pack` differs from `spread` only in where a wake goes; what a hart pulls is the same. KERNEL-V1-SPEC 5.6 and the item say pack pulls only when idle and only from a hart with more than one queued thread, which would leave a thread waiting while a hart idles: GP1 (no hart runs lower than a waiting thread it may run) is the stronger rule and both policies must keep it. The policy is an enum with two methods, not a trait, until a third policy exists.
 
+  - 2026-11-23, PL8 part b: the region quota is a **per-address-space limit set on a job** (`job_set_region_limit`, the smallest along the ancestors), not a job-wide ledger level, and it is a new call rather than a seventh word of the limits record. The item says "a new per-job `regions` level" charged at about eight sites of `aspace.rs` and a changed `Limits` record; a ledger needs the job's counts threaded through every region operation (none of them takes the ledger today), and a changed record contradicts the versioning rule (a changed call is a new call beside the old). Alternative: the ledger and a flag-day record. Weaker than the item: a job with many processes holds the quota times that many regions, each process also paying pages, objects and kernel bytes. `MAX_REGIONS` stays as the hard backstop; `MAX_THREADS_PER_PROCESS` is gone.
+
 (One line each: what, the alternative, why, and where it is recorded.)
 
 - 2026-11-18, while writing the plan (all inside the owner's answers of that day, each recorded in the spec or an item):

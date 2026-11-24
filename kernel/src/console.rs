@@ -168,7 +168,8 @@ impl fmt::Write for Console {
 
     fn write_str(&mut self, s: &str) -> fmt::Result {
         with_uart(|| {
-            // SAFETY: interrupts are off and this is the only access path to `LINE`.
+            // SAFETY: the UART lock is held (`with_uart`), which makes this the only access to `LINE` on any hart: the panic and fatal-trap paths no longer
+            // reach it (they write through `PanicConsole`, which has a line state of its own, T240), so breaking the lock cannot alias this reference.
             let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
             line.kernel_text(s.as_bytes(), &mut put);
         });
@@ -181,7 +182,7 @@ impl fmt::Write for Console {
 #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn write_user(bytes: &[u8]) {
     with_uart(|| {
-        // SAFETY: as in `write_str`.
+        // SAFETY: the UART lock is held, and `LINE` is touched only under it (see `write_str`).
         let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
         for &b in bytes {
             line.user_byte(b, &mut put);

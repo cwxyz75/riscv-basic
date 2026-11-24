@@ -612,6 +612,13 @@ pub mod sys {
             ],
         )
     }
+    /// Set a job's limit on the regions one address space of its processes may hold (PL8): SET_LIMITS.
+    pub fn job_set_region_limit(job: u64, limit: u64) -> Ret {
+        syscall(
+            JOB_SET_REGION_LIMIT,
+            [job as usize, limit as usize, 0, 0, 0, 0],
+        )
+    }
     /// Set a thread's base priority (1 to 63) and flags (bit 0: round robin); `thread` 0 is the caller.
     pub fn thread_set_sched(thread: u64, priority: u8, flags: u8) -> Ret {
         syscall(

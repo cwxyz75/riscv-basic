@@ -1,5 +1,5 @@
-# The system library's symbols as of ABI version 1 (AB9): every one must stay (additive only; a removed capability stays as a NOT_SUPPORTED stub).
 # One per line. `cargo test -p libsys` fails when a symbol listed here is missing from the built library.
+# The system library's symbols as of ABI version 1 (AB9): every one must stay (additive only; a removed capability stays as a NOT_SUPPORTED stub).
 sys_abi_version
 sys_channel_call
 sys_channel_create
@@ -30,6 +30,7 @@ sys_job_info
 sys_job_kill
 sys_job_root
 sys_job_set_limits
+sys_job_set_region_limit
 sys_job_set_sched
 sys_object_info
 sys_object_signals
