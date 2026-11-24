@@ -37,8 +37,8 @@ pub use lifecycle::{
     thread_set_sched_target, thread_target,
 };
 pub use proc::{
-    cow_sync, place_anywhere, proc_call, put_process, LibRange, Machine, NoMap, PCtx, ProcState,
-    ProcTable, Process, SpawnStack, StartMap,
+    cow_sync, place_anywhere, proc_call, put_process, vmo_range_begin, vmo_range_step, LibRange,
+    Machine, NoMap, PCtx, ProcState, ProcTable, Process, RangeCall, SpawnStack, StartMap,
 };
 pub use state::{PendingRegs, ThreadStart, UThread, UserState};
 pub use thread::{

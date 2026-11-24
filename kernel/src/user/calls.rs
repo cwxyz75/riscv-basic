@@ -24,7 +24,7 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_MAP => process_table_call(n, a),
         nr::PROCESS_UNMAP => process_table_call(n, a),
         nr::PROCESS_PROTECT | nr::PROCESS_MAP_INFO => process_table_call(n, a),
-        nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => process_table_call(n, a),
+        nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => vmo_range_call(n, a),
         nr::VMO_CREATE_CHILD | nr::PROCESS_CLONE_REGION => process_table_call(n, a),
         nr::PROCESS_START => process_start(a),
         nr::PROCESS_KILL => process_kill(a),
@@ -122,6 +122,52 @@ impl ksys::Machine for KernelMachine {
     fn random_below(&mut self, n: u64) -> u64 {
         // (a pool that is not seeded yet gives nothing: the placement is then the first fit, which is still a valid place)
         crate::entropy::placement_below(n)
+    }
+}
+
+/// `vmo_decommit` and `vmo_set_size` (T207 PR 3a): the pages go a batch at a time, each batch under the locks (every address space, then the memory)
+/// and the switch point between two batches, so that a range of any size holds them for a bounded time and a runnable thread can take the hart. The VMO
+/// is busy from the first part to the last (`Vmos::range_end`, always run); a failure in the middle leaves the batches before it done.
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
+fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
+    let mut call: Option<ksys::RangeCall> = None;
+    // one part of the call under the locks: `begin` when `call` is empty, a step otherwise
+    let part = |call: &mut Option<ksys::RangeCall>| -> Result<bool, Status> {
+        locked_state(|s| -> Result<bool, Status> {
+            let me = caller_pid(s)?;
+            let mut machine = KernelMachine::default();
+            let _as = AsLocks::all(s)?;
+            let k = kmem::get();
+            let mut ctx = ksys::PCtx {
+                objs: &mut s.objs,
+                procs: &mut s.procs,
+                me,
+                mm: k.mm,
+                vmos: k.vmos,
+                jobs: k.jobs,
+                machine: &mut machine,
+            };
+            match *call {
+                None => {
+                    *call = ksys::vmo_range_begin(&mut ctx, n, a)?;
+                    Ok(call.is_none())
+                }
+                Some(c) => ksys::vmo_range_step(&mut ctx, n, c),
+            }
+        })
+    };
+    let mut r = part(&mut call);
+    while r == Ok(false) {
+        // (the switch point: interrupts are on here, nothing is held)
+        irq::without(|| {});
+        r = part(&mut call);
+    }
+    if let Some(c) = call {
+        locked_state(|_| kmem::get().vmos.range_end(c.id));
+    }
+    match r {
+        Ok(_) => Ok((None, None)),
+        Err(e) => bad(e),
     }
 }
 

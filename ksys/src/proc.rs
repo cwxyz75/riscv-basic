@@ -208,6 +208,161 @@ pub enum ProcState {
     Running,
 }
 
+/// A chunked decommit or shrink that `vmo_range_begin` started: the VMO is busy until `vmo_range_end`.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeCall {
+    pub id: u64,
+}
+
+fn range_status(e: kcore::aspace::VmoError) -> Status {
+    use kcore::aspace::VmoError;
+    match e {
+        VmoError::Gone => Status::BadHandle,
+        VmoError::NotResizable => Status::AccessDenied,
+        VmoError::HasChildren => Status::BadState,
+        VmoError::NoMemory => Status::NoMemory,
+        VmoError::Busy => Status::ShouldWait,
+        _ => Status::InvalidArgs,
+    }
+}
+
+/// `vmo_decommit` / `vmo_set_size`, first part (T207 PR 3a): resolve and check the arguments, refuse what is refused, and mark the VMO busy.
+/// `Ok(None)`: nothing to take away (a growth, or an empty range); otherwise the steps follow (`vmo_range_step` until it says done, then
+/// `Vmos::range_end`, whatever the steps answered).
+pub fn vmo_range_begin<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    n: usize,
+    a: [u64; 6],
+) -> Result<Option<RangeCall>, Status> {
+    let caller = c.procs.get(&c.me).ok_or(Status::BadState)?;
+    let id = ipc::vmo_of(c.objs, &caller.handles, Handle(a[0]), Rights::WRITE)?;
+    let size = c.vmos.pages(id).ok_or(Status::BadHandle)?;
+    let (first, count, new_size) = if n == nr::VMO_DECOMMIT {
+        if c.vmos.kind(id) != Some(kcore::aspace::VmoKind::Plain) {
+            return Err(Status::NotSupported);
+        }
+        let (offset, len) = (a[1], a[2]);
+        if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) || len == 0 {
+            return Err(Status::InvalidArgs);
+        }
+        let first = offset / 4096;
+        let count = len / 4096;
+        if first.checked_add(count).is_none_or(|end| end > size) {
+            return Err(Status::InvalidArgs);
+        }
+        (first, count, None)
+    } else {
+        // (a VMO that is not resizable, which every device and DMA VMO is, is refused before the size is looked at)
+        if !c.vmos.is_resizable(id) {
+            return Err(Status::AccessDenied);
+        }
+        let bytes = a[1];
+        if bytes == 0 || !bytes.is_multiple_of(4096) || bytes / 4096 > abi::limits::MAX_VMO_PAGES {
+            return Err(Status::InvalidArgs);
+        }
+        let new = bytes / 4096;
+        // growing takes nothing away; shrinking takes the tail
+        (new.min(size), size.saturating_sub(new), Some(new))
+    };
+    // (a VMO with children cannot change size: refused before anything is unmapped)
+    if new_size.is_some() && c.vmos.has_children(id) {
+        return Err(Status::BadState);
+    }
+    if count > 0 {
+        // V1 (INVARIANTS): a process of another job than the VMO's holds its mapping on the promise that touching it never fails on the
+        // VMO's job and never ends it; taking pages from under such a mapping would break that (a touch would charge the VMO's job, or
+        // fault past a new end). The holder's own job may take pages back; a stranger's mapping stops the call.
+        let vmo_job = c.vmos.job_of(id).ok_or(Status::BadHandle)?;
+        if c.procs
+            .values()
+            .any(|p| p.job != vmo_job && p.aspace.held_ref().maps_vmo_range(id, first, count))
+        {
+            return Err(Status::BadState);
+        }
+    }
+    match c
+        .vmos
+        .range_begin(id, first, first.saturating_add(count), new_size)
+    {
+        Ok(true) => Ok(Some(RangeCall { id })),
+        Ok(false) => Ok(None),
+        Err(e) => Err(range_status(e)),
+    }
+}
+
+/// One step of the call `vmo_range_begin` started: take at most a batch of the pages, unmap them from every address space that shows them (the VMO's
+/// descendants' too: a PRIVATE child shows the pages of its source through its own mappings), have every hart drop its translations, and only then
+/// let the VMO give the frames back (TLB2). `Ok(true)` when the call is done. After an `Err` the call is over as well (the caller ends it).
+pub fn vmo_range_step<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    n: usize,
+    call: RangeCall,
+) -> Result<bool, Status> {
+    let PCtx {
+        procs,
+        mm,
+        vmos,
+        jobs,
+        machine,
+        ..
+    } = c;
+    let mut batch = [0 as kcore::frame::Pfn; kcore::aspace::RANGE_STEP];
+    let st = vmos
+        .range_step(jobs, call.id, &mut batch)
+        .map_err(range_status)?;
+    let (first, count) = (st.lo, st.next.saturating_sub(st.lo));
+    if count > 0 {
+        let mut cleared = 0u64;
+        vmos.for_each_below(call.id, 0, &mut |d, base| {
+            if let Some(f) = first
+                .checked_sub(base)
+                .or((first.saturating_add(count) > base).then_some(0))
+            {
+                let k = first
+                    .saturating_add(count)
+                    .saturating_sub(base)
+                    .saturating_sub(f);
+                for p in procs.values_mut() {
+                    cleared =
+                        cleared.saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, d, f, k));
+                }
+            }
+        });
+        // other harts may still cache the translations of what was just unmapped: before any frame is freed. (When nothing was
+        // mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.)
+        if cleared > 0 {
+            if !machine.skip_shootdown(n) {
+                machine.shootdown();
+            }
+            machine.flush_tlb();
+        }
+    }
+    let got = batch.get(..st.n).unwrap_or(&[]);
+    vmos.range_free(mm, jobs, call.id, got);
+    match st.err {
+        Some(e) => Err(range_status(e)),
+        None => Ok(st.done),
+    }
+}
+
+/// `vmo_decommit` / `vmo_set_size` without a switch point between the steps (the host tests, where nothing else runs).
+fn vmo_range_all<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, n: usize, a: [u64; 6]) -> Reply {
+    let call = match vmo_range_begin(c, n, a) {
+        Ok(Some(call)) => call,
+        Ok(None) => return Ok((None, None)),
+        Err(s) => return Err(e(s)),
+    };
+    let r = loop {
+        match vmo_range_step(c, n, call) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(s) => break Err(s),
+        }
+    };
+    c.vmos.range_end(call.id);
+    r.map(|()| (None, None)).map_err(e)
+}
+
 fn bad(s: Status) -> Reply {
     fail(s)
 }
@@ -339,6 +494,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
     a: [u64; 6],
     c: &mut PCtx<'_, M, X>,
 ) -> Option<Reply> {
+    if n == nr::VMO_DECOMMIT || n == nr::VMO_SET_SIZE {
+        // (the steps the kernel runs with a switch point between them, run here one after another)
+        return Some(vmo_range_all(c, n, a));
+    }
     let PCtx {
         objs,
         procs,
@@ -421,6 +580,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             {
                 return bad(Status::BadState);
             }
+            // (a stranger's mapping of pages being taken away would outlive the promise above: wait for the call to end)
+            if vmo_job != Some(caller_job) && vmo_job != Some(target.job) && vmos.is_busy(vid) {
+                return bad(Status::ShouldWait);
+            }
             let perms = Perms {
                 read: true,
                 write: flags & PF_W != 0,
@@ -458,92 +621,6 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 .held_mut()
                 .merge_near(mm, vmos, jobs, vaddr, vaddr + length);
             Ok((anywhere.then_some(vaddr), None))
-        })(),
-        nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => (|| {
-            // Both take pages away from a VMO, so both first unmap them from every address space that maps them, then have every hart drop
-            // its translations, and only then let the VMO give the frames back (TLB2).
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::WRITE).map_err(e)?;
-            let size = vmos.pages(id).ok_or(e(Status::BadHandle))?;
-            let (first, count, new_size) = if n == nr::VMO_DECOMMIT {
-                if vmos.kind(id) != Some(kcore::aspace::VmoKind::Plain) {
-                    return Err(e(Status::NotSupported));
-                }
-                let (offset, len) = (a[1], a[2]);
-                if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) || len == 0 {
-                    return Err(e(Status::InvalidArgs));
-                }
-                let first = offset / 4096;
-                let count = len / 4096;
-                if first.checked_add(count).is_none_or(|end| end > size) {
-                    return Err(e(Status::InvalidArgs));
-                }
-                (first, count, None)
-            } else {
-                // (a VMO that is not resizable, which every device and DMA VMO is, is refused before the size is looked at)
-                if !vmos.is_resizable(id) {
-                    return Err(e(Status::AccessDenied));
-                }
-                let bytes = a[1];
-                if bytes == 0
-                    || !bytes.is_multiple_of(4096)
-                    || bytes / 4096 > abi::limits::MAX_VMO_PAGES
-                {
-                    return Err(e(Status::InvalidArgs));
-                }
-                let new = bytes / 4096;
-                // growing takes nothing away; shrinking takes the tail
-                (new.min(size), size.saturating_sub(new), Some(new))
-            };
-            // (a VMO with children cannot change size: refused before anything is unmapped)
-            if new_size.is_some() && vmos.has_children(id) {
-                return Err(e(Status::BadState));
-            }
-            if count > 0 {
-                // V1 (INVARIANTS): a process of another job than the VMO's holds its mapping on the promise that touching it never fails on the
-                // VMO's job and never ends it; taking pages from under such a mapping would break that (a touch would charge the VMO's job, or
-                // fault past a new end). The holder's own job may take pages back; a stranger's mapping stops the call.
-                let vmo_job = vmos.job_of(id).ok_or(e(Status::BadHandle))?;
-                if procs.values().any(|p| {
-                    p.job != vmo_job && p.aspace.held_ref().maps_vmo_range(id, first, count)
-                }) {
-                    return Err(e(Status::BadState));
-                }
-                // (with the VMO's descendants: a PRIVATE child shows the pages of its source through its own mappings)
-                let mut cleared = 0u64;
-                vmos.for_each_below(id, 0, &mut |d, base| {
-                    if let Some(f) = first
-                        .checked_sub(base)
-                        .or((first + count > base).then_some(0))
-                    {
-                        let n = (first + count).saturating_sub(base).saturating_sub(f);
-                        for p in procs.values_mut() {
-                            cleared = cleared
-                                .saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, d, f, n));
-                        }
-                    }
-                });
-                // other harts may still cache the translations of what was just unmapped: before any frame is freed. (When nothing was
-                // mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.)
-                if cleared > 0 {
-                    if !machine.skip_shootdown(n) {
-                        machine.shootdown();
-                    }
-                    machine.flush_tlb();
-                }
-            }
-            let r = match new_size {
-                None => vmos.decommit(mm, jobs, id, first, count).map(|_| ()),
-                Some(new) => vmos.set_size(mm, jobs, id, new),
-            };
-            match r {
-                Ok(()) => Ok((None, None)),
-                Err(kcore::aspace::VmoError::Gone) => Err(e(Status::BadHandle)),
-                Err(kcore::aspace::VmoError::NotResizable) => Err(e(Status::AccessDenied)),
-                Err(kcore::aspace::VmoError::HasChildren) => Err(e(Status::BadState)),
-                Err(kcore::aspace::VmoError::NoMemory) => Err(e(Status::NoMemory)),
-                Err(_) => Err(e(Status::InvalidArgs)),
-            }
         })(),
         nr::VMO_CREATE_CHILD => (|| {
             use kcore::aspace::{ChildMode, VmoError};
@@ -587,6 +664,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 Err(VmoError::TooDeep) => return bad(Status::BadState),
                 Err(VmoError::NotCopyable) => return bad(Status::NotSupported),
                 Err(VmoError::NoMemory) => return bad(Status::NoMemory),
+                Err(VmoError::Busy) => return bad(Status::ShouldWait),
                 Err(_) => return bad(Status::InvalidArgs),
             };
             let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
@@ -675,6 +753,9 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 // (V1, as `process_map`: a stranger's VMO must already be paid for)
                 return bad(Status::BadState);
             }
+            if vmo_job != caller_job && vmo_job != target_job && vmos.is_busy(vid) {
+                return bad(Status::ShouldWait);
+            }
             let tables = region.pages / 512 + 4;
             jobs.charge(target_job, Resource::Pages, tables)
                 .map_err(|x| e(crate::job_status(x)))?;
@@ -700,6 +781,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                             VmoError::JobMismatch => Status::AccessDenied,
                             VmoError::Gone => Status::BadHandle,
                             VmoError::NotCopyable => Status::NotSupported,
+                            VmoError::Busy => Status::ShouldWait,
                             VmoError::NoMemory => Status::NoMemory,
                             _ => Status::InvalidArgs,
                         });

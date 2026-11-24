@@ -20,6 +20,7 @@ fn map_vmo_error(e: VmoError) -> Status {
         VmoError::Gone => Status::BadHandle,
         VmoError::NoMemory => Status::NoMemory,
         VmoError::NotSuppliable => Status::BadState,
+        VmoError::Busy => Status::ShouldWait,
         _ => Status::InvalidArgs,
     }
 }
