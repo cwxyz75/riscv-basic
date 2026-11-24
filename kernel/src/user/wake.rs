@@ -94,10 +94,8 @@ fn notify_with(sync: bool) {
 fn notify_held(sync: bool) {
     cleanup_dead();
     // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
-    let woken = with_state(|s| crate::heap::nofail(|| ksys::pager::reap_closed_channels(s)));
-    if !woken.is_empty() {
-        crate::heap::nofail(|| thread::wake_many(&woken));
-    }
+    with_state(ksys::pager::reap_closed_channels);
+    super::waits::wake_pager_waiters();
     commit_wake_with(sync);
     // the safe point where the kernel heap may grow (heap.rs)
     crate::heap::service();
@@ -151,10 +149,8 @@ fn cleanup_dead_held() {
                 }),
                 // the last handle to a pager: every wait for its pages fails, and the kernel's end of its channel goes (MM9)
                 ipc::KObj::Pager(id) => {
-                    crate::heap::nofail(|| {
-                        let woken = with_state(|s| ksys::pager::pager_destroyed(s, id));
-                        thread::wake_many(&woken);
-                    });
+                    with_state(|s| ksys::pager::pager_destroyed(s, id));
+                    super::waits::wake_pager_waiters();
                 }
                 ipc::KObj::Interrupt(i) => with_state(|s| {
                     // mask the source unless a newer object already owns it

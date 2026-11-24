@@ -44,6 +44,8 @@ fn supply_is_never_lost(buggy: bool) {
     let s = Arc::new(Mutex::new(Shared {
         pagers: {
             let mut p = Pagers::new();
+            p.reserve_room(8).unwrap();
+            p.reserve_pager().unwrap();
             p.create(PAGER);
             p
         },
@@ -53,7 +55,8 @@ fn supply_is_never_lost(buggy: bool) {
     let supplier = thread::spawn(move || {
         let mut g = s2.lock().unwrap();
         g.present = true;
-        g.pagers.supply(PAGER, VMO, 0, 1)
+        g.pagers.supply(PAGER, VMO, 0, 1);
+        drained(&mut g.pagers)
     });
     let registered = wait_for_page(&s, 7, buggy);
     let woken = supplier.join().unwrap();
@@ -88,6 +91,8 @@ fn shuttle_a_failure_wakes_every_waiter_once() {
             let s = Arc::new(Mutex::new(Shared {
                 pagers: {
                     let mut p = Pagers::new();
+                    p.reserve_room(8).unwrap();
+                    p.reserve_pager().unwrap();
                     p.create(PAGER);
                     p
                 },
@@ -105,12 +110,12 @@ fn shuttle_a_failure_wakes_every_waiter_once() {
             let s2 = s.clone();
             let failer = thread::spawn(move || {
                 let mut g = s2.lock().unwrap();
-                let a = g
-                    .pagers
+                g.pagers
                     .fail(PAGER, VMO, 0, 1, abi::status::Status::TimedOut);
-                let b = g
-                    .pagers
+                let a = drained(&mut g.pagers);
+                g.pagers
                     .fail(PAGER, VMO, 0, 1, abi::status::Status::TimedOut);
+                let b = drained(&mut g.pagers);
                 (a, b)
             });
             for w in waiters {
@@ -132,4 +137,10 @@ fn shuttle_a_failure_wakes_every_waiter_once() {
         },
         3000,
     );
+}
+
+fn drained(p: &mut Pagers) -> Vec<u64> {
+    let mut out = Vec::new();
+    p.drain_woken(&mut |w| out.extend_from_slice(w));
+    out
 }

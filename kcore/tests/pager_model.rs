@@ -13,8 +13,10 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
     for seed in 1..=300u64 {
         let mut rng = Rng::new(seed);
         let mut p = Pagers::new();
+        p.reserve_room(64).unwrap();
         let mut alive: BTreeSet<u64> = BTreeSet::new();
         for id in 1..=2u64 {
+            p.reserve_pager().unwrap();
             p.create(id);
             alive.insert(id);
         }
@@ -51,11 +53,12 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
                     let vmo = pager * 10 + rng.below(2);
                     let (first, count) = (rng.below(6), 1 + rng.below(4));
                     let failing = rng.below(3) == 0;
-                    let woken = if failing {
-                        p.fail(pager, vmo, first, count, Status::TimedOut)
+                    if failing {
+                        p.fail(pager, vmo, first, count, Status::TimedOut);
                     } else {
-                        p.supply(pager, vmo, first, count)
-                    };
+                        p.supply(pager, vmo, first, count);
+                    }
+                    let woken = drained(&mut p);
                     let want: BTreeSet<u64> = waiting
                         .iter()
                         .filter(|(_, &(pg, v, page))| {
@@ -109,7 +112,8 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
                         _ => {
                             let pager = 1 + rng.below(2);
                             if alive.remove(&pager) {
-                                let woken = p.destroy(pager);
+                                p.destroy(pager);
+                                let woken = drained(&mut p);
                                 let want: BTreeSet<u64> = waiting
                                     .iter()
                                     .filter(|(_, &(pg, _, _))| pg == pager)
@@ -156,6 +160,8 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
 #[test]
 fn unsent_requests_wait_for_room_in_order_and_go_with_their_pages() {
     let mut p = Pagers::new();
+    p.reserve_room(64).unwrap();
+    p.reserve_pager().unwrap();
     p.create(1);
     assert!(p.wait(1, 1, 10, 0).unwrap().is_some());
     assert!(p.wait(2, 1, 10, 1).unwrap().is_some());
@@ -168,7 +174,15 @@ fn unsent_requests_wait_for_room_in_order_and_go_with_their_pages() {
     p.sent(1);
     assert_eq!(p.unsent(1).map(|r| r.page), Some(1));
     // page 1 is supplied before it was sent: its request is dropped, and both waiters of page 0 are still waiting
-    assert_eq!(p.supply(1, 10, 1, 1), vec![2]);
+    p.supply(1, 10, 1, 1);
+    assert_eq!(drained(&mut p), vec![2]);
     assert!(!p.any_unsent());
     assert!(p.waiting(1) && p.waiting(3));
+}
+
+/// The threads whose wait the last call ended.
+fn drained(p: &mut Pagers) -> Vec<u64> {
+    let mut out = Vec::new();
+    p.drain_woken(&mut |w| out.extend_from_slice(w));
+    out
 }

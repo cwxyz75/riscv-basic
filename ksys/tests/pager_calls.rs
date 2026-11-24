@@ -73,6 +73,7 @@ fn world() -> W {
         },
     );
     let mut jobs = Jobs::new();
+    us.pagers.reserve_room(2048).unwrap();
     let (pager, chan) = pager_create(&mut us, &mut jobs, 1).unwrap();
     W {
         mm,
@@ -121,7 +122,16 @@ impl W {
             .unwrap();
         (id, self.vmo_handle(id, Rights::VMO))
     }
-    fn begin(&mut self, tid: u64, vmo: u64, page: u64) -> Result<Vec<u64>, Status> {
+    /// The threads whose wait the last step ended, in order of tid.
+    fn woken(&mut self) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.us
+            .pagers
+            .drain_woken(&mut |w| out.extend_from_slice(w));
+        out.sort();
+        out
+    }
+    fn begin(&mut self, tid: u64, vmo: u64, page: u64) -> Result<(), Status> {
         pager_wait_begin(
             &mut self.us,
             &self.vmos,
@@ -161,7 +171,7 @@ impl W {
         len: u64,
         src_h: u64,
         soff: u64,
-    ) -> Result<Vec<u64>, Status> {
+    ) -> Result<(), Status> {
         pager_supply(
             &mut self.us,
             &mut self.mm,
@@ -190,9 +200,8 @@ fn a_page_is_asked_for_once_however_many_wait_and_a_supply_wakes_them_all() {
         "one request per page, in order, with the VMO's key"
     );
     let (_, sh) = w.source(2, 0x42);
-    let mut woken = w.supply(vh, 3 * 4096, 2 * 4096, sh, 0).unwrap();
-    woken.sort();
-    assert_eq!(woken, vec![10, 11, 12]);
+    w.supply(vh, 3 * 4096, 2 * 4096, sh, 0).unwrap();
+    assert_eq!(w.woken(), vec![10, 11, 12]);
     for t in [10, 11, 12] {
         assert!(pager_wait_done(&w.us, t));
         assert_eq!(pager_wait_end(&mut w.us, t), Some(Ok(())));
@@ -218,7 +227,8 @@ fn a_failure_wakes_the_waiters_with_the_status_and_asks_nothing_again_until_some
         "OK is not a failure"
     );
     assert_eq!(fail(&mut w, -999), Err(Status::InvalidArgs));
-    assert_eq!(fail(&mut w, Status::TimedOut.code() as i64), Ok(vec![10]));
+    assert_eq!(fail(&mut w, Status::TimedOut.code() as i64), Ok(()));
+    assert_eq!(w.woken(), vec![10]);
     assert_eq!(pager_wait_end(&mut w.us, 10), Some(Err(Status::TimedOut)));
     w.requests();
     w.begin(11, vmo, 0).unwrap();
@@ -231,9 +241,8 @@ fn a_destroyed_pager_fails_every_wait_and_refuses_new_ones() {
     let (vmo, _) = w.pager_vmo(1, 4);
     w.begin(10, vmo, 0).unwrap();
     w.begin(11, vmo, 1).unwrap();
-    let mut woken = pager_destroyed(&mut w.us, 1);
-    woken.sort();
-    assert_eq!(woken, vec![10, 11]);
+    pager_destroyed(&mut w.us, 1);
+    assert_eq!(w.woken(), vec![10, 11]);
     assert_eq!(pager_wait_end(&mut w.us, 10), Some(Err(Status::PeerClosed)));
     assert_eq!(pager_wait_end(&mut w.us, 11), Some(Err(Status::PeerClosed)));
     assert_eq!(w.begin(12, vmo, 0), Err(Status::PeerClosed));
@@ -257,16 +266,14 @@ fn a_closed_channel_fails_the_waiters_and_a_full_one_keeps_the_request_pending()
     // the pager reads some: a flush writes the rest
     let got = w.requests();
     assert!(!got.is_empty());
-    assert!(pager_flush(&mut w.us, &w.vmos, &mut w.jobs, 1).is_empty());
+    pager_flush(&mut w.us, &w.vmos, &mut w.jobs, 1);
+    assert!(w.woken().is_empty());
     // the pager closes its end of the channel: the next flush fails everything
     let p = w.us.procs.get_mut(&1).unwrap();
     p.handles.close(&mut w.us.objs, Handle(w.chan)).unwrap();
     assert_eq!(w.begin(1, vmo, 1000), Err(Status::PeerClosed));
     assert!(!w.us.pagers.exists(1));
-    assert!(
-        !w.us.pending_wake.is_empty(),
-        "the old waiters are woken through pending_wake"
-    );
+    assert!(!w.woken().is_empty(), "the old waiters end with the pager");
 }
 
 #[test]
@@ -278,11 +285,8 @@ fn a_channel_closed_after_the_request_was_sent_kills_the_pager_for_waiters_and_n
     assert!(!w.us.pagers.any_unsent(), "the request was written");
     let p = w.us.procs.get_mut(&1).unwrap();
     p.handles.close(&mut w.us.objs, Handle(w.chan)).unwrap();
-    assert_eq!(
-        reap_closed_channels(&mut w.us),
-        vec![10],
-        "the waiter fails"
-    );
+    reap_closed_channels(&mut w.us);
+    assert_eq!(w.woken(), vec![10], "the waiter fails");
     assert_eq!(pager_wait_end(&mut w.us, 10), Some(Err(Status::PeerClosed)));
     assert_eq!(w.begin(11, vmo, 0), Err(Status::PeerClosed));
 }
@@ -308,7 +312,7 @@ fn a_cancelled_wait_takes_its_request_and_a_supplied_page_is_not_waited_for() {
     );
     let (_, sh) = w.source(1, 3);
     w.supply(vh, 0, 4096, sh, 0).unwrap();
-    assert_eq!(w.begin(12, vmo, 0), Ok(vec![]));
+    assert_eq!(w.begin(12, vmo, 0), Ok(()));
     assert!(
         !w.us.pagers.waiting(12),
         "the page is there: nothing registered"

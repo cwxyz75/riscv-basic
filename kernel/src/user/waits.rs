@@ -364,24 +364,31 @@ pub fn futex_wake(pid: u64, a: [u64; 6]) -> Reply {
     }
 }
 
+/// Wake the threads a pager step ended the wait of, in batches: each batch is taken under the state lock and woken after it (the wake takes the
+/// scheduler's locks, which come after it). A wake cannot be refused: class N.
+pub(super) fn wake_pager_waiters() {
+    loop {
+        let mut batch = [0; 16];
+        let n = any_state(|s| s.pagers.take_woken(&mut batch));
+        let Some(w) = batch.get(..n).filter(|w| !w.is_empty()) else {
+            return;
+        };
+        crate::heap::nofail(|| thread::wake_many(w));
+    }
+}
+
 /// Wait for a page of a pager's VMO (MM9, KERNEL-V1-SPEC 4.5, PG1): register as a waiter (the request goes to the pager once per page), let go of every
 /// lock, and sleep until the pager supplies the page, fails it, dies, or this thread is killed or interrupted. `Ok` when the page was supplied
 /// (the caller tries again) or the wait was cut short by a kill or an interrupt (the return to user mode ends the process, or the access is
 /// tried again); `Err` with the pager's status when the page cannot be had.
 pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Result<(), Status> {
     let me = thread::current();
-    // (class N until the pager tables are prepaid per thread: T248 PR B; a fault has no status to return, and a refused allocation here would be a panic)
-    let (begun, woken) = crate::heap::nofail(|| {
-        let begun = any_state(|s| {
-            let k = kmem::get();
-            ksys::pager::pager_wait_begin(s, k.vmos, k.jobs, me, need)
-        });
-        // (a pager found dead while registering wakes the others through `pending_wake`)
-        let mut woken = any_state(|s| core::mem::take(&mut s.pending_wake));
-        woken.extend(begun.as_ref().map(|w| w.as_slice()).unwrap_or(&[]));
-        (begun, woken)
+    // (the room for this thread's wait was made when it was: T248; a pager found dead while registering ends the others' waits too)
+    let begun = any_state(|s| {
+        let k = kmem::get();
+        ksys::pager::pager_wait_begin(s, k.vmos, k.jobs, me, need)
     });
-    thread::wake_many(&woken);
+    wake_pager_waiters();
     begun?;
     // (the page came in since the call found it missing: nothing was registered)
     if !any_state(|s| s.pagers.waiting(me)) {
@@ -413,13 +420,11 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
         if ended {
             break;
         }
-        let woken = crate::heap::nofail(|| {
-            with_state(|s| {
-                let k = kmem::get();
-                ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager)
-            })
+        with_state(|s| {
+            let k = kmem::get();
+            ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager);
         });
-        thread::wake_many(&woken);
+        wake_pager_waiters();
         commit_wake();
     }
     // a fault ignores `thread_interrupt` (the flag stays for the next blocking call); a call that was interrupted or killed while it waited

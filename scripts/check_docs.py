@@ -244,8 +244,8 @@ NOFAIL = {
     "kernel/src/user/trap.rs": (1, "the calls that end or deliver something for a process that exists (kill, exception, pager, thread state: T248)"),
     "kernel/src/user/calls.rs": (2, "the kill of a process and of each process of a job (the caller's own exit, which does not return, is outside)"),
     "kernel/src/user/kobjects.rs": (1, "a kernel thread's admission to the wait table"),
-    "kernel/src/user/waits.rs": (2, "a pager wait's registration and flush: stopgaps until the tables are prepaid (T248 PR B)"),
-    "kernel/src/user/wake.rs": (8, "the epilogue's wakes, kills, teardown arms and the pager reap: a wake or a teardown cannot be refused"),
+    "kernel/src/user/waits.rs": (1, "the wake of the threads a pager step ended (a wake cannot be refused); the pager tables themselves are prepaid per thread (T248)"),
+    "kernel/src/user/wake.rs": (5, "the epilogue's wakes, kills and teardown arms: a wake or a teardown cannot be refused"),
 }
 
 
