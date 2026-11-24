@@ -22,8 +22,9 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
             process_table_call(n, a)
         }
         nr::PROCESS_MAP => process_table_call(n, a),
-        nr::PROCESS_UNMAP => process_table_call(n, a),
-        nr::PROCESS_PROTECT | nr::PROCESS_MAP_INFO => process_table_call(n, a),
+        nr::PROCESS_UNMAP => process_unmap_call(a),
+        nr::PROCESS_PROTECT => process_protect_call(n, a),
+        nr::PROCESS_MAP_INFO => process_table_call(n, a),
         nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => vmo_range_call(n, a),
         nr::VMO_CREATE_CHILD | nr::PROCESS_CLONE_REGION => process_table_call(n, a),
         nr::PROCESS_START => process_start(a),
@@ -158,15 +159,140 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
     };
     let mut r = part(&mut call);
     while r == Ok(false) {
-        // (the switch point: interrupts are on here, nothing is held)
+        // (the switch point: nothing is held; another hart takes the locks, and a thread that was woken runs)
         irq::without(|| {});
         r = part(&mut call);
     }
     if let Some(c) = call {
-        locked_state(|_| kmem::get().vmos.range_end(c.id));
+        locked_state(|_| kmem::get().vmos.range_end(c.id, r.is_ok()));
     }
     match r {
         Ok(_) => Ok((None, None)),
+        Err(e) => bad(e),
+    }
+}
+
+/// `process_unmap` (T207 PR 3b): the regions are marked dying under the locks of the call (every failure is there), then the mappings go a batch at a
+/// time, each batch under the target's address-space lock and the memory locks with a shootdown before they are let go, and the switch point between
+/// two batches. A sibling that touches the range meanwhile takes an exception (a dying region is no region).
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
+fn process_unmap_call(a: [u64; 6]) -> Reply {
+    // the first part: `AsLocks::all` (the handle names the target)
+    let call = locked_state(|s| -> Result<ksys::UnmapCall, Status> {
+        let me = caller_pid(s)?;
+        let mut machine = KernelMachine::default();
+        let _as = AsLocks::all(s)?;
+        let k = kmem::get();
+        let mut ctx = ksys::PCtx {
+            objs: &mut s.objs,
+            procs: &mut s.procs,
+            me,
+            mm: k.mm,
+            vmos: k.vmos,
+            jobs: k.jobs,
+            machine: &mut machine,
+        };
+        ksys::process_unmap_begin(&mut ctx, a)
+    });
+    let call = match call {
+        Ok(c) => c,
+        Err(e) => return bad(e),
+    };
+    let part = |end: bool| -> Result<bool, Status> {
+        locked_state(|s| -> Result<bool, Status> {
+            let me = caller_pid(s)?;
+            let mut machine = KernelMachine::default();
+            let _as = AsLocks::one(s, call.tpid);
+            let k = kmem::get();
+            let mut ctx = ksys::PCtx {
+                objs: &mut s.objs,
+                procs: &mut s.procs,
+                me,
+                mm: k.mm,
+                vmos: k.vmos,
+                jobs: k.jobs,
+                machine: &mut machine,
+            };
+            if end {
+                ksys::process_unmap_end(&mut ctx, call);
+                Ok(true)
+            } else {
+                ksys::process_unmap_step(&mut ctx, call)
+            }
+        })
+    };
+    let mut r = part(false);
+    while r == Ok(false) {
+        irq::without(|| {});
+        r = part(false);
+    }
+    match r {
+        Ok(_) => {
+            let _ = part(true);
+            Ok((None, None))
+        }
+        Err(e) => bad(e),
+    }
+}
+
+/// `process_protect` (T207 PR 3b): the regions take their new permissions under the locks of the call (every failure is there), then the page-table
+/// entries follow a batch at a time under the target's address-space lock, with the switch point between batches; the shootdown and the
+/// instruction-cache sync come before the call returns (M9).
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
+fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
+    let call = locked_state(|s| -> Result<ksys::ProtectCall, Status> {
+        let me = caller_pid(s)?;
+        let mut machine = KernelMachine::default();
+        let _as = AsLocks::all(s)?;
+        let k = kmem::get();
+        let mut ctx = ksys::PCtx {
+            objs: &mut s.objs,
+            procs: &mut s.procs,
+            me,
+            mm: k.mm,
+            vmos: k.vmos,
+            jobs: k.jobs,
+            machine: &mut machine,
+        };
+        ksys::process_protect_begin(&mut ctx, a)
+    });
+    let mut call = match call {
+        Ok(c) => c,
+        Err(e) => return bad(e),
+    };
+    let part = |call: &mut ksys::ProtectCall, end: bool| -> Result<bool, Status> {
+        locked_state(|s| -> Result<bool, Status> {
+            let me = caller_pid(s)?;
+            let mut machine = KernelMachine::default();
+            let _as = AsLocks::one(s, call.tpid);
+            let k = kmem::get();
+            let mut ctx = ksys::PCtx {
+                objs: &mut s.objs,
+                procs: &mut s.procs,
+                me,
+                mm: k.mm,
+                vmos: k.vmos,
+                jobs: k.jobs,
+                machine: &mut machine,
+            };
+            if end {
+                ksys::process_protect_end(&mut ctx, n, *call);
+                Ok(true)
+            } else {
+                ksys::process_protect_step(&mut ctx, call)
+            }
+        })
+    };
+    let mut r = part(&mut call, false);
+    while r == Ok(false) {
+        irq::without(|| {});
+        r = part(&mut call, false);
+    }
+    match r {
+        Ok(_) => {
+            let _ = part(&mut call, true);
+            Ok((None, None))
+        }
         Err(e) => bad(e),
     }
 }
@@ -213,10 +339,30 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
 
 /// After a call or a fault: drop what the copy log made stale in every address space (COW1). A load when nothing is pending.
 pub(crate) fn cow_sync() {
+    if kcore::aspace::DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) {
+        drain_dying();
+    }
     if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
     cow_sync_held();
+}
+
+/// Give back the pages of the VMOs whose last reference went (T207 PR 3c), a batch at a time under the memory locks, with the switch point between
+/// batches; nothing is held at it. Run at the tail of every call and fault, so no thread is back in user mode with its VMO still draining.
+fn drain_dying() {
+    loop {
+        let was = irq::save_and_disable();
+        let more = {
+            let k = kmem::mem();
+            k.vmos.drain_dying(k.mm, k.jobs, kcore::aspace::RANGE_STEP)
+        };
+        irq::restore(was);
+        if !more {
+            return;
+        }
+        irq::without(|| {});
+    }
 }
 
 fn cow_sync_held() {

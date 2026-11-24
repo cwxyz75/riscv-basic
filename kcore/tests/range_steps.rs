@@ -54,7 +54,7 @@ fn run(
         exact(vmos, jobs, job);
         assert!(st.err.is_none());
         if st.done {
-            vmos.range_end(id);
+            vmos.range_end(id, true);
             return steps;
         }
         between(mm, vmos, jobs);
@@ -78,6 +78,7 @@ fn a_big_decommit_takes_many_steps_and_the_ledger_is_exact_after_each() {
     vmos.read(&mut mm, id, 300 * PAGE, &mut b).unwrap();
     assert_eq!(b, [0], "a decommitted page reads zeros");
     vmos.release(&mut mm, &mut jobs, id).unwrap();
+    vmos.drain_all(&mut mm, &mut jobs);
     assert_eq!(used(&jobs, job, Resource::Pages), 0);
     assert_eq!(used(&jobs, job, Resource::KernelBytes), 0);
 }
@@ -105,12 +106,12 @@ fn a_busy_vmo_refuses_what_would_race_the_cursor_and_the_end_frees_it() {
     let mut batch = [0u64; RANGE_STEP];
     let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
     vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
-    vmos.range_end(id);
+    vmos.range_end(id, true);
     assert!(!vmos.is_busy(id));
     exact(&vmos, &jobs, job);
     assert_eq!(used(&jobs, job, Resource::Pages), 300 - RANGE_STEP as u64);
     assert_eq!(vmos.range_begin(id, 0, 10, None), Ok(true));
-    vmos.range_end(id);
+    vmos.range_end(id, true);
 }
 
 #[test]
@@ -205,12 +206,12 @@ fn a_hole_the_job_cannot_pay_stops_the_call_with_what_it_did_and_the_end_frees_t
         }
         assert!(!st.done, "thirty leaves of holes cannot fit");
     };
-    vmos.range_end(c);
+    vmos.range_end(c, true);
     assert!(!vmos.is_busy(c));
     assert!(refused_at < 64 * 30, "the pages before it were done");
     // a retry goes on from where the holes stop
     assert_eq!(vmos.range_begin(c, 0, 64 * 30, None), Ok(true));
-    vmos.range_end(c);
+    vmos.range_end(c, true);
 }
 
 #[test]
@@ -260,4 +261,78 @@ fn the_stepped_call_equals_the_one_shot_call() {
         }
         assert_eq!(out[0], out[1], "range {first}..{end}");
     }
+}
+
+#[test]
+fn a_shrink_that_stops_short_gives_the_size_back() {
+    let (mut mm, mut vmos, mut jobs) = world();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 300, job);
+    vmos.set_resizable(id);
+    for p in 0..300u64 {
+        vmos.write(&mut mm, &mut jobs, id, p * PAGE, &[1]).unwrap();
+    }
+    assert_eq!(vmos.range_begin(id, 100, 300, Some(100)), Ok(true));
+    let mut batch = [0u64; RANGE_STEP];
+    let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
+    vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
+    vmos.range_end(id, false); // (the next step found no memory for its locks)
+    assert_eq!(vmos.pages(id), Some(300), "no tail is left past the size");
+    exact(&vmos, &jobs, job);
+    // a repeat finishes the job
+    vmos.set_size(&mut mm, &mut jobs, id, 100).unwrap();
+    assert_eq!(vmos.pages(id), Some(100));
+    assert_eq!(used(&jobs, job, Resource::Pages), 100);
+    vmos.set_size(&mut mm, &mut jobs, id, 300).unwrap();
+    let mut b = [9u8];
+    vmos.read(&mut mm, id, 250 * PAGE, &mut b).unwrap();
+    assert_eq!(b, [0]);
+}
+
+#[test]
+fn the_last_close_of_a_big_vmo_drains_in_batches_with_the_ledger_exact_at_each() {
+    let (mut mm, mut vmos, mut jobs) = world();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 400, job);
+    for p in 0..400u64 {
+        vmos.write(&mut mm, &mut jobs, id, p * PAGE, &[1]).unwrap();
+    }
+    let free = mm.db.free_count();
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
+    assert!(!vmos.exists(id), "the id is invalid at once");
+    assert_eq!(vmos.count(), 0);
+    // nothing was credited yet, and the frames are still held: the ledger says exactly that
+    assert_eq!(used(&jobs, job, Resource::Pages), 400);
+    exact(&vmos, &jobs, job);
+    let mut batches = 0;
+    while vmos.drain_dying(&mut mm, &mut jobs, RANGE_STEP) {
+        batches += 1;
+        exact(&vmos, &jobs, job);
+        assert!(used(&jobs, job, Resource::Pages) < 400);
+    }
+    assert!(batches >= 5, "{batches} batches");
+    exact(&vmos, &jobs, job);
+    assert_eq!(used(&jobs, job, Resource::Pages), 0);
+    assert_eq!(used(&jobs, job, Resource::KernelBytes), 0);
+    assert!(mm.db.free_count() > free);
+}
+
+#[test]
+fn a_dying_vmos_slot_is_not_reused_until_it_is_empty_and_an_exhausted_one_is_retired() {
+    let (mut mm, mut vmos, mut jobs) = world();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    vmos.set_first_generation(u32::MAX);
+    let big = vmos.create_in(&mut jobs, 200, job);
+    for p in 0..200u64 {
+        vmos.write(&mut mm, &mut jobs, big, p * PAGE, &[1]).unwrap();
+    }
+    vmos.release(&mut mm, &mut jobs, big).unwrap();
+    // a new VMO must not land on the dying slot
+    let other = vmos.create_in(&mut jobs, 1, job);
+    assert_ne!(other & 0xffff_ffff, big & 0xffff_ffff);
+    vmos.drain_all(&mut mm, &mut jobs);
+    // the exhausted slot is retired, not wrapped: the next one is still not it
+    let third = vmos.create_in(&mut jobs, 1, job);
+    assert_ne!(third & 0xffff_ffff, big & 0xffff_ffff);
+    assert!(!vmos.exists(big));
 }
