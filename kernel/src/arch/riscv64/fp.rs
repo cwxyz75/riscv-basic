@@ -296,38 +296,75 @@ fn hart() -> usize {
 /// This hart's register file now holds `tid`'s latest FP (`fp`) or vector state: record the claim, and drop the one the thread's previous holder
 /// hart had (that copy is stale now). Under the big lock.
 fn claim<R>(t: &mut kcore::fp::UnitThread<R>, harts: &mut [FpHart], tid: u64, h: usize, fp: bool) {
-    use core::sync::atomic::Ordering::Release;
-    let cells = |hart: usize| {
-        let p = crate::percpu::hart(hart);
-        if fp {
-            (&p.fs_claim, &p.fs_buf)
-        } else {
-            (&p.vs_claim, &p.vs_buf)
-        }
-    };
-    if let Some(old) = t.holder() {
-        if old != h {
-            let (c, b) = cells(old);
-            // (only if the old hart still holds this thread: another thread's load there has replaced the claim already)
-            if c.load(core::sync::atomic::Ordering::Acquire) == tid {
-                c.store(0, Release);
-                b.store(0, Release);
-                // (a save that takes no lock keeps the token, so the old hart's token must stop matching)
-                if let Some(f) = harts.get_mut(old) {
-                    f.forget();
-                }
-            }
-        }
+    if fp {
+        kcore::fp::claim(&FpCells, t, harts, tid, h);
+    } else {
+        kcore::fp::claim(&VecCells, t, harts, tid, h);
     }
-    // (T188: a claim names a hart whose register file holds the thread's latest state: `claim` is called right after the save or the load that made it so)
-    debug_assert!(
-        harts.get(h).is_some_and(|f| f.holds(t)),
-        "a claim for thread {tid} on hart {h} that does not hold its state"
-    );
-    t.set_holder(Some(h));
-    let (c, b) = cells(h);
-    b.store(t.regs_ptr().map_or(0, |p| p as usize), Release);
-    c.store(tid, Release);
+}
+
+/// The per-hart claim cells of the FP unit, in the hart's record (`kcore::fp::ClaimCells`; the protocol is modelled in `kcore/tests/fp_claim_model.rs`).
+struct FpCells;
+/// The same for the vector unit.
+struct VecCells;
+
+impl kcore::fp::ClaimCells for FpCells {
+    fn claim(&self, hart: usize) -> u64 {
+        crate::percpu::hart(hart)
+            .fs_claim
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn buf(&self, hart: usize) -> usize {
+        crate::percpu::hart(hart)
+            .fs_buf
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn set(&self, hart: usize, tid: u64, buf: usize) {
+        let p = crate::percpu::hart(hart);
+        p.fs_buf.store(buf, core::sync::atomic::Ordering::Release);
+        p.fs_claim.store(tid, core::sync::atomic::Ordering::Release);
+    }
+    fn clear(&self, hart: usize) {
+        let p = crate::percpu::hart(hart);
+        p.fs_claim.store(0, core::sync::atomic::Ordering::Release);
+        p.fs_buf.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+impl kcore::fp::ClaimCells for VecCells {
+    fn claim(&self, hart: usize) -> u64 {
+        crate::percpu::hart(hart)
+            .vs_claim
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn buf(&self, hart: usize) -> usize {
+        crate::percpu::hart(hart)
+            .vs_buf
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn set(&self, hart: usize, tid: u64, buf: usize) {
+        let p = crate::percpu::hart(hart);
+        p.vs_buf.store(buf, core::sync::atomic::Ordering::Release);
+        p.vs_claim.store(tid, core::sync::atomic::Ordering::Release);
+    }
+    fn clear(&self, hart: usize) {
+        let p = crate::percpu::hart(hart);
+        p.vs_claim.store(0, core::sync::atomic::Ordering::Release);
+        p.vs_buf.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// What a frame's `sstatus` field says about a unit.
+fn lazy_of(bits: u64, clean: u64, dirty: u64) -> kcore::fp::Lazy {
+    if bits == 0 {
+        kcore::fp::Lazy::Off
+    } else if bits == dirty {
+        kcore::fp::Lazy::Dirty
+    } else if bits == clean {
+        kcore::fp::Lazy::Clean
+    } else {
+        kcore::fp::Lazy::Initial
+    }
 }
 
 /// Save what the user left dirty in the FP and vector units without the big lock, when this hart's claim names the running thread (so its
@@ -349,10 +386,9 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
     let tid = crate::thread::current();
     let me = crate::percpu::this();
     if vsb == VS_DIRTY {
-        let buf = me.vs_buf.load(Acquire);
-        if me.vs_claim.load(Acquire) != tid || buf == 0 {
+        let Some(buf) = kcore::fp::light_target(&VecCells, me.index.load(Acquire), tid) else {
             return false;
-        }
+        };
         // SAFETY: the claim names the thread running here (set only under the object lock together with the holder and `vs_buf`; another hart clears it only when it
         // loads or saves the same thread, which cannot run in two places, and thread ids are never reused), so its registers are in this hart's unit and nothing else
         // touches its saved copy. `buf` is the address of that copy's box, which is freed or replaced only by `thread_gone` and `write_vec`'s replacement, each of which drops
@@ -361,10 +397,9 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
         frame.sstatus = (frame.sstatus & !VS_MASK) | VS_CLEAN;
     }
     if fsb == FS_DIRTY {
-        let buf = me.fs_buf.load(Acquire);
-        if me.fs_claim.load(Acquire) != tid || buf == 0 {
+        let Some(buf) = kcore::fp::light_target(&FpCells, me.index.load(Acquire), tid) else {
             return false;
-        }
+        };
         // SAFETY: as above, for the FP unit's copy (`fs_claim`, `fs_buf`; `write_fp`'s replacement drops the claim first, for a parked target) (T242).
         unsafe { HartUnit.save_into(&mut *(buf as *mut FpRegs)) };
         frame.sstatus = (frame.sstatus & !FS_MASK) | FS_CLEAN;
@@ -467,10 +502,9 @@ fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     // names the thread. The claim is set where the state is saved or loaded and is cleared when another hart saves or loads the thread's state.
     let tid = crate::thread::current();
     let me = crate::percpu::this();
-    let fs_ok = fsb == 0
-        || (fsb >= FS_CLEAN && me.fs_claim.load(core::sync::atomic::Ordering::Acquire) == tid);
-    let vs_ok = vsb == 0
-        || (vsb >= VS_CLEAN && me.vs_claim.load(core::sync::atomic::Ordering::Acquire) == tid);
+    let h = me.index.load(core::sync::atomic::Ordering::Relaxed);
+    let fs_ok = kcore::fp::quiet_return(&FpCells, h, tid, lazy_of(fsb, FS_CLEAN, FS_DIRTY));
+    let vs_ok = kcore::fp::quiet_return(&VecCells, h, tid, lazy_of(vsb, VS_CLEAN, VS_DIRTY));
     if fs_ok && vs_ok {
         return;
     }
@@ -632,22 +666,11 @@ fn credit_state(book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>, tid: u64) {
 pub fn thread_gone(tid: u64) {
     let s = state();
     // (a claim must not outlive the state it names)
-    for (t, fp) in [
-        (s.threads.get(&tid).and_then(|t| t.holder()), true),
-        (s.vthreads.get(&tid).and_then(|t| t.holder()), false),
-    ] {
-        if let Some(h) = t {
-            let p = crate::percpu::hart(h);
-            let (cell, buf) = if fp {
-                (&p.fs_claim, &p.fs_buf)
-            } else {
-                (&p.vs_claim, &p.vs_buf)
-            };
-            if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
-                cell.store(0, core::sync::atomic::Ordering::Release);
-                buf.store(0, core::sync::atomic::Ordering::Release);
-            }
-        }
+    if let Some(t) = s.threads.get(&tid) {
+        kcore::fp::drop_claim(&FpCells, t, &mut [], tid, false);
+    }
+    if let Some(t) = s.vthreads.get(&tid) {
+        kcore::fp::drop_claim(&VecCells, t, &mut [], tid, false);
     }
     s.threads.remove(&tid);
     s.vthreads.remove(&tid);
@@ -685,28 +708,12 @@ pub fn read_fp(tid: u64) -> [u64; 33] {
 
 /// Make the registers of the hart that holds `tid`'s state stale (its claim is dropped, so the return to user mode loads from the saved copy).
 fn drop_claim(s: &mut FpState, tid: u64, fp: bool) {
-    let holder = if fp {
-        s.threads.get(&tid).and_then(|t| t.holder())
-    } else {
-        s.vthreads.get(&tid).and_then(|t| t.holder())
-    };
-    if let Some(h) = holder {
-        let p = crate::percpu::hart(h);
-        let (cell, buf) = if fp {
-            (&p.fs_claim, &p.fs_buf)
-        } else {
-            (&p.vs_claim, &p.vs_buf)
-        };
-        // (only if the hart still holds this thread: another thread's load there has replaced the claim already)
-        if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
-            cell.store(0, core::sync::atomic::Ordering::Release);
-            buf.store(0, core::sync::atomic::Ordering::Release);
-            if fp {
-                s.harts[h].forget();
-            } else {
-                s.vharts[h].forget();
-            }
+    if fp {
+        if let Some(t) = s.threads.get(&tid) {
+            kcore::fp::drop_claim(&FpCells, t, &mut s.harts, tid, true);
         }
+    } else if let Some(t) = s.vthreads.get(&tid) {
+        kcore::fp::drop_claim(&VecCells, t, &mut s.vharts, tid, true);
     }
 }
 
