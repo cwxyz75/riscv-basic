@@ -20,6 +20,14 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct FakeMem {
     frames: HashMap<Pfn, Box<[u64; 512]>>,
+    /// Every frame read or written since the audit last looked (T176 4: each must be one the frame database manages, so a wild physical access cannot pass).
+    touched: std::cell::RefCell<std::collections::HashSet<Pfn>>,
+}
+
+impl FakeMem {
+    pub fn take_touched(&self) -> Vec<Pfn> {
+        self.touched.borrow_mut().drain().collect()
+    }
 }
 
 /// Non-zero while the fake machine allocates for itself.
@@ -27,6 +35,7 @@ pub static EXEMPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 impl PhysMem for FakeMem {
     fn read_u64(&self, pa: u64) -> u64 {
+        self.touched.borrow_mut().insert(pa >> 12);
         self.frames
             .get(&(pa >> 12))
             .map_or(0xdead_beef_dead_beef, |f| f[((pa & 0xfff) / 8) as usize])
@@ -34,6 +43,7 @@ impl PhysMem for FakeMem {
     fn write_u64(&mut self, pa: u64, value: u64) {
         // (the fake machine's own allocation of a frame's words is not the code under test: the allocation-failure sweep must not fail it)
         EXEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.touched.borrow_mut().insert(pa >> 12);
         self.frames
             .entry(pa >> 12)
             .or_insert_with(|| Box::new([0; 512]))[((pa & 0xfff) / 8) as usize] = value;
@@ -204,6 +214,13 @@ pub fn cleanup(w: &mut World) {
 /// Every audit; the first problem found.
 pub fn audit(w: &mut World) -> Result<(), String> {
     w.mm.db.audit()?;
+    for pfn in w.mm.mem.take_touched() {
+        if !w.mm.db.is_managed(pfn) {
+            return Err(format!(
+                "frame {pfn:#x} was read or written but the frame database does not manage it"
+            ));
+        }
+    }
     for o in w.handles.objects() {
         if !w.objs.is_alive(o) {
             return Err(format!("a handle names the dead object {o:?}"));

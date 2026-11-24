@@ -17,6 +17,7 @@ use abi::rights::Rights;
 use abi::Handle;
 use kcore::ipc::{self, KObj, Quota};
 use kcore::job::JobId;
+use kcore::object::ObjId;
 use kfuzz_gen::{Gen, Kind, Model, Window};
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
@@ -127,6 +128,13 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             }
         }
         at.set(("call", i));
+        // (T176 6: what the call may have changed is in the dirty log, which the kernel's wake-up pass reads: a signal word that moved, or an object that went, with no entry would never wake its waiters)
+        let before: Vec<(ObjId, u32)> = w
+            .objs
+            .live_ids()
+            .into_iter()
+            .filter_map(|o| ipc::signals_of_object(&w.objs, o).map(|s| (o, s)))
+            .collect();
         let r = match ksys::wide_argument_error(call.nr, &call.args) {
             Some(st) => Some(Err((st, None, None))), // refused before it runs, as in the kernel
             None => w.call(call.nr, call.args),
@@ -138,6 +146,32 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
         };
         if std::env::var("KFUZZ_TRACE").is_ok() {
             eprintln!("{i}: {call:?} -> {r:?}");
+        }
+        at.set(("dirty", i));
+        {
+            let mut logged: std::collections::HashSet<ObjId> =
+                w.objs.peek_dirty().iter().map(|&(o, _)| o).collect();
+            // (a port's READABLE follows what it binds: the wait table releases a port's waiters when something it binds is touched, L21a)
+            for (o, _) in &before {
+                if ipc::port_bound_objects(&w.objs, *o)
+                    .iter()
+                    .any(|b| logged.contains(b))
+                {
+                    logged.insert(*o);
+                }
+            }
+            for (o, was) in &before {
+                let now = ipc::signals_of_object(&w.objs, *o);
+                // (a signal that is only cleared wakes nobody: a waiter wants a bit that is set)
+                if now.is_none_or(|n| n & !*was != 0)
+                    && !logged.contains(o)
+                    && !w.objs.dirty_overflowed()
+                {
+                    return Err(format!(
+                        "seed {seed}, call {i} ({call:?}): {o:?} gained signals ({was:#x} to {now:?}) or died and the dirty log does not name it"
+                    ));
+                }
+            }
         }
         at.set(("observe", i));
         model.observe(&call, ok, a1, a2);

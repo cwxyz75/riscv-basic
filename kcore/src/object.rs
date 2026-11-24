@@ -372,6 +372,11 @@ impl<T: Object> Registry<T> {
         self.first_gen = n;
     }
 
+    /// Did the dirty log run out of room since it was last taken (it then names nothing in particular: everything is to be looked at)?
+    pub fn dirty_overflowed(&self) -> bool {
+        self.dirty_overflow
+    }
+
     /// Is anything waiting in the dirty log?
     pub fn has_dirty(&self) -> bool {
         !self.dirty.is_empty() || self.dirty_overflow
