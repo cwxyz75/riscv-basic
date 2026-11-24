@@ -295,6 +295,22 @@ fn scenarios() -> Vec<Scenario> {
             },
         },
         Scenario {
+            name: "a_garbage_cycle_is_swept",
+            run: |w, go| {
+                // y holds q and q holds y, in their queues: closing x and p leaves only the cycle
+                let (x, y) = w.pair(nr::CHANNEL_CREATE);
+                let (p, q) = w.pair(nr::CHANNEL_CREATE);
+                w.poke(BASE + 0x100, &q.to_le_bytes());
+                w.ok(nr::CHANNEL_WRITE, [x, BASE, 0, BASE + 0x100, 1, 0]);
+                w.poke(BASE + 0x100, &y.to_le_bytes());
+                w.ok(nr::CHANNEL_WRITE, [p, BASE, 0, BASE + 0x100, 1, 0]);
+                vec![
+                    go(w, nr::HANDLE_CLOSE, [x, 0, 0, 0, 0, 0]),
+                    go(w, nr::HANDLE_CLOSE, [p, 0, 0, 0, 0, 0]),
+                ]
+            },
+        },
+        Scenario {
             name: "closing_a_channel_with_a_queued_handle",
             run: |w, go| {
                 let (x, y) = w.pair(nr::CHANNEL_CREATE);
@@ -320,6 +336,12 @@ fn dispatch(w: &mut World, n: usize, a: [u64; 6]) -> Reply {
 /// What the kernel does at the end of every syscall, armed like the call: hand the dead to their cleanup (a VMO's pages, a job's record) and
 /// give the emptied vector back, and drain the dirty log.
 fn armed_cleanup(w: &mut World) {
+    // (T177: the sweep of what nothing can reach runs here too, under the failing allocator: it must give up without freeing anything reachable)
+    let mut roots: Vec<kcore::object::ObjId> = Vec::new();
+    if roots.try_reserve(w.handles.len()).is_ok() {
+        roots.extend(w.handles.objects());
+        w.objs.sweep(&roots);
+    }
     let mut dead = w.objs.drain_dead();
     for o in dead.drain(..) {
         match o {
