@@ -223,13 +223,15 @@ pub(super) fn wake_threads_of(pid: u64) {
 
 fn wake_threads_of_held(pid: u64) {
     // (the process's own set of live threads: not a walk of every thread in the system, T191)
-    let tids: Vec<Tid> = with_state(|s| {
-        s.procs
-            .get(&pid)
-            .map(|p| p.live_tids.iter().copied().collect())
-            .unwrap_or_default()
+    crate::heap::nofail(|| {
+        let tids: Vec<Tid> = with_state(|s| {
+            s.procs
+                .get(&pid)
+                .map(|p| p.live_tids.iter().copied().collect())
+                .unwrap_or_default()
+        });
+        thread::wake_many(&tids);
     });
-    thread::wake_many(&tids);
 }
 
 pub(super) fn request_kill(pid: u64, code: i32) {

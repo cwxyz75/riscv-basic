@@ -360,6 +360,16 @@ impl<T: Object> Registry<T> {
         }
     }
 
+    /// How many bindings of `port` name `obj`, as the index has them (audits).
+    pub fn bound_count(&self, obj: ObjId, port: ObjId) -> u32 {
+        self.bound_by.get(&(obj, port)).copied().unwrap_or(0)
+    }
+
+    /// Did an insert into the index find no reserved room (it must never: `bound_reserve` comes first)?
+    pub fn bound_short_inserts(&self) -> u32 {
+        self.bound_by.short_inserts()
+    }
+
     /// How many (object, port) pairs are recorded (audits).
     pub fn bound_pairs(&self) -> usize {
         self.bound_by.len()

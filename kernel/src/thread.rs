@@ -586,19 +586,21 @@ fn spawn_with_affinity(
 fn register_kthread(thread: KThread, prio: Prio, affinity: Option<usize>) -> Tid {
     // (class N: the scheduler's queues, timers and maps grow here, and a thread that has been made cannot be refused; `prepare_user_thread` made the
     // room that can be refused: the stack)
-    heap::nofail(|| register_kthread_inner(thread, prio, affinity))
+    register_kthread_inner(thread, prio, affinity)
 }
 
 #[allow(clippy::expect_used)] // INVARIANT: as above
 fn register_kthread_inner(thread: KThread, prio: Prio, affinity: Option<usize>) -> Tid {
     irq::off(|| {
-        let mut k = kernel();
-        let tid = sched()
-            .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
-            .expect("valid priority");
-        k.threads.insert(tid, thread);
-        note_resched();
-        tid
+        heap::nofail(|| {
+            let mut k = kernel();
+            let tid = sched()
+                .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
+                .expect("valid priority");
+            k.threads.insert(tid, thread);
+            note_resched();
+            tid
+        })
     })
 }
 
@@ -1208,27 +1210,31 @@ pub fn push_owed() {
 /// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
 /// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
 pub fn pi_donate(from: Tid, to: Tid) {
-    irq::off(|| {
-        pi_op(|d| match d.donate(from, to) {
-            Ok(ch) => ((), ch.as_slice().to_vec()),
-            Err(e) => {
-                // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
-                if matches!(
-                    e,
-                    kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
-                ) {
-                    DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+    heap::nofail(|| {
+        irq::off(|| {
+            pi_op(|d| match d.donate(from, to) {
+                Ok(ch) => ((), ch.as_slice().to_vec()),
+                Err(e) => {
+                    // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
+                    if matches!(
+                        e,
+                        kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
+                    ) {
+                        DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ((), alloc::vec::Vec::new())
                 }
-                ((), alloc::vec::Vec::new())
-            }
+            });
         });
     });
 }
 
 /// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
 pub fn pi_revoke(tid: Tid) {
-    irq::off(|| {
-        pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
+    heap::nofail(|| {
+        irq::off(|| {
+            pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
+        });
     });
 }
 
@@ -1245,8 +1251,10 @@ pub fn pi_register(tid: Tid) {
 
 /// A user thread leaves the graph (it has exited): the donations it made and received lapse. Big lock held.
 pub fn pi_gone(tid: Tid) {
-    irq::off(|| {
-        pi_op(|d| ((), d.remove_thread(tid).as_slice().to_vec()));
+    heap::nofail(|| {
+        irq::off(|| {
+            pi_op(|d| ((), d.remove_thread(tid).as_slice().to_vec()));
+        });
     });
 }
 

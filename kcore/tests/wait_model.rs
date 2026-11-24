@@ -147,6 +147,7 @@ fn run(seed: u64) {
             |_, _| false,
             dirty,
         );
+        audit_bound_index(&reg).unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
         waits
             .audit(|o| reg.get(o).is_some())
             .unwrap_or_else(|e| panic!("seed {seed} step {step}: audit: {e}"));

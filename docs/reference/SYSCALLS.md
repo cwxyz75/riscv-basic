@@ -309,7 +309,7 @@ Errors: BAD_HANDLE. Tests: `object_info_names_objects_and_peers`.
 Blocks the calling thread until `signals(handle) & mask != 0` or the clock reaches
 `deadline` (absolute nanoseconds, as `clock_get` counts; `0` means "do not wait", `u64::MAX`
 "forever"). The result `observed` is the signal word when the call returned (also on
-TIMED_OUT).
+TIMED_OUT). NO_MEMORY (nothing changed) when the kernel cannot make the thread's record in the wait table, which it needs before the thread can sleep; `port_wait`, `port_wait_many` and `channel_call` can report it for the same reason, before anything is sent.
 Rights: WAIT on `handle`. Blocking: until a signal in `mask` is set, the deadline, or the
 process is killed.
 Effects: none (waiting changes no signal).
