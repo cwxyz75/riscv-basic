@@ -186,6 +186,9 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
                     "{ctx}"
                 );
             }
+            // ML1: the two spaces' regions are exactly the VMOs' lists of mappings
+            vmos.audit_maps(&asp.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|e| panic!("{ctx}: {e}"));
             let prepaid: u64 = asp.iter().map(|a| a.reserved_pages()).sum();
             assert_eq!(
                 jobs.usage(job).unwrap().get(Resource::Pages),

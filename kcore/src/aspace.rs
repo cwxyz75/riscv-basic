@@ -237,6 +237,16 @@ struct Vmo {
     had_parent: bool,
     /// Made by `pager_create_vmo` (MM9): the pager and the key its requests carry. A page nobody has supplied is not zero: it is asked for.
     pager: Option<(u64, u64)>,
+    /// The regions that map this VMO (T207 ML1): (the address space's owner id, the region's base) to what the region maps. Kept by `AddressSpace`
+    /// under its own lock and the VMO store's, so a holder of either sees its side stable. `refs` counts one reference for each entry.
+    maps: crate::fmap::FMap<(u64, u64), MapRef>,
+}
+
+/// What a region says about its window onto the VMO (a copy kept in the VMO's `maps`; ML1 says it equals the region's own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapRef {
+    pub pages: u64,
+    pub vmo_page: u64,
 }
 
 struct VmoSlot {
@@ -364,6 +374,94 @@ impl Vmos {
         v
     }
 
+    // ---- the lists of mappings (T207 ML1): kept by `AddressSpace`, which calls these with its own owner id ----
+
+    /// Room for one more entry in `id`'s list of mappings, before the caller changes anything (class R: `Err` is no memory, or no such VMO).
+    fn maps_reserve(&mut self, id: u64) -> Result<(), ()> {
+        let v = Self::vmo_in(&mut self.slots, id).ok_or(())?;
+        v.maps.reserve(1).map_err(|_| ())
+    }
+
+    /// Record a region (after `maps_reserve`).
+    fn maps_insert(&mut self, id: u64, key: (u64, u64), m: MapRef) {
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            v.maps.insert_reserved(key, m);
+        }
+    }
+
+    fn maps_remove(&mut self, id: u64, key: (u64, u64)) {
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            v.maps.remove(&key);
+        }
+    }
+
+    /// A region's window changed: its page count (a split's lower half, a merge's union).
+    fn maps_set_pages(&mut self, id: u64, key: (u64, u64), pages: u64) {
+        if let Some(m) = Self::vmo_in(&mut self.slots, id).and_then(|v| v.maps.get_mut(&key)) {
+            m.pages = pages;
+        }
+    }
+
+    /// A region's start moved up inside its own gap (a teardown cuts it from the front): the same entry under a new base, allocating nothing.
+    fn maps_shift(&mut self, id: u64, owner: u64, old: u64, new: u64, m: MapRef) {
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            if v.maps.rekey(&(owner, old), (owner, new)) {
+                if let Some(e) = v.maps.get_mut(&(owner, new)) {
+                    *e = m;
+                }
+            }
+        }
+    }
+
+    /// The regions that map `id`, in (owner, base) order.
+    pub fn mappings(&self, id: u64) -> alloc::vec::Vec<((u64, u64), MapRef)> {
+        self.vmo(id)
+            .map(|v| v.maps.iter().map(|(k, m)| (*k, *m)).collect())
+            .unwrap_or_default()
+    }
+
+    /// ML1, checked: every region of every space in `spaces` has its entry in its VMO's list with the same window, every entry names a region of one of
+    /// them, and every VMO holds one reference for each entry (the rest of `refs` are handles and children, which this does not know).
+    pub fn audit_maps<F: PageTableFormat>(
+        &self,
+        spaces: &[&AddressSpace<F>],
+    ) -> Result<(), alloc::string::String> {
+        use alloc::format;
+        let mut seen = 0usize;
+        for sp in spaces {
+            for (&base, r) in sp.regions.iter() {
+                let v = self.vmo(r.vmo).ok_or_else(|| {
+                    format!(
+                        "region {base:#x} of owner {} maps a VMO that is gone",
+                        sp.owner
+                    )
+                })?;
+                match v.maps.get(&(sp.owner, base)) {
+                    Some(m) if *m == (MapRef { pages: r.pages, vmo_page: r.vmo_page }) => {}
+                    other => {
+                        return Err(format!(
+                            "ML1: region {base:#x} of owner {} says {} pages from {} but the VMO lists {other:?}",
+                            sp.owner, r.pages, r.vmo_page
+                        ))
+                    }
+                }
+                seen = seen.saturating_add(1);
+            }
+        }
+        let listed: usize = self
+            .slots
+            .iter()
+            .filter_map(|s| s.vmo.as_ref())
+            .map(|v| v.maps.len())
+            .sum();
+        if listed != seen {
+            return Err(format!(
+                "ML1: the VMOs list {listed} mappings, the spaces hold {seen} regions"
+            ));
+        }
+        Ok(())
+    }
+
     /// A new lazily committed VMO of `pages` pages (nothing allocated yet), charged to the
     /// root job (the kernel's own VMOs).
     pub fn create(&mut self, jobs: &mut Jobs, pages: u64) -> u64 {
@@ -385,6 +483,7 @@ impl Vmos {
             children: alloc::vec::Vec::new(),
             hidden: false,
             had_parent: false,
+            maps: crate::fmap::FMap::new(),
             pager: None,
             inherit: 0,
         })
@@ -406,6 +505,7 @@ impl Vmos {
             children: alloc::vec::Vec::new(),
             hidden: false,
             had_parent: false,
+            maps: crate::fmap::FMap::new(),
             pager: None,
             inherit: 0,
         })
@@ -452,6 +552,7 @@ impl Vmos {
             children: alloc::vec::Vec::new(),
             hidden: false,
             had_parent: false,
+            maps: crate::fmap::FMap::new(),
             pager: None,
             inherit: 0,
         }))
@@ -915,6 +1016,7 @@ impl Vmos {
             children: stash,
             hidden: false,
             had_parent: false,
+            maps: crate::fmap::FMap::new(),
             pager: None,
             inherit: 0,
         }))
@@ -983,6 +1085,7 @@ impl Vmos {
                         children: kids,
                         hidden: true,
                         had_parent: old_parent.is_some(),
+                        maps: crate::fmap::FMap::new(),
                         pager: None,
                         inherit: old_inherit,
                     });
@@ -1243,6 +1346,10 @@ impl Vmos {
             }
             jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
             jobs.release(vmo.job);
+            debug_assert!(
+                vmo.maps.is_empty(),
+                "ML1: a VMO went with a region still listed on it"
+            );
             let mut committed = vmo.committed;
             committed.drain_pfns(|pfn| {
                 let dropped = mm.db.dec(pfn);
@@ -1846,7 +1953,13 @@ pub struct AddressSpace<F: PageTableFormat = Sv39> {
     replaced: u64,
     /// Most regions this space may hold: the job's quota as the caller last set it (`set_region_limit`), never above `MAX_REGIONS` (PL8).
     region_limit: usize,
+    /// The id the VMOs' lists of mappings know this space by (T207 ML1): unique among spaces, never reused (a counter), so a walker that has gone
+    /// past one owner cannot meet it again.
+    owner: u64,
 }
+
+/// The next owner id.
+static NEXT_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 impl<F: PageTableFormat> AddressSpace<F> {
     /// An address space with a vacant table and no regions (the placeholder of a pooled cell, see `PageTable::vacant`).
@@ -1862,7 +1975,13 @@ impl<F: PageTableFormat> AddressSpace<F> {
             next_gen: 1,
             replaced: 0,
             region_limit: abi::limits::MAX_REGIONS,
+            owner: NEXT_OWNER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// This space's id in the VMOs' lists of mappings.
+    pub fn owner(&self) -> u64 {
+        self.owner
     }
 
     /// Set the most regions this space may hold (the job's quota: `Jobs::region_limit`); the hard backstop `MAX_REGIONS` caps it. A space already over it keeps its
@@ -1947,6 +2066,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         // (KT9: the room for the entry before anything changes; no memory is `TooMany` as well, and reaches the caller as NO_MEMORY just the same)
         self.regions.reserve(1).map_err(|_| RegionError::TooMany)?;
+        vmos.maps_reserve(vmo).map_err(|_| RegionError::TooMany)?;
         // Overlap with the previous region or any region starting inside this one.
         if let Some((&s, r)) = self.regions.range(..=start).next_back() {
             if s + r.pages * PAGE_SIZE > start {
@@ -1970,6 +2090,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
             },
         );
         self.next_gen = self.next_gen.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
+        vmos.maps_insert(vmo, (self.owner, start), MapRef { pages, vmo_page });
         Ok(())
     }
 
@@ -2089,6 +2210,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         let (vmo, vmo_page, perms, max_perms, pages) =
             (r.vmo, r.vmo_page, r.perms, r.max_perms, r.pages);
         self.regions.reserve(1).map_err(|_| RegionError::TooMany)?;
+        vmos.maps_reserve(vmo).map_err(|_| RegionError::TooMany)?;
         vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
         let (lower_gen, upper_gen) = (self.next_gen, self.next_gen.saturating_add(1));
         self.next_gen = self.next_gen.saturating_add(2);
@@ -2105,6 +2227,15 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 perms,
                 max_perms,
                 gen: upper_gen,
+            },
+        );
+        vmos.maps_set_pages(vmo, (self.owner, start), lower_pages);
+        vmos.maps_insert(
+            vmo,
+            (self.owner, va),
+            MapRef {
+                pages: pages - lower_pages,
+                vmo_page: vmo_page + lower_pages,
             },
         );
         Ok(())
@@ -2286,7 +2417,9 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 if let Some(x) = self.regions.get_mut(&cur) {
                     x.pages += y.pages;
                     x.gen = gen;
+                    vmos.maps_set_pages(y.vmo, (self.owner, cur), x.pages);
                 }
+                vmos.maps_remove(y.vmo, (self.owner, next));
                 let _ = vmos.release(mm, jobs, y.vmo);
             }
         }
@@ -2381,6 +2514,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         start: u64,
     ) -> Result<(), RegionError> {
         let region = self.regions.remove(&start).ok_or(RegionError::NoRegion)?;
+        vmos.maps_remove(region.vmo, (self.owner, start));
         for p in 0..region.pages {
             if let Some((pfn, _)) = self.table.unmap(mm, start + p * PAGE_SIZE) {
                 if !mm.db.is_managed(pfn) {
@@ -2672,13 +2806,20 @@ impl<F: PageTableFormat> AddressSpace<F> {
             };
             if n == r.pages {
                 if let Some(region) = self.regions.remove(&start) {
+                    vmos.maps_remove(region.vmo, (self.owner, start));
                     let _ = vmos.release(mm, jobs, region.vmo);
                 }
             } else {
                 r.pages -= n;
                 r.vmo_page += n;
+                let moved = MapRef {
+                    pages: r.pages,
+                    vmo_page: r.vmo_page,
+                };
+                let vmo = r.vmo;
                 // (the region's start moves up inside its own gap: the same entry under a new key, which allocates nothing)
                 self.regions.rekey(&start, start + n * PAGE_SIZE);
+                vmos.maps_shift(vmo, self.owner, start, start + n * PAGE_SIZE, moved);
             }
         }
         self.regions.is_empty()

@@ -223,6 +223,9 @@ fn range_unmap_protect_split_and_merge_agree_with_a_per_page_model() {
                     && x.max_perms == y.max_perms;
                 assert!(!mergeable, "{ctx}: two regions that should have merged");
             }
+            // ML1: every region is in its VMO's list of mappings with the same window, and nothing else is
+            vmos.audit_maps(&[&a])
+                .unwrap_or_else(|e| panic!("{ctx}: {e}"));
             // translations: the model's permissions, the VMO's frame, and each frame's references
             let mut mappers: std::collections::BTreeMap<u64, u64> = Default::default();
             for p in 0..WIN {
