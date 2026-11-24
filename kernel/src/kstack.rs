@@ -99,6 +99,7 @@ impl DerefMut for KStack {
 impl Drop for KStack {
     fn drop(&mut self) {
         let slot = self.slot;
+        LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         slots().free.push(slot);
     }
 }
@@ -151,6 +152,9 @@ fn make_slot(s: &mut Slots) -> Option<u32> {
     Some(slot)
 }
 
+/// How many kernel stacks are in use (one per thread): the allocator's reserve for the allocations that cannot be refused grows with it (KT9, `heap::reserve`).
+pub static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// A zeroed kernel stack, or `None` if there is no slot or no memory.
 pub fn alloc() -> Option<KStack> {
     let slot = {
@@ -160,6 +164,7 @@ pub fn alloc() -> Option<KStack> {
             None => make_slot(&mut s)?,
         }
     };
+    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut stack = KStack { slot };
     stack.fill(0); // a recycled stack starts clean (and `thread::stack_high_water` relies on it)
     Some(stack)

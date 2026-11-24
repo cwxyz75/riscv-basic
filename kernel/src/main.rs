@@ -193,6 +193,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
             core::hint::spin_loop();
         }
     }
+    heap::enable_reserve(); // (from here class R is refused below the reserve, KT9)
     timer::start();
     irq::enable_timer_interrupt();
     irq::enable();

@@ -180,3 +180,5 @@ kernel/src/user/aslocks.rs	ea0f814cdb76	ok	Scratch is a Vec that is touched only
 kernel/src/user/aslocks.rs	d7e7bbea1fb8	ok	boot, one hart running and the scratch not yet handed out; the reference is dropped at the end of the statement
 kernel/src/user/aslocks.rs	ecfbffc7c827	ok	take_scratch: the big lock is held (AsLocks::all runs inside locked_state/with_state); the reference lives for the one mem::take
 kernel/src/user/aslocks.rs	36b79689f874	ok	put_scratch: as take_scratch, the lock is held when an AsLocks drops (its holds are released first, then the vector is put back)
+kernel/src/heap.rs	f48533a74165	ok	the impl forwards as before; the only change since the last row is the gate inside `alloc`: a class-R request that would leave the free bytes below the reserve returns null (a valid answer), decided inside the HEAP section, with the hart-local class-N check made with interrupts off
+kernel/src/heap.rs	fc1ab716c944	ok	the contract is as before: null on refusal, a pointer into the heap otherwise; the gate reads only atomics and the hart own held-lock stack (interrupts off), allocates nothing and returns before the free lists are touched

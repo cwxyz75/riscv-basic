@@ -117,6 +117,13 @@ allocation aborts on failure: a child that dies is reported with the scenario, t
 allocation. A child that survives must have returned NO_MEMORY from the call that met the failure, the same call must
 succeed when repeated with memory, and the state must pass the fuzzer's audits. `cargo test` runs the one-failure mode;
 `make os-allocfail` (overnight) adds the persistent mode, where every allocation from the N-th on fails.
+The guest half (`make os-fault-alloc` family, `init/src/bin/suite.rs` "alloc sweep") does the same in the real kernel: the suite thread arms the
+N-th allocation (`debug_stat` 200), runs a scenario, disarms (201) and checks that no VMO or object was left behind (204, 206, after a reachability
+sweep, 205). The epilogue of every call (wake commit, cleanup, copy-on-write sync) is **counted**, not exempt: what it allocates is either
+allocation-free (the wait table, the address-space scratch), refused with `NO_MEMORY` at an R point, or in `heap::nofail` (class N, counted per file by
+`scripts/check_docs.py`). After the one-failure sweep of a scenario a **persistent pass** (`debug_stat` 208) fails every class-R allocation from the
+first on, with class N exempt as the reserve makes it: nothing may panic or leak. (A scenario that touches a lazily committed page is left out of
+that pass: its fault ends the process, which is the right answer, and the process is the one running the suite.)
 `KALLOC_SCENARIO=<name>` and `KALLOC_MAX=<n>` run one scenario; `KALLOC_CHILD=<scenario>:<n>[:persist]` replays one case.
 
 **Mutation testing.** `make os-mutants` (overnight; cargo-mutants) mutates `kcore` and `klock` with their host tests as
