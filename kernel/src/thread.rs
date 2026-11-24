@@ -642,6 +642,7 @@ fn switch_done() {
 /// The thread this hart replaced, if it has exited and nobody will join it, is dead now: its context is saved, so its stack is in
 /// nobody's use (SCHED-SMP-SPEC 3.6: `Dead`, then reap by the hart; the reaper thread this replaced needed a wake and a switch for
 /// every thread that ended). The big kernel lock is held, so the table is ours.
+#[inline(never)]
 fn reap_prev() {
     let prev = crate::percpu::this().prev.swap(0, Ordering::Relaxed);
     if prev != 0 {
@@ -651,6 +652,7 @@ fn reap_prev() {
 
 /// Free `tid` if it is an exited detached thread (a joined one is freed by its joiner). The caller has completed the switch away
 /// from it and holds the big kernel lock.
+#[inline(never)]
 fn reap_if_dead(tid: Tid) {
     let mut k = kernel();
     // (not while it is in transit: `prev` is consumed after the lock is taken again, which can wait, and by then the thread may have
@@ -667,10 +669,16 @@ fn reap_if_dead(tid: Tid) {
             // class, which comes before it in the order)
             let gone = k.threads.remove(&tid);
             drop(k);
-            if let Some(t) = gone {
-                note_stack_use(tid, &t);
-            }
+            drop_reaped(tid, gone);
         }
+    }
+}
+
+/// Record the stack use of a reaped thread and free it, in a frame of its own (the stack pages and their tables are released here).
+#[inline(never)]
+fn drop_reaped(tid: Tid, gone: Option<KThread>) {
+    if let Some(t) = gone {
+        note_stack_use(tid, &t);
     }
 }
 
@@ -1759,7 +1767,7 @@ static STACK_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 #[cfg(not(kernel_optimized))]
 pub const STACK_BUDGET: usize = 8 * 1024;
 #[cfg(kernel_optimized)]
-pub const STACK_BUDGET: usize = 12 * 1024;
+pub const STACK_BUDGET: usize = 9 * 1024;
 
 /// The first thread seen over the budget: its stack use, or 0 while none is (the thread's id is in `OVER_BUDGET_TID`; atomics only, so the
 /// check at a thread's exit is lock-free).
@@ -1808,7 +1816,9 @@ pub fn exempt_from_stack_budget() {
 }
 static EXEMPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: i is below 16 (take(16)), so i % 8 * 8 is below 64 and the shift cannot overflow; the byte is shifted into its own lane
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: i is below 16 (take(16)), so i % 8 * 8 is below 64 and the shift cannot overflow; the byte is shifted into its own lane
+#[inline(never)]
 fn note_stack_use(tid: Tid, t: &KThread) {
     if let Some(stack) = t.stack.as_ref() {
         let used = stack_used(stack);
