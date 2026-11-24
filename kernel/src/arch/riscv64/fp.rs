@@ -517,11 +517,13 @@ fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     } else {
         Some(match s.threads.get_mut(&tid) {
             Some(t) => {
+                // (asked before the load: afterwards the hart holds the thread's state whatever it held)
+                let was_held = s.harts[hart()].holds(t);
                 let fs = s.harts[hart()].return_to_user(t, &mut HartUnit);
                 claim(t, &mut s.harts, tid, hart(), true);
                 // dirty state still in the unit (a trap that skipped `trap_entry`) is the thread's own
                 debug_assert!(
-                    fsb != FS_DIRTY || s.harts[hart()].holds(t),
+                    fsb != FS_DIRTY || was_held,
                     "returning to a thread with unsaved dirty FP state that is not in this hart's unit"
                 );
                 fs
@@ -534,10 +536,11 @@ fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     } else {
         Some(match s.vthreads.get_mut(&tid) {
             Some(t) => {
+                let was_held = s.vharts[hart()].holds(t);
                 let vs = s.vharts[hart()].return_to_user(t, &mut VecHartUnit);
                 claim(t, &mut s.vharts, tid, hart(), false);
                 debug_assert!(
-                    vsb != VS_DIRTY || s.vharts[hart()].holds(t),
+                    vsb != VS_DIRTY || was_held,
                     "returning to a thread with unsaved dirty vector state that is not in this hart's unit"
                 );
                 vs
