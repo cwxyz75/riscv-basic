@@ -14793,6 +14793,47 @@ fn jobs_do_not_leak() -> Outcome {
     Ok(())
 }
 
+/// T249: the page index of a VMO is charged to its job as kernel bytes, one 528-byte leaf per 64 pages touched, and given back with the VMO. A job
+/// too small for a leaf has the write refused (NO_MEMORY) with its usage unchanged.
+fn the_page_index_is_charged_to_the_job() -> Outcome {
+    const LEAF: u64 = 528;
+    let root = root_job()?;
+    let j = job(root, 4, 4, 64)?;
+    let (before, _) = job_use(j, 8)?;
+    let v = ok(sys::vmo_create_in(64 * 40, j), "a VMO of 40 leaves")?.a1 as u64;
+    // (the VMO's own object body and handle are kernel bytes too: the leaves are what moves from here)
+    let (base, _) = job_use(j, 8)?;
+    for k in 0..8u64 {
+        ok(
+            sys::vmo_write(v, k * 64 * 4096, b"x".as_ptr(), 1),
+            "touch one page of a new leaf",
+        )?;
+    }
+    // (another page of a leaf that exists costs nothing more)
+    ok(sys::vmo_write(v, 4096, b"y".as_ptr(), 1), "same leaf")?;
+    ensure_eq!(job_use(j, 8)?.0, base + 8 * LEAF, "eight leaves charged");
+    // half the VMO gone: its leaves with it
+    ok(
+        sys::vmo_decommit(v, 0, 4 * 64 * 4096),
+        "decommit four leaves",
+    )?;
+    ensure_eq!(job_use(j, 8)?.0, base + 4 * LEAF, "four leaves credited");
+    sys::handle_close(v);
+    job_use_settles(j, 8, before, 500)?;
+    // a job whose one page allows 512 kernel bytes cannot hold a leaf
+    let tiny = job(root, 1, 1, 1)?;
+    let t = ok(sys::vmo_create_in(64, tiny), "a VMO in a tiny job")?.a1 as u64;
+    let tb = job_use(tiny, 8)?.0;
+    let r = sys::vmo_write(t, 0, b"x".as_ptr(), 1);
+    ensure_eq!(st(r), Some(S::NoMemory), "no room for the leaf");
+    ensure_eq!(job_use(tiny, 8)?.0, tb, "nothing was charged");
+    ensure_eq!(job_use(tiny, 2)?.0, 0, "no page either");
+    for h in [t, tiny, j, root] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 /// MM2: contiguous runs come from the buddy allocator and go back to it. The most one DMA object may hold is 64 pages (`MAX_DMA_PAGES`;
 /// PL8 derives the limits from RAM later), and 1024 pages may be held in all: runs of 64 pages are made and closed many times, several
 /// live at once (each at its own address, all in RAM, none overlapping), and runs of an odd length round up and give the tail back.
@@ -16651,6 +16692,7 @@ pub fn app_main() -> i32 {
             job_kill_ends_every_process_below_and_forbids_more,
         ),
         ("jobs_do_not_leak", jobs_do_not_leak),
+        ("the_page_index_is_charged_to_the_job", the_page_index_is_charged_to_the_job),
         (
             "dma_runs_are_allocated_and_freed_repeatedly",
             dma_runs_are_allocated_and_freed_repeatedly,
