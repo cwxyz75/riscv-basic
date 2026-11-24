@@ -79,6 +79,10 @@ fn helper_main(_: usize) {
                     // the conformance program image (AB9)
                     let _ = end.write_with_vmo(&msg[..5], user::ABI_CONFORMANCE_ELF);
                 }
+                b'F' => {
+                    // the guest fuzzer's program image (KT8)
+                    let _ = end.write_with_vmo(&msg[..5], user::KFUZZ_ELF);
+                }
                 b'H' => {
                     // the `hello` program image, for the runtime tests
                     let _ = end.write_with_vmo(&msg[..5], user::HELLO_ELF);

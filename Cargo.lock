@@ -270,6 +270,7 @@ dependencies = [
  "http1",
  "ish",
  "kcore",
+ "kfuzz-gen",
  "libsys",
  "memfs",
  "mounts",
