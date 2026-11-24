@@ -30,6 +30,9 @@ def newest(name):
 def main():
     archives = [a for a in (newest("liblua.a"), newest("libctests.a")) if a]
     if not archives:
+        if os.environ.get("REQUIRE_C_ARCHIVES"):
+            print("check_vector_codegen: FAILED: no C archive was built and REQUIRE_C_ARCHIVES is set")
+            return 1
         print("check_vector_codegen: no C archive was built (no RISC-V clang?), skipped")
         return 0
     tool = objdump()

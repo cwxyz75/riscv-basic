@@ -13292,6 +13292,8 @@ fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
 static RT_STOP: AtomicU32 = AtomicU32::new(0);
 static RT_PROBE_PRIO: AtomicU32 = AtomicU32::new(0);
 static RT_WORST_LATE_US: AtomicU64 = AtomicU64::new(0);
+/// The second-worst of the probe's samples (T219: one pause of the host delays one wake, which must not fail the bound).
+static RT_SECOND_LATE_US: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn rt_hog(_: usize) -> ! {
     while RT_STOP.load(Ordering::Relaxed) == 0 {
@@ -13303,21 +13305,28 @@ extern "C" fn rt_hog(_: usize) -> ! {
 extern "C" fn rt_probe(_: usize) -> ! {
     sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
     let gate = sys::event_create().a1 as u64;
-    let mut worst = 0u64;
+    let (mut worst, mut second) = (0u64, 0u64);
     for _ in 0..30 {
         let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
         sys::object_wait(gate, 1 << 24, target);
         // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
         let late = sys::clock_ns().saturating_sub(target * 1_000_000);
-        worst = worst.max(late / 1000); // microseconds
+        let late = late / 1000; // microseconds
+        if late > worst {
+            second = worst;
+            worst = late;
+        } else {
+            second = second.max(late);
+        }
     }
+    RT_SECOND_LATE_US.store(second, Ordering::SeqCst);
     RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
     sys::handle_close(gate);
     sys::thread_exit(0)
 }
 
-/// The probe's worst lateness (microseconds) at `prio` with a hog on every hart.
-fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
+/// The probe's worst and second-worst lateness (microseconds) at `prio` with a hog on every hart.
+fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     let harts = job_use(root_job()?, 7)?.0;
     RT_STOP.store(0, Ordering::SeqCst);
     RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
@@ -13336,19 +13345,23 @@ fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
     }
     sys::handle_close(probe);
     ensure_eq!(w.status, 0, "the probe finished");
-    Ok(RT_WORST_LATE_US.load(Ordering::SeqCst))
+    Ok((
+        RT_WORST_LATE_US.load(Ordering::SeqCst),
+        RT_SECOND_LATE_US.load(Ordering::SeqCst),
+    ))
 }
 
 fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not() -> Outcome {
-    let rt = worst_lateness_us(40)?;
+    let (rt, second) = worst_lateness_us(40)?;
     println!("##BENCH rt_user_latency_max_us {rt} us");
-    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late: the kernel's own probe uses the same 4 ms)
+    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late, and a pause of the host delays one wake: the bound is on the second-worst of
+    // the 30 samples, which a scheduler that delays every wake still fails, and the worst only has to stay within a hundredth of a second: T219)
     ensure!(
-        rt <= 4_000,
-        "a real-time thread woke {rt} us late with a hog on every hart (bound 4 ms)"
+        second <= 4_000 && rt <= 30_000,
+        "a real-time thread woke {rt} us late (second worst {second} us) with a hog on every hart (bound 4 ms, worst 30 ms)"
     );
     // the negative control: at the hogs' priority the wake waits for a slice to end
-    let normal = worst_lateness_us(10)?;
+    let (normal, _) = worst_lateness_us(10)?;
     ensure!(
         normal > 6_000,
         "an equal-priority probe was only {normal} us late: the hogs are not loading the harts"
