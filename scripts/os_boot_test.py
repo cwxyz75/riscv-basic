@@ -1309,6 +1309,10 @@ def main() -> int:
     for kernel, expect_fail, required, label in runs:
         lines, status, timed_out, text = run(kernel)
         found = problems(lines, status, timed_out, expect_fail, required)
+        want = os.environ.get("OS_REQUIRE_LINE")
+        if want and want not in text and not expect_fail:
+            # (KT9) a run meant to exercise a build feature (the allocation-failure sweep) must show that it did, or a kernel built without it passes vacuously
+            found.append(f"OS_REQUIRE_LINE: the output has no {want!r}")
         # a recording is kept only for a failing boot (the fail-demo kernel fails by design: it is the acceptance check)
         if LAST_RECORD[0] and os.path.exists(LAST_RECORD[0]):
             if found or expect_fail:
