@@ -35,6 +35,13 @@ pub struct ObjId {
     gen: u64,
 }
 
+impl ObjId {
+    /// A word to hash the id by (the wait table's buckets).
+    pub fn hash_bits(self) -> u64 {
+        u64::from(self.index) ^ self.gen.rotate_left(32)
+    }
+}
+
 /// What the registry needs from the objects it stores.
 pub trait Object {
     /// The ids this object holds references to (queued handles, for a channel).
@@ -120,6 +127,9 @@ pub struct Registry<T: Object> {
     dirty_overflow: bool,
     /// Requests of `channel_call`s that were read since the last `take_dequeued_calls` (L22): the calling thread and the transaction id.
     dequeued_calls: Vec<(u64, u64)>,
+    /// Which ports bind which objects, kept from the bind to the unbind (KT9, T177: the wait table asks it which ports a touch of an object can release, so
+    /// a wait registers nothing about the ports it waits on): (object, port) to how many bindings of the port name the object.
+    bound_by: crate::fmap::FMap<(ObjId, ObjId), u32>,
     /// Handles removed since the last `take_gone` (L21c): the object, the identity of the table and the handle's value. Bindings of a port made through
     /// one of them end.
     gone: Vec<(ObjId, u64, u64)>,
@@ -211,6 +221,7 @@ impl<T: Object> Registry<T> {
             credits: Vec::with_capacity(PREALLOC_SLOTS),
             dirty: Vec::with_capacity(DIRTY_RESERVE),
             dirty_overflow: false,
+            bound_by: crate::fmap::FMap::new(),
             gone: Vec::new(),
             dequeued_calls: Vec::new(),
             work: Vec::with_capacity(PREALLOC_SLOTS),
@@ -309,6 +320,49 @@ impl<T: Object> Registry<T> {
 
     pub fn take_gone(&mut self) -> Vec<(ObjId, u64, u64)> {
         core::mem::take(&mut self.gone)
+    }
+
+    /// Room for one more `bound_add` (an R point: `port_bind`).
+    pub fn bound_reserve(&mut self) -> Result<(), crate::fmap::NoMem> {
+        self.bound_by.reserve(1)
+    }
+
+    /// `port` binds `obj` once more (with the room `bound_reserve` made).
+    pub fn bound_add(&mut self, obj: ObjId, port: ObjId) {
+        let n = self.bound_by.get(&(obj, port)).copied().unwrap_or(0);
+        self.bound_by
+            .insert_reserved((obj, port), n.saturating_add(1));
+    }
+
+    /// `port` binds `obj` once less (removal never allocates).
+    pub fn bound_remove(&mut self, obj: ObjId, port: ObjId) {
+        match self.bound_by.get(&(obj, port)).copied() {
+            Some(n) if n > 1 => {
+                self.bound_by
+                    .insert_reserved((obj, port), n.saturating_sub(1));
+            }
+            Some(_) => {
+                self.bound_by.remove(&(obj, port));
+            }
+            None => {}
+        }
+    }
+
+    /// The ports that bind `obj`, each once.
+    pub fn for_each_binder(&self, obj: ObjId, f: &mut dyn FnMut(ObjId)) {
+        let lo = ObjId { index: 0, gen: 0 };
+        let hi = ObjId {
+            index: u32::MAX,
+            gen: u64::MAX,
+        };
+        for (&(_, port), _) in self.bound_by.range((obj, lo)..=(obj, hi)) {
+            f(port);
+        }
+    }
+
+    /// How many (object, port) pairs are recorded (audits).
+    pub fn bound_pairs(&self) -> usize {
+        self.bound_by.len()
     }
 
     /// One more (`delta` 1) or one fewer (`-1`) port binding names `obj`.
@@ -577,7 +631,10 @@ impl<T: Object> Registry<T> {
             }
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
-            obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
+            obj.for_each_watched(&mut |o| {
+                self.watch_adjust(o, -1);
+                self.bound_remove(o, id);
+            });
             // (room for the references the object held, before they are queued: if there is none they are leaked, which `sweep` reclaims later,
             // rather than failing a destruction: KT9)
             if work.try_reserve(obj.held_count()).is_ok() {
@@ -873,7 +930,10 @@ impl<T: Object> Registry<T> {
         }
         self.live -= 1;
         self.meter = self.meter.saturating_sub(obj.meter());
-        obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
+        obj.for_each_watched(&mut |o| {
+            self.watch_adjust(o, -1);
+            self.bound_remove(o, id);
+        });
         // The references a doomed object holds go away with it. Those to other doomed
         // objects are moot; those to survivors must be given back, or the survivor
         // could never be freed.

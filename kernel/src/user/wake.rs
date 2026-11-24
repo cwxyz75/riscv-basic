@@ -59,7 +59,7 @@ fn commit_wake_held(sync: bool) {
         }
         let woken = waits.commit(
             |id| ipc::signals_of_object(objs, id),
-            |id| ipc::port_bound_objects(objs, id),
+            |id, f| objs.for_each_binder(id, f),
             |ch, txid| ipc::channel_has_txid(objs, ch, txid),
             &dirty,
         );
@@ -69,6 +69,7 @@ fn commit_wake_held(sync: bool) {
         } else {
             thread::wake_many(&woken);
         }
+        waits.recycle(woken);
     });
 }
 
