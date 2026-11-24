@@ -187,6 +187,12 @@ impl World {
 
 /// What the kernel does after a call: free what died (a VMO's pages, a job's ledger record) and sweep what nothing can reach.
 pub fn cleanup(w: &mut World) {
+    let d = cleanup_keep(w);
+    w.objs.recycle_dirty(d);
+}
+
+/// `cleanup`, handing back the log of touched objects (the waits' commit reads it).
+pub fn cleanup_keep(w: &mut World) -> kcore::object::Dirty {
     for round in 0..3 {
         let mut dead = w.objs.drain_dead();
         if dead.is_empty() && round > 0 {
@@ -207,8 +213,7 @@ pub fn cleanup(w: &mut World) {
             w.objs.sweep(&roots);
         }
     }
-    let d = w.objs.take_dirty();
-    w.objs.recycle_dirty(d);
+    w.objs.take_dirty()
 }
 
 /// Every audit; the first problem found.
@@ -313,6 +318,39 @@ pub fn audit(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
+/// The page-table frames of the user half of the world's address space (Sv39: the root, and every table below an entry that is valid and has no
+/// read, write or execute bit), found by reading the tables as the hardware would.
+pub fn table_frames(w: &World) -> usize {
+    fn below(w: &World, table: Pfn, level: u32, user_half_only: bool) -> usize {
+        let mut n = 1;
+        let entries = if user_half_only { 256 } else { 512 };
+        for i in 0..entries {
+            let pte = w.mm.mem.read_u64((table << 12) + i * 8);
+            let valid = pte & 1 != 0;
+            let leaf = pte & 0b1110 != 0;
+            if valid && !leaf && level > 0 {
+                n += below(w, pte >> 10, level - 1, false);
+            }
+        }
+        n
+    }
+    below(w, w.aspace.table().root(), 2, true)
+}
+
+/// T176 (4): at the end of a sequence every allocated frame is accounted for: the two page-table roots (the kernel's, which has nothing below it here,
+/// and the space's, with the tables under its user half) and the pages the VMOs still hold.
+pub fn frame_accounting(w: &World) -> Result<(), String> {
+    let allocated = w.mm.db.total() - w.mm.db.free_count();
+    let tables = 1 + table_frames(w);
+    let pages = w.vmos.frames_held() as usize;
+    if allocated != tables + pages {
+        return Err(format!(
+            "{allocated} frames are allocated, but the page tables hold {tables} and the VMOs {pages}"
+        ));
+    }
+    Ok(())
+}
+
 /// After every handle is closed and the sweep has run, nothing may be left.
 pub fn baseline(w: &mut World) -> Result<(), String> {
     w.handles.drain(&mut w.objs);
@@ -340,5 +378,5 @@ pub fn baseline(w: &mut World) -> Result<(), String> {
             w.objs.meter()
         ));
     }
-    Ok(())
+    frame_accounting(w)
 }

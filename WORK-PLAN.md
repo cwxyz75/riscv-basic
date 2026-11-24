@@ -102,7 +102,7 @@ be host-testable, fuzzable and covered before that starts.
 - [x] **KT12** (PR 282) the checked release build
 - [x] **KT13** (PR 283) the kernel stack budget
 - [x] **KT5** (PR 290) instruction-count checks
-- [ ] **KT8** syscall fuzzing (host and guest): the host half is merged (PR 291; the guest `kfuzz` program is merged (PR 514); T176 lists what the host fuzzer does not reach)
+- [ ] **KT8** syscall fuzzing (host and guest): the host half is merged (PR 291; the guest `kfuzz` program is merged (PR 514); T176 closed: the host fuzzer reaches the items it listed)
 - [ ] **KT9** the allocation-failure sweep: the host half is merged (PR 292; the guest sweep with a failing kernel allocator is not built; T177 lists what is not yet swept)
 - [x] **KT11** (PR 289) coverage report
 
