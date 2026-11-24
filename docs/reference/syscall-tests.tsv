@@ -43,6 +43,7 @@ futex_lock_pi	BAD_STATE	pi_futex_argument_errors
 futex_lock_pi	INTERRUPTED	UNTESTED
 futex_lock_pi	INVALID_ARGS	pi_futex_argument_errors
 futex_lock_pi	NOT_SUPPORTED	UNTESTED
+futex_lock_pi	NO_MEMORY	UNTESTED
 futex_lock_pi	SHOULD_WAIT	UNTESTED
 futex_lock_pi	TIMED_OUT	pi_futex_argument_errors
 futex_unlock_pi	ACCESS_DENIED	pi_futex_argument_errors

@@ -654,6 +654,8 @@ fn register_kthread_inner(thread: KThread, prio: Prio, affinity: Option<usize>) 
 pub struct PreparedThread(crate::kstack::KStack);
 
 pub fn prepare_user_thread() -> Option<PreparedThread> {
+    // (the donation graph's room for the thread, made now, where a refusal is NO_MEMORY with nothing done: the registration after the spawn takes it)
+    pi_reserve_thread().ok()?;
     crate::kstack::alloc().map(PreparedThread)
 }
 
@@ -1227,15 +1229,36 @@ fn pi_apply(changes: &[kcore::donate::Change]) {
     }
 }
 
-/// Run `f` on the donation graph with the `PI` lock held and apply the priority changes it returns before the lock is let go. Interrupts must
-/// be off, and the big lock need not be held (the PI futex calls this with a futex bucket's lock held: `FUTEX` is before `PI`).
+/// Run `f` on the donation graph with the `PI` lock held; `f` hands each list of priority changes it makes to the sink, which applies it to the
+/// run queues before the lock is let go. Interrupts must be off, and the big lock need not be held (the PI futex calls this with a futex bucket's
+/// lock held: `FUTEX` is before `PI`). Nothing is collected.
 pub fn pi_op<R>(
+    f: impl FnOnce(&mut kcore::donate::Donations, &mut dyn FnMut(&[kcore::donate::Change])) -> R,
+) -> R {
+    debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
+    let mut d = PI.lock();
+    f(&mut d, &mut |c| pi_apply(c))
+}
+
+/// `pi_op` for an operation that returns a list it built (the owner's death): applied after `f`, under the same hold.
+pub fn pi_op_vec<R>(
     f: impl FnOnce(&mut kcore::donate::Donations) -> (R, alloc::vec::Vec<kcore::donate::Change>),
 ) -> R {
     debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
     let mut d = PI.lock();
     let (r, changes) = f(&mut d);
     pi_apply(&changes);
+    r
+}
+
+/// `pi_op` for a graph operation that returns its (fixed-size) change list: applied from the list itself, nothing allocated.
+fn pi_op_changes<R>(
+    f: impl FnOnce(&mut kcore::donate::Donations) -> (R, kcore::donate::Changes),
+) -> R {
+    debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
+    let mut d = PI.lock();
+    let (r, changes) = f(&mut d);
+    pi_apply(changes.as_slice());
     r
 }
 
@@ -1254,33 +1277,35 @@ pub fn push_owed() {
 
 /// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
 /// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
+#[allow(clippy::large_stack_frames)] // KT13: audited, the fixed change list (304 bytes) is moved a few times; T172 shrinks it
 pub fn pi_donate(from: Tid, to: Tid) {
-    heap::nofail(|| {
-        irq::off(|| {
-            pi_op(|d| match d.donate(from, to) {
-                Ok(ch) => ((), ch.as_slice().to_vec()),
-                Err(e) => {
-                    // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
-                    if matches!(
-                        e,
-                        kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
-                    ) {
-                        DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
-                    }
-                    ((), alloc::vec::Vec::new())
+    irq::off(|| {
+        pi_op_changes(|d| match d.donate(from, to) {
+            Ok(ch) => ((), ch),
+            Err(e) => {
+                // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
+                if matches!(
+                    e,
+                    kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
+                ) {
+                    DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
                 }
-            });
+                ((), kcore::donate::Changes::default())
+            }
         });
     });
 }
 
 /// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
 pub fn pi_revoke(tid: Tid) {
-    heap::nofail(|| {
-        irq::off(|| {
-            pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
-        });
+    irq::off(|| {
+        pi_op_changes(|d| ((), d.revoke(tid)));
     });
+}
+
+/// Room in the donation graph for one user thread: the spawner's reportable step, before it spawns (the `pi_register` that follows takes the room).
+pub fn pi_reserve_thread() -> Result<(), kcore::fmap::NoMem> {
+    irq::off(|| PI.lock().reserve_thread())
 }
 
 /// A user thread enters the donation graph at its base priority (when it registers, big lock held).
@@ -1289,17 +1314,17 @@ pub fn pi_register(tid: Tid) {
         let base = sched().priority(tid).unwrap_or(1);
         let mut d = PI.lock();
         if d.eff(tid).is_none() {
-            d.add_thread(tid, base); // (a thread the spawner registered is registered again by itself: the first stands)
+            // (a thread the spawner registered is registered again by itself: the first stands; a spawner reserved the room: `pi_reserve_thread`. A thread
+            // that finds no room stays out of the graph, which donates nothing to it and for it)
+            let _ = d.add_thread(tid, base);
         }
     });
 }
 
 /// A user thread leaves the graph (it has exited): the donations it made and received lapse. Big lock held.
 pub fn pi_gone(tid: Tid) {
-    heap::nofail(|| {
-        irq::off(|| {
-            pi_op(|d| ((), d.remove_thread(tid).as_slice().to_vec()));
-        });
+    irq::off(|| {
+        pi_op_changes(|d| ((), d.remove_thread(tid)));
     });
 }
 

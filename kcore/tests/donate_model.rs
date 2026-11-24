@@ -99,7 +99,7 @@ fn random_walk_against_the_recomputation() {
             match rng.next() % 8 {
                 0 | 1 => {
                     let b = (rng.next() % 64) as u8;
-                    d.add_thread(next, b);
+                    d.add_thread(next, b).unwrap();
                     r.base.insert(next, b);
                     next += 1;
                     check(&d, &r, &before, &[], &format!("{what}: add"));
@@ -190,7 +190,7 @@ fn random_walk_against_the_recomputation() {
 fn a_boost_propagates_the_whole_chain_and_drops_back() {
     let mut d = Donations::new();
     for (t, b) in [(1, 50), (2, 10), (3, 10), (4, 10)] {
-        d.add_thread(t, b);
+        d.add_thread(t, b).unwrap();
     }
     d.donate(3, 4).unwrap();
     d.donate(2, 3).unwrap();
@@ -221,7 +221,7 @@ fn a_boost_propagates_the_whole_chain_and_drops_back() {
 fn cycles_and_over_long_chains_are_refused() {
     let mut d = Donations::new();
     for t in 1..=12 {
-        d.add_thread(t, t as u8);
+        d.add_thread(t, t as u8).unwrap();
     }
     assert_eq!(
         d.donate(1, 1).err(),
@@ -249,7 +249,7 @@ fn cycles_and_over_long_chains_are_refused() {
 fn a_change_list_says_whether_it_is_empty() {
     // (KT10: the mutant "Changes::is_empty gives true" survived the first mutation run)
     let mut d = Donations::new();
-    d.add_thread(1, 10);
+    d.add_thread(1, 10).unwrap();
     let none = d.set_base(1, 10);
     assert!(none.is_empty(), "no thread's effective priority changed");
     assert!(none.as_slice().is_empty());
