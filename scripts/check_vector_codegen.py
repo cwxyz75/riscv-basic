@@ -46,6 +46,13 @@ def main():
         n = sum(1 for line in out.splitlines() if any(f"\t{m}" in line for m in ("vsetvli", "vsetivli", "vle", "vse", "vadd", "vmv")))
         print(f"check_vector_codegen: {os.path.relpath(a, ROOT)}: {n} vector instructions")
         total += n
+        if os.path.basename(a) == "libctests.a":
+            # (T188 item 4: the C test's `cbo.zero` is emitted as a raw encoding, 0x0045200f for rs1 = a0 and so on: opcode 0x0f, funct3 2, imm 4)
+            zero = sum(1 for line in out.splitlines() if "cbo.zero" in line or (line.split("\t")[-2:-1] and "45200f" in line.replace(" ", "")[:40]))
+            print(f"check_vector_codegen: {os.path.relpath(a, ROOT)}: {zero} cbo.zero")
+            if zero == 0:
+                print("check_vector_codegen: FAILED: no cbo.zero in libctests.a (the transcript's cache-block test did not assemble)")
+                return 1
         if os.path.basename(a) == "liblua.a":
             lua = n
     if lua == 0 and any(os.path.basename(a) == "liblua.a" for a in archives):

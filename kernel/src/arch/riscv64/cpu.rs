@@ -112,6 +112,10 @@ pub fn enable_cache_block_ops() -> bool {
     const SENVCFG_CBIE_FLUSH: usize = 1 << 4;
     const SENVCFG_CBCFE: usize = 1 << 6;
     const SENVCFG_CBZE: usize = 1 << 7;
+    // (the negative control `fault-skip-cbze`: `cbo.zero` is left disabled, so the user build's `cbo.zero` must trap and mode 98 of the vector test fail)
+    #[cfg(feature = "fault-skip-cbze")]
+    const WANT: usize = SENVCFG_CBIE_FLUSH | SENVCFG_CBCFE;
+    #[cfg(not(feature = "fault-skip-cbze"))]
     const WANT: usize = SENVCFG_CBIE_FLUSH | SENVCFG_CBCFE | SENVCFG_CBZE;
     let v: usize;
     // SAFETY: sets bits of `senvcfg` (0x10a), the supervisor's environment configuration for user mode, and reads it back; nothing else changes.

@@ -75,3 +75,15 @@ fn a_tree_without_harts_or_with_one_deficient_hart_is_refused() {
     }
     assert_eq!(missing_extensions(&broken), vec![(1, "zicond")]);
 }
+
+/// T188 item 5: the kernel enables the cache-block instructions for user mode through `senvcfg` (`enable_cache_block_ops`), and a read-back of
+/// the bits proves only that they stuck. The profile check is the other half of the evidence: a machine that lacks Zicbom or Zicboz does not boot.
+#[test]
+fn the_cache_block_extensions_are_required_to_boot() {
+    for ext in ["zicbom", "zicboz"] {
+        assert!(
+            kcore::isa::REQUIRED_EXTENSIONS.contains(&ext),
+            "{ext} is part of RVA23 and the user build uses its instructions"
+        );
+    }
+}

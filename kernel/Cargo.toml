@@ -71,6 +71,8 @@ fault-skip-forced-touch = []
 # wake), a hart never pulls, an exiting detached thread's stack is freed before its switch completes.
 fault-skip-poke = []
 fault-skip-entry-check = []
+# T188 item 5: `senvcfg.CBZE` is not set, so a user `cbo.zero` traps (`vector_state_is_private_to_each_thread_and_process` must fail)
+fault-skip-cbze = []
 fault-skip-pull = ["kcore/fault-skip-pull"]
 fault-early-reap = []
 # KT9 (guest half): the kernel heap fails the Nth allocation made by an armed thread (`debug_stat` 200 to 202); only for `make os-allocfail`

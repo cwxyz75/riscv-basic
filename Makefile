@@ -101,6 +101,7 @@ OS_NODECOMMIT_ELF := target/os-fault-decommit/$(KERNEL_TARGET)/debug/kernel
 OS_NOPROTSHOOT_ELF := target/os-fault-protshoot/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
 OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
+OS_NOCBZE_ELF := target/os-fault-cbze/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
@@ -146,10 +147,10 @@ os-models:
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test latch_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test ticket_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --target-dir target/loom
-	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test park_concurrency --target-dir target/loom
+	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test park_concurrency --test fp_claim_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test latch_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test ticket_concurrency --target-dir target/shuttle
-	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --test fp_claim_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test rq_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test fcache_concurrency --target-dir target/shuttle
@@ -315,6 +316,8 @@ os-boot-test-smp-neg: kernel os-interactive
 	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) user_threads_run_in_parallel,kill_a_spinner_on_another_hart
 	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave
 	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFPSAVE_ELF) fp_state_is_private_to_each_thread_and_process
+	cd kernel && cargo build --features fault-skip-cbze --target-dir ../target/os-fault-cbze
+	OS_SMP=1 python3 scripts/os_boot_test.py --neg $(OS_NOCBZE_ELF) vector_state_is_private_to_each_thread_and_process
 	cd kernel && cargo build --features fault-skip-forced-touch --target-dir ../target/os-fault-forced
 	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFORCED_ELF) replacing_a_handle_ends_a_siblings_wait
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
