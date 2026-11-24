@@ -199,6 +199,9 @@ impl<T: Object> Default for Registry<T> {
     }
 }
 
+/// The references one section of a release or of a sweep's freeing slice pays (T206: 256 units at most).
+pub const RELEASE_UNITS: usize = 256;
+
 impl<T: Object> Registry<T> {
     pub fn new() -> Registry<T> {
         Registry {
@@ -614,12 +617,36 @@ impl<T: Object> Registry<T> {
 
     /// Drop a reference; destroy the object, and whatever that frees in turn, when
     /// it was the last.
-    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released
     pub fn release(&mut self, id: ObjId) {
+        self.release_bounded(id, usize::MAX);
+    }
+
+    /// `release`, but looks at no more than `budget` references (the one given and the ones destroying objects frees in turn); what is left stays
+    /// on the registry's persistent list of owed references for `release_step` (T206: a close that frees a chain of thousands is many sections, not one).
+    /// Returns true when nothing is owed. An owed reference is a counted reference of an object already destroyed, so what it names only lives longer;
+    /// if a sweep dooms that first, the owed release finds a stale id and is skipped.
+    pub fn release_bounded(&mut self, id: ObjId, budget: usize) -> bool {
+        // (`reserve_for` made room for every live object: the push cannot allocate unless the caller skipped it, and then the reference is leaked for
+        // `sweep` to reclaim, as a failed push of a held reference is)
+        if self.work.try_reserve(1).is_ok() {
+            self.work.push(id);
+        }
+        self.release_step(budget)
+    }
+
+    /// References owed by earlier bounded releases.
+    pub fn owed(&self) -> usize {
+        self.work.len()
+    }
+
+    /// Drop up to `budget` owed references (see `release_bounded`). True when none remain.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released; units is at most budget
+    pub fn release_step(&mut self, budget: usize) -> bool {
         let mut work = core::mem::take(&mut self.work);
-        work.clear();
-        work.push(id);
-        while let Some(id) = work.pop() {
+        let mut units = 0usize;
+        while units < budget {
+            let Some(id) = work.pop() else { break };
+            units += 1;
             let Some(slot) = self.slot_mut(id) else {
                 continue;
             };
@@ -659,7 +686,9 @@ impl<T: Object> Registry<T> {
                 self.bury(obj);
             }
         }
+        let done = work.is_empty();
         self.work = work;
+        done
     }
 
     /// Hand a destroyed object that needs cleanup to the graveyard. The room was made by `reserve_one` (the graveyard holds at least one slot
@@ -816,6 +845,19 @@ impl<T: Object> Registry<T> {
         self.mark_work.push(id);
     }
 
+    /// Debug check of the sweep's invariant (a) (T206): while a sweep runs, an object that goes into a queued message is not white (it was shaded
+    /// by `remove_for_transfer` or born during the sweep), or a black channel could hold the only path to an object the sweep then frees.
+    pub fn debug_assert_not_white(&self, id: ObjId) {
+        debug_assert!(
+            self.phase == Phase::Idle
+                || self
+                    .slots
+                    .get(id.index as usize)
+                    .is_none_or(|s| s.gen != id.gen || s.obj.is_none() || s.mark == self.epoch),
+            "a white object is going into a queued message during a sweep"
+        );
+    }
+
     /// One slice of the sweep: follow the references of up to `budget` marked objects, or (once everything reachable is marked) free the
     /// unmarked objects among the next `budget` slots. Between slices anything may happen to the object graph as long as new handles are
     /// shaded and nothing is unmarked. `More` until the last slice, which says how many objects the whole sweep freed.
@@ -894,11 +936,13 @@ impl<T: Object> Registry<T> {
                 p.peer_destroyed();
             }
         }
+        // (T206: the references the doomed objects held are owed, and a bounded number are paid now; `owed` says what is left)
         for id in dropped_refs {
             if self.is_alive(id) {
-                self.release(id);
+                self.release_bounded(id, 0);
             }
         }
+        self.release_step(RELEASE_UNITS);
         if abandoned {
             self.phase = Phase::Idle;
             return SweepStep::Done(self.swept);

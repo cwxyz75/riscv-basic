@@ -400,6 +400,21 @@ impl HandleTable {
         self.slots.iter().filter_map(|s| s.entry.map(|e| e.obj))
     }
 
+    /// How many slots the table has (free ones included): the length a root scan in slices walks (T206).
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The objects of the handles in slots `from .. to` (a root scan a slice at a time: a handle made or moved while it goes shades its own object,
+    /// so a slot the scan has passed or not reached makes no difference).
+    pub fn objects_in(&self, from: usize, to: usize) -> impl Iterator<Item = ObjId> + '_ {
+        self.slots
+            .iter()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .filter_map(|s| s.entry.map(|e| e.obj))
+    }
+
     /// Every live handle value in this table (for tests and audits).
     pub fn handle_values(&self) -> impl Iterator<Item = Handle> + '_ {
         self.slots
@@ -421,6 +436,10 @@ impl HandleTable {
     #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)] // INVARIANT: slot < slots.len() (loop bound); looked <= budget
     pub fn drain_some<T: Object>(&mut self, reg: &mut Registry<T>, budget: usize) -> bool {
         let mut looked = 0usize;
+        // (what an earlier slice's release left owed is paid first)
+        if !reg.release_step(budget.min(crate::object::RELEASE_UNITS)) {
+            return false;
+        }
         while self.drain_next < self.slots.len() {
             if looked >= budget {
                 return false;
@@ -433,7 +452,9 @@ impl HandleTable {
                 let entry = self.remove(slot);
                 reg.touch_forced(entry.obj);
                 reg.handle_gone(entry.obj, self.id, gone.0);
-                reg.release(entry.obj);
+                if !reg.release_bounded(entry.obj, crate::object::RELEASE_UNITS) {
+                    return false;
+                }
             }
         }
         self.drain_next = 0;
