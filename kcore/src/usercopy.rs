@@ -34,6 +34,8 @@ fn resolve<M: PhysMem>(
             .map_err(|e| match e {
                 // (MM9) the page is not supplied yet: the kernel asks the pager, waits, and the call answers "try again"
                 FaultError::NeedPager(_) => Status::ShouldWait,
+                // (a commit or copy that found no memory is not the caller's bad address: T233)
+                FaultError::NoMemory => Status::NoMemory,
                 _ => Status::InvalidArgs,
             })?;
         t = aspace.table().translate(mm, page);
