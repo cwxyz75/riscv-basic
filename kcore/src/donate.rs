@@ -1,4 +1,5 @@
-//! The priority donation graph (SCHED-SMP-SPEC 4.8, task 7): pure, no locks, no allocation per change list.
+//! The priority donation graph (SCHED-SMP-SPEC 4.8, task 7): pure, no locks. It allocates only when a thread is added (`reserve_thread`, then
+//! `add_thread`: the spawner's reportable step, T248); donating, revoking, retargeting and removing allocate nothing (the in-edges are an intrusive list).
 //!
 //! A thread has a *base* priority (its own attribute) and an *effective* priority: the maximum of its base and the
 //! effective priority of every thread **donating** to it. A thread that blocks waiting for another (a `channel_call`
@@ -22,8 +23,8 @@
     clippy::indexing_slicing
 )] // INVARIANT: the donation graph is not wired into the kernel yet (task 22): every lookup is of a thread that `add_thread` put in `nodes` and `audit` checks that; the item arrays are sized for the longest chain
 
+use crate::fmap::{FMap, NoMem};
 use crate::sched::{Prio, Tid};
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 
 /// The longest chain of donations: a donor, then up to this many hops to the thread that finally runs.
@@ -40,6 +41,12 @@ pub struct Change {
 pub struct Changes {
     items: [Change; 2 * (MAX_DONATION_DEPTH + 1)],
     len: usize,
+}
+
+impl Default for Changes {
+    fn default() -> Changes {
+        Changes::new()
+    }
 }
 
 impl Changes {
@@ -78,31 +85,79 @@ struct Node {
     base: Prio,
     eff: Prio,
     out: Option<Tid>,
-    ins: BTreeSet<Tid>,
+    /// The donors to this thread: the head of an intrusive list through the donors' own `next_in`/`prev_in` (a thread lends to at most one, so it
+    /// is on at most one list).
+    first_in: Option<Tid>,
+    next_in: Option<Tid>,
+    prev_in: Option<Tid>,
 }
 
 #[derive(Default)]
 pub struct Donations {
-    nodes: BTreeMap<Tid, Node>,
+    nodes: FMap<Tid, Node>,
 }
 
 impl Donations {
     pub const fn new() -> Donations {
-        Donations {
-            nodes: BTreeMap::new(),
+        Donations { nodes: FMap::new() }
+    }
+
+    /// Room for one more thread: the spawner's reportable step. The `add_thread` that follows, in the same critical section, allocates nothing.
+    pub fn reserve_thread(&mut self) -> Result<(), NoMem> {
+        self.nodes.reserve(1)
+    }
+
+    /// Add a thread at `base` (allocates only if `reserve_thread` was not called first).
+    pub fn add_thread(&mut self, tid: Tid, base: Prio) -> Result<(), NoMem> {
+        self.nodes
+            .try_insert(
+                tid,
+                Node {
+                    base,
+                    eff: base,
+                    out: None,
+                    first_in: None,
+                    next_in: None,
+                    prev_in: None,
+                },
+            )
+            .map(|_| ())
+    }
+
+    /// The donors to `tid`, in list order.
+    fn ins(&self, tid: Tid) -> Ins<'_> {
+        Ins {
+            g: self,
+            next: self.nodes.get(&tid).and_then(|n| n.first_in),
         }
     }
 
-    pub fn add_thread(&mut self, tid: Tid, base: Prio) {
-        self.nodes.insert(
-            tid,
-            Node {
-                base,
-                eff: base,
-                out: None,
-                ins: BTreeSet::new(),
-            },
-        );
+    /// Put `from` at the head of `to`'s list of donors.
+    fn link(&mut self, from: Tid, to: Tid) {
+        let head = self.nodes[&to].first_in;
+        if let Some(h) = head {
+            self.nodes.get_mut(&h).expect("donor exists").prev_in = Some(from);
+        }
+        let f = self.nodes.get_mut(&from).expect("donor exists");
+        f.out = Some(to);
+        f.next_in = head;
+        f.prev_in = None;
+        self.nodes.get_mut(&to).expect("target exists").first_in = Some(from);
+    }
+
+    /// Take `from` off its target's list (its `out` is cleared); the target, if there was one.
+    fn unlink(&mut self, from: Tid) -> Option<Tid> {
+        let n = self.nodes.get_mut(&from)?;
+        let to = n.out.take()?;
+        let (next, prev) = (n.next_in.take(), n.prev_in.take());
+        match prev {
+            Some(p) => self.nodes.get_mut(&p).expect("donor exists").next_in = next,
+            None => self.nodes.get_mut(&to).expect("target exists").first_in = next,
+        }
+        if let Some(nx) = next {
+            self.nodes.get_mut(&nx).expect("donor exists").prev_in = prev;
+        }
+        Some(to)
     }
 
     pub fn eff(&self, tid: Tid) -> Option<Prio> {
@@ -123,11 +178,9 @@ impl Donations {
     }
 
     fn recompute(&self, tid: Tid) -> Prio {
-        let n = &self.nodes[&tid];
-        n.ins
-            .iter()
-            .map(|d| self.nodes[d].eff)
-            .fold(n.base, Prio::max)
+        self.ins(tid)
+            .map(|d| self.nodes[&d].eff)
+            .fold(self.nodes[&tid].base, Prio::max)
     }
 
     /// Re-derive `tid`'s effective priority and carry any change up the out-chain, recording each change.
@@ -159,12 +212,7 @@ impl Donations {
 
     /// The longest chain of donors below `tid` (0 for a thread nobody lends to).
     fn height(&self, tid: Tid) -> usize {
-        self.nodes[&tid]
-            .ins
-            .iter()
-            .map(|&d| 1 + self.height(d))
-            .max()
-            .unwrap_or(0)
+        self.ins(tid).map(|d| 1 + self.height(d)).max().unwrap_or(0)
     }
 
     pub fn set_base(&mut self, tid: Tid, base: Prio) -> Changes {
@@ -198,8 +246,7 @@ impl Donations {
         if self.height(from) + 1 + self.up(to) > MAX_DONATION_DEPTH {
             return Err(DonateError::TooDeep);
         }
-        self.nodes.get_mut(&from).expect("checked").out = Some(to);
-        self.nodes.get_mut(&to).expect("checked").ins.insert(from);
+        self.link(from, to);
         let mut out = Changes::new();
         self.propagate(to, &mut out);
         Ok(out)
@@ -208,14 +255,9 @@ impl Donations {
     /// End `from`'s donation (its wait ended): whatever it lifted drops back.
     pub fn revoke(&mut self, from: Tid) -> Changes {
         let mut out = Changes::new();
-        let Some(to) = self.nodes.get_mut(&from).and_then(|n| n.out.take()) else {
+        let Some(to) = self.unlink(from) else {
             return out;
         };
-        self.nodes
-            .get_mut(&to)
-            .expect("target exists")
-            .ins
-            .remove(&from);
         self.propagate(to, &mut out);
         out
     }
@@ -228,16 +270,20 @@ impl Donations {
             return Err(DonateError::NoThread);
         }
         // the effective priorities of everything either chain can touch, before anything moves
-        let mut before: alloc::vec::Vec<(Tid, Prio)> = alloc::vec::Vec::new();
+        // (two chains of at most MAX_DONATION_DEPTH + 1 threads each: an array, nothing allocated)
+        let mut before = [(0 as Tid, 0 as Prio); 2 * (MAX_DONATION_DEPTH + 1)];
+        let mut nb = 0;
         for start in [old, Some(to)].into_iter().flatten() {
             let mut t = Some(start);
             while let Some(x) = t {
-                if !before.iter().any(|&(y, _)| y == x) {
-                    before.push((x, self.nodes[&x].eff));
+                if !before[..nb].iter().any(|&(y, _)| y == x) {
+                    before[nb] = (x, self.nodes[&x].eff);
+                    nb += 1;
                 }
                 t = self.nodes[&x].out;
             }
         }
+        let before = &before[..nb];
         let first = self.revoke(from);
         match self.donate(from, to) {
             Ok(second) => {
@@ -272,18 +318,13 @@ impl Donations {
         if !self.nodes.contains_key(&tid) {
             return out;
         }
-        let donors: alloc::vec::Vec<Tid> = self.nodes[&tid].ins.iter().copied().collect();
-        for d in donors {
-            self.nodes.get_mut(&d).expect("donor exists").out = None;
+        // (the donors are taken off one at a time: no list of them is made)
+        while let Some(d) = self.nodes[&tid].first_in {
+            self.unlink(d);
         }
-        let target = self.nodes[&tid].out;
+        let target = self.unlink(tid);
         self.nodes.remove(&tid);
         if let Some(to) = target {
-            self.nodes
-                .get_mut(&to)
-                .expect("target exists")
-                .ins
-                .remove(&tid);
             self.propagate(to, &mut out);
         }
         out
@@ -292,17 +333,24 @@ impl Donations {
     /// DN1 to DN3 from scratch: the edges are consistent, the graph is acyclic and no chain is too long, and every
     /// effective priority equals the recomputed maximum.
     pub fn audit(&self) -> Result<(), String> {
-        for (&t, n) in &self.nodes {
+        for (&t, n) in self.nodes.iter() {
             if let Some(o) = n.out {
-                match self.nodes.get(&o) {
-                    Some(on) if on.ins.contains(&t) => {}
-                    _ => return Err(alloc::format!("edge {t} -> {o} has no mirror")),
+                if !self.nodes.contains_key(&o) || !self.ins(o).any(|d| d == t) {
+                    return Err(alloc::format!("edge {t} -> {o} has no mirror"));
                 }
             }
-            for d in &n.ins {
-                if self.nodes.get(d).and_then(|x| x.out) != Some(t) {
+            let mut prev = None;
+            let mut seen = 0usize;
+            for d in self.ins(t) {
+                seen += 1;
+                let dn = self.nodes.get(&d);
+                if dn.and_then(|x| x.out) != Some(t) || dn.and_then(|x| x.prev_in) != prev {
                     return Err(alloc::format!("in-edge {d} -> {t} has no mirror"));
                 }
+                if seen > self.nodes.len() {
+                    return Err(alloc::format!("thread {t}: its donor list has a cycle"));
+                }
+                prev = Some(d);
             }
             // acyclic, bounded
             let mut hops = 0;
@@ -324,6 +372,27 @@ impl Donations {
                 ));
             }
         }
+        // every out-edge is on exactly one list (counted from the lists)
+        let edges = self.nodes.iter().filter(|(_, n)| n.out.is_some()).count();
+        let listed: usize = self.nodes.iter().map(|(&t, _)| self.ins(t).count()).sum();
+        if edges != listed {
+            return Err(alloc::format!("{edges} edges, {listed} on the donor lists"));
+        }
         Ok(())
+    }
+}
+
+/// The donors of a thread, by the intrusive list.
+struct Ins<'a> {
+    g: &'a Donations,
+    next: Option<Tid>,
+}
+
+impl Iterator for Ins<'_> {
+    type Item = Tid;
+    fn next(&mut self) -> Option<Tid> {
+        let cur = self.next?;
+        self.next = self.g.nodes.get(&cur).and_then(|n| n.next_in);
+        Some(cur)
     }
 }

@@ -37,18 +37,18 @@ type Bucket = Arc<Mutex<(PiFutexes, Donations)>>;
 
 fn setup() -> (Bucket, W) {
     let mut d = Donations::new();
-    d.add_thread(1, 5); // the owner
-    d.add_thread(2, 20); // the waiter
+    d.add_thread(1, 5).unwrap(); // the owner
+    d.add_thread(2, 20).unwrap(); // the waiter
     let word = Arc::new(AtomicU32::new(0));
     let w = W(word);
     let mut pi = PiFutexes::new();
     assert_eq!(
-        pi.lock(&mut d, &w, KEY, 1, |_| true, true),
+        pi.lock(&mut d, &w, KEY, 1, |_| true, true, &mut |_| {}),
         Ok(Lock::Acquired)
     );
     assert!(matches!(
-        pi.lock(&mut d, &w, KEY, 2, |_| true, true),
-        Ok(Lock::Blocked { .. })
+        pi.lock(&mut d, &w, KEY, 2, |_| true, true, &mut |_| {}),
+        Ok(Lock::Blocked)
     ));
     (Arc::new(Mutex::new((pi, d))), w)
 }
@@ -62,7 +62,7 @@ fn timeout_races_unlock() {
         let mut g = b2.lock().unwrap();
         let (pi, d) = &mut *g;
         matches!(
-            pi.unlock(d, &word, KEY, 1),
+            pi.unlock(d, &word, KEY, 1, &mut |_| {}),
             Ok(Unlock::Handed { to: 2, .. })
         )
     });
@@ -71,7 +71,7 @@ fn timeout_races_unlock() {
         let mut g = b.lock().unwrap();
         let (pi, d) = &mut *g;
         if pi.still_waiting(2) {
-            let _ = pi.cancel(d, 2);
+            pi.cancel(d, 2, &mut |_| {});
             None
         } else {
             pi.take_outcome(2)
@@ -112,7 +112,9 @@ fn death_races_timeout() {
     let gave_up = {
         let mut g = b.lock().unwrap();
         let (pi, d) = &mut *g;
-        let changed = !pi.cancel(d, 2).is_empty();
+        let mut n = 0;
+        pi.cancel(d, 2, &mut |c| n += c.len());
+        let changed = n != 0;
         changed
     };
     let woken = dier.join().unwrap();

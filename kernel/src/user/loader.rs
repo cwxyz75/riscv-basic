@@ -211,7 +211,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         };
         let tid = thread::spawn_free("user", 10, user_thread_main, token);
         ksys::thread_registered_by_spawner(s, tid, &mut spawn);
-        crate::heap::nofail(|| thread::pi_register(tid)); // (the donation graph, L23)
+        thread::pi_register(tid); // (the donation graph, L23: the boot loader's thread; if no room the thread stays out of the graph)
         tid
     });
     Ok((pid, tid))

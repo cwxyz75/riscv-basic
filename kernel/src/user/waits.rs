@@ -188,6 +188,7 @@ fn pi_status(e: kcore::pifutex::PiError) -> Status {
         kcore::pifutex::PiError::BadState => Status::BadState,
         kcore::pifutex::PiError::NotOwner => Status::AccessDenied,
         kcore::pifutex::PiError::NoId => Status::NotSupported,
+        kcore::pifutex::PiError::NoMemory => Status::NoMemory,
     }
 }
 
@@ -207,27 +208,18 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
         let live = |t: Tid| s.pid_of(t) == Some(me);
-        // (class N until the PI tables are prepaid: T248 PR B; a refused allocation here would be a panic)
-        let r = crate::heap::nofail(|| {
-            futex_table().with_key(key, |f| {
-                let r =
-                    thread::pi_op(
-                        |d| match f.pi.lock(d, &word, key, who, live, deadline != 0) {
-                            Ok(kcore::pifutex::Lock::Acquired) => (Ok(Some(true)), Vec::new()),
-                            Ok(kcore::pifutex::Lock::WouldBlock) => (Ok(None), Vec::new()),
-                            Ok(kcore::pifutex::Lock::Blocked { changes }) => {
-                                (Ok(Some(false)), changes)
-                            }
-                            Err(e) => (Err(e), Vec::new()),
-                        },
-                    );
-                // (waiters the call ended because the word and the record had come apart: woken with the bucket lock held)
-                let ended = f.pi.drain_wake();
-                if !ended.is_empty() {
-                    thread::wake_many_quiet(&ended);
+        let r = futex_table().with_key(key, |f| {
+            let r = thread::pi_op(|d, sink| {
+                match f.pi.lock(d, &word, key, who, live, deadline != 0, sink) {
+                    Ok(kcore::pifutex::Lock::Acquired) => Ok(Some(true)),
+                    Ok(kcore::pifutex::Lock::WouldBlock) => Ok(None),
+                    Ok(kcore::pifutex::Lock::Blocked) => Ok(Some(false)),
+                    Err(e) => Err(e),
                 }
-                r
-            })
+            });
+            // (waiters the call ended because the word and the record had come apart: woken with the bucket lock held)
+            f.pi.drain_wake_into(thread::wake_many_quiet);
+            r
         });
         match r {
             Ok(outcome) => {
@@ -259,7 +251,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
     let ended = irq::without(|| {
         futex_table().with_key(key, |f| {
             if f.pi.still_waiting(who) {
-                crate::heap::nofail(|| thread::pi_op(|d| ((), f.pi.cancel(d, who))));
+                thread::pi_op(|d, sink| f.pi.cancel(d, who, sink));
                 None
             } else {
                 f.pi.take_outcome(who)
@@ -288,23 +280,18 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
         };
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
-        let r = crate::heap::nofail(|| {
-            futex_table().with_key(key, |f| {
-                let r = thread::pi_op(|d| match f.pi.unlock(d, &word, key, who) {
-                    Ok(kcore::pifutex::Unlock::Handed { to, changes }) => {
-                        // (the wake is issued with the bucket lock held, as `futex_wake` does)
-                        thread::wake_many_quiet(&[to]);
-                        (Ok(()), changes)
-                    }
-                    Ok(kcore::pifutex::Unlock::Free) => (Ok(()), Vec::new()),
-                    Err(e) => (Err(e), Vec::new()),
-                });
-                let ended = f.pi.drain_wake();
-                if !ended.is_empty() {
-                    thread::wake_many_quiet(&ended);
+        let r = futex_table().with_key(key, |f| {
+            let r = thread::pi_op(|d, sink| match f.pi.unlock(d, &word, key, who, sink) {
+                Ok(kcore::pifutex::Unlock::Handed { to }) => {
+                    // (the wake is issued with the bucket lock held, as `futex_wake` does)
+                    thread::wake_many_quiet(&[to]);
+                    Ok(())
                 }
-                r
-            })
+                Ok(kcore::pifutex::Unlock::Free) => Ok(()),
+                Err(e) => Err(e),
+            });
+            f.pi.drain_wake_into(thread::wake_many_quiet);
+            r
         });
         r.map(|()| (None, None))
             .map_err(|e| (pi_status(e), None, None))
@@ -339,7 +326,8 @@ pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
         let mut dead: Vec<(kcore::pifutex::Key, Vec<u64>)> = Vec::new();
         let mut ended: Vec<u64> = Vec::new();
         futex_table().for_each_bucket(|f| {
-            let found = thread::pi_op(|d| f.pi.owner_died(d, tid, |key| words.get(&key).copied()));
+            let found =
+                thread::pi_op_vec(|d| f.pi.owner_died(d, tid, |key| words.get(&key).copied()));
             dead.extend(found);
             ended.extend(f.pi.drain_wake());
         });

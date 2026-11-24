@@ -297,8 +297,7 @@ fn spawn_registered(
 ) -> Tid {
     let tid = thread::spawn_prepared(prepared, "user", spawn.prio, user_thread_main, spawn.token);
     ksys::thread_registered_by_spawner(s, tid, &mut spawn);
-    // (class N: the donation graph's node)
-    crate::heap::nofail(|| thread::pi_register(tid)); // (the donation graph, L23)
+    thread::pi_register(tid); // (the donation graph, L23: its room was reserved by `prepare_user_thread`)
     if spawn.suspended {
         sync_suspends(s);
     }
