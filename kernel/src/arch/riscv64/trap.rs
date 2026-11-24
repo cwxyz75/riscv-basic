@@ -625,8 +625,12 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
 /// T206: an interrupt taken inside `irq::window()` of a syscall, on the user thread's kernel stack above its ecall frame. It never switches, never takes the
 /// heap's service and never touches the FP unit (a kernel frame); it records what the interrupt asked for in `need_resched` and returns with interrupts off
 /// (SPIE cleared), so the window sees exactly this trap and then makes the switch itself at its own depth.
+/// Interrupts taken inside a syscall's window since boot (T206: a guest test reads it with `debug_stat(214)`).
+pub static WINDOW_TRAPS: AtomicU64 = AtomicU64::new(0);
+
 #[inline(never)]
 fn window_trap(frame: &mut TrapFrame, cause: u64) {
+    WINDOW_TRAPS.fetch_add(1, Ordering::Relaxed);
     if cause == (1 << 63) | 5 {
         crate::percpu::this()
             .timer_ticks

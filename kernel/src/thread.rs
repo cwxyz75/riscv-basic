@@ -381,6 +381,13 @@ fn idle_stat(which: u64) -> u64 {
     if which == 213 {
         return u64::from(idle_mode());
     }
+    // (T206: 214 interrupts taken inside a syscall's `irq::window()` since boot, 215 the windows made)
+    if which == 214 {
+        return crate::trap::WINDOW_TRAPS.load(Relaxed);
+    }
+    if which == 215 {
+        return crate::irq::WINDOWS.load(Relaxed);
+    }
     (0..crate::percpu::MAX_HARTS)
         .map(|h| {
             let p = crate::percpu::hart(h);
@@ -1725,7 +1732,7 @@ pub fn wake_stat(which: u64) -> u64 {
         }
         // (T213 M2: sums over every hart of the counters a benchmark reads before and after: 209 reschedule IPIs received, 210 retentive suspends,
         // 211 `wfi` idles, 212 nanoseconds idle; 213 the idle policy a boot argument asked for: 0 normal, 1 `idle=nosuspend`, 2 `idle=spin`)
-        209..=213 => idle_stat(which),
+        209..=215 => idle_stat(which),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

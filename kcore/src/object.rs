@@ -135,6 +135,8 @@ pub struct Registry<T: Object> {
     gone: Vec<(ObjId, u64, u64)>,
     /// The work list of `release` (objects whose last reference just went), kept between calls so a release never allocates.
     work: Vec<ObjId>,
+    /// References the last `release_step` looked at (T206: the unit counter the host tests hold to the budget; a unit is one reference released).
+    last_units: usize,
     /// The dirty log's twin: `take_dirty` swaps it in (`recycle_dirty` gives the emptied log back), so taking the log allocates nothing.
     dirty_spare: Vec<(ObjId, bool)>,
     /// The graveyard's twin: `drain_dead` hands out one and keeps the other, so its capacity survives (`recycle` returns it).
@@ -228,6 +230,7 @@ impl<T: Object> Registry<T> {
             gone: Vec::new(),
             dequeued_calls: Vec::new(),
             work: Vec::with_capacity(PREALLOC_SLOTS),
+            last_units: 0,
             dirty_spare: Vec::with_capacity(DIRTY_RESERVE),
             spare: Vec::new(),
             phase: Phase::Idle,
@@ -688,7 +691,13 @@ impl<T: Object> Registry<T> {
         }
         let done = work.is_empty();
         self.work = work;
+        self.last_units = units;
         done
+    }
+
+    /// How many references the last `release_step` (or `release_bounded`) looked at: never more than its budget.
+    pub fn last_units(&self) -> usize {
+        self.last_units
     }
 
     /// Hand a destroyed object that needs cleanup to the graveyard. The room was made by `reserve_one` (the graveyard holds at least one slot

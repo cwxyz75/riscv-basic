@@ -235,6 +235,11 @@ fn a_close_that_frees_a_chain_is_paid_in_bounded_slices() {
             calls += 1;
             let freed = before.saturating_sub(reg.live());
             assert!(
+                reg.last_units() <= kcore::object::RELEASE_UNITS,
+                "a step looked at {} references",
+                reg.last_units()
+            );
+            assert!(
                 freed <= 2 * kcore::object::RELEASE_UNITS,
                 "freed {freed} in one call"
             );
