@@ -214,6 +214,9 @@ pub enum VmoKind {
     Dma,
 }
 
+/// Page-table entries a step may look at for each mapping it may clear (T207 PR 3b): a present but empty leaf table costs 512 reads.
+pub const SCAN_PER_PTE: u64 = 32;
+
 /// The pages one step of a chunked decommit takes at most.
 pub const RANGE_STEP: usize = 64;
 
@@ -258,6 +261,8 @@ struct Vmo {
     /// A chunked `decommit` or shrink is under way (T207 PR 3a): the pages from `.0` to `.1` are still to go. The VMO is refused to another such call,
     /// to a child, to a supply and to a foreign mapping until it ends (`Vmos::range_end`).
     busy: Option<(u64, u64)>,
+    /// A shrink under way: the size and `inherit` to go back to when it stops short (`range_end(id, false)`), so that no tail stays reachable but unmapped-from.
+    restore: Option<(u64, u64)>,
 }
 
 impl Vmo {
@@ -332,7 +337,25 @@ pub struct MapRef {
 struct VmoSlot {
     gen: u32,
     vmo: Option<Vmo>,
+    /// The page index of a VMO whose last reference went with more than a batch of pages held (T207 PR 3c): the id is invalid already, the pages go
+    /// back in batches (`Vmos::drain_dying`), and the slot is free again when the last is gone.
+    dying: Option<DyingVmo>,
+    /// The next slot with a dying VMO (index + 1, 0 for none).
+    dying_next: u32,
 }
+
+/// What is left of a VMO that is being given back in batches: its job (still held), its index and what it was charged.
+struct DyingVmo {
+    job: JobId,
+    committed: PageMap,
+    charged: bool,
+    /// The slot's generation was exhausted: it is retired, not reused (CNT1).
+    retire: bool,
+}
+
+/// Set when a VMO is dying (`Vmos::drain_dying` has work): the kernel looks here after every call and fault, so the common case costs one load.
+pub static DRAIN_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// All memory objects, by id.
 #[derive(Default)]
@@ -344,6 +367,8 @@ pub struct Vmos {
     live: usize,
     /// Pages held by live DMA VMOs.
     dma_pages: u64,
+    /// The first slot with a dying VMO (index + 1, 0 for none).
+    dying_head: u32,
     /// The most pages DMA VMOs may hold together (the backstop, PL8).
     dma_total_cap: u64,
     /// The generation a slot made from now on starts at (0, except in a test that reaches the end of the 32 bits: `set_first_generation`).
@@ -409,6 +434,8 @@ impl Vmos {
         self.slots.push(VmoSlot {
             gen,
             vmo: Some(vmo),
+            dying: None,
+            dying_next: 0,
         });
         (u64::from(gen) << 32) | self.slots.len() as u64
     }
@@ -442,16 +469,30 @@ impl Vmos {
 
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
     fn take(&mut self, id: u64) -> Option<Vmo> {
+        let (v, i, retire) = self.take_slot(id)?;
+        self.free_slot(i, retire);
+        Some(v)
+    }
+
+    /// Take the VMO out of its slot and make its id invalid; the slot is not free yet (`free_slot`). Says whether the slot's generation is exhausted.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
+    fn take_slot(&mut self, id: u64) -> Option<(Vmo, usize, bool)> {
         let i = self.slot_index(id)?;
         let slot = &mut self.slots[i];
-        let v = slot.vmo.take();
+        let v = slot.vmo.take()?;
         // (CNT1: a slot whose 32-bit generation is exhausted is retired, not wrapped: its ids stay invalid for ever)
-        if slot.gen < u32::MAX {
+        let retire = slot.gen == u32::MAX;
+        if !retire {
             slot.gen += 1;
-            self.free.push(i as u32);
         }
         self.live -= 1;
-        v
+        Some((v, i, retire))
+    }
+
+    fn free_slot(&mut self, i: usize, retire: bool) {
+        if !retire {
+            self.free.push(i as u32);
+        }
     }
 
     // ---- the lists of mappings (T207 ML1): kept by `AddressSpace`, which calls these with its own owner id ----
@@ -565,6 +606,7 @@ impl Vmos {
             had_parent: false,
             maps: crate::fmap::FMap::new(),
             busy: None,
+            restore: None,
             pager: None,
             inherit: 0,
         })
@@ -588,6 +630,7 @@ impl Vmos {
             had_parent: false,
             maps: crate::fmap::FMap::new(),
             busy: None,
+            restore: None,
             pager: None,
             inherit: 0,
         })
@@ -645,6 +688,7 @@ impl Vmos {
             had_parent: false,
             maps: crate::fmap::FMap::new(),
             busy: None,
+            restore: None,
             pager: None,
             inherit: 0,
         }))
@@ -1117,6 +1161,7 @@ impl Vmos {
             had_parent: false,
             maps: crate::fmap::FMap::new(),
             busy: None,
+            restore: None,
             pager: None,
             inherit: 0,
         }))
@@ -1187,6 +1232,7 @@ impl Vmos {
                         had_parent: old_parent.is_some(),
                         maps: crate::fmap::FMap::new(),
                         busy: None,
+                        restore: None,
                         pager: None,
                         inherit: old_inherit,
                     });
@@ -1434,7 +1480,7 @@ impl Vmos {
                 }
                 return Ok(());
             }
-            let Some(vmo) = self.take(cur) else {
+            let Some((vmo, slot_i, retire)) = self.take_slot(cur) else {
                 return if first { Err(VmoGone) } else { Ok(()) };
             };
             first = false;
@@ -1444,31 +1490,44 @@ impl Vmos {
             if vmo.kind == VmoKind::Device {
                 // device frames are not ours: nothing was charged and nothing is freed
                 jobs.release(vmo.job);
+                self.free_slot(slot_i, retire);
                 return Ok(());
             }
             if vmo.kind == VmoKind::Dma {
                 self.dma_pages -= vmo.pages;
             }
-            jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
-            // (the index: one charge per leaf it still holds, holes included)
-            jobs.credit(
-                vmo.job,
-                Resource::KernelBytes,
-                (vmo.committed.leaf_count() as u64).saturating_mul(crate::pagemap::LEAF_BYTES),
-            );
-            jobs.release(vmo.job);
             debug_assert!(
                 vmo.maps.is_empty(),
                 "ML1: a VMO went with a region still listed on it"
             );
-            let mut committed = vmo.committed;
-            committed.drain_pfns(|pfn| {
-                let dropped = mm.db.dec(pfn);
-                debug_assert!(
-                    dropped.is_ok(),
-                    "a committed page holds the VMO's reference"
+            if vmo.committed.len() > crate::aspace::RANGE_STEP {
+                // a big one: its pages go back in batches (`drain_dying`), with the credits; nothing of it is reachable by id any more
+                self.stash_dying(
+                    slot_i,
+                    retire,
+                    vmo.job,
+                    vmo.committed,
+                    vmo.kind != VmoKind::Device,
                 );
-            });
+            } else {
+                jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
+                // (the index: one charge per leaf it still holds, holes included)
+                jobs.credit(
+                    vmo.job,
+                    Resource::KernelBytes,
+                    (vmo.committed.leaf_count() as u64).saturating_mul(crate::pagemap::LEAF_BYTES),
+                );
+                jobs.release(vmo.job);
+                let mut committed = vmo.committed;
+                committed.drain_pfns(|pfn| {
+                    let dropped = mm.db.dec(pfn);
+                    debug_assert!(
+                        dropped.is_ok(),
+                        "a committed page holds the VMO's reference"
+                    );
+                });
+                self.free_slot(slot_i, retire);
+            }
             match vmo.parent {
                 Some(l) => {
                     if let Some(p) = Self::vmo_in(&mut self.slots, l.id) {
@@ -1481,6 +1540,95 @@ impl Vmos {
                 None => return Ok(()),
             }
         }
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: slot_i came from `take_slot`; slot indices fit u32 (the free list holds u32)
+    fn stash_dying(
+        &mut self,
+        slot_i: usize,
+        retire: bool,
+        job: JobId,
+        committed: PageMap,
+        charged: bool,
+    ) {
+        let head = self.dying_head;
+        let slot = &mut self.slots[slot_i];
+        slot.dying = Some(DyingVmo {
+            job,
+            committed,
+            charged,
+            retire,
+        });
+        slot.dying_next = head;
+        self.dying_head = slot_i as u32 + 1;
+        DRAIN_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Give back up to `budget` pages of the VMOs that are dying (T207 PR 3c): the frames' references go, the job is credited as they do, and a VMO
+    /// that has nothing left releases its job and frees its slot. Returns whether work is left. Every caller of `release` reaches a call to this before
+    /// the thread it runs for goes back to user mode (the kernel's call and fault tails, and teardown).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: dying_head - 1 is a slot with a dying VMO; the leaf count only falls
+    pub fn drain_dying<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        budget: usize,
+    ) -> bool {
+        let head = self.dying_head;
+        if head == 0 {
+            DRAIN_PENDING.store(false, core::sync::atomic::Ordering::Release);
+            return false;
+        }
+        let i = head as usize - 1;
+        let slot = &mut self.slots[i];
+        let next = slot.dying_next;
+        let Some(d) = slot.dying.as_mut() else {
+            self.dying_head = next;
+            return self.dying_head != 0;
+        };
+        let leaves = d.committed.leaf_count();
+        let (mut n, mut freed) = (0usize, 0u64);
+        while n < budget {
+            let Some((pg, _)) = d.committed.next_entry_at_or_after(0) else {
+                break;
+            };
+            if let Entry::Frame(pfn) = d.committed.clear(pg) {
+                let dropped = mm.db.dec(pfn);
+                debug_assert!(
+                    dropped.is_ok(),
+                    "a committed page holds the VMO's reference"
+                );
+                freed += 1;
+            }
+            n += 1;
+        }
+        jobs.credit(d.job, Resource::Pages, freed);
+        if d.charged {
+            jobs.credit(
+                d.job,
+                Resource::KernelBytes,
+                ((leaves - d.committed.leaf_count()) as u64)
+                    .saturating_mul(crate::pagemap::LEAF_BYTES),
+            );
+        }
+        if d.committed.next_entry_at_or_after(0).is_none() {
+            jobs.release(d.job);
+            let retire = d.retire;
+            slot.dying = None;
+            slot.dying_next = 0;
+            self.dying_head = next;
+            self.free_slot(i, retire);
+        }
+        let more = self.dying_head != 0;
+        if !more {
+            DRAIN_PENDING.store(false, core::sync::atomic::Ordering::Release);
+        }
+        more
+    }
+
+    /// Drain every dying VMO (the host tests, which have no switch points to run it between).
+    pub fn drain_all<M: PhysMem>(&mut self, mm: &mut Mm<M>, jobs: &mut Jobs) {
+        while self.drain_dying(mm, jobs, usize::MAX) {}
     }
 
     /// Write bytes into a VMO at `offset`, committing pages as needed (loading a program
@@ -1673,7 +1821,14 @@ impl Vmos {
             .filter_map(|s| s.vmo.as_ref())
             .filter(|v| v.kind == VmoKind::Plain)
             .map(|v| v.committed.len() as u64)
-            .sum()
+            .sum::<u64>()
+            .saturating_add(
+                self.slots
+                    .iter()
+                    .filter_map(|s| s.dying.as_ref())
+                    .map(|d| d.committed.len() as u64)
+                    .sum::<u64>(),
+            )
     }
 
     /// Leaves the index of VMO `id` holds, charged to its job as `KernelBytes` (`LEAF_BYTES` each) unless it is a device VMO (T249).
@@ -1695,7 +1850,17 @@ impl Vmos {
             .filter_map(|s| s.vmo.as_ref())
             .filter(|v| v.job == job && v.index_charged())
             .map(|v| (v.committed.leaf_count() as u64).saturating_mul(crate::pagemap::LEAF_BYTES))
-            .sum()
+            .sum::<u64>()
+            .saturating_add(
+                self.slots
+                    .iter()
+                    .filter_map(|s| s.dying.as_ref())
+                    .filter(|d| d.job == job && d.charged)
+                    .map(|d| {
+                        (d.committed.leaf_count() as u64).saturating_mul(crate::pagemap::LEAF_BYTES)
+                    })
+                    .sum::<u64>(),
+            )
     }
 
     /// Pages of VMO `id` that have a frame now (committed by a fault, a write or `commit`).
@@ -1757,6 +1922,9 @@ impl Vmos {
         };
         if let Some(new) = shrink_to {
             // (the new size is in force at once: a touch past it is refused; the pages past it go in the steps)
+            if first < end {
+                v.restore = Some((v.pages, v.inherit));
+            }
             v.pages = new;
             v.inherit = v.inherit.min(new);
         }
@@ -1851,10 +2019,18 @@ impl Vmos {
         }
     }
 
-    /// The call is over (done, or stopped by an error): the VMO is free for the next. Harmless when the VMO is gone.
-    pub fn range_end(&mut self, id: u64) {
+    /// The call is over: the VMO is free for the next. `finished` is false when it stopped short (an error): a shrink then gives the size back
+    /// (the pages it took stay gone, and read as the VMO showed them before or as zeros), so that no page past the size is left committed and mapped.
+    /// Harmless when the VMO is gone.
+    pub fn range_end(&mut self, id: u64, finished: bool) {
         if let Some(v) = Self::vmo_in(&mut self.slots, id) {
             v.busy = None;
+            if let Some((pages, inherit)) = v.restore.take() {
+                if !finished {
+                    v.pages = pages;
+                    v.inherit = inherit;
+                }
+            }
         }
     }
 
@@ -1903,7 +2079,7 @@ impl Vmos {
                 Err(e) => break Err(e),
             }
         };
-        self.range_end(id);
+        self.range_end(id, r.is_ok());
         r
     }
 
@@ -2088,6 +2264,9 @@ struct Region {
     /// Which incarnation of the region this is: a number from the address space's counter, never reused, so a fault that looked the region up
     /// and later finds a region with another number (or none) at that start knows it was unmapped (and maybe replaced) meanwhile.
     gen: u64,
+    /// Being unmapped in chunks (`unmap_begin`): a fault on it is `NoRegion`, a protect or a merge leaves it alone, `find_gap` and a map see it as
+    /// occupied, until `unmap_step` has taken its last page and removed it.
+    dying: bool,
 }
 
 /// Pages an address space prepays from a job at a time (KERNEL-V1-SPEC 4.7): the fault path takes a page from the reservation and
@@ -2312,6 +2491,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 perms,
                 max_perms,
                 gen: self.next_gen,
+                dying: false,
             },
         );
         self.next_gen = self.next_gen.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
@@ -2348,20 +2528,20 @@ impl<F: PageTableFormat> AddressSpace<F> {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted
     pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
         let (&start, r) = self.regions.range(..=va).next_back()?;
-        (va < start + r.pages * PAGE_SIZE).then_some(r.perms)
+        (va < start + r.pages * PAGE_SIZE && !r.dying).then_some(r.perms)
     }
 
     /// The region that contains `va`, or the first one above it (`process_map_info`'s walk), with its start.
     pub fn region_at_or_after(&self, va: u64) -> Option<RegionInfo> {
         let below = self.regions.range(..=va).next_back();
         if let Some((&s, r)) = below {
-            if va < s.saturating_add(r.pages.saturating_mul(PAGE_SIZE)) {
+            if va < s.saturating_add(r.pages.saturating_mul(PAGE_SIZE)) && !r.dying {
                 return Some(Self::info(s, r));
             }
         }
         self.regions
             .range(va..)
-            .next()
+            .find(|(_, r)| !r.dying)
             .map(|(&s, r)| Self::info(s, r))
     }
 
@@ -2432,8 +2612,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
             return Err(RegionError::TooMany);
         }
         let lower_pages = (va - start) / PAGE_SIZE;
-        let (vmo, vmo_page, perms, max_perms, pages) =
-            (r.vmo, r.vmo_page, r.perms, r.max_perms, r.pages);
+        let (vmo, vmo_page, perms, max_perms, pages, dying) =
+            (r.vmo, r.vmo_page, r.perms, r.max_perms, r.pages, r.dying);
         self.regions.reserve(1).map_err(|_| RegionError::TooMany)?;
         vmos.maps_reserve(vmo).map_err(|_| RegionError::TooMany)?;
         vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
@@ -2452,6 +2632,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 perms,
                 max_perms,
                 gen: upper_gen,
+                dying,
             },
         );
         vmos.maps_set_pages(vmo, (self.owner, start), lower_pages);
@@ -2486,14 +2667,150 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         self.split_at(vmos, start)?;
         self.split_at(vmos, end)?;
-        // (a cursor, not a list of the keys: nothing is allocated, so the call cannot fail halfway for want of memory)
+        let n = self.mark_dying(start, end);
+        while !self
+            .unmap_step(mm, vmos, jobs, start, end, u64::MAX, u64::MAX)
+            .0
+        {}
+        Ok(n)
+    }
+
+    /// First part of an unmap in chunks (T207 PR 3b): everything `unmap_range` can refuse is refused here, the regions are split at the edges, and the
+    /// ones inside are marked **dying**: a fault on them is `NoRegion`, a map or a protect sees them as in the way or not there, and nothing of
+    /// them changes but `unmap_step`. Returns how many regions are dying. Nothing changes on `Err`.
+    pub fn unmap_begin(
+        &mut self,
+        vmos: &mut Vmos,
+        start: u64,
+        len: u64,
+    ) -> Result<u64, RegionError> {
+        let end = Self::range_end(start, len)?;
+        let splits = self.splits_needed(start, end);
+        if splits > 0 && self.regions.len().saturating_add(splits) > self.region_limit {
+            return Err(RegionError::TooMany);
+        }
+        self.split_at(vmos, start)?;
+        self.split_at(vmos, end)?;
+        Ok(self.mark_dying(start, end))
+    }
+
+    /// `unmap_begin` for the one region that starts at `start` (a length of 0 in the call): it is marked dying; returns where it ends.
+    pub fn unmap_region_begin(&mut self, start: u64) -> Result<u64, RegionError> {
+        let r = self.regions.get(&start).ok_or(RegionError::NoRegion)?;
+        if r.dying {
+            return Err(RegionError::NoRegion);
+        }
+        let end = start.saturating_add(r.pages.saturating_mul(PAGE_SIZE));
+        self.mark_dying(start, start.saturating_add(1));
+        Ok(end)
+    }
+
+    /// Mark the regions that start in `[start, end)` dying; a new `gen` makes a fault that looked one up before find it stale. Allocates nothing.
+    fn mark_dying(&mut self, start: u64, end: u64) -> u64 {
         let (mut n, mut from) = (0u64, start);
         while let Some(s) = self.regions.range(from..end).next().map(|(&s, _)| s) {
-            let _ = self.unmap_region(mm, vmos, jobs, s);
+            let gen = self.next_gen;
+            self.next_gen = self.next_gen.saturating_add(1);
+            if let Some(r) = self.regions.get_mut(&s) {
+                r.dying = true;
+                r.gen = gen;
+            }
             n = n.saturating_add(1);
             from = s.saturating_add(1);
         }
-        Ok(n)
+        n
+    }
+
+    /// One step of the unmap `unmap_begin` started: clear at most `ptes` mappings (looking at no more than `scan` page-table entries) of the dying
+    /// regions in `[start, end)`, lowest first; a region goes, with its `maps` entry and its VMO reference, with its last page, and one that is not
+    /// finished loses the front it has cleared. Returns whether no dying region is left in the range, and how many mappings were cleared. **The caller flushes every hart's TLB before
+    /// a freed frame can be reused.**
+    #[allow(clippy::too_many_arguments)] // INVARIANT: one private-looking step with the space's three stores, the range and the two budgets
+    pub fn unmap_step<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        start: u64,
+        end: u64,
+        mut ptes: u64,
+        mut scan: u64,
+    ) -> (bool, u64) {
+        let budget = ptes;
+        loop {
+            let Some(s) = self
+                .regions
+                .range(start..end)
+                .find(|(_, r)| r.dying)
+                .map(|(&s, _)| s)
+            else {
+                return (true, budget.saturating_sub(ptes));
+            };
+            if ptes == 0 || scan == 0 {
+                return (false, budget.saturating_sub(ptes));
+            }
+            self.clear_front(mm, vmos, jobs, s, &mut ptes, &mut scan);
+        }
+    }
+
+    /// Clear the mappings of the region at `start` from its front while the budgets last; the region is removed when nothing is left of it
+    /// (its VMO reference goes last), else cut so that it starts where the clearing stopped. Returns whether the region is gone.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region's range was checked when it was inserted; stop <= end_va
+    fn clear_front<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        start: u64,
+        ptes: &mut u64,
+        scan: &mut u64,
+    ) -> bool {
+        let Some(r) = self.regions.get(&start) else {
+            return true;
+        };
+        let end_va = start + r.pages * PAGE_SIZE;
+        let mut va = start;
+        let stop = loop {
+            if *ptes == 0 {
+                break va;
+            }
+            match self.table.next_mapped_budgeted(mm, va, end_va, scan) {
+                Ok(Some(at)) => {
+                    if let Some((pfn, _)) = self.table.unmap(mm, at) {
+                        if mm.db.is_managed(pfn) {
+                            let _ = mm.db.dec(pfn);
+                        }
+                    }
+                    *ptes -= 1;
+                    va = at + PAGE_SIZE;
+                }
+                Ok(None) => break end_va,
+                Err(resume) => break resume,
+            }
+        };
+        if stop >= end_va {
+            if let Some(region) = self.regions.remove(&start) {
+                vmos.maps_remove(region.vmo, (self.owner, start));
+                let _ = vmos.release(mm, jobs, region.vmo);
+            }
+            return true;
+        }
+        let n = (stop - start) / PAGE_SIZE;
+        if n > 0 {
+            if let Some(r) = self.regions.get_mut(&start) {
+                r.pages -= n;
+                r.vmo_page += n;
+                let moved = MapRef {
+                    pages: r.pages,
+                    vmo_page: r.vmo_page,
+                };
+                let vmo = r.vmo;
+                // (the region's start moves up inside its own gap: the same entry under a new key, which allocates nothing)
+                self.regions.rekey(&start, stop);
+                vmos.maps_shift(vmo, self.owner, start, stop, moved);
+            }
+        }
+        false
     }
 
     /// `start + len` for a page-aligned, non-empty range inside the address space.
@@ -2512,12 +2829,12 @@ impl<F: PageTableFormat> AddressSpace<F> {
         Ok(end)
     }
 
-    /// Change the permissions of `[start, start + len)` to `perms` (MM7): the whole range must be mapped (regions that touch each other
+    /// Change the permissions of `[start, start + len)` to `perms` (MM7), first part (T207 PR 3b): the whole range must be mapped (regions that touch each other
     /// count as one), `perms` must be within each region's `max_perms` and never write with execute; regions are split at the edges, the
     /// page-table entries change in place, and neighbours that now agree merge. Nothing changes on `Err`. The caller owes the harts a
     /// shootdown if `downgraded`, and an instruction-cache sync if `exec_pages` is not 0.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked; region page counts bound every sum
-    pub fn protect_range<M: PhysMem>(
+    pub fn protect_begin<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
@@ -2525,7 +2842,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         start: u64,
         len: u64,
         perms: Perms,
-    ) -> Result<ProtectStats, ProtectError> {
+    ) -> Result<(), ProtectError> {
         let end = Self::range_end(start, len).map_err(|_| ProtectError::BadRange)?;
         if perms.write && perms.exec || perms.validate().is_err() {
             return Err(ProtectError::Denied);
@@ -2538,7 +2855,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 .regions
                 .range(..=at)
                 .next_back()
-                .filter(|(&s, r)| at < s + r.pages * PAGE_SIZE)
+                .filter(|(&s, r)| at < s + r.pages * PAGE_SIZE && !r.dying)
                 .ok_or(ProtectError::NotMapped)?;
             denied |= perms.write && !r.max_perms.write || perms.exec && !r.max_perms.exec;
             at = s + r.pages * PAGE_SIZE;
@@ -2554,7 +2871,6 @@ impl<F: PageTableFormat> AddressSpace<F> {
             .map_err(|_| ProtectError::TooMany)?;
         self.split_at(vmos, end)
             .map_err(|_| ProtectError::TooMany)?;
-        let mut stats = ProtectStats::default();
         let mut from = start;
         while let Some(s) = self.regions.range(from..end).next().map(|(&s, _)| s) {
             from = s.saturating_add(1);
@@ -2568,27 +2884,91 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 ..perms
             };
             r.gen = gen;
-            let (pages, new, rvmo, rpage) = (r.pages, r.perms, r.vmo, r.vmo_page);
-            for p in 0..pages {
-                // a page the VMO only inherits (or maps as the shared zero frame) stays read-only whatever the region allows: a write
-                // to it must fault and copy (COW1), not reach a frame other members see
-                let own = vmos.frame_info(rvmo, rpage + p).is_some_and(|(_, own)| own);
-                let new = Perms {
-                    write: new.write && own,
-                    ..new
-                };
-                if let Some(old) = self.table.protect(mm, s + p * PAGE_SIZE, new) {
-                    if old.read && !new.read || old.write && !new.write || old.exec && !new.exec {
-                        stats.downgraded = true;
+        }
+        self.merge_near(mm, vmos, jobs, start, end);
+        Ok(())
+    }
+
+    /// One step of the protect `protect_begin` started: bring the page-table entries from `*cursor` up to `end` to what their regions now allow, at most `ptes`
+    /// of them, looking at no more than `scan` entries. Returns whether the range is done, and what changed (the caller owes the harts a shootdown if
+    /// `downgraded`, and an instruction-cache sync if `exec_pages` is not 0).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region found has start <= at < its end, so the page index is below its length
+    pub fn protect_step<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &Vmos,
+        cursor: &mut u64,
+        end: u64,
+        mut ptes: u64,
+        mut scan: u64,
+    ) -> (bool, ProtectStats) {
+        let mut stats = ProtectStats::default();
+        loop {
+            if ptes == 0 {
+                return (*cursor >= end, stats);
+            }
+            match self.table.next_mapped_budgeted(mm, *cursor, end, &mut scan) {
+                Ok(Some(at)) => {
+                    *cursor = at + PAGE_SIZE;
+                    ptes -= 1;
+                    let Some((&s, r)) = self.regions.range(..=at).next_back() else {
+                        continue;
+                    };
+                    if at >= s + r.pages * PAGE_SIZE || r.dying {
+                        continue;
                     }
-                    if !old.exec && new.exec {
-                        stats.exec_pages += 1;
+                    // a page the VMO only inherits (or maps as the shared zero frame) stays read-only whatever the region allows: a write
+                    // to it must fault and copy (COW1), not reach a frame other members see
+                    let own = vmos
+                        .frame_info(r.vmo, r.vmo_page + (at - s) / PAGE_SIZE)
+                        .is_some_and(|(_, own)| own);
+                    let new = Perms {
+                        write: r.perms.write && own,
+                        ..r.perms
+                    };
+                    if let Some(old) = self.table.protect(mm, at, new) {
+                        if old.read && !new.read || old.write && !new.write || old.exec && !new.exec
+                        {
+                            stats.downgraded = true;
+                        }
+                        if !old.exec && new.exec {
+                            stats.exec_pages += 1;
+                        }
                     }
+                }
+                Ok(None) => {
+                    *cursor = end;
+                    return (true, stats);
+                }
+                Err(resume) => {
+                    *cursor = resume;
+                    return (false, stats);
                 }
             }
         }
-        self.merge_near(mm, vmos, jobs, start, end);
-        Ok(stats)
+    }
+
+    /// `protect_begin` and every step (the host tests and the callers that need no switch point).
+    pub fn protect_range<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        start: u64,
+        len: u64,
+        perms: Perms,
+    ) -> Result<ProtectStats, ProtectError> {
+        self.protect_begin(mm, vmos, jobs, start, len, perms)?;
+        let end = start.saturating_add(len);
+        let (mut cursor, mut total) = (start, ProtectStats::default());
+        loop {
+            let (done, st) = self.protect_step(mm, vmos, &mut cursor, end, u64::MAX, u64::MAX);
+            total.downgraded |= st.downgraded;
+            total.exec_pages = total.exec_pages.saturating_add(st.exec_pages);
+            if done {
+                return Ok(total);
+            }
+        }
     }
 
     /// Merge regions that touch, map the same VMO at contiguous offsets and agree on permissions, from the one before `lo` to the one at
@@ -2625,6 +3005,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
             let mergeable = match (self.regions.get(&cur), self.regions.get(&next)) {
                 (Some(x), Some(y)) => {
                     cur + x.pages * PAGE_SIZE == next
+                        && !x.dying
+                        && !y.dying
                         && x.vmo == y.vmo
                         && x.vmo_page + x.pages == y.vmo_page
                         && x.perms == y.perms
@@ -2841,7 +3223,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
             .next_back()
             .ok_or(FaultError::NoRegion)?;
         let page = (va - start) / PAGE_SIZE;
-        if page >= region.pages {
+        if page >= region.pages || region.dying {
             return Err(FaultError::NoRegion);
         }
         let allowed = match access {
@@ -3011,41 +3393,14 @@ impl<F: PageTableFormat> AddressSpace<F> {
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
         jobs: &mut Jobs,
-        mut budget: u64,
+        budget: u64,
     ) -> bool {
-        while budget > 0 {
-            let Some((&start, region)) = self.regions.iter().next() else {
+        let (mut ptes, mut scan) = (budget, budget.saturating_mul(SCAN_PER_PTE));
+        while ptes > 0 && scan > 0 {
+            let Some((&start, _)) = self.regions.iter().next() else {
                 return true;
             };
-            let n = region.pages.min(budget);
-            for p in 0..n {
-                if let Some((pfn, _)) = self.table.unmap(mm, start + p * PAGE_SIZE) {
-                    if mm.db.is_managed(pfn) {
-                        let _ = mm.db.dec(pfn);
-                    }
-                }
-            }
-            budget -= n;
-            let Some(r) = self.regions.get_mut(&start) else {
-                return true;
-            };
-            if n == r.pages {
-                if let Some(region) = self.regions.remove(&start) {
-                    vmos.maps_remove(region.vmo, (self.owner, start));
-                    let _ = vmos.release(mm, jobs, region.vmo);
-                }
-            } else {
-                r.pages -= n;
-                r.vmo_page += n;
-                let moved = MapRef {
-                    pages: r.pages,
-                    vmo_page: r.vmo_page,
-                };
-                let vmo = r.vmo;
-                // (the region's start moves up inside its own gap: the same entry under a new key, which allocates nothing)
-                self.regions.rekey(&start, start + n * PAGE_SIZE);
-                vmos.maps_shift(vmo, self.owner, start, start + n * PAGE_SIZE, moved);
-            }
+            self.clear_front(mm, vmos, jobs, start, &mut ptes, &mut scan);
         }
         self.regions.is_empty()
     }

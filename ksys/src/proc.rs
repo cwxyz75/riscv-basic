@@ -359,8 +359,274 @@ fn vmo_range_all<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, n: usize, a: [u
             Err(s) => break Err(s),
         }
     };
-    c.vmos.range_end(call.id);
+    c.vmos.range_end(call.id, r.is_ok());
     r.map(|()| (None, None)).map_err(e)
+}
+
+/// An unmap in chunks that `process_unmap_begin` started: the regions of `[start, end)` of process `tpid` are dying until the steps have taken them.
+#[derive(Debug, Clone, Copy)]
+pub struct UnmapCall {
+    pub tpid: u64,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Mappings one unmap step clears at most, and the page-table entries it may look at (T207 PR 3b).
+pub const UNMAP_STEP_PTES: u64 = 64;
+
+/// `process_unmap`, first part: resolve and check the arguments, split the regions at the edges and mark the ones inside dying. Every failure is
+/// here, before the first page goes.
+pub fn process_unmap_begin<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    a: [u64; 6],
+) -> Result<UnmapCall, Status> {
+    let PCtx {
+        objs,
+        procs,
+        me,
+        vmos,
+        jobs,
+        ..
+    } = c;
+    let caller = procs.get(me).ok_or(Status::BadState)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
+    let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
+    target
+        .aspace
+        .held_mut()
+        .set_region_limit(jobs.region_limit(target.job));
+    if target.exit_code.is_some() || target.killed.is_some() {
+        return Err(Status::BadState);
+    }
+    // length 0: the region that starts at `vaddr`, whole (the original call). Otherwise (MM7) every page of `[vaddr, vaddr + length)`:
+    // holes are fine, regions are split at the edges.
+    if a[2] == 0 {
+        let end = target
+            .aspace
+            .held_mut()
+            .unmap_region_begin(a[1])
+            .map_err(|_| Status::InvalidArgs)?;
+        return Ok(UnmapCall {
+            tpid,
+            start: a[1],
+            end,
+        });
+    }
+    if !in_user_range(a[1], a[2]) {
+        return Err(Status::InvalidArgs);
+    }
+    target
+        .aspace
+        .held_mut()
+        .unmap_begin(vmos, a[1], a[2])
+        .map_err(|x| match x {
+            kcore::aspace::RegionError::TooMany => Status::NoMemory,
+            _ => Status::InvalidArgs,
+        })?;
+    Ok(UnmapCall {
+        tpid,
+        start: a[1],
+        end: a[1].saturating_add(a[2]),
+    })
+}
+
+/// One step of the unmap: clear a batch of mappings, have every hart drop its translations (the frames the batch freed are not reused before:
+/// the memory locks are held), and say whether the call is done. A target that is gone or ending leaves its dying regions to its teardown.
+pub fn process_unmap_step<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    call: UnmapCall,
+) -> Result<bool, Status> {
+    let PCtx {
+        procs,
+        mm,
+        vmos,
+        jobs,
+        machine,
+        ..
+    } = c;
+    let target = procs.get_mut(&call.tpid).ok_or(Status::BadState)?;
+    if target.exit_code.is_some() || target.killed.is_some() {
+        return Err(Status::BadState);
+    }
+    let (done, cleared) = target.aspace.held_mut().unmap_step(
+        mm,
+        vmos,
+        jobs,
+        call.start,
+        call.end,
+        UNMAP_STEP_PTES,
+        UNMAP_STEP_PTES.saturating_mul(kcore::aspace::SCAN_PER_PTE),
+    );
+    // other harts may still cache the translations of what was just unmapped (also when a step found none mapped: as the one-shot call, it asks
+    // once at least)
+    let _ = cleared;
+    machine.shootdown();
+    machine.flush_tlb();
+    Ok(done)
+}
+
+/// The end of the unmap: the page-table charge of a `process_map` is credited when no region is left in the span it covered (a mapping that was
+/// split keeps the charge for what stays: its tables are still there). A target that is gone has nothing to credit.
+pub fn process_unmap_end<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, call: UnmapCall) {
+    let PCtx { procs, jobs, .. } = c;
+    if let Some(target) = procs.get_mut(&call.tpid) {
+        // (a cursor over the keys, not a list of them: nothing is allocated, so the call cannot fail after the unmap has been done: KT9)
+        let mut from = 0u64;
+        while let Some(k) = target
+            .charge_end
+            .range(from..)
+            .find(|&(&k, &end)| !target.aspace.held_ref().has_region_in(k, end))
+            .map(|(&k, _)| k)
+        {
+            from = k.saturating_add(1);
+            target.charge_end.remove(&k);
+            if let Some(tables) = target.table_charge.remove(&k) {
+                jobs.credit(target.job, Resource::Pages, tables);
+            }
+        }
+    }
+}
+
+/// `process_unmap` without a switch point between the steps (the host tests).
+fn process_unmap_all<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, a: [u64; 6]) -> Reply {
+    let call = process_unmap_begin(c, a).map_err(e)?;
+    let r = loop {
+        match process_unmap_step(c, call) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(s) => break Err(s),
+        }
+    };
+    if r.is_ok() {
+        process_unmap_end(c, call);
+    }
+    r.map(|()| (None, None)).map_err(e)
+}
+
+/// A protect in chunks that `process_protect_begin` started: the regions of `[cursor, end)` have their new permissions, the page-table entries follow.
+#[derive(Debug, Clone, Copy)]
+pub struct ProtectCall {
+    pub tpid: u64,
+    pub cursor: u64,
+    pub end: u64,
+    downgraded: bool,
+    exec_pages: u64,
+}
+
+/// `process_protect`, first part: every check, the split, and the new permissions of the regions. Every failure is here.
+pub fn process_protect_begin<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    a: [u64; 6],
+) -> Result<ProtectCall, Status> {
+    let PCtx {
+        objs,
+        procs,
+        me,
+        mm,
+        vmos,
+        jobs,
+        ..
+    } = c;
+    let (vaddr, length, flags) = (a[1], a[2], a[3]);
+    let caller = procs.get(me).ok_or(Status::BadState)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
+    if flags & !(PF_R | PF_W | PF_X) != 0
+        || flags & PF_W != 0 && flags & PF_X != 0
+        || !in_user_range(vaddr, length)
+    {
+        return Err(Status::InvalidArgs);
+    }
+    let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
+    target
+        .aspace
+        .held_mut()
+        .set_region_limit(jobs.region_limit(target.job));
+    if target.exit_code.is_some() || target.killed.is_some() {
+        return Err(Status::BadState);
+    }
+    let perms = Perms {
+        read: true,
+        write: flags & PF_W != 0,
+        exec: flags & PF_X != 0,
+        user: true,
+    };
+    target
+        .aspace
+        .held_mut()
+        .protect_begin(mm, vmos, jobs, vaddr, length, perms)
+        .map_err(|x| match x {
+            kcore::aspace::ProtectError::Denied => Status::AccessDenied,
+            kcore::aspace::ProtectError::TooMany => Status::NoMemory,
+            _ => Status::InvalidArgs,
+        })?;
+    Ok(ProtectCall {
+        tpid,
+        cursor: vaddr,
+        end: vaddr.saturating_add(length),
+        downgraded: false,
+        exec_pages: 0,
+    })
+}
+
+/// One step: bring a batch of page-table entries to the permissions of their regions. `Ok(true)` when the range is done.
+pub fn process_protect_step<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    call: &mut ProtectCall,
+) -> Result<bool, Status> {
+    let PCtx {
+        procs, mm, vmos, ..
+    } = c;
+    let target = procs.get_mut(&call.tpid).ok_or(Status::BadState)?;
+    if target.exit_code.is_some() || target.killed.is_some() {
+        return Err(Status::BadState);
+    }
+    let (done, st) = target.aspace.held_mut().protect_step(
+        mm,
+        vmos,
+        &mut call.cursor,
+        call.end,
+        UNMAP_STEP_PTES,
+        UNMAP_STEP_PTES.saturating_mul(kcore::aspace::SCAN_PER_PTE),
+    );
+    call.downgraded |= st.downgraded;
+    call.exec_pages = call.exec_pages.saturating_add(st.exec_pages);
+    Ok(done)
+}
+
+/// The end: a permission taken away may still be cached by every hart; code made visible must reach every instruction fetch (M9: both before
+/// the call returns).
+pub fn process_protect_end<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    n: usize,
+    call: ProtectCall,
+) {
+    let machine = &mut c.machine;
+    if call.downgraded {
+        if !machine.skip_shootdown(n) {
+            machine.shootdown();
+        }
+        machine.flush_tlb();
+    }
+    if call.exec_pages > 0 {
+        machine.icache_sync(call.exec_pages);
+    }
+}
+
+fn process_protect_all<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    n: usize,
+    a: [u64; 6],
+) -> Reply {
+    let mut call = process_protect_begin(c, a).map_err(e)?;
+    loop {
+        match process_protect_step(c, &mut call) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(s) => return Err(e(s)),
+        }
+    }
+    process_protect_end(c, n, call);
+    Ok((None, None))
 }
 
 fn bad(s: Status) -> Reply {
@@ -494,6 +760,12 @@ pub fn proc_call<M: PhysMem, X: Machine>(
     a: [u64; 6],
     c: &mut PCtx<'_, M, X>,
 ) -> Option<Reply> {
+    if n == nr::PROCESS_UNMAP {
+        return Some(process_unmap_all(c, a));
+    }
+    if n == nr::PROCESS_PROTECT {
+        return Some(process_protect_all(c, n, a));
+    }
     if n == nr::VMO_DECOMMIT || n == nr::VMO_SET_SIZE {
         // (the steps the kernel runs with a switch point between them, run here one after another)
         return Some(vmo_range_all(c, n, a));
@@ -581,7 +853,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::BadState);
             }
             // (a stranger's mapping of pages being taken away would outlive the promise above: wait for the call to end)
-            if vmo_job != Some(caller_job) && vmo_job != Some(target.job) && vmos.is_busy(vid) {
+            if vmo_job != Some(target.job) && vmos.is_busy(vid) {
                 return bad(Status::ShouldWait);
             }
             let perms = Perms {
@@ -753,7 +1025,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 // (V1, as `process_map`: a stranger's VMO must already be paid for)
                 return bad(Status::BadState);
             }
-            if vmo_job != caller_job && vmo_job != target_job && vmos.is_busy(vid) {
+            if vmo_job != target_job && vmos.is_busy(vid) {
                 return bad(Status::ShouldWait);
             }
             let tables = region.pages / 512 + 4;
@@ -838,106 +1110,6 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 );
                 let _ = vmos.release(mm, jobs, c);
                 snapshot_protect(procs, mm, &mut **machine, vid);
-            }
-            Ok((None, None))
-        })(),
-        nr::PROCESS_UNMAP => (|| {
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (_, tpid, _, _) =
-                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
-            let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
-            target
-                .aspace
-                .held_mut()
-                .set_region_limit(jobs.region_limit(target.job));
-            if target.exit_code.is_some() || target.killed.is_some() {
-                return bad(Status::BadState);
-            }
-            // length 0: the region that starts at `vaddr`, whole (the original call). Otherwise (MM7) every page of `[vaddr, vaddr + length)`:
-            // holes are fine, regions are split at the edges.
-            if a[2] == 0 {
-                target
-                    .aspace
-                    .held_mut()
-                    .unmap_region(mm, vmos, jobs, a[1])
-                    .map_err(|_| e(Status::InvalidArgs))?;
-            } else {
-                if !in_user_range(a[1], a[2]) {
-                    return bad(Status::InvalidArgs);
-                }
-                target
-                    .aspace
-                    .held_mut()
-                    .unmap_range(mm, vmos, jobs, a[1], a[2])
-                    .map_err(|x| match x {
-                        kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
-                        _ => e(Status::InvalidArgs),
-                    })?;
-            }
-            // other harts may still cache the translations of what was just unmapped
-            machine.shootdown();
-            // the page-table charge of a `process_map` is credited when no region is left in the span it covered (a mapping that was split
-            // keeps the charge for what stays: its tables are still there)
-            // (a cursor over the keys, not a list of them: nothing is allocated, so the call cannot fail after the unmap has been done: KT9)
-            let mut from = 0u64;
-            while let Some(k) = target
-                .charge_end
-                .range(from..)
-                .find(|&(&k, &end)| !target.aspace.held_ref().has_region_in(k, end))
-                .map(|(&k, _)| k)
-            {
-                from = k.saturating_add(1);
-                target.charge_end.remove(&k);
-                if let Some(tables) = target.table_charge.remove(&k) {
-                    jobs.credit(target.job, Resource::Pages, tables);
-                }
-            }
-            machine.flush_tlb();
-            Ok((None, None))
-        })(),
-        nr::PROCESS_PROTECT => (|| {
-            let (vaddr, length, flags) = (a[1], a[2], a[3]);
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (_, tpid, _, _) =
-                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
-            if flags & !(PF_R | PF_W | PF_X) != 0
-                || flags & PF_W != 0 && flags & PF_X != 0
-                || !in_user_range(vaddr, length)
-            {
-                return bad(Status::InvalidArgs);
-            }
-            let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
-            target
-                .aspace
-                .held_mut()
-                .set_region_limit(jobs.region_limit(target.job));
-            if target.exit_code.is_some() || target.killed.is_some() {
-                return bad(Status::BadState);
-            }
-            let perms = Perms {
-                read: true,
-                write: flags & PF_W != 0,
-                exec: flags & PF_X != 0,
-                user: true,
-            };
-            let stats = target
-                .aspace
-                .held_mut()
-                .protect_range(mm, vmos, jobs, vaddr, length, perms)
-                .map_err(|x| match x {
-                    kcore::aspace::ProtectError::Denied => e(Status::AccessDenied),
-                    kcore::aspace::ProtectError::TooMany => e(Status::NoMemory),
-                    _ => e(Status::InvalidArgs),
-                })?;
-            // a permission taken away may still be cached by every hart; code made visible must reach every instruction fetch
-            if stats.downgraded {
-                if !machine.skip_shootdown(n) {
-                    machine.shootdown();
-                }
-                machine.flush_tlb();
-            }
-            if stats.exec_pages > 0 {
-                machine.icache_sync(stats.exec_pages);
             }
             Ok((None, None))
         })(),

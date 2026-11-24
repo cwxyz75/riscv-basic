@@ -574,6 +574,52 @@ impl<F: PageTableFormat> PageTable<F> {
         None
     }
 
+    /// `next_mapped` with a budget: every step of the walk costs one from `scan`. `Err(va)` when the budget ran out before the answer: nothing is mapped
+    /// in `[start, va)` and the walk resumes there.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `next_mapped`; the budget is decremented only above 0
+    pub fn next_mapped_budgeted<M: PhysMem>(
+        &self,
+        mm: &Mm<M>,
+        mut va: u64,
+        end: u64,
+        scan: &mut u64,
+    ) -> Result<Option<u64>, u64> {
+        while va < end {
+            if !F::is_canonical(va) {
+                return Ok(None);
+            }
+            if *scan == 0 {
+                return Err(va);
+            }
+            *scan -= 1;
+            let mut table = self.root;
+            let mut skip = None;
+            for level in (0..F::LEVELS).rev() {
+                let pte = mm.mem.read_u64((table << 12) + index(va, level) * 8);
+                if !F::is_valid(pte) {
+                    skip = Some(PAGE_SIZE << (9 * level));
+                    break;
+                }
+                if F::is_leaf(pte, level) {
+                    return Ok(Some(va));
+                }
+                if level == 0 {
+                    skip = Some(PAGE_SIZE);
+                    break;
+                }
+                table = F::pfn_of(pte);
+            }
+            let Some(span) = skip else {
+                return Ok(None);
+            };
+            let Some(next) = (va / span).checked_add(1).and_then(|k| k.checked_mul(span)) else {
+                return Ok(None);
+            };
+            va = next;
+        }
+        Ok(None)
+    }
+
     /// Translate `va` (any byte of a page). Huge leaves translate too.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the span is 1 << (9 * level) with level < 4; a leaf's pfn plus an in-span page offset stays a frame number
     pub fn translate<M: PhysMem>(&self, mm: &Mm<M>, va: u64) -> Option<Translation> {
