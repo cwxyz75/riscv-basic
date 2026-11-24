@@ -424,6 +424,8 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
                 {}
                 return Ok((Some(0), None));
             }
+            // 206: the registry's live objects
+            206 => return Ok((Some(s.objs.live() as u64), None)),
             // 204: the VMOs that exist, so a sweep can check a scenario leaves none behind
             204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
             _ => {}
