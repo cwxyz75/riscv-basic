@@ -7658,6 +7658,82 @@ fn fetch_the_conformance_image() -> Outcome {
     Ok(())
 }
 
+static KFUZZ_IMAGE: AtomicU64 = AtomicU64::new(0);
+
+fn fetch_the_fuzzer_image() -> Outcome {
+    let (m, n) = request(25, b'F', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u64; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the image");
+    KFUZZ_IMAGE.store(got[0], Ordering::Relaxed);
+    Ok(())
+}
+
+/// KT8, the guest half: the program `kfuzz` runs the generator of the host fuzzer against this kernel, seed by seed, each in a child of its own inside a small job
+/// (a handle to the job goes to it over the bootstrap channel). Whatever the sequence did (the program may even fault: it can close a handle of its own runtime
+/// by chance), killing the job must bring the job's counters and the kernel heap back to where they began, and the kernel must still be running (a panic is
+/// the boot test's `##PANIC`).
+fn the_guest_fuzzer_leaves_nothing_behind() -> Outcome {
+    const SEEDS: u64 = 4;
+    let root = root_job()?;
+    for seed in 1..=SEEDS {
+        let j = job(root, 4, 12, 2000)?;
+        let heap_before = sys::debug_stat(109);
+        let (p, mine) =
+            launch_image_in(KFUZZ_IMAGE.load(Ordering::Relaxed), seed as usize as u64, j)?;
+        // the job handle the program's job calls act on: a duplicate with every right
+        let dup = ok(
+            sys::handle_duplicate(j, Rights::JOB.0),
+            "duplicate the job handle",
+        )?
+        .a1 as u64;
+        let hs = [dup];
+        ensure_eq!(
+            st(sys::channel_write(
+                mine,
+                [0u8; 1].as_ptr(),
+                1,
+                hs.as_ptr(),
+                1
+            )),
+            Some(S::Ok),
+            "send the job handle"
+        );
+        // it ends by itself (the sequence is finite); if it does not within the budget, that is a hang worth knowing about
+        let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 6000);
+        ensure!(
+            r.status == 0 && r.a1 as u32 & sig::TERMINATED != 0,
+            "seed {seed}: the fuzzer ended within its budget"
+        );
+        sys::job_kill(j, 1);
+        sys::handle_close(p);
+        sys::handle_close(mine);
+        for which in [0, 1, 2, 3, 4, 5, 8] {
+            job_use_settles(j, which, 0, 2000)?;
+        }
+        sys::handle_close(j);
+        let held = heap_before.wrapping_sub(sys::debug_stat(109)) as i64;
+        ensure!(
+            held <= 64 * 1024,
+            "seed {seed}: {held} kernel heap bytes stayed behind"
+        );
+    }
+    sys::handle_close(root);
+    Ok(())
+}
+
 /// AB9: the conformance program (built against `libsys` alone) runs to the end with no check failed; each failure it found comes back as a message.
 fn abi_conformance_passes() -> Outcome {
     let (p, mine) = launch_image(ABI_CONFORMANCE_IMAGE.load(Ordering::Relaxed), 0)?;
@@ -16214,6 +16290,8 @@ pub fn app_main() -> i32 {
             fetch_the_conformance_image,
         ),
         ("abi_conformance_passes", abi_conformance_passes),
+        ("fetch_the_fuzzer_image", fetch_the_fuzzer_image),
+        ("the_guest_fuzzer_leaves_nothing_behind", the_guest_fuzzer_leaves_nothing_behind),
         (
             "runtime_startup_heap_and_stdio",
             runtime_startup_heap_and_stdio,

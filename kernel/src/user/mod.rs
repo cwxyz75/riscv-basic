@@ -50,6 +50,8 @@ pub static BOOT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootimg
 /// The conformance program of the system library (AB9): started by the boot-time suite, not part of the boot image.
 pub static ABI_CONFORMANCE_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/abi_conformance.elf"));
+/// The guest syscall fuzzer (KT8): started by the boot-time suite in a limited job, not part of the boot image.
+pub static KFUZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kfuzz.elf"));
 pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the

@@ -20,6 +20,7 @@ pathres = { path = "../pathres" }
 rt = { path = "../rt", features = ["heap"] }
 libsys = { path = "../libsys", default-features = false }
 abi = { path = "../abi" }
+kfuzz-gen = { path = "../kfuzz-gen" }
 shell-core = { path = "../shell-core" }
 ish = { path = "../ish" }
 profile = { path = "../profile" }

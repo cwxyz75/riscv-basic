@@ -109,6 +109,8 @@ the checked release build (`FUZZ_SEEDS`, `FUZZ_CALLS`). A failure prints its rep
 (`KFUZZ_SEEDS=<seed> KFUZZ_CALLS=<n> cargo test --profile release-checked -p ksys --test fuzz sequences`);
 `KFUZZ_TRACE=1` prints every call.
 
+The guest half is the program `init/src/bin/kfuzz.rs`: the same generator, its calls made through the system library against the real kernel, one seed per child process in a small job (the suite test `the_guest_fuzzer_leaves_nothing_behind` runs seeds 1 to 4 on every kernel boot; widen `SEEDS` there, or run the shard with a larger range, for a long hunt). A kernel panic is the boot test's `##PANIC`; after each child the job is killed and its counters (processes, threads, pages, jobs, objects, IPC bytes, kernel bytes) must settle at zero and the kernel heap must come back. A seed replays to the same calls (the window moves with ASLR, but the calls are relative to it).
+
 **The allocation-failure sweep.** `ksys/tests/allocfail.rs` runs each scenario with its N-th allocation failing, for
 every N until the scenario finishes without reaching it. Each case runs in a child process, because an infallible
 allocation aborts on failure: a child that dies is reported with the scenario, the N and the frames of the failing

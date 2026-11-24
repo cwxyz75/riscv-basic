@@ -59,6 +59,7 @@ fn main() {
     for name in [
         "suite",
         "abi_conformance",
+        "kfuzz",
         "init",
         "crash",
         "hello",
@@ -108,7 +109,7 @@ fn main() {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
         let bytes = std::fs::read(&src).unwrap_or_default();
-        if name != "suite" && name != "abi_conformance" {
+        if name != "suite" && name != "abi_conformance" && name != "kfuzz" {
             image_files.push((format!("bin/{name}").into_bytes(), bytes.clone()));
         }
         std::fs::write(out.join(format!("{name}.elf")), bytes).expect("write the embedded program");
