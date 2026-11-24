@@ -240,8 +240,8 @@ def check_atomics():
 # silently: a new use is a new row here, with the reason.
 NOFAIL = {
     "kernel/src/thread.rs": (5, "the scheduler's spawn tail, the kernel thread registration, and the donation graph's three operations (a channel_call's lend and revoke, a thread's exit)"),
-    "kernel/src/user/lifecycle.rs": (2, "teardown's list of a process's VMOs and a thread's exit from its PI futexes"),
-    "kernel/src/user/trap.rs": (2, "the calls that end or deliver something for a process that exists (kill, exception, pager, thread state: T248) and port_wait_many's buffer"),
+    "kernel/src/user/lifecycle.rs": (1, "a thread's exit from its PI futexes"),
+    "kernel/src/user/trap.rs": (1, "the calls that end or deliver something for a process that exists (kill, exception, pager, thread state: T248)"),
     "kernel/src/user/calls.rs": (1, "the donation graph's node of a user thread, after its spawn"),
     "kernel/src/user/kobjects.rs": (1, "a kernel thread's admission to the wait table"),
     "kernel/src/user/loader.rs": (1, "the donation graph's node of a boot thread"),

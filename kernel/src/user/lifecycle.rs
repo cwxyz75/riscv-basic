@@ -318,13 +318,18 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
         irq::restore(was);
     }
     // 2. the VMOs the process owned: the pages of one that nothing else holds go back in chunks, then the VMO itself
-    let ids: alloc::vec::Vec<u64> = crate::heap::nofail(|| {
-        core::mem::take(&mut process.vmos)
-            .into_iter()
-            .chain(process.stacks.values().map(|st| st.vmo))
-            .collect()
-    });
-    for id in ids {
+    // (popped one at a time, from the process's own lists: nothing is collected, so this cannot fail for want of memory: T248)
+    loop {
+        let id = match process.vmos.pop() {
+            Some(id) => id,
+            None => match process.stacks.first_key_value().map(|(&t, st)| (t, st.vmo)) {
+                Some((t, vmo)) => {
+                    process.stacks.remove(&t);
+                    vmo
+                }
+                None => break,
+            },
+        };
         irq::without(|| {}); // a switch point (X4)
         {
             let k = kmem::mem();
