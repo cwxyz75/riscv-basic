@@ -5646,7 +5646,7 @@ fn kernel_allocation_failure_sweep() -> Outcome {
     if stat(203, 0) == 0 {
         return Ok(());
     }
-    let scenarios: [(&str, fn()); 9] = [
+    let scenarios: [(&str, fn()); 10] = [
         ("channel", || {
             let r = sys::channel_create();
             if r.status != 0 {
@@ -5754,6 +5754,33 @@ fn kernel_allocation_failure_sweep() -> Outcome {
             static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             sys::futex_wait(WORD.as_ptr(), 0, sys::clock_get() + 2);
             sys::futex_wake(WORD.as_ptr(), 1);
+        }),
+        ("snapshot child decommit", || {
+            // (a child's decommit inside the window it inherits makes explicit holes, which are allocations of their own)
+            sweep_stat(207, 1);
+            let v = sys::vmo_create(4);
+            if v.status == 0 {
+                let src = v.a1 as u64;
+                sys::vmo_commit(src, 0, 4 * 4096);
+                sweep_stat(207, 0);
+                let c = sys::vmo_create_child(src, 0, 4 * 4096, 0, rt::abi::child_flags::SNAPSHOT);
+                sweep_stat(207, 1);
+                let c = if c.status == 0 {
+                    c
+                } else {
+                    sys::vmo_create_child(src, 0, 4 * 4096, 0, rt::abi::child_flags::SNAPSHOT)
+                };
+                if c.status == 0 {
+                    sweep_stat(207, 0);
+                    let d = sys::vmo_decommit(c.a1 as u64, 4096, 2 * 4096);
+                    sweep_stat(207, 1);
+                    if d.status != 0 {
+                        sys::vmo_decommit(c.a1 as u64, 4096, 2 * 4096);
+                    }
+                    sys::handle_close(c.a1 as u64);
+                }
+                sys::handle_close(src);
+            }
         }),
         ("map and touch", || {
             let me = sys::process_self();
