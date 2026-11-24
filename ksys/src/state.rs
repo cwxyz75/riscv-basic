@@ -87,8 +87,6 @@ pub struct UserState {
     pub pager_ends: kcore::fmap::FMap<u64, abi::Handle>,
     /// The next pager id.
     pub next_pager: u64,
-    /// Threads a call that failed has to wake anyway (a partly done supply): the kernel takes them after the call.
-    pub pending_wake: Vec<Tid>,
     /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
     pub job_exc: kcore::fmap::FMap<kcore::job::JobId, abi::Handle>,
     /// The next exception serial.
@@ -239,7 +237,6 @@ impl UserState {
             pagers: kcore::pager::Pagers::new(),
             pager_ends: kcore::fmap::FMap::new(),
             next_pager: 1,
-            pending_wake: Vec::new(),
             next_exc: 1,
             starts: kcore::fmap::FMap::new(),
             threads: kcore::fmap::FMap::new(),
@@ -430,6 +427,10 @@ impl UserState {
             .map_err(|_| abi::status::Status::NoMemory)?;
         self.starts
             .reserve(1)
+            .map_err(|_| abi::status::Status::NoMemory)?;
+        // (room for the new thread to wait for a page: T248)
+        self.pagers
+            .reserve_room(self.threads.len().saturating_add(1))
             .map_err(|_| abi::status::Status::NoMemory)?;
         match self.procs.get_mut(&pid) {
             Some(p) => {

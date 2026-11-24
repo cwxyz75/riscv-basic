@@ -356,15 +356,10 @@ pub(super) fn pager_create_call() -> Reply {
     })
 }
 
-/// Wake the threads whose wait a pager call ended (the answer of the call is what it is: a partly done supply still wakes the pages it moved).
-fn wake_pager_waiters(mut woken: Vec<Tid>) {
-    woken.extend(locked_state(|s| core::mem::take(&mut s.pending_wake)));
-    thread::wake_many(&woken);
-}
-
-/// `pager_supply(pager, vmo, offset, length, source, source_offset)` (MM9).
+/// `pager_supply(pager, vmo, offset, length, source, source_offset)` (MM9). A partly done supply still ends the waits of the pages it moved.
+#[allow(clippy::large_stack_frames)] // INVARIANT: the lock set of every address space and the supply's arguments: one frame on the syscall path, no recursion
 pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
-    let r = locked_state(|s| -> Result<Vec<Tid>, ReplyErr> {
+    let r = locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let _as = AsLocks::all(s).map_err(|e| (e, None, None))?;
         let k = kmem::get();
@@ -377,29 +372,23 @@ pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
             me,
             a,
         )
-        .map_err(|e| (e, None, None))
+        .map_err(|e| (e, None, None))?;
+        Ok((None, None))
     });
-    match r {
-        Ok(woken) => {
-            wake_pager_waiters(woken);
-            Ok((None, None))
-        }
-        Err(e) => {
-            wake_pager_waiters(Vec::new());
-            Err(e)
-        }
-    }
+    super::waits::wake_pager_waiters();
+    r
 }
 
 /// `pager_fail(pager, vmo, offset, length, status)` (MM9).
 pub(super) fn pager_fail_call(a: [u64; 6]) -> Reply {
-    let woken = locked_state(|s| -> Result<Vec<Tid>, ReplyErr> {
+    let r = locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let k = kmem::get();
-        ksys::pager::pager_fail(s, k.vmos, me, a).map_err(|e| (e, None, None))
-    })?;
-    wake_pager_waiters(woken);
-    Ok((None, None))
+        ksys::pager::pager_fail(s, k.vmos, me, a).map_err(|e| (e, None, None))?;
+        Ok((None, None))
+    });
+    super::waits::wake_pager_waiters();
+    r
 }
 
 /// `process_exception_channel(process) -> channel` and `job_exception_channel(job) -> channel` (EX2): the user end of the channel the kernel writes
