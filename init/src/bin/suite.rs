@@ -14580,9 +14580,10 @@ fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
         (95_000_000..=105_000_000).contains(&spun),
         "a thread that spun for 100 ms was charged {spun} ns"
     );
-    // (the thread's start-up, its event and its two calls cost about a millisecond on a loaded CI machine: the point is that 50 ms of sleep cost nothing)
+    // (the thread's start-up, its event and its two calls cost a few milliseconds on a loaded CI machine under emulation, 5.5 to 7.9 ms seen (T250): the point
+    // is that 50 ms of sleep were not charged, which 25 ms still tells)
     ensure!(
-        slept < 5_000_000,
+        slept < 25_000_000,
         "a thread that slept 50 ms was charged {slept} ns"
     );
     // an ended thread's handle keeps the total
