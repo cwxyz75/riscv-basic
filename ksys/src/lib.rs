@@ -39,8 +39,9 @@ pub use lifecycle::{
 pub use proc::{
     cow_sync, place_anywhere, proc_call, process_protect_begin, process_protect_end,
     process_protect_step, process_unmap_begin, process_unmap_end, process_unmap_step, put_process,
-    vmo_range_begin, vmo_range_step, LibRange, Machine, NoMap, PCtx, ProcState, ProcTable, Process,
-    ProtectCall, RangeCall, SpawnStack, StartMap, UnmapCall,
+    vmo_range_begin, vmo_range_finish, vmo_range_next_owner, vmo_range_take, vmo_range_unmap_owner,
+    LibRange, Machine, NoMap, PCtx, ProcState, ProcTable, Process, ProtectCall, RangeBatch,
+    RangeCall, SpawnStack, StartMap, UnmapCall,
 };
 pub use state::{PendingRegs, ThreadStart, UThread, UserState};
 pub use thread::{

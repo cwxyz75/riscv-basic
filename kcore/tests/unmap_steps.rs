@@ -255,3 +255,76 @@ fn a_stepped_protect_gives_the_regions_their_permissions_at_once_and_the_entries
         vmos.release(&mut mm, &mut jobs, id).unwrap();
     }
 }
+
+#[test]
+fn a_snapshot_write_protect_in_the_window_of_a_stepped_protect_reaches_the_entries_still_writable()
+{
+    // COW1: the region says read-only but the entries not yet reached still allow writes; the write-protect must go by the entries
+    let (mut mm, mut vmos, mut jobs, mut a, job) = world();
+    let ids = fill(&mut mm, &mut vmos, &mut jobs, &mut a, job);
+    a.protect_begin(&mut mm, &mut vmos, &mut jobs, BASE, 300 * PAGE, Perms::R)
+        .unwrap();
+    let changed = ids
+        .iter()
+        .map(|&id| a.write_protect_vmo(&mut mm, id))
+        .sum::<u64>();
+    assert!(
+        changed > 0,
+        "the writable entries under a read-only region were skipped"
+    );
+    let t = a.table().translate(&mm, BASE + 200 * PAGE).unwrap();
+    assert!(!t.perms.write);
+    for id in ids {
+        vmos.release(&mut mm, &mut jobs, id).unwrap();
+    }
+}
+
+#[test]
+fn the_list_names_the_owners_and_finds_a_mapping_by_another_job() {
+    let (mut mm, mut vmos, mut jobs, mut a, job) = world();
+    let other_job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 50, job);
+    a.set_owner_fresh(7);
+    a.map_region(&mut vmos, BASE, 50, id, 0, Perms::RW).unwrap();
+    let mut b = AddressSpace::new(PageTable::new(&mut mm).unwrap());
+    b.set_owner_fresh(9);
+    b.map_region(&mut vmos, BASE, 10, id, 20, Perms::R).unwrap();
+    assert_eq!(vmos.max_mapper(id), 9);
+    assert_eq!(vmos.next_mapper(id, 0, 100), Some(7));
+    assert_eq!(vmos.next_mapper(id, 7, 100), Some(9));
+    assert_eq!(vmos.next_mapper(id, 9, 100), None);
+    assert_eq!(
+        vmos.next_mapper(id, 0, 6),
+        None,
+        "above the bound is not seen"
+    );
+    let jobs_of = |o: u64| match o {
+        7 => Some(job),
+        9 => Some(other_job),
+        _ => None,
+    };
+    // owner 9 (another job) maps pages 20..30
+    assert!(vmos.maps_other_job(id, 25, 1, job, &jobs_of));
+    assert!(!vmos.maps_other_job(id, 0, 20, job, &jobs_of));
+    assert!(!vmos.maps_other_job(id, 30, 20, job, &jobs_of));
+    assert!(vmos.maps_other_job(id, 0, u64::MAX, job, &jobs_of));
+    // a PRIVATE child's own mapping shows the source's pages through it
+    let c = vmos
+        .child_prepare(&mut jobs, id, 5, 10, job, kcore::aspace::ChildMode::Private)
+        .unwrap();
+    vmos.child_attach(&mut jobs, c, id, 5, 10, kcore::aspace::ChildMode::Private);
+    let mut d = AddressSpace::new(PageTable::new(&mut mm).unwrap());
+    d.set_owner_fresh(11);
+    d.map_region(&mut vmos, BASE, 10, c, 0, Perms::R).unwrap();
+    let jobs_of2 = |o: u64| match o {
+        7 | 9 => Some(job),
+        11 => Some(other_job),
+        _ => None,
+    };
+    assert!(
+        vmos.maps_other_job(id, 7, 1, job, &jobs_of2),
+        "page 7 of the source is page 2 of the child"
+    );
+    assert!(!vmos.maps_other_job(id, 16, 4, job, &jobs_of2));
+    assert_eq!(vmos.max_mapper(id), 11);
+}

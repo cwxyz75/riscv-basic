@@ -63,13 +63,12 @@ struct W {
     tlb: Tlb,
 }
 
-fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
+fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId, pid: u64) -> Process {
+    let mut space = AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap());
+    space.set_owner_fresh(pid); // (the lists of mappings name processes)
     Process {
         live_tids: Default::default(),
-        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
-            1,
-            AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
-        )),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(pid, space)),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
@@ -103,8 +102,8 @@ fn world() -> (W, u64) {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut procs = kcore::fmap::FMap::new();
-    ksys::put_process(&mut procs, 1, process(&mut mm, &kernel, JobId::ROOT));
-    ksys::put_process(&mut procs, 2, process(&mut mm, &kernel, JobId::ROOT));
+    ksys::put_process(&mut procs, 1, process(&mut mm, &kernel, JobId::ROOT, 1));
+    ksys::put_process(&mut procs, 2, process(&mut mm, &kernel, JobId::ROOT, 2));
     let mut w = W {
         objs: Kobjs::new(),
         procs,

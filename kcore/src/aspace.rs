@@ -369,6 +369,8 @@ pub struct Vmos {
     dma_pages: u64,
     /// The first slot with a dying VMO (index + 1, 0 for none).
     dying_head: u32,
+    /// Frames a chunked decommit took out of a page index and has not freed yet (T207 PR 3d): still charged to their job, held by no index. J1 counts them.
+    detached: u64,
     /// The most pages DMA VMOs may hold together (the backstop, PL8).
     dma_total_cap: u64,
     /// The generation a slot made from now on starts at (0, except in a test that reaches the end of the 32 bits: `set_first_generation`).
@@ -524,6 +526,12 @@ impl Vmos {
     }
 
     /// A region's start moved up inside its own gap (a teardown cuts it from the front): the same entry under a new base, allocating nothing.
+    fn maps_rekey(&mut self, id: u64, old: (u64, u64), new: (u64, u64)) {
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            v.maps.rekey(&old, new);
+        }
+    }
+
     fn maps_shift(&mut self, id: u64, owner: u64, old: u64, new: u64, m: MapRef) {
         if let Some(v) = Self::vmo_in(&mut self.slots, id) {
             if v.maps.rekey(&(owner, old), (owner, new)) {
@@ -532,6 +540,73 @@ impl Vmos {
                 }
             }
         }
+    }
+
+    /// Does a mapping by a process whose job is not `job` show pages `first .. first + pages` of VMO `id`, in `id` or any node below it (V4: a PRIVATE
+    /// child shows its source's pages through its own mappings)? `job_of` names the job of an owner (a process id); an owner it does not know has no
+    /// mapping to speak of. Reads the lists of mappings only, so it needs no address-space lock. Allocates nothing.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: end > base was checked
+    pub fn maps_other_job(
+        &self,
+        id: u64,
+        first: u64,
+        pages: u64,
+        job: JobId,
+        job_of: &dyn Fn(u64) -> Option<JobId>,
+    ) -> bool {
+        let end = first.saturating_add(pages);
+        let mut found = false;
+        self.for_each_below(id, 0, &mut |d, base| {
+            if found {
+                return;
+            }
+            let Some(v) = self.vmo(d) else { return };
+            // (the node's window of the pages asked for: node page p is the VMO's page p + base)
+            if end <= base {
+                return;
+            }
+            let lo = first.saturating_sub(base);
+            let hi = end - base;
+            for (&(owner, _), m) in v.maps.iter() {
+                if lo < m.vmo_page.saturating_add(m.pages)
+                    && m.vmo_page < hi
+                    && job_of(owner).is_some_and(|j| j != job)
+                {
+                    found = true;
+                    return;
+                }
+            }
+        });
+        found
+    }
+
+    /// The first owner above `after` (and not above `bound`) that has a mapping of VMO `id` or of a node below it, and the greatest owner of all of them
+    /// (`bound` for the walk that starts now). `None` when there is no such owner.
+    pub fn next_mapper(&self, id: u64, after: u64, bound: u64) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        self.for_each_below(id, 0, &mut |d, _| {
+            if let Some(v) = self.vmo(d) {
+                if let Some((&(o, _), _)) = v.maps.range((after.saturating_add(1), 0)..).next() {
+                    if o <= bound && best.is_none_or(|b| o < b) {
+                        best = Some(o);
+                    }
+                }
+            }
+        });
+        best
+    }
+
+    /// The greatest owner that maps VMO `id` or a node below it (0 for none).
+    pub fn max_mapper(&self, id: u64) -> u64 {
+        let mut best = 0u64;
+        self.for_each_below(id, 0, &mut |d, _| {
+            if let Some(v) = self.vmo(d) {
+                if let Some((&(o, _), _)) = v.maps.iter().next_back() {
+                    best = best.max(o);
+                }
+            }
+        });
+        best
     }
 
     /// The regions that map `id`, in (owner, base) order.
@@ -1829,6 +1904,7 @@ impl Vmos {
                     .map(|d| d.committed.len() as u64)
                     .sum::<u64>(),
             )
+            .saturating_add(self.detached)
     }
 
     /// Leaves the index of VMO `id` holds, charged to its job as `KernelBytes` (`LEAF_BYTES` each) unless it is a device VMO (T249).
@@ -1994,6 +2070,7 @@ impl Vmos {
         }
         let done = err.is_none() && at >= end;
         v.busy = Some((at, end));
+        self.detached = self.detached.saturating_add(n as u64);
         Ok(RangeStep {
             lo,
             next: at,
@@ -2014,6 +2091,7 @@ impl Vmos {
         for &pfn in frames {
             let _ = mm.db.dec(pfn);
         }
+        self.detached = self.detached.saturating_sub(frames.len() as u64);
         if let Some(job) = self.vmo(id).map(|v| v.job) {
             jobs.credit(job, Resource::Pages, frames.len() as u64);
         }
@@ -2363,7 +2441,12 @@ pub struct AddressSpace<F: PageTableFormat = Sv39> {
 }
 
 /// The next owner id.
-static NEXT_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_OWNER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(OWNER_COUNTER_BASE);
+
+/// Spaces made by `AddressSpace::new` take their owner id from a counter that starts here, far above any process id: the kernel gives a process's space
+/// its process id (`set_owner`), and the walk of a VMO's mappings finds the process by it.
+pub const OWNER_COUNTER_BASE: u64 = 1 << 48;
 
 impl<F: PageTableFormat> AddressSpace<F> {
     /// An address space with a vacant table and no regions (the placeholder of a pooled cell, see `PageTable::vacant`).
@@ -2386,6 +2469,25 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// This space's id in the VMOs' lists of mappings.
     pub fn owner(&self) -> u64 {
         self.owner
+    }
+
+    /// `set_owner` for a space that has no region yet (a process being created).
+    pub fn set_owner_fresh(&mut self, owner: u64) {
+        debug_assert!(self.regions.is_empty());
+        self.owner = owner;
+    }
+
+    /// Make the process id the owner id of this space (T207 PR 3d): a VMO's list of mappings then names processes. The mappings it has already
+    /// (the loader's, made before the process id was drawn) are listed under the new id. Allocates nothing.
+    pub fn set_owner(&mut self, vmos: &mut Vmos, owner: u64) {
+        let old = self.owner;
+        if old == owner {
+            return;
+        }
+        for (&start, r) in self.regions.iter() {
+            vmos.maps_rekey(r.vmo, (old, start), (owner, start));
+        }
+        self.owner = owner;
     }
 
     /// Set the most regions this space may hold (the job's quota: `Jobs::region_limit`); the hard backstop `MAX_REGIONS` caps it. A space already over it keeps its
@@ -3048,8 +3150,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
     pub fn write_protect_vmo<M: PhysMem>(&mut self, mm: &mut Mm<M>, vmo: u64) -> u64 {
         let mut changed = 0u64;
         for (&start, r) in self.regions.iter() {
-            if r.vmo != vmo || !r.perms.write {
-                continue;
+            if r.vmo != vmo {
+                continue; // (a region protected read-only mid-way through a chunked protect may still hold writable translations: the PTE decides)
             }
             for p in 0..r.pages {
                 let va = start + p * PAGE_SIZE;
@@ -3251,8 +3353,9 @@ impl<F: PageTableFormat> AddressSpace<F> {
                     replaced: 0,
                     exec: 0,
                 }))
-            } else if access == Access::Write && region.perms.write {
-                // mapped read-only under a writable region: the page is shared copy-on-write (MM8)
+            } else {
+                // the region allows the access but the translation does not: a page shared copy-on-write under a writable region (MM8), or a
+                // translation a chunked protect has not reached yet (the region's permissions changed first). The fault maps the page afresh.
                 Ok(Lookup::Plan(FaultPlan {
                     start,
                     page,
@@ -3262,11 +3365,9 @@ impl<F: PageTableFormat> AddressSpace<F> {
                     perms: region.perms,
                     pages: region.pages,
                     gen: region.gen,
-                    write: true,
+                    write: access == Access::Write,
                     cow: true,
                 }))
-            } else {
-                Err(FaultError::Denied)
             };
         }
         Ok(Lookup::Plan(FaultPlan {

@@ -336,3 +336,24 @@ fn a_dying_vmos_slot_is_not_reused_until_it_is_empty_and_an_exhausted_one_is_ret
     assert_ne!(third & 0xffff_ffff, big & 0xffff_ffff);
     assert!(!vmos.exists(big));
 }
+
+#[test]
+fn frames_taken_but_not_freed_are_detached_and_the_ledger_counts_them() {
+    let (mut mm, mut vmos, mut jobs) = world();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 200, job);
+    for p in 0..200u64 {
+        vmos.write(&mut mm, &mut jobs, id, p * PAGE, &[1]).unwrap();
+    }
+    assert_eq!(vmos.range_begin(id, 0, 200, None), Ok(true));
+    let mut batch = [0u64; RANGE_STEP];
+    let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
+    // between the parts: out of the index, still charged, still counted
+    assert_eq!(st.n, RANGE_STEP);
+    assert_eq!(used(&jobs, job, Resource::Pages), 200);
+    exact(&vmos, &jobs, job);
+    vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
+    exact(&vmos, &jobs, job);
+    assert_eq!(used(&jobs, job, Resource::Pages), 200 - RANGE_STEP as u64);
+    vmos.range_end(id, true);
+}

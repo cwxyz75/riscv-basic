@@ -120,7 +120,11 @@ pub fn process_create<M: PhysMem>(
         }
     };
     // (a pooled cell is held by the pool alone, so arming cannot fail)
-    let armed = AsCell::arm(&mut record.aspace, pid, AddressSpace::new(table));
+    let armed = AsCell::arm(&mut record.aspace, pid, {
+        let mut a = AddressSpace::new(table);
+        a.set_owner_fresh(pid);
+        a
+    });
     debug_assert!(armed.is_ok(), "a pooled address-space cell is shared");
     record.obj = Some(obj);
     procs.insert_reserved(pid, record);
