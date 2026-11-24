@@ -1116,12 +1116,12 @@ fn sweep_before_create(n: usize) {
     // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
     while locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active())
     {
-        with_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
+        locked_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
     }
     if locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
-        let began = with_state(|s| s.sweep_start());
+        let began = locked_state(|s| s.sweep_start());
         if began {
-            while with_state(|s| {
+            while locked_state(|s| {
                 s.objs.sweep_active()
                     && !matches!(
                         s.sweep_slice(SWEEP_SLICE_BUDGET),

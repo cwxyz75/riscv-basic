@@ -14,3 +14,5 @@ refs: [KERNEL-V1-SPEC, OD133]
 **Review.** Fable, soak.
 
 **Precondition (2026-11-24, owner's decision):** before building the rest of this item, have Fable write a design plan and append it here (a section "Plan (Fable, date)"): the VMO size cap and per-VMO mapping lists, what they change in the frame accounting guarantees, the committed-page map's sparse cost and the VMO id generation wrap, and the order of the PRs.
+
+**Plan (2026-11-24):** the design plan the precondition asks for is in `work/T207.md`, section "Plan (Fable, 2026-11-24)".
