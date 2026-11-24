@@ -104,6 +104,18 @@ impl Futexes {
         gone
     }
 
+    /// `forget_process` without the list: one sleeper at a time, nothing allocated (a teardown's backstop must not fail for want of memory).
+    pub fn forget_process_quiet(&mut self, pid: u64) {
+        while let Some(w) = self
+            .sleeping_on
+            .iter()
+            .find(|(_, k)| k.0 == pid)
+            .map(|(&w, _)| w)
+        {
+            self.forget(w);
+        }
+    }
+
     /// Is `who` still asleep?
     pub fn contains(&self, who: Waiter) -> bool {
         self.sleeping_on.contains_key(&who)
@@ -224,6 +236,13 @@ impl<B: Buckets> FutexTable<B> {
             gone.extend(self.buckets.with(b, |f| f.forget_process(pid)));
         }
         gone
+    }
+
+    /// `forget_process` for a caller that does not need the list: allocates nothing.
+    pub fn forget_process_quiet(&self, pid: u64) {
+        for b in 0..BUCKETS {
+            self.buckets.with(b, |f| f.forget_process_quiet(pid));
+        }
     }
 
     /// How many sleepers there are (a leak counter for tests). Not one instant: the buckets are counted one after another.
