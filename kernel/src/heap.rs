@@ -380,10 +380,14 @@ pub mod faultalloc {
 
     /// Run `f` with the armed thread's allocations not counted: the epilogue that must not fail (the commit that wakes waiters, T246).
     pub fn exempt<R>(f: impl FnOnce() -> R) -> R {
+        // (only the armed thread has anything to be exempt from; any other thread must not touch the slot, or it could leave the armed one exempt for good)
         let me = crate::thread::current().saturating_add(1);
-        let before = EXEMPT.swap(me, Relaxed);
+        if ARMED.load(Relaxed) != me {
+            return f();
+        }
+        EXEMPT.store(me, Relaxed);
         let r = f();
-        EXEMPT.store(before, Relaxed);
+        EXEMPT.store(0, Relaxed);
         r
     }
 

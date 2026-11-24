@@ -177,19 +177,24 @@ pub(crate) fn cow_sync() {
 
 fn cow_sync_held() {
     with_state(|s| {
-        // (no memory for the list: nothing is changed and the pending flag stays set, so the next call or fault does this again)
+        // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB. This part takes the
+        // caller's space only (no allocation), so it is done even when there is no memory for the list below
+        {
+            let _own = AsLocks::caller(s);
+            let replaced = caller_pid(s)
+                .ok()
+                .and_then(|pid| s.procs.get_mut(&pid))
+                .is_some_and(|p| p.aspace.held_mut().take_replaced() > 0);
+            if replaced {
+                crate::smp::shootdown();
+                kmem::flush_tlb();
+            }
+        }
+        // (every address space: the copy log names pages of any; before the memory locks. No memory for the list: the log stays pending, which keeps the
+        // flag set, and the next call or fault applies it: the other spaces may hold a stale entry until then, T246)
         let Ok(_as) = AsLocks::all(s) else {
             return;
-        }; // (every address space: the copy log names pages of any; before the memory locks)
-           // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB
-        let replaced = caller_pid(s)
-            .ok()
-            .and_then(|pid| s.procs.get_mut(&pid))
-            .is_some_and(|p| p.aspace.held_mut().take_replaced() > 0);
-        if replaced {
-            crate::smp::shootdown();
-            kmem::flush_tlb();
-        }
+        };
         let k = kmem::get();
         ksys::cow_sync(&mut s.procs, k.mm, k.vmos, &mut KernelMachine::default());
     });
