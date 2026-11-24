@@ -54,7 +54,7 @@ fn run(
         exact(vmos, jobs, job);
         assert!(st.err.is_none());
         if st.done {
-            vmos.range_end(id, true);
+            vmos.range_end(mm, jobs, id, true);
             return steps;
         }
         between(mm, vmos, jobs);
@@ -106,12 +106,12 @@ fn a_busy_vmo_refuses_what_would_race_the_cursor_and_the_end_frees_it() {
     let mut batch = [0u64; RANGE_STEP];
     let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
     vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
-    vmos.range_end(id, true);
+    vmos.range_end(&mut mm, &mut jobs, id, true);
     assert!(!vmos.is_busy(id));
     exact(&vmos, &jobs, job);
     assert_eq!(used(&jobs, job, Resource::Pages), 300 - RANGE_STEP as u64);
     assert_eq!(vmos.range_begin(id, 0, 10, None), Ok(true));
-    vmos.range_end(id, true);
+    vmos.range_end(&mut mm, &mut jobs, id, true);
 }
 
 #[test]
@@ -206,12 +206,12 @@ fn a_hole_the_job_cannot_pay_stops_the_call_with_what_it_did_and_the_end_frees_t
         }
         assert!(!st.done, "thirty leaves of holes cannot fit");
     };
-    vmos.range_end(c, true);
+    vmos.range_end(&mut mm, &mut jobs, c, true);
     assert!(!vmos.is_busy(c));
     assert!(refused_at < 64 * 30, "the pages before it were done");
     // a retry goes on from where the holes stop
     assert_eq!(vmos.range_begin(c, 0, 64 * 30, None), Ok(true));
-    vmos.range_end(c, true);
+    vmos.range_end(&mut mm, &mut jobs, c, true);
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn a_shrink_that_stops_short_gives_the_size_back() {
     let mut batch = [0u64; RANGE_STEP];
     let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
     vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
-    vmos.range_end(id, false); // (the next step found no memory for its locks)
+    vmos.range_end(&mut mm, &mut jobs, id, false); // (the next step found no memory for its locks)
     assert_eq!(vmos.pages(id), Some(300), "no tail is left past the size");
     exact(&vmos, &jobs, job);
     // a repeat finishes the job
@@ -355,5 +355,31 @@ fn frames_taken_but_not_freed_are_detached_and_the_ledger_counts_them() {
     vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
     exact(&vmos, &jobs, job);
     assert_eq!(used(&jobs, job, Resource::Pages), 200 - RANGE_STEP as u64);
-    vmos.range_end(id, true);
+    vmos.range_end(&mut mm, &mut jobs, id, true);
+}
+
+#[test]
+fn the_last_close_between_two_steps_does_not_lose_the_credit_of_the_frames_taken() {
+    // (the locks drop between the steps: a close on another hart may take the last handle in the gap; the call holds the VMO until it ends)
+    let (mut mm, mut vmos, mut jobs) = world();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 300, job);
+    vmos.commit(&mut mm, &mut jobs, id, 0, 300).unwrap();
+    assert_eq!(vmos.range_begin(id, 0, 300, None), Ok(true));
+    let mut batch = [0u64; RANGE_STEP];
+    let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
+    // the last handle goes now: the VMO stays (the call holds it), nothing is freed or lost
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
+    vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
+    exact(&vmos, &jobs, job);
+    assert_eq!(used(&jobs, job, Resource::Pages), 300 - st.n as u64);
+    vmos.range_end(&mut mm, &mut jobs, id, true);
+    vmos.drain_all(&mut mm, &mut jobs);
+    assert_eq!(
+        used(&jobs, job, Resource::Pages),
+        0,
+        "every page was credited"
+    );
+    assert_eq!(vmos.frames_held(), 0);
+    assert_eq!(mm.db.free_count(), 3000);
 }

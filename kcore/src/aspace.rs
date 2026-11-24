@@ -2004,6 +2004,9 @@ impl Vmos {
         }
         if first < end {
             v.busy = Some((first, end));
+            // the call holds the VMO until `range_end`: the locks drop between the steps, and a close on another hart may take the last handle in
+            // the gap, which would free the frames the call has taken with no VMO left to credit (J1)
+            v.refs = v.refs.saturating_add(1);
         }
         Ok(first < end)
     }
@@ -2098,15 +2101,26 @@ impl Vmos {
     /// The call is over: the VMO is free for the next. `finished` is false when it stopped short (an error): a shrink then gives the size back
     /// (the pages it took stay gone, and read as the VMO showed them before or as zeros), so that no page past the size is left committed and mapped.
     /// Harmless when the VMO is gone.
-    pub fn range_end(&mut self, id: u64, finished: bool) {
+    pub fn range_end<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+        finished: bool,
+    ) {
+        let mut held = false;
         if let Some(v) = Self::vmo_in(&mut self.slots, id) {
-            v.busy = None;
+            held = v.busy.take().is_some();
             if let Some((pages, inherit)) = v.restore.take() {
                 if !finished {
                     v.pages = pages;
                     v.inherit = inherit;
                 }
             }
+        }
+        if held {
+            // (the reference `range_begin` took: if it was the last, the VMO goes now, its remaining frames in batches by `drain_dying`)
+            let _ = self.release(mm, jobs, id);
         }
     }
 
@@ -2155,7 +2169,7 @@ impl Vmos {
                 Err(e) => break Err(e),
             }
         };
-        self.range_end(id, r.is_ok());
+        self.range_end(mm, jobs, id, r.is_ok());
         r
     }
 
