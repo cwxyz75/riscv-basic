@@ -352,7 +352,7 @@ os-bench: kernel-main
 	rm -f target/bench.tsv
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
-	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO)
+	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling.tsv
 
 # KT5: the guest's retired-instruction counts of the main syscall paths (`##BENCH count_<name> <n> instr` lines of the suite's
 # `instruction_counts_report`), booted at one hart under `-icount shift=0`, where they are deterministic. bench/counts.tsv holds the recorded
@@ -389,7 +389,7 @@ os-latency: kernel-main
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
 	rm -f target/latency.tsv
 	OS_BENCH=target/latency.tsv OS_BENCH_FULL=1 OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
-	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO)
+	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling.tsv
 
 os-boot-test-aia: kernel
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
