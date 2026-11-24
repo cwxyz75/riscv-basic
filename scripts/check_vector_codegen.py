@@ -46,6 +46,11 @@ def main():
         n = sum(1 for line in out.splitlines() if any(f"\t{m}" in line for m in ("vsetvli", "vsetivli", "vle", "vse", "vadd", "vmv")))
         print(f"check_vector_codegen: {os.path.relpath(a, ROOT)}: {n} vector instructions")
         total += n
+        if n == 0:
+            # (every archive on its own: a sum over both would hide one that lost the extension; the C tests' hand-written vector loop only
+            # assembles with V on, so its archive must hold vector code whatever the compiler did)
+            print(f"check_vector_codegen: FAILED: no vector instruction in {os.path.relpath(a, ROOT)}")
+            return 1
         if os.path.basename(a) == "libctests.a":
             # (T188 item 4: the C test's `cbo.zero` is emitted as a raw encoding, 0x0045200f for rs1 = a0 and so on: opcode 0x0f, funct3 2, imm 4)
             zero = sum(1 for line in out.splitlines() if "cbo.zero" in line or (line.split("\t")[-2:-1] and "45200f" in line.replace(" ", "")[:40]))
