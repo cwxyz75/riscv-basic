@@ -25,6 +25,8 @@ const PROGRAM_PAGES: u64 = 34816;
 /// Kernel objects the program may hold alive (handles are bounded separately), and bytes it may
 /// leave queued in the channels and sockets it creates.
 const PROGRAM_OBJECTS: u64 = 256;
+/// Regions one program's address space may hold (PL8: the quota that replaced the constant).
+const PROGRAM_REGIONS: u64 = 1024;
 /// The highest base priority a program may give its own threads (the normal band's upper part).
 const PROGRAM_MAX_PRIO: u8 = 20;
 const PROGRAM_IPC_BYTES: u64 = 192 * 1024;
@@ -129,6 +131,8 @@ impl Launcher {
                 // Policy (SCHED-SMP-SPEC 4.9): a program runs in the normal band and may raise itself only to 20, with no
                 // real-time budget. (Without this every job inherits the root's 63.)
                 let _ = sys::job_set_sched(job, PROGRAM_MAX_PRIO, 0, 1024);
+                // (PL8: the regions of its address space are a quota too, no constant)
+                let _ = sys::job_set_region_limit(job, PROGRAM_REGIONS);
                 let r = spawn::spawn_in_exact(&image, req.startup, forwarded, job);
                 // (the process holds the job now; ours is not needed, and must not be kept: a
                 // handle to its own job's MANAGE would let the launcher outlive nothing useful)

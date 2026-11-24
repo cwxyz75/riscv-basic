@@ -368,8 +368,8 @@ fn every_failure_after_the_checks_gives_back_what_it_took() {
     );
     assert_eq!(w.us.procs[&2].threads_alive, 0);
     assert!(w.us.starts.is_empty() && w.us.procs[&2].stacks.is_empty());
-    // the per-process and per-job thread limits
-    w.us.procs.get_mut(&2).unwrap().threads_alive = abi::limits::MAX_THREADS_PER_PROCESS;
+    // (no per-process constant any more, PL8: the job's thread level and the system-wide backstop bound the threads)
+    w.us.procs.get_mut(&2).unwrap().threads_alive = w.us.backstops.user_threads;
     assert_eq!(w.spawn(w.plain()), Err(Status::NoMemory));
 }
 

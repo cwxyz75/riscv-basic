@@ -370,6 +370,10 @@ pub fn init() {
 // handler then records it and steps over the faulting instruction instead of
 // dying. (The refusal itself is what is being tested.)
 static EXPECT: AtomicBool = AtomicBool::new(false);
+
+/// Per hart: the last kernel fault answered with a flush of a stale page (T241), to tell a second fault at the same place from a stale entry.
+static STALE_RETRY: [AtomicU64; crate::percpu::MAX_HARTS] =
+    [const { AtomicU64::new(0) }; crate::percpu::MAX_HARTS];
 static LOG_ACCESS: AtomicU64 = AtomicU64::new(0);
 static LOG_ADDR: AtomicU64 = AtomicU64::new(0);
 static LOG_ERROR: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -708,6 +712,12 @@ fn trap_body(frame: &mut TrapFrame) {
         );
     }
     let k = kmem::get_as();
+    // A page the kernel's own table maps with the right permission is no fault: this hart cached the entry while it was invalid (a mapping `heap::grow` or
+    // `kstack::make_slot` made valid on another hart; QEMU never caches invalid entries, hardware without Svvptc may; T241). Flush that page here and retry;
+    // a second fault at the same place with a valid entry is not stale (an access or dirty bit, say) and is reported as before.
+    if cause != 12 && stale_entry(k.mm, frame, access) {
+        return;
+    }
     match k
         .aspace
         .handle_fault_mapped(k.mm, k.vmos, k.jobs, frame.stval, access)
@@ -738,6 +748,37 @@ fn trap_body(frame: &mut TrapFrame) {
         }
         Err(error) => fatal(frame, format_args!("page fault refused: {error:?}")),
     }
+}
+
+/// Whether a kernel fault is a stale invalid entry this hart cached (T241), answered with a flush of the page (the caller then retries the access).
+#[inline(never)] // (a frame of its own: folded into `trap_body` it deepens every kernel path that starts with a trap, KT13)
+fn stale_entry(
+    mm: &mut kcore::Mm<crate::kmem::DirectMap>,
+    frame: &TrapFrame,
+    access: Access,
+) -> bool {
+    let hart = crate::percpu::this().index.load(Ordering::Relaxed);
+    let allowed = kmem::kernel_table()
+        .translate(mm, frame.stval)
+        .is_some_and(|t| match access {
+            Access::Read => t.perms.read,
+            _ => t.perms.write,
+        });
+    let key = frame.sepc ^ frame.stval.rotate_left(17) | 1;
+    let seen = STALE_RETRY
+        .get(hart)
+        .map(|s| s.swap(key, Ordering::Relaxed));
+    if allowed && seen != Some(key) {
+        // SAFETY: `sfence.vma` with an address drops this hart's cached translations of that page for every ASID; no other effect.
+        unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) frame.stval) };
+        return true;
+    }
+    if !allowed {
+        if let Some(s) = STALE_RETRY.get(hart) {
+            s.store(0, Ordering::Relaxed);
+        }
+    }
+    false
 }
 
 /// 2 for a compressed instruction, 4 otherwise (RISC-V encodes it in the low bits).

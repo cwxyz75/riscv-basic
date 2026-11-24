@@ -76,6 +76,15 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         })(),
         // `job_set_limits(job, limits_ptr)`: needs SET_LIMITS (not MANAGE). Usage above a new limit is not undone: later charges
         // fail until it is back under.
+        // `job_set_region_limit(job, limit)`: the most regions one address space of a process of the job may hold (PL8); the smallest value along the
+        // job's ancestors applies. Needs SET_LIMITS. A space already above a lowered limit keeps its regions and can add none.
+        nr::JOB_SET_REGION_LIMIT => (|| {
+            let job = ipc::job_of(c.objs, c.handles, h, Rights::SET_LIMITS).map_err(e)?;
+            c.jobs
+                .set_region_limit(job, a[1])
+                .map_err(|x| e(job_status(x)))?;
+            Ok((None, None))
+        })(),
         nr::JOB_SET_LIMITS => (|| {
             let job = ipc::job_of(c.objs, c.handles, h, Rights::SET_LIMITS).map_err(e)?;
             let limits = read_limits(c, a[1]).map_err(e)?;
@@ -123,6 +132,15 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                         }
                     });
                     return Ok((Some(sum), Some(0)));
+                }
+                // 11 (PL8): the most regions one address space of this job's processes may hold: the effective limit (the smallest along the ancestors, at most
+                // `MAX_REGIONS`) in both `a1` and `a2`
+                11 => {
+                    let l = c
+                        .jobs
+                        .region_limit(job)
+                        .min(abi::limits::MAX_REGIONS as u64);
+                    return Ok((Some(l), Some(l)));
                 }
                 _ => return fail(Status::InvalidArgs),
             };

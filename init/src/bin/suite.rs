@@ -5558,91 +5558,150 @@ fn thread_priority_is_bounded_by_the_job() -> Outcome {
     Ok(())
 }
 
-/// The per-process thread limit is reached with NO_MEMORY, over two thousand threads are alive at once (slice T:
-/// stacks are frames, the heap grows), and the slots come back when they end. The threads share one stack mapping
-/// (a slice each) so the handle table is not what runs out first.
+/// A job's thread limit is reached with NO_MEMORY (PL8: there is no per-process constant any more: the job's `threads` level bounds the threads of a process,
+/// and the system-wide backstop bounds the rest), and the slots come back when the process ends. The threads of the child share one stack mapping (a slice each).
 fn thread_limit_and_slots_are_reused() -> Outcome {
-    const LIMIT: usize = rt::abi::limits::MAX_THREADS_PER_PROCESS;
-    const STACK_PAGES: u64 = 2;
-    let ev = event()?;
-    let me = me()?;
-    let v = vmo(LIMIT as u64 * STACK_PAGES)?;
-    let base = NEXT_STACK.fetch_add(0x100_0000 * 2, Ordering::SeqCst);
-    ok(
-        sys::process_map(
-            me,
-            v,
-            base,
-            0,
-            LIMIT as u64 * STACK_PAGES * 4096,
-            PF_R | PF_W,
-        ),
-        "map the shared stacks",
-    )?;
+    const LIMIT: u64 = 64;
+    const STACK_PAGES: u64 = 4;
+    let root = root_job()?;
+    let j = job(root, u64::MAX, LIMIT, u64::MAX)?;
+    let (p, _m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 16, j)?;
+    nap(5)?;
+    let v = vmo(LIMIT * STACK_PAGES)?;
+    let base = ok(
+        sys::process_map_anywhere(p, v, 0, LIMIT * STACK_PAGES * 4096, PF_R | PF_W),
+        "map the shared stacks into the child",
+    )?
+    .a1 as u64;
+    sys::handle_close(v);
+    let entry = child_entry(p)?;
     let mut ts: Vec<u64> = Vec::new();
     loop {
         let top = base + (ts.len() as u64 + 1) * STACK_PAGES * 4096;
-        let r = sys::thread_on_stack(me, worker_wait_event as *const () as usize as u64, top, ev);
+        let r = sys::thread_on_stack(p, entry, top, 16);
         if r.status != 0 {
             ensure_eq!(st(r), Some(S::NoMemory), "the limit is NO_MEMORY");
             break;
         }
         ensure!(
-            ts.len() < LIMIT,
+            (ts.len() as u64) < LIMIT,
             "more than the limit of threads was allowed"
         );
         ts.push(r.a1 as u64);
-        if ts.len().is_multiple_of(256) {
-            println!(
-                "mark: thread_limit created {} at {} ms",
-                ts.len(),
-                sys::clock_get()
-            );
-        }
     }
-    println!(
-        "mark: thread_limit created all {} at {} ms",
-        ts.len(),
-        sys::clock_get()
-    );
-    // this thread plus the others: the limit is `MAX_THREADS_PER_PROCESS` in all
+    // the child's first thread plus the others: the limit is the job's in all
     ensure_eq!(
-        ts.len(),
+        ts.len() as u64,
         LIMIT - 1,
-        "threads created on top of the one we are"
+        "threads created on top of the child's first"
     );
-    ensure!(ts.len() >= 2000, "two thousand threads are alive at once");
-    ensure_eq!(
-        st(sys::event_signal(ev, 0, 1 << 24)),
-        Some(S::Ok),
-        "wake them all"
-    );
-    println!("mark: thread_limit woken at {} ms", sys::clock_get());
-    for (n, &t) in ts.iter().enumerate() {
-        let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + SLOW_MS);
-        ensure_eq!(r.status, 0, "a thread ended");
+    ensure_eq!(job_use(j, 1)?.0, LIMIT, "the job's thread level is full");
+    ensure_eq!(st(sys::process_kill(p, 3)), Some(S::Ok), "kill the child");
+    wait_ended(p, 1000)?;
+    for &t in &ts {
         sys::handle_close(t);
-        if (n + 1).is_multiple_of(256) {
-            println!(
-                "mark: thread_limit joined {} at {} ms",
-                n + 1,
-                sys::clock_get()
-            );
-        }
     }
+    sys::handle_close(p);
+    job_use_settles(j, 1, 0, 500)?;
+    // the slots are the job's: another process in it can make threads again
+    let (p2, _m2) = launch_image_in(IMAGE.load(Ordering::Relaxed), 16, j)?;
+    ensure_eq!(job_use(j, 1)?.0, 1, "the job's slots came back");
+    ensure_eq!(st(sys::process_kill(p2, 3)), Some(S::Ok), "kill the second");
+    wait_ended(p2, 1000)?;
+    sys::handle_close(p2);
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+/// PL8: a job's region quota bounds the regions of one address space of its processes (the quota replaces the constant): mapping one more VMO than it allows is
+/// NO_MEMORY, an unmap makes room, a lowered quota leaves what is mapped and refuses more, and `job_info` 11 reports the effective value.
+fn a_jobs_region_quota_bounds_its_processes() -> Outcome {
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let before = ok(sys::job_info(j, 11), "job_info 11")?.a1 as u64;
     ensure_eq!(
-        st(sys::event_signal(ev, 1 << 24, 0)),
-        Some(S::Ok),
-        "clear the signal"
+        before,
+        rt::abi::limits::MAX_REGIONS as u64,
+        "no quota: the backstop"
     );
-    let t = new_thread(worker_set, 1)?;
+    let (p, _m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 16, j)?;
+    nap(5)?;
+    // the child already holds some regions (image, stack, library): the quota leaves room for ten more
+    let held = {
+        let mut n = 0u64;
+        let mut at = 0u64;
+        for _ in 0..256 {
+            let mut rec = [0u64; 6];
+            let next = ok(
+                sys::process_map_info(p, at, rec.as_mut_ptr()),
+                "the child's mappings",
+            )?
+            .a1 as u64;
+            n += 1;
+            if next == 0 {
+                break;
+            }
+            at = next;
+        }
+        n
+    };
+    let sr = sys::job_set_region_limit(j, held + 10);
     ensure_eq!(
-        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        sr.status,
         0,
-        "after they ended, there is room again"
+        "set the quota (held {held}, a1 {}, a2 {})",
+        sr.a1,
+        sr.a2
     );
-    ok(sys::process_unmap(me, base), "unmap the shared stacks")?;
+    ensure_eq!(
+        ok(sys::job_info(j, 11), "job_info 11")?.a1 as u64,
+        held + 10,
+        "the quota shows"
+    );
+    let mut bases = Vec::new();
+    let mut vmos = Vec::new();
+    loop {
+        let v = vmo(1)?;
+        let r = sys::process_map_anywhere(p, v, 0, 4096, PF_R | PF_W);
+        if r.status != 0 {
+            ensure_eq!(st(r), Some(S::NoMemory), "the quota is NO_MEMORY");
+            sys::handle_close(v);
+            break;
+        }
+        ensure!(bases.len() < 20, "more regions than the quota allowed");
+        bases.push(r.a1 as u64);
+        vmos.push(v);
+    }
+    ensure_eq!(bases.len(), 10, "ten more regions fit");
+    // an unmap makes room for one more
+    ok(sys::process_unmap(p, bases.pop().unwrap_or(0)), "unmap one")?;
+    let v = vmo(1)?;
+    let r = sys::process_map_anywhere(p, v, 0, 4096, PF_R | PF_W);
+    ensure_eq!(r.status, 0, "room again after an unmap");
     sys::handle_close(v);
+    // lowering the quota below what is held leaves it and refuses more
+    ensure_eq!(
+        st(sys::job_set_region_limit(j, 1)),
+        Some(S::Ok),
+        "lower the quota"
+    );
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map_anywhere(p, v, 0, 4096, PF_R | PF_W)),
+        Some(S::NoMemory),
+        "nothing more"
+    );
+    sys::handle_close(v);
+    for v in vmos {
+        sys::handle_close(v);
+    }
+    ensure_eq!(st(sys::process_kill(p, 3)), Some(S::Ok), "kill");
+    wait_ended(p, 1000)?;
+    sys::handle_close(p);
+    job_use_settles(j, 2, 0, 500)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
     Ok(())
 }
 
@@ -13865,6 +13924,16 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_info on an event"
     );
     ensure_eq!(
+        st(sys::job_set_region_limit(ev, 5)),
+        Some(S::WrongType),
+        "job_set_region_limit on an event"
+    );
+    ensure_eq!(
+        st(sys::job_set_region_limit(0, 5)),
+        Some(S::BadHandle),
+        "job_set_region_limit on handle 0"
+    );
+    ensure_eq!(
         st(sys::job_create(0, &[1, 1, 1, u64::MAX, u64::MAX, u64::MAX])),
         Some(S::BadHandle),
         "job_create on handle 0"
@@ -13880,7 +13949,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 11)),
+        st(sys::job_info(root, 12)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -13899,7 +13968,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     );
     sys::handle_close(child);
     ensure_eq!(
-        st(sys::job_info(root, 11)),
+        st(sys::job_info(root, 12)),
         Some(S::InvalidArgs),
         "the resource after the last"
     );
@@ -13935,6 +14004,11 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         )),
         Some(S::AccessDenied),
         "kill may not set limits"
+    );
+    ensure_eq!(
+        st(sys::job_set_region_limit(manage, 5)),
+        Some(S::AccessDenied),
+        "manage may not set the region limit"
     );
     ensure_eq!(
         st(sys::job_set_limits(
@@ -16275,6 +16349,14 @@ pub fn app_main() -> i32 {
         (
             "a_dead_client_frees_everything",
             stream_proto::a_dead_client_frees_everything,
+        ),
+        (
+            "a_kill_storm_on_a_stream_loses_no_range",
+            stream_proto::a_kill_storm_on_a_stream_loses_no_range,
+        ),
+        (
+            "a_jobs_region_quota_bounds_its_processes",
+            a_jobs_region_quota_bounds_its_processes,
         ),
         (
             "a_bad_stream_handle_is_refused",

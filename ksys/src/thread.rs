@@ -173,9 +173,7 @@ pub fn thread_spawn<M: PhysMem>(
     {
         return Err(Status::InvalidArgs);
     }
-    if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
-        || total_threads(us) >= us.backstops.user_threads
-    {
+    if total_threads(us) >= us.backstops.user_threads {
         return Err(Status::NoMemory);
     }
     // where the stack goes: a gap in the arena for the guard and the stack, at or after the hint, wrapping once
@@ -277,6 +275,9 @@ pub fn thread_spawn<M: PhysMem>(
             user: true,
         };
         let t = procs.get_mut(&tpid).expect("target exists");
+        t.aspace
+            .held_mut()
+            .set_region_limit(jobs.region_limit(t.job));
         if let Err(e) =
             t.aspace
                 .held_mut()
