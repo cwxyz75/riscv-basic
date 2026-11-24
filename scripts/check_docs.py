@@ -234,6 +234,39 @@ def check_atomics():
     return out
 
 
+# KT9 (T177, T246): class N, the allocations that cannot be refused because nobody could be told, run in `heap::nofail(..)`. The class cannot grow
+# silently: a new use is a new row here, with the reason.
+NOFAIL = {
+    "kernel/src/thread.rs": (2, "the scheduler's spawn tail and the kernel thread registration"),
+    "kernel/src/user/calls.rs": (1, "the donation graph's node of a user thread, after its spawn"),
+    "kernel/src/user/kobjects.rs": (1, "a kernel thread's admission to the wait table"),
+    "kernel/src/user/loader.rs": (1, "the donation graph's node of a boot thread"),
+    "kernel/src/user/wake.rs": (7, "the epilogue's wakes, kills, teardown arms and the pager reap: a wake or a teardown cannot be refused"),
+}
+
+
+def check_nofail():
+    """T177: the number of `heap::nofail(` sites per file is the audited one."""
+    out = []
+    seen = {}
+    for d, _, files in os.walk(os.path.join(ROOT, "kernel", "src")):
+        for f in files:
+            if not f.endswith(".rs"):
+                continue
+            rel = os.path.relpath(os.path.join(d, f), ROOT)
+            n = sum(l.split("//")[0].count("heap::nofail(") for l in open(os.path.join(d, f)) if not l.lstrip().startswith("//"))
+            if n:
+                seen[rel] = n
+    for rel, n in sorted(seen.items()):
+        want = NOFAIL.get(rel)
+        if want is None or want[0] != n:
+            out.append(f"T177: {rel} has {n} heap::nofail site(s), the audited count is {want[0] if want else 0} (scripts/check_docs.py NOFAIL): a new class-N allocation needs a row and a reason")
+    for rel in NOFAIL:
+        if rel not in seen:
+            out.append(f"T177: {rel} is in NOFAIL but has no heap::nofail site")
+    return out
+
+
 # AR1 (OD143, KERNEL-V1-SPEC 2.6): the architecture boundary. No inline assembly, control-register access, TLB or
 # firmware instruction, or RISC-V register name in the kernel outside kernel/src/arch/, nor in ksys, nor in kcore (kcore's
 # page-table format is the one exception, AR1c). ARCH_PENDING lists files not yet clean (empty since AR1b; it only shrinks).
@@ -434,7 +467,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

@@ -378,7 +378,7 @@ pub mod faultalloc {
 
     static EXEMPT: AtomicU64 = AtomicU64::new(0); // the thread inside `exempt`, plus one
 
-    /// Run `f` with the armed thread's allocations not counted: the epilogue that must not fail (the commit that wakes waiters, T246).
+    /// Run `f` with the armed thread's allocations not counted: an allocation that must not fail (class N).
     pub fn exempt<R>(f: impl FnOnce() -> R) -> R {
         // (only the armed thread has anything to be exempt from; any other thread must not touch the slot, or it could leave the armed one exempt for good)
         let me = crate::thread::current().saturating_add(1);
@@ -430,12 +430,6 @@ pub fn nofail<R>(f: impl FnOnce() -> R) -> R {
 #[inline(always)]
 pub fn nofail<R>(f: impl FnOnce() -> R) -> R {
     f()
-}
-
-/// The syscall epilogue whose allocations cannot fail yet (T246): `nofail` under its older name, until the epilogue is made allocation-free.
-#[inline(always)]
-pub fn epilogue<R>(f: impl FnOnce() -> R) -> R {
-    nofail(f)
 }
 
 #[global_allocator]

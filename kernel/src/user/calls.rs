@@ -170,8 +170,7 @@ pub(crate) fn cow_sync() {
     if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
-    // (after a call, so it cannot fail: its list of address spaces is outside the allocation-failure sweep, T246)
-    crate::heap::epilogue(cow_sync_held);
+    cow_sync_held();
 }
 
 fn cow_sync_held() {
