@@ -7,7 +7,7 @@ use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
 use kcore::ipc::{self, ExcLevel, ExceptionObj, KObj, Quota};
-use kcore::job::{JobId, Jobs};
+use kcore::job::Jobs;
 use kcore::object::ObjId;
 use kcore::sched::Tid;
 
@@ -310,13 +310,16 @@ pub fn exception_channel(
             return Err(Status::BadState);
         }
     }
-    // (room for the handle is made first, so that the insert below cannot fail and strand the user end)
+    // (room for the handle, and for a job's entry, is made first, so that the inserts below cannot fail and strand the user end: T248)
     us.procs
         .get_mut(&me)
         .ok_or(Status::BadState)?
         .handles
         .reserve(1)
         .map_err(|_| Status::NoMemory)?;
+    if pid_or_job.is_err() {
+        us.job_exc.reserve(1).map_err(|_| Status::NoMemory)?;
+    }
     let UserState {
         objs,
         ktable,
@@ -357,7 +360,7 @@ pub fn exception_channel(
             }
         }
         Err(j) => {
-            job_exc.insert(j, kernel_end);
+            job_exc.insert_reserved(j, kernel_end);
         }
     }
     Ok(handle.0)
@@ -380,12 +383,12 @@ pub fn reap_closed_job_channels(us: &mut UserState) {
         job_exc,
         ..
     } = us;
-    let closed: alloc::vec::Vec<JobId> = job_exc
+    // (one at a time, so that no list is made: this runs where nothing may be refused)
+    while let Some(j) = job_exc
         .iter()
-        .filter(|(_, h)| ipc::channel_peer_closed(objs, ktable, **h))
+        .find(|(_, h)| ipc::channel_peer_closed(objs, ktable, **h))
         .map(|(j, _)| *j)
-        .collect();
-    for j in closed {
+    {
         if let Some(h) = job_exc.remove(&j) {
             let _ = ktable.close(objs, h);
         }
