@@ -24,6 +24,16 @@ pub enum Entry {
     Frame(Pfn),
 }
 
+impl Entry {
+    /// The frame, if the entry is one.
+    pub fn frame(self) -> Option<Pfn> {
+        match self {
+            Entry::Frame(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 /// One chunk: 64 slots and how many of them are not `NONE` (a frame or a hole). A leaf with `used == 0` does not exist.
 #[derive(Debug)]
 struct Leaf {
@@ -224,6 +234,36 @@ impl PageMap {
             at = pg + 1;
         }
         (n, end)
+    }
+
+    /// Does the leaf that holds `page` exist (an insert there needs no new leaf)?
+    pub fn has_leaf(&self, page: u64) -> bool {
+        self.leaves.contains_key(&(page / CHUNK))
+    }
+
+    /// Remove whatever the map says about `page`, a frame or a hole, and return it. A leaf left empty is freed (`leaf_count` falls). Never
+    /// allocates.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a frame is removed; used is at least 1 in a leaf
+    pub fn clear(&mut self, page: u64) -> Entry {
+        let key = page / CHUNK;
+        let Some(leaf) = self.leaves.get_mut(&key) else {
+            return Entry::None;
+        };
+        let slot = &mut leaf.slots[(page % CHUNK) as usize];
+        let v = *slot;
+        if v == NONE {
+            return Entry::None;
+        }
+        *slot = NONE;
+        leaf.used -= 1;
+        let gone = leaf.used == 0;
+        if v != HOLE {
+            self.len -= 1;
+        }
+        if gone {
+            self.leaves.remove(&key);
+        }
+        Self::decode(v)
     }
 
     /// Remove the frame at `page` (a hole stays). Never allocates.

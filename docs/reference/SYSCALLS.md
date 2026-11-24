@@ -414,7 +414,7 @@ Map the region of `source` that **starts at** `vaddr` into `target` at the same 
 
 Commit the pages `[offset, offset + length)` of a VMO **now** (slice V): the VMO's *creating job* is charged for
 each page that is not already committed and the frames are taken, so that a later touch can neither fail nor
-charge anyone. All or nothing: if the job's page limit or the frames run out, everything this call committed is
+charge anyone. The page index costs the job kernel bytes too, one 528-byte leaf per 64 pages the VMO touches (T249): a leaf the job's kernel-byte allowance (an eighth of a page of kernel memory per page of its page limit) cannot pay is NO_MEMORY like a page it cannot pay, and the same holds for `vmo_write`, a fault, `pager_supply` (the destination's job pays) and a decommit that has to make holes in an inheriting child. All or nothing: if the job's page limit or the frames run out, everything this call committed is
 given back and the call returns NO_MEMORY with the VMO and the job ledger exactly as before. Rights: COMMIT
 (a new right; creating a VMO gives its handle COMMIT, and a creator narrows it away before handing the VMO to
 someone else, since a holder with COMMIT spends the creator's quota). `offset` and `length` must be page

@@ -212,10 +212,13 @@ pub fn reported() -> (u32, u32) {
 /// How many processes exist right now (a leak counter for tests).
 /// (jobs alive including the root, and the root job's live processes, threads, objects, queued
 /// IPC bytes and kernel bytes): `(1, 0, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
-/// J2). Applies the credits of destroyed objects first.
+/// J2). Applies the credits of destroyed objects first. The kernel bytes exclude the page-index leaves of the VMOs that are alive (T249: each VMO's
+/// index is charged to its job while it lives; the tests count the surviving VMOs themselves), so a leaf charge that outlives its VMO shows.
 pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
     locked_state(|s| {
         ipc::settle(&mut s.objs, kmem::jobs().jobs);
+        // (the memory locks before the job ledger's: the lock order)
+        let index = kmem::get().vmos.index_bytes_of_job(JobId::ROOT);
         let jobs = &kmem::jobs().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
         (
@@ -224,7 +227,7 @@ pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
             u.threads,
             u.objects,
             u.ipc_bytes,
-            u.kernel_bytes,
+            u.kernel_bytes.saturating_sub(index),
         )
     })
 }

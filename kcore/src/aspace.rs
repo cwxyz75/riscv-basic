@@ -242,6 +242,68 @@ struct Vmo {
     maps: crate::fmap::FMap<(u64, u64), MapRef>,
 }
 
+impl Vmo {
+    /// Is the index of this VMO charged to its job (T249)? A device VMO is the kernel's own and never is.
+    fn index_charged(&self) -> bool {
+        self.kind != VmoKind::Device
+    }
+
+    /// Record `raw` (a frame, or `None` for a hole) at `page`. A new leaf is charged to the VMO's job first (`NoMemory`, nothing changed, when
+    /// the job refuses or the memory is not there); the charge goes back if the insert fails.
+    fn put(
+        &mut self,
+        jobs: &mut Jobs,
+        page: u64,
+        raw: Option<Pfn>,
+    ) -> Result<(), abi::status::Status> {
+        let charge = self.index_charged() && !self.committed.has_leaf(page);
+        if charge
+            && jobs
+                .charge(self.job, Resource::KernelBytes, crate::pagemap::LEAF_BYTES)
+                .is_err()
+        {
+            return Err(abi::status::Status::NoMemory);
+        }
+        let r = match raw {
+            Some(pfn) => self.committed.insert(page, pfn),
+            None => self.committed.insert_hole(page),
+        };
+        if r.is_err() && charge {
+            jobs.credit(self.job, Resource::KernelBytes, crate::pagemap::LEAF_BYTES);
+        }
+        r
+    }
+
+    /// Credit the leaves a removal freed (`before` was `leaf_count()` ahead of it). Every removal from the index goes through a helper that does this
+    /// (or credits by the difference itself): the charge is exactly `leaf_count() * LEAF_BYTES`.
+    fn credit_leaves(&self, jobs: &mut Jobs, before: usize) {
+        let freed = before.saturating_sub(self.committed.leaf_count());
+        if freed > 0 && self.index_charged() {
+            jobs.credit(
+                self.job,
+                Resource::KernelBytes,
+                (freed as u64).saturating_mul(crate::pagemap::LEAF_BYTES),
+            );
+        }
+    }
+
+    /// Remove whatever the index holds at `page` (a frame or a hole).
+    fn clear_page(&mut self, jobs: &mut Jobs, page: u64) -> Entry {
+        let before = self.committed.leaf_count();
+        let e = self.committed.clear(page);
+        self.credit_leaves(jobs, before);
+        e
+    }
+
+    /// Remove the frame at `page` (a hole stays).
+    fn take_frame(&mut self, jobs: &mut Jobs, page: u64) -> Option<Pfn> {
+        let before = self.committed.leaf_count();
+        let f = self.committed.remove(page);
+        self.credit_leaves(jobs, before);
+        f
+    }
+}
+
 /// What a region says about its window onto the VMO (a copy kept in the VMO's `maps`; ML1 says it equals the region's own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapRef {
@@ -532,7 +594,16 @@ impl Vmos {
         }
         jobs.charge(job, Resource::Pages, pages)
             .map_err(|_| VmoError::NoMemory)?;
+        // (the index of a run is one leaf per 64 pages, charged with the pages)
+        let leaf_bytes = pages
+            .div_ceil(64)
+            .saturating_mul(crate::pagemap::LEAF_BYTES);
+        if jobs.charge(job, Resource::KernelBytes, leaf_bytes).is_err() {
+            jobs.credit(job, Resource::Pages, pages);
+            return Err(VmoError::NoMemory);
+        }
         let Some(first) = mm.db.alloc_contiguous(pages as usize) else {
+            jobs.credit(job, Resource::KernelBytes, leaf_bytes);
             jobs.credit(job, Resource::Pages, pages);
             return Err(VmoError::NoMemory);
         };
@@ -784,22 +855,23 @@ impl Vmos {
             if djob != sjob && jobs.charge(djob, Resource::Pages, 1).is_err() {
                 return Err((moved, VmoError::NoMemory));
             }
-            let Some(pfn) =
-                Self::vmo_in(&mut self.slots, src).and_then(|v| v.committed.remove(spage + i))
-            else {
+            let Some(pfn) = self.vmo(src).and_then(|v| v.committed.get(spage + i)) else {
+                if djob != sjob {
+                    jobs.credit(djob, Resource::Pages, 1);
+                }
                 return Err((moved, VmoError::NotSuppliable));
             };
+            // (the destination first, so that a refusal (the page, or a new leaf of the index) leaves the source whole: nothing to put back)
             let inserted = Self::vmo_in(&mut self.slots, dst)
-                .is_some_and(|v| v.committed.insert(dpage + i, pfn).is_ok());
+                .is_some_and(|v| v.put(jobs, dpage + i, Some(pfn)).is_ok());
             if !inserted {
-                // (put it back where it was: the slot was just emptied, so this cannot need a new node)
-                if let Some(v) = Self::vmo_in(&mut self.slots, src) {
-                    let _ = v.committed.insert(spage + i, pfn);
-                }
                 if djob != sjob {
                     jobs.credit(djob, Resource::Pages, 1);
                 }
                 return Err((moved, VmoError::NoMemory));
+            }
+            if let Some(v) = Self::vmo_in(&mut self.slots, src) {
+                v.take_frame(jobs, spage + i);
             }
             if djob != sjob {
                 jobs.credit(sjob, Resource::Pages, 1);
@@ -1163,8 +1235,8 @@ impl Vmos {
                         drop_frame(mm, jobs);
                     } else {
                         let moved = match entry {
-                            Entry::Frame(pfn) => cvm.committed.insert(q, pfn),
-                            _ => cvm.committed.insert_hole(q),
+                            Entry::Frame(pfn) => cvm.put(jobs, q, Some(pfn)),
+                            _ => cvm.put(jobs, q, None),
                         };
                         if moved.is_err() {
                             return;
@@ -1174,7 +1246,7 @@ impl Vmos {
                 None => drop_frame(mm, jobs),
             }
             if let Some(pvm) = Self::vmo_in(&mut self.slots, p) {
-                pvm.committed.remove(pg);
+                pvm.clear_page(jobs, pg);
             }
         }
         let new_parent = pparent.map(|l| Link {
@@ -1195,6 +1267,10 @@ impl Vmos {
             }
         }
         // the node's reference on its parent passes to the child with the link; its job use goes
+        debug_assert!(
+            self.vmo(p).is_none_or(|v| v.committed.leaf_count() == 0),
+            "a merged node leaves nothing in its index"
+        );
         if self.take(p).is_some() {
             jobs.release(pjob);
         }
@@ -1345,6 +1421,12 @@ impl Vmos {
                 self.dma_pages -= vmo.pages;
             }
             jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
+            // (the index: one charge per leaf it still holds, holes included)
+            jobs.credit(
+                vmo.job,
+                Resource::KernelBytes,
+                (vmo.committed.leaf_count() as u64).saturating_mul(crate::pagemap::LEAF_BYTES),
+            );
             jobs.release(vmo.job);
             debug_assert!(
                 vmo.maps.is_empty(),
@@ -1525,7 +1607,7 @@ impl Vmos {
                     // undo this call's commits: frames back, charges back
                     let vmo = Self::vmo_in(&mut self.slots, id).expect("checked above");
                     for p in done {
-                        if let Some(pfn) = vmo.committed.remove(p) {
+                        if let Some(pfn) = vmo.take_frame(jobs, p) {
                             let _ = mm.db.dec(pfn);
                             jobs.credit(vmo.job, Resource::Pages, 1);
                         }
@@ -1562,6 +1644,28 @@ impl Vmos {
             .filter_map(|s| s.vmo.as_ref())
             .filter(|v| v.kind == VmoKind::Plain)
             .map(|v| v.committed.len() as u64)
+            .sum()
+    }
+
+    /// Leaves the index of VMO `id` holds, charged to its job as `KernelBytes` (`LEAF_BYTES` each) unless it is a device VMO (T249).
+    pub fn index_leaves(&self, id: u64) -> Option<u64> {
+        self.vmo(id).map(|v| {
+            if v.index_charged() {
+                v.committed.leaf_count() as u64
+            } else {
+                0
+            }
+        })
+    }
+
+    /// The `KernelBytes` the indexes of all live VMOs of `job` hold (hidden nodes included): what the job's usage must contain for them (tests
+    /// and audits).
+    pub fn index_bytes_of_job(&self, job: JobId) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|s| s.vmo.as_ref())
+            .filter(|v| v.job == job && v.index_charged())
+            .map(|v| (v.committed.leaf_count() as u64).saturating_mul(crate::pagemap::LEAF_BYTES))
             .sum()
     }
 
@@ -1627,9 +1731,9 @@ impl Vmos {
                     return Err(VmoError::Gone);
                 };
                 if v.committed.entry(page) == Entry::None {
-                    if v.committed.insert_hole(page).is_err() {
+                    if v.put(jobs, page, None).is_err() {
                         for p in made {
-                            v.committed.remove(p);
+                            v.clear_page(jobs, p);
                         }
                         return Err(VmoError::NoMemory);
                     }
@@ -1642,10 +1746,11 @@ impl Vmos {
             return Err(VmoError::Gone);
         };
         for page in first..end {
+            // (a hole stays a hole inside the window and its leaf stays; outside, a frame goes and its leaf with it when it was the last)
             let frame = if in_window(page) {
                 vmo.committed.make_hole(page)
             } else {
-                vmo.committed.remove(page)
+                vmo.clear_page(jobs, page).frame()
             };
             if let Some(pfn) = frame {
                 let _ = mm.db.dec(pfn);
@@ -1687,7 +1792,8 @@ impl Vmos {
                 let Some((pg, _)) = v.committed.next_entry_at_or_after(at) else {
                     break;
                 };
-                if let Some(pfn) = v.committed.remove(pg) {
+                // (a hole past the new end goes as well: it shadows nothing there, and its leaf is charged)
+                if let Some(pfn) = v.clear_page(jobs, pg).frame() {
                     let _ = mm.db.dec(pfn);
                     freed = freed.saturating_add(1);
                 }
@@ -1755,10 +1861,10 @@ impl Vmos {
         {
             if let Some((node, op)) = self.takeover_source(id, page) {
                 let inserted = Self::vmo_in(&mut self.slots, id)
-                    .is_some_and(|v| v.committed.insert(page, pfn).is_ok());
+                    .is_some_and(|v| v.put(jobs, page, Some(pfn)).is_ok());
                 if inserted {
                     if let Some(o) = Self::vmo_in(&mut self.slots, node) {
-                        o.committed.remove(op);
+                        o.take_frame(jobs, op);
                     }
                     return Ok((pfn, true));
                 }
@@ -1795,7 +1901,7 @@ impl Vmos {
             return Err(FaultError::NoMemory);
         };
         // (the bookkeeping first: if it cannot be had, the frame and the charge go back and nothing was committed)
-        if vmo.committed.insert(page, pfn).is_err() {
+        if vmo.put(jobs, page, Some(pfn)).is_err() {
             let _ = mm.db.dec(pfn);
             give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);

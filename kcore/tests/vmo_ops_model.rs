@@ -195,6 +195,12 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
                 committed + prepaid,
                 "{ctx}: the ledger is the committed pages plus the prepaid ones"
             );
+            // T249: the index is charged exactly: one leaf of kernel bytes per leaf it holds
+            assert_eq!(
+                jobs.usage(job).unwrap().get(Resource::KernelBytes),
+                vmos.index_bytes_of_job(job),
+                "{ctx}: the ledger holds the index leaves"
+            );
             // every translation is the VMO's own frame (no stale mapping), and each frame's count is the VMO's reference plus its mappings
             let mut mappers: std::collections::BTreeMap<u64, u64> = Default::default();
             for (ai, a) in asp.iter().enumerate() {
@@ -258,6 +264,11 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
             jobs.usage(job).unwrap().get(Resource::Pages),
             0,
             "seed {seed}: the prepaid pages went back too"
+        );
+        assert_eq!(
+            jobs.usage(job).unwrap().get(Resource::KernelBytes),
+            0,
+            "seed {seed}: every leaf was credited"
         );
         mm.db.audit().unwrap();
     }
