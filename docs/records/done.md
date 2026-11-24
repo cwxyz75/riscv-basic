@@ -131,3 +131,9 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-23 | T239 | KT14: aliased `&mut` through nested `with_state` and the FP tables' `state()` (undefined behaviour by the language rules; no machine-level corruption found) | with_state never nests (debug guard) and the FP tables' drop_claim takes s; the shards and the gate run with the guard (PR 496) |
 | 2026-11-23 | MM4 | A slab kernel allocator with per-hart magazines; `linked_list_allocator` retired | the slab allocator with per-hart magazines; the end state is amended (the pool and the fallback heap stay: KERNEL-V1-SPEC amendment 2026-11-23) |
 | 2026-11-23 | T196 | MM4's end state: the allocator takes frame runs inline and `linked_list_allocator` leaves the kernel | closed by the same amendment (an inline frame take would deadlock under kmem::mem()) |
+| 2026-11-23 | AB7 | The system library: `libsys.so` in the kernel image, mapped into every process; `rt` and the C library call through it | AB8 (PR AB9) |
+| 2026-11-23 | PL8 | Limits derived from RAM; per-process ceilings become quotas | per-job region quota (job_set_region_limit), thread limit from the job, verified at epic/phase-12b smoke (PR 504) |
+| 2026-11-23 | AB8 | Entry enforcement: an `ecall` from outside the system library is an exception; shuffled syscall numbers in soak | entry enforcement and shuffled numbers, verified at smoke |
+| 2026-11-23 | AB9 | The contract written down: `abi-conformance`, `SYSCALLS.md` as the reference of the system library, the versioning rule | conformance program and library versioning rule, verified at smoke |
+| 2026-11-23 | T13 | Hand-tuned caps | limits are derived from RAM and set as job quotas (PL8) |
+| 2026-11-23 | T79 | Many hard limits assume QEMU as the target machine | limits are derived from RAM and set as job quotas (PL8) |
