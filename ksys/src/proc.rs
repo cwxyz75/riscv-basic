@@ -432,7 +432,7 @@ fn vmo_range_all<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, n: usize, a: [u
             Err(s) => break Err(s),
         }
     };
-    c.vmos.range_end(call.id, r.is_ok());
+    c.vmos.range_end(c.mm, c.jobs, call.id, r.is_ok());
     r.map(|()| (None, None)).map_err(e)
 }
 

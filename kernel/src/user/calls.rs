@@ -194,7 +194,10 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
         irq::without(|| {});
     })();
     let ok = r.is_ok();
-    locked_state(|_| kmem::get().vmos.range_end(call.id, ok));
+    locked_state(|_| {
+        let k = kmem::get();
+        k.vmos.range_end(k.mm, k.jobs, call.id, ok)
+    });
     match r {
         Ok(()) => Ok((None, None)),
         Err(e) => bad(e),
