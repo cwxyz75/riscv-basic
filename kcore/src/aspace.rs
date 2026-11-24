@@ -1837,6 +1837,8 @@ pub struct AddressSpace<F: PageTableFormat = Sv39> {
     next_gen: u64,
     /// Translations a copy-on-write fault replaced since the last `take_replaced` (MM8): other harts may still cache the old, read-only ones.
     replaced: u64,
+    /// Most regions this space may hold: the job's quota as the caller last set it (`set_region_limit`), never above `MAX_REGIONS` (PL8).
+    region_limit: usize,
 }
 
 impl<F: PageTableFormat> AddressSpace<F> {
@@ -1847,7 +1849,16 @@ impl<F: PageTableFormat> AddressSpace<F> {
             reserve: Reservation::default(),
             next_gen: 1,
             replaced: 0,
+            region_limit: abi::limits::MAX_REGIONS,
         }
+    }
+
+    /// Set the most regions this space may hold (the job's quota: `Jobs::region_limit`); the hard backstop `MAX_REGIONS` caps it. A space already over it keeps its
+    /// regions and can add none.
+    pub fn set_region_limit(&mut self, limit: u64) {
+        self.region_limit = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(abi::limits::MAX_REGIONS);
     }
 
     /// How many translations copy-on-write faults replaced since the last call, and forget them: the caller shoots down every hart's TLB
@@ -1919,7 +1930,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if vmo_page.checked_add(pages).is_none_or(|e| e > total) {
             return Err(RegionError::OutsideVmo);
         }
-        if self.regions.len() >= abi::limits::MAX_REGIONS {
+        if self.regions.len() >= self.region_limit {
             return Err(RegionError::TooMany);
         }
         // Overlap with the previous region or any region starting inside this one.
@@ -2057,7 +2068,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if va == start || va >= start + r.pages * PAGE_SIZE {
             return Ok(());
         }
-        if self.regions.len() >= abi::limits::MAX_REGIONS {
+        if self.regions.len() >= self.region_limit {
             return Err(RegionError::TooMany);
         }
         let lower_pages = (va - start) / PAGE_SIZE;
@@ -2098,12 +2109,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
     ) -> Result<u64, RegionError> {
         let end = Self::range_end(start, len)?;
         // (room for the splits this range needs, before anything changes: none at all for a range on region boundaries)
-        if self
-            .regions
-            .len()
-            .saturating_add(self.splits_needed(start, end))
-            > abi::limits::MAX_REGIONS
-        {
+        let splits = self.splits_needed(start, end);
+        if splits > 0 && self.regions.len().saturating_add(splits) > self.region_limit {
             return Err(RegionError::TooMany);
         }
         self.split_at(vmos, start)?;
@@ -2167,12 +2174,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if denied {
             return Err(ProtectError::Denied);
         }
-        if self
-            .regions
-            .len()
-            .saturating_add(self.splits_needed(start, end))
-            > abi::limits::MAX_REGIONS
-        {
+        let splits = self.splits_needed(start, end);
+        if splits > 0 && self.regions.len().saturating_add(splits) > self.region_limit {
             return Err(ProtectError::TooMany);
         }
         self.split_at(vmos, start)

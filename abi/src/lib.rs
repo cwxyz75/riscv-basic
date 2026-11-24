@@ -316,8 +316,6 @@ pub mod limits {
     pub const MAX_COMMIT_PAGES: u64 = 1024;
     /// Live processes at once.
     pub const MAX_PROCESSES: usize = 64;
-    /// Live user threads in one process.
-    pub const MAX_THREADS_PER_PROCESS: usize = 2048;
     /// Live user threads in the whole system (each costs a 32 KiB kernel stack from the
     /// kernel heap (an 8 MiB boot heap that grows from the frame database); a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
     pub const MAX_USER_THREADS: usize = 4096;
@@ -326,7 +324,7 @@ pub mod limits {
     pub const MAX_IPC_BYTES: usize = 2 * 1024 * 1024;
     /// Bytes buffered per socket endpoint.
     pub const SOCKET_BUFFER: usize = 65536;
-    /// Mapped regions in one address space.
+    /// Mapped regions in one address space: the hard backstop; a job's `job_set_region_limit` lowers it for its processes (PL8).
     pub const MAX_REGIONS: usize = 16384;
 }
 
@@ -481,6 +479,8 @@ pub mod syscall {
         JOB_INFO = 92,
         /// Set a job's `max_prio`, `rt_budget` and `cpu_weight`.
         JOB_SET_SCHED = 96,
+        /// Set a job's limit on the regions one address space of its processes may hold (PL8): `a0` job (SET_LIMITS), `a1` the limit.
+        JOB_SET_REGION_LIMIT = 98,
         JOB_KILL = 93,
         JOB_ROOT = 94,
         RESOURCE_ROOT = 95,
@@ -622,6 +622,17 @@ pub mod layout {
 #[cfg(test)]
 mod tests {
     use super::finisher;
+
+    /// No two calls share a number (a collision made `job_set_region_limit` and `exception_resume` the same call, PL8).
+    #[test]
+    fn syscall_numbers_are_unique() {
+        let t = super::syscall::TABLE;
+        for (i, &(name, n)) in t.iter().enumerate() {
+            for &(other, m) in &t[..i] {
+                assert!(n != m, "{name} and {other} share the number {n}");
+            }
+        }
+    }
 
     #[test]
     fn layout_is_consistent() {

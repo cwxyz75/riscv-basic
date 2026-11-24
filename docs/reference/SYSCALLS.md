@@ -94,8 +94,8 @@ change.
 
 A process holds as many handles as its job's object quota and memory allow (up to 2^24 - 1; there is no fixed `MAX_HANDLES`); `MAX_MSG_BYTES`
 65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
-`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_REGIONS` 16384 per address space and
-`MAX_THREADS_PER_PROCESS` 2048. The system-wide **backstops** are derived from the RAM the machine has (PL8, KERNEL-V1-SPEC 2.5) and are
+`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_REGIONS` 16384 regions per address space as the hard backstop, which a job's region quota (`job_set_region_limit`) lowers;
+there is no per-process thread constant (the job's thread level and the system-wide user-thread backstop bound the threads). The system-wide **backstops** are derived from the RAM the machine has (PL8, KERNEL-V1-SPEC 2.5) and are
 never below the figures these constants had (16384 objects, 2 MiB of queued IPC bytes, 64 processes, 4096 user threads, 1024 DMA pages):
 kernel objects alive at once, RAM / 4096 (creating more is NO_MEMORY); queued channel and socket data (message bytes, headers, queued
 handles, port bindings), RAM / 32; processes, RAM / 1 MiB, at most 2^20 and, until the calls that lock every address space at once are gone (T214), 64; user threads, RAM / 64 KiB, at most the slots of the
@@ -166,10 +166,11 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
 | job_exception_channel | `a0` job (MANAGE) | `a1` channel |
-| job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors, 8 kernel bytes, 9 real-time time, 10 CPU time) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
+| job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors, 8 kernel bytes, 9 real-time time, 10 CPU time, 11 regions per address space) | `a1` used, `a2` limit (for 11: the regions one address space of the job's processes may hold, effective, in both; for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
 | job_kill | `a0` job, `a1` exit code |  |
 | job_root |  | `a1` handle |
 | job_set_limits | `a0` job, `a1` pointer to the limits |  |
+| job_set_region_limit | `a0` job, `a1` the most regions one address space of its processes may hold |  |
 | job_set_sched | `a0` job, `a1` max_prio 0-63, `a2` rt_budget ns per 100 ms, `a3` cpu_weight 1-65536 |  |
 | object_info | `a0` handle | `a1` koid, `a2` peer koid |
 | object_signals | `a0` handle | `a1` the signal word |
@@ -673,6 +674,13 @@ the job but cannot lift its limits). Usage above a new limit is not undone; late
 until usage is back under it. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (the limits at `a1` cannot be
 read). The rights are checked before the pointer is touched.
 
+### job_set_region_limit(job, limit) -> status
+
+The most regions one address space of a process of `job` may hold (PL8; the quota that replaced the per-process constant). Needs SET_LIMITS. The smallest value set on the job and
+its ancestors applies, and the hard backstop `MAX_REGIONS` caps it; a new job has none of its own. A call that would add a region beyond it (`process_map`, a `process_unmap` or
+`process_protect` that splits a region, `thread_spawn`'s stack, `process_clone`) is NO_MEMORY; a space already above a lowered limit keeps its regions, can unmap, and can add none.
+Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
+
 ### job_info(job, which) -> status, used, limit
 
 Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet), 9 the real-time CPU time (SCHED-SMP-SPEC 4.5, task 8): `a1` the nanoseconds the job's own threads have run **at a real-time base priority** in the current 100 ms window (the windows are aligned to multiples of 100 ms since boot; the figure restarts at zero with each), `a2` the job's `rt_budget` (enforced: a job that has used it has its real-time threads demoted to priority 31, round robin, until the window ends), 10 the CPU time (`a1`: the nanoseconds run by the threads of the job and of the jobs below it since each was created; the root job also holds the kernel's own threads, which are charged to it; a job that has been freed is no longer counted; `a2` 0), 8 kernel memory in bytes (MM5: the memory the kernel holds because of the job's programs, other than pages they map; its limit is an eighth of the job's page limit in bytes, none without one); `used` counts the job and everything
@@ -724,7 +732,7 @@ A process runs one or more user threads, all sharing its address space and handl
 The first thread starts at `process_start` (or at load, for a kernel-started process); more
 are made with `thread_spawn` (the kernel provisions the stack, or the caller brings one: CALLER_STACK). A thread is a kernel object (kind THREAD): a handle to it can
 be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
-INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (2048) live threads per process. A thread's kernel stack (four frames) is **billed to the process's job as four pages, for as long as the thread lives** (and the thread itself counts against the job's thread limit); the job's page limit can therefore refuse a thread.
+INSPECT, WAIT. The job's thread level and the system-wide `MAX_USER_THREADS` bound the live threads (there is no per-process constant, PL8). A thread's kernel stack (four frames) is **billed to the process's job as four pages, for as long as the thread lives** (and the thread itself counts against the job's thread limit); the job's page limit can therefore refuse a thread.
 
 Ending. `thread_exit(code)` ends the calling thread only. When the last live thread of a
 process ends, the process ends, with exit code `code` of that last thread unless the
@@ -1079,8 +1087,7 @@ a per-process hint (just above the last stack it gave), wrapping once, and maps 
 target's job as it is touched, with the page-table estimate charged at once like `process_map`) read-write above the
 guard. A priority above the job's maximum is ACCESS_DENIED, one above 63 is INVALID_ARGS. When the thread ends the
 region is unmapped, other harts' translations are shot down and the VMO is freed before the frames can be reused; a
-whole-process exit leaves the stacks to the teardown. `MAX_THREADS_PER_PROCESS` (2048) and `MAX_USER_THREADS` (4096)
-still apply (the per-process one goes with the job-quota work, T83). Tests: `thread_spawn_*`,
+whole-process exit leaves the stacks to the teardown. `MAX_USER_THREADS` (4096) still applies. Tests: `thread_spawn_*`,
 `two_thousand_threads_live`, `ten_thousand_threads_leak_nothing`, `find_gap_agrees_with_a_scan` (host).
 
 ### thread_set_sched(thread, priority, flags) -> status

@@ -322,6 +322,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 resolve_map_args(objs, caller, ph, vh, flags).map_err(e)?;
             let caller_job = caller.job;
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
+            target
+                .aspace
+                .held_mut()
+                .set_region_limit(jobs.region_limit(target.job));
             if target.exit_code.is_some() || target.killed.is_some() {
                 return bad(Status::BadState);
             }
@@ -606,7 +610,11 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::InvalidArgs);
             }
             // (the mapping below cannot fail for want of a region slot)
-            if target.aspace.held_ref().region_count() >= abi::limits::MAX_REGIONS {
+            if target.aspace.held_ref().region_count() as u64
+                >= jobs
+                    .region_limit(target.job)
+                    .min(abi::limits::MAX_REGIONS as u64)
+            {
                 return bad(Status::NoMemory);
             }
             let target_job = target.job;
@@ -665,6 +673,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 (vid, region.vmo_page, None)
             };
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
+            target
+                .aspace
+                .held_mut()
+                .set_region_limit(jobs.region_limit(target.job));
             if let Err(x) = target.aspace.held_mut().map_region_max(
                 vmos,
                 vaddr,
@@ -710,6 +722,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             let (_, tpid, _, _) =
                 ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
+            target
+                .aspace
+                .held_mut()
+                .set_region_limit(jobs.region_limit(target.job));
             if target.exit_code.is_some() || target.killed.is_some() {
                 return bad(Status::BadState);
             }
@@ -765,6 +781,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::InvalidArgs);
             }
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
+            target
+                .aspace
+                .held_mut()
+                .set_region_limit(jobs.region_limit(target.job));
             if target.exit_code.is_some() || target.killed.is_some() {
                 return bad(Status::BadState);
             }

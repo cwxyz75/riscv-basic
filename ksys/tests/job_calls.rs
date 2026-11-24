@@ -165,7 +165,7 @@ fn job_info_rows() {
         Status::AccessDenied
     );
     assert_eq!(
-        w.err(nr::JOB_INFO, [root, 11, 0, 0, 0, 0]),
+        w.err(nr::JOB_INFO, [root, 12, 0, 0, 0, 0]),
         Status::InvalidArgs
     );
     // the usage counts what was made: a channel is two objects, charged to the job
@@ -235,4 +235,42 @@ fn a_job_slot_that_is_used_again_starts_with_no_cpu_time() {
     assert_eq!(w.jobs.live_ids()[2].index(), 2);
     assert_eq!(w.ok(nr::JOB_INFO, [b, 10, 0, 0, 0, 0]).0, Some(0));
     assert_eq!(w.ok(nr::JOB_INFO, [b, 9, 0, 0, 0, 0]).0, Some(0));
+}
+
+/// PL8: `job_set_region_limit` needs SET_LIMITS, the value shows in `job_info` 11 as the effective limit (the smallest along the ancestors, at most
+/// `MAX_REGIONS`), and a child inherits what its parent set.
+#[test]
+fn job_set_region_limit_is_a_quota_that_children_inherit() {
+    let mut w = world();
+    let root = root_handle(&mut w, Rights::JOB);
+    w.poke(BASE, &limits([NONE; 6]));
+    let parent = w.ok(nr::JOB_CREATE, [root, BASE, 0, 0, 0, 0]).0.unwrap();
+    let max = abi::limits::MAX_REGIONS as u64;
+    assert_eq!(
+        w.ok(nr::JOB_INFO, [parent, 11, 0, 0, 0, 0]),
+        (Some(max), Some(max)),
+        "no quota: the backstop"
+    );
+    w.ok(nr::JOB_SET_REGION_LIMIT, [parent, 100, 0, 0, 0, 0]);
+    let child = w.ok(nr::JOB_CREATE, [parent, BASE, 0, 0, 0, 0]).0.unwrap();
+    assert_eq!(
+        w.ok(nr::JOB_INFO, [child, 11, 0, 0, 0, 0]).0,
+        Some(100),
+        "a child inherits"
+    );
+    // a child's own limit may be lower, never higher than the parent's
+    w.ok(nr::JOB_SET_REGION_LIMIT, [child, 10, 0, 0, 0, 0]);
+    assert_eq!(w.ok(nr::JOB_INFO, [child, 11, 0, 0, 0, 0]).0, Some(10));
+    w.ok(nr::JOB_SET_REGION_LIMIT, [child, 1 << 40, 0, 0, 0, 0]);
+    assert_eq!(w.ok(nr::JOB_INFO, [child, 11, 0, 0, 0, 0]).0, Some(100));
+    // the rights come first
+    let weak = w.narrow(child, Rights::MANAGE);
+    assert_eq!(
+        w.err(nr::JOB_SET_REGION_LIMIT, [weak, 5, 0, 0, 0, 0]),
+        Status::AccessDenied
+    );
+    assert_eq!(
+        w.err(nr::JOB_SET_REGION_LIMIT, [0x999, 5, 0, 0, 0, 0]),
+        Status::BadHandle
+    );
 }

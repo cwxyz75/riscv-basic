@@ -179,6 +179,9 @@ struct Rec {
     parent: Option<JobId>,
     limits: Limits,
     sched: SchedLimits,
+    /// Most regions one address space of this job's processes may hold (PL8: the per-job quota that replaces a constant; the effective value is the
+    /// smallest along the ancestors; `UNLIMITED` is the hard backstop only).
+    regions: u64,
     usage: Usage,
     /// Holders of this id (see the module comment).
     uses: u32,
@@ -204,6 +207,7 @@ impl Jobs {
             parent: None,
             limits: Limits::UNLIMITED,
             sched: SchedLimits::ROOT,
+            regions: UNLIMITED,
             usage: Usage::default(),
             uses: 1,
         }));
@@ -270,6 +274,7 @@ impl Jobs {
             parent: Some(parent),
             limits,
             sched: inherited,
+            regions: UNLIMITED,
             usage: Usage::default(),
             uses: 1,
         };
@@ -343,6 +348,26 @@ impl Jobs {
 
     pub fn sched(&self, id: JobId) -> Option<SchedLimits> {
         Some(self.rec(id)?.sched)
+    }
+
+    /// The most regions one address space of a process of `id` may hold: the smallest limit set on the job and its ancestors (`UNLIMITED` if none).
+    pub fn region_limit(&self, id: JobId) -> u64 {
+        let mut cur = Some(id);
+        let mut lim = UNLIMITED;
+        while let Some(c) = cur {
+            match self.rec(c) {
+                Some(r) => lim = lim.min(r.regions),
+                None => break,
+            }
+            cur = self.parent(c);
+        }
+        lim
+    }
+
+    /// Set the job's own limit on regions per address space (see `region_limit`).
+    pub fn set_region_limit(&mut self, id: JobId, regions: u64) -> Result<(), JobError> {
+        self.rec_mut(id).ok_or(JobError::NoSuchJob)?.regions = regions;
+        Ok(())
     }
 
     /// Set a job's scheduling limits. Each value may not exceed the parent's (PR2); lowering one lowers it in every
