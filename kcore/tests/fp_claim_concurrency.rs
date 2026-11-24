@@ -12,7 +12,9 @@
 //! `claim` without the `== tid` guard on the old hart wipes T's claim after the set (second assert).
 #![cfg(any(loom, shuttle))]
 
-use kcore::fp::{light_target, quiet_return, ClaimCells, Lazy};
+use kcore::fp::{
+    claim, light_target, quiet_return, ClaimCells, FpHart, Lazy, StateUnit, Tokens, UnitThread,
+};
 use kcore::sync::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(loom)]
@@ -25,6 +27,16 @@ use shuttle::{
     sync::{Arc, Mutex},
     thread,
 };
+
+/// A register file with nothing in it: only the bookkeeping is under test.
+struct Dummy;
+impl StateUnit for Dummy {
+    type Regs = u8;
+    fn save(&mut self) -> u8 {
+        0
+    }
+    fn load(&mut self, _: &u8) {}
+}
 
 struct Cells {
     claim: [AtomicU64; 2],
@@ -65,10 +77,14 @@ fn takeover_races_the_light_path() {
     let other = thread::spawn(move || {
         // hart 1 loads U (U's holder was hart 0): the old hart's claim goes, if it still names U
         let _g = l1.lock().unwrap();
-        if c1.claim(0) == U {
-            c1.clear(0);
-        }
-        c1.set(1, U, ADDR_U);
+        // (the protocol's own `claim`, not a copy of it: it clears hart 0's claim only if it still names U, and sets hart 1's)
+        let mut tokens = Tokens::new();
+        let mut u = UnitThread::<u8>::new();
+        u.enable_with(&mut tokens, 0);
+        let mut harts = [FpHart::new(), FpHart::new()];
+        harts[1].return_to_user(&u, &mut Dummy);
+        u.set_holder(Some(0));
+        claim(&*c1, &mut u, &mut harts, U, 1);
     });
     // hart 0 is running T, whose state is not in the registers yet: the lock-free paths must say no
     assert_eq!(
