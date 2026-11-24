@@ -3135,6 +3135,129 @@ fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
     check("the kill")
 }
 
+/// T207: while a chunked decommit is under way, a second decommit, a `vmo_set_size` and a `vmo_create_child` on the VMO are refused with SHOULD_WAIT
+/// (seen from a thread on another hart; with one hart nothing runs beside the call and the test passes without looking).
+fn a_decommit_under_way_refuses_the_calls_that_would_race_it() -> Outcome {
+    // T207 (3a, 3d): a chunked decommit holds its VMO to the end, and the calls that would race its cursor are refused with SHOULD_WAIT.
+    static RANGE_V: AtomicU64 = AtomicU64::new(0);
+    static RANGE_MODE: AtomicU32 = AtomicU32::new(0);
+    static RANGE_SEEN: AtomicU32 = AtomicU32::new(0);
+    static RANGE_READY: AtomicU32 = AtomicU32::new(0);
+    static RANGE_DONE: AtomicU32 = AtomicU32::new(0);
+
+    /// The other hart's side: until the decommit is over, try the call of the round and record that it was refused.
+    extern "C" fn range_prober(_arg: usize) -> ! {
+        let v = RANGE_V.load(Ordering::SeqCst);
+        let mode = RANGE_MODE.load(Ordering::SeqCst);
+        RANGE_READY.store(1, Ordering::SeqCst);
+        while RANGE_DONE.load(Ordering::SeqCst) == 0 {
+            let r = match mode {
+                // (the size it already has: nothing changes when the VMO is free)
+                0 => sys::vmo_decommit(v, 0, 4096),
+                1 => sys::vmo_set_size(v, 16384 * 4096),
+                _ => sys::vmo_create_child(v, 0, 4096, 0, rt::abi::child_flags::PRIVATE),
+            };
+            match st(r) {
+                Some(S::ShouldWait) => {
+                    RANGE_SEEN.store(1, Ordering::SeqCst);
+                }
+                Some(S::Ok) if mode == 2 => {
+                    sys::handle_close(r.a1 as u64);
+                }
+                _ => {}
+            }
+        }
+        sys::thread_exit(0)
+    }
+
+    let harts = job_use(root_job()?, 7)?.0;
+    if harts < 2 {
+        return Ok(()); // (nothing runs beside the call on one hart: the refusal cannot be seen)
+    }
+    let v = ok(
+        sys::vmo_create_flags(16384, 0, rt::abi::vmo_flags::RESIZABLE),
+        "a 64 MiB resizable VMO",
+    )?
+    .a1 as u64;
+    RANGE_V.store(v, Ordering::SeqCst);
+    // mode 0: a second `vmo_decommit`; 1: `vmo_set_size`; 2: `vmo_create_child`
+    for mode in 0..3u32 {
+        RANGE_MODE.store(mode, Ordering::SeqCst);
+        RANGE_SEEN.store(0, Ordering::SeqCst);
+        RANGE_READY.store(0, Ordering::SeqCst);
+        RANGE_DONE.store(0, Ordering::SeqCst);
+        let t = new_thread(range_prober, 0)?;
+        while RANGE_READY.load(Ordering::SeqCst) == 0 {
+            sys::thread_yield();
+        }
+        // (the call takes a while: 256 batches of 64 pages; a few tries make the overlap certain)
+        for _ in 0..8 {
+            if RANGE_SEEN.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            for k in 0..16u64 {
+                ensure_eq!(
+                    st(sys::vmo_commit(v, k * 1024 * 4096, 1024 * 4096)),
+                    Some(S::Ok),
+                    "commit the VMO"
+                );
+            }
+            ensure_eq!(
+                st(sys::vmo_decommit(v, 0, 16384 * 4096)),
+                Some(S::Ok),
+                "decommit all of it"
+            );
+        }
+        RANGE_DONE.store(1, Ordering::SeqCst);
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(t);
+        ensure_eq!(
+            RANGE_SEEN.load(Ordering::SeqCst),
+            1,
+            "round {mode}: a call made during the decommit was refused with SHOULD_WAIT"
+        );
+    }
+    ensure_eq!(
+        sys::vmo_get_size(v).a1 as u64,
+        16384 * 4096,
+        "the size is untouched"
+    );
+    sys::handle_close(v);
+    Ok(())
+}
+
+/// T207: a decommit inside the window a child inherits makes holes, and a hole's leaf is charged to the child's job: a job that cannot pay stops the
+/// call with NO_MEMORY, nothing changed.
+fn a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory() -> Outcome {
+    let root = root_job()?;
+    let parent = ok(sys::vmo_create(64), "a parent of 64 pages")?.a1 as u64;
+    ok(
+        sys::vmo_write(parent, 0, b"p".as_ptr(), 1),
+        "write the parent",
+    )?;
+    // (a job whose one page allows 512 kernel bytes cannot hold a leaf of 528)
+    let tiny = job(root, 1, 1, 1)?;
+    let child = ok(
+        sys::vmo_create_child(parent, 0, 64 * 4096, tiny, rt::abi::child_flags::PRIVATE),
+        "a PRIVATE child in the tiny job",
+    )?
+    .a1 as u64;
+    let before = job_use(tiny, 8)?.0;
+    ensure_eq!(
+        st(sys::vmo_decommit(child, 0, 4096)),
+        Some(S::NoMemory),
+        "no room for the hole's leaf"
+    );
+    ensure_eq!(job_use(tiny, 8)?.0, before, "nothing was charged");
+    let mut b = [0u8; 1];
+    ok(sys::vmo_read(child, 0, b.as_mut_ptr(), 1), "read the child")?;
+    ensure_eq!(b[0], b'p', "the child still shows the parent's page");
+    for h in [child, parent, tiny] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 /// T207 PR 4 (MM6): there is no size cap below the user half. A 2 GiB VMO is created, mapped whole and touched one page per 2 MiB (1024 pages
 /// committed, and a page table each), read back, then decommitted whole in one call; the job's page usage is back where it started, and a page
 /// read afterwards is a fresh zero.
@@ -16816,6 +16939,14 @@ pub fn app_main() -> i32 {
         (
             "the_heap_gives_memory_back_when_it_is_freed",
             the_heap_gives_memory_back_when_it_is_freed,
+        ),
+        (
+            "a_decommit_under_way_refuses_the_calls_that_would_race_it",
+            a_decommit_under_way_refuses_the_calls_that_would_race_it,
+        ),
+        (
+            "a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory",
+            a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory,
         ),
         (
             "a_two_gib_sparse_vmo_is_mapped_touched_and_given_back",
