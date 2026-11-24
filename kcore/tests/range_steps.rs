@@ -383,3 +383,36 @@ fn the_last_close_between_two_steps_does_not_lose_the_credit_of_the_frames_taken
     assert_eq!(vmos.frames_held(), 0);
     assert_eq!(mm.db.free_count(), 3000);
 }
+
+#[test]
+fn a_step_covers_at_most_the_span_however_sparse_the_vmo_is() {
+    // (B scans the mappings' page tables over the span of a step: a sparse VMO must not give it all of the range at once)
+    let (mut mm, mut vmos, mut jobs) = world();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 10_000, job);
+    vmos.commit(&mut mm, &mut jobs, id, 9_999, 1).unwrap();
+    assert_eq!(vmos.range_begin(id, 0, 10_000, None), Ok(true));
+    let mut batch = [0u64; RANGE_STEP];
+    let (mut steps, mut freed) = (0, 0);
+    loop {
+        let st = vmos.range_step(&mut jobs, id, &mut batch).unwrap();
+        assert!(
+            st.next - st.lo <= kcore::aspace::RANGE_SPAN,
+            "a step of {} pages",
+            st.next - st.lo
+        );
+        vmos.range_free(&mut mm, &mut jobs, id, &batch[..st.n]);
+        freed += st.n;
+        steps += 1;
+        if st.done {
+            break;
+        }
+    }
+    vmos.range_end(&mut mm, &mut jobs, id, true);
+    assert_eq!(freed, 1);
+    assert_eq!(
+        steps,
+        10_000usize.div_ceil(kcore::aspace::RANGE_SPAN as usize)
+    );
+    exact(&vmos, &jobs, job);
+}

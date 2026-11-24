@@ -927,15 +927,16 @@ fn decommit_takes_the_pages_from_every_mapping_and_asks_for_the_shootdown_only_w
         (0, 0),
         "no translation existed: no shootdown"
     );
-    // mapped and touched in two processes of the VMO's own job: both lose the pages, one shootdown
+    // mapped and touched in two processes of the VMO's own job: both lose the pages, a shootdown for each
     w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
     w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, W | R]);
     touch(&mut w, 1, VA + 2 * 4096);
     touch(&mut w, 2, VA + 3 * 4096);
     let jobs_before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
     w.ok(nr::VMO_DECOMMIT, [v, 2 * 4096, 2 * 4096, 0, 0, 0]);
-    assert_eq!(w.tlb.shootdowns, 1);
-    assert_eq!(w.tlb.flushes, 1);
+    // (one shootdown for each address space cleared, inside its section: the locks drop between two)
+    assert_eq!(w.tlb.shootdowns, 2);
+    assert_eq!(w.tlb.flushes, 2);
     for pid in [1, 2] {
         let a = w.procs[&pid].aspace.held_ref();
         assert!(a.table().translate(&w.mm, VA + 2 * 4096).is_none());

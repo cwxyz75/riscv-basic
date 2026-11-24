@@ -135,11 +135,16 @@ impl ksys::Machine for KernelMachine {
 fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
     // one part under the locks the part needs: `own` is the address space to hold (none for A and C); `f` gets the call's context
     fn section<R>(
+        must: bool, // (false for C: the frames taken must go back whatever became of the caller)
         own: Option<u64>,
         f: impl FnOnce(&mut ksys::PCtx<'_, kmem::DirectMap, KernelMachine>) -> R,
     ) -> Result<R, Status> {
         locked_state(|s| -> Result<R, Status> {
-            let me = caller_pid(s)?;
+            let me = if must {
+                caller_pid(s)?
+            } else {
+                caller_pid(s).unwrap_or(0)
+            };
             let mut machine = KernelMachine::default();
             let _as = match own {
                 Some(pid) => AsLocks::one(s, pid),
@@ -158,18 +163,20 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
             Ok(f(&mut ctx))
         })
     }
-    let call = match section(None, |ctx| ksys::vmo_range_begin(ctx, n, a)) {
+    let call = match section(true, None, |ctx| ksys::vmo_range_begin(ctx, n, a)) {
         Ok(Ok(Some(c))) => c,
         Ok(Ok(None)) => return Ok((None, None)),
         Ok(Err(e)) | Err(e) => return bad(e),
     };
     let r: Result<(), Status> = (|| loop {
         // A
-        let mut batch = section(None, |ctx| ksys::vmo_range_take(ctx, call))??;
+        let mut batch = section(true, None, |ctx| ksys::vmo_range_take(ctx, call))??;
         // B (a failure here stops the walk, not the batch: C still runs, or the frames taken would never go back)
         let mut walked: Result<(), Status> = Ok(());
         loop {
-            let owner = match section(None, |ctx| ksys::vmo_range_next_owner(ctx, call, &batch)) {
+            let owner = match section(true, None, |ctx| {
+                ksys::vmo_range_next_owner(ctx, call, &batch)
+            }) {
                 Ok(Some(o)) => o,
                 Ok(None) => break,
                 Err(e) => {
@@ -177,15 +184,17 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
                     break;
                 }
             };
-            if let Err(e) = section(Some(owner), |ctx| {
-                ksys::vmo_range_unmap_owner(ctx, call, &mut batch, owner)
+            if let Err(e) = section(true, Some(owner), |ctx| {
+                ksys::vmo_range_unmap_owner(ctx, n, call, &mut batch, owner)
             }) {
                 walked = Err(e);
                 break;
             }
         }
         // C
-        let done = section(None, |ctx| ksys::vmo_range_finish(ctx, n, call, &mut batch))??;
+        let done = section(false, None, |ctx| {
+            ksys::vmo_range_finish(ctx, n, call, &mut batch)
+        })??;
         walked?;
         if done {
             return Ok(());

@@ -347,12 +347,17 @@ pub fn vmo_range_next_owner<M: PhysMem, X: Machine>(
 /// B: clear the batch's span in the address space of process `owner` (the caller holds it, and no other), for the VMO and every node below it.
 pub fn vmo_range_unmap_owner<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
+    n: usize,
     call: RangeCall,
     batch: &mut RangeBatch,
     owner: u64,
 ) {
     let PCtx {
-        procs, mm, vmos, ..
+        procs,
+        mm,
+        vmos,
+        machine,
+        ..
     } = c;
     batch.cursor = owner;
     let Some(p) = procs.get_mut(&owner) else {
@@ -373,10 +378,17 @@ pub fn vmo_range_unmap_owner<M: PhysMem, X: Machine>(
         }
     });
     batch.cleared = batch.cleared.saturating_add(cleared);
+    if cleared > 0 {
+        // the translations go from every hart before the locks drop (SMP5): a sibling that faults the page in meanwhile must not leave another hart
+        // writing the frame this clear took away
+        if !machine.skip_shootdown(n) {
+            machine.shootdown();
+        }
+        machine.flush_tlb();
+    }
 }
 
-/// C: other harts may still cache the translations of what was just unmapped: they drop them before any frame is freed (TLB2); then the VMO gives the
-/// frames back. (When nothing was mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.) Returns
+/// C: the VMO gives the frames back (B shot the translations down in each section, so no hart caches one: TLB2). Returns
 /// the status the take stopped with, if any.
 pub fn vmo_range_finish<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
@@ -391,12 +403,7 @@ pub fn vmo_range_finish<M: PhysMem, X: Machine>(
         machine,
         ..
     } = c;
-    if batch.cleared > 0 {
-        if !machine.skip_shootdown(n) {
-            machine.shootdown();
-        }
-        machine.flush_tlb();
-    }
+    let _ = (n, &machine);
     let got = batch.frames.get(..batch.n).unwrap_or(&[]);
     vmos.range_free(mm, jobs, call.id, got);
     match batch.err {
@@ -413,7 +420,7 @@ pub fn vmo_range_step<M: PhysMem, X: Machine>(
 ) -> Result<bool, Status> {
     let mut batch = vmo_range_take(c, call)?;
     while let Some(owner) = vmo_range_next_owner(c, call, &batch) {
-        vmo_range_unmap_owner(c, call, &mut batch, owner);
+        vmo_range_unmap_owner(c, n, call, &mut batch, owner);
     }
     vmo_range_finish(c, n, call, &mut batch)
 }

@@ -215,6 +215,8 @@ pub enum VmoKind {
 pub const SCAN_PER_PTE: u64 = 32;
 
 /// The pages one step of a chunked decommit takes at most.
+/// The most pages one step of a chunked decommit or shrink covers, whatever the index holds (2,048 page-table scans and clears at most in part B).
+pub const RANGE_SPAN: u64 = 2048;
 pub const RANGE_STEP: usize = 64;
 
 /// What one `range_step` did: it took the pages `lo .. next` (`n` frames, in the caller's batch), and `done` when nothing is left.
@@ -2050,13 +2052,15 @@ impl Vmos {
             }
         } else {
             let mut entries = 0usize;
-            while at < end && entries < out.len() {
+            // (a step covers at most `RANGE_SPAN` pages: the scan of the mappings' page tables in part B is bounded by it, and so is what B clears)
+            let limit = end.min(at.saturating_add(RANGE_SPAN));
+            while at < limit && entries < out.len() {
                 let Some((pg, _)) = v.committed.next_entry_at_or_after(at) else {
-                    at = end;
+                    at = limit;
                     break;
                 };
-                if pg >= end {
-                    at = end;
+                if pg >= limit {
+                    at = limit;
                     break;
                 }
                 if let Entry::Frame(pfn) = v.clear_page(jobs, pg) {
