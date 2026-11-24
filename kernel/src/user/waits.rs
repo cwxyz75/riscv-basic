@@ -37,6 +37,17 @@ pub(super) fn touch_port_of(h: Handle) {
     });
 }
 
+/// An R point of the blocking calls (T177): make the calling thread known to the wait table, with room for everything it can register or be woken by.
+/// Idempotent; no memory is `NoMemory` and nothing has changed.
+pub(super) fn admit_caller() -> Result<(), ReplyErr> {
+    locked_state(|s| {
+        s.waits
+            .admit(thread::current())
+            .map_err(|_| Status::NoMemory)
+    })
+    .map_err(|e| (e, None, None))
+}
+
 fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
     with_state(|s| {
         let Some(pid) = s.pid_of(thread) else {
@@ -48,11 +59,10 @@ fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
         if let Ok(entry) = p.handles.get(h) {
             if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
                 // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
-                let bound = ipc::port_bound_objects(&s.objs, entry.obj);
                 if poller {
-                    s.waits.register_poller(thread, entry.obj, mask, bound);
+                    s.waits.register_poller(thread, entry.obj, mask);
                 } else {
-                    s.waits.register_port(thread, entry.obj, mask, bound);
+                    s.waits.register_port(thread, entry.obj, mask);
                 }
             } else {
                 s.waits.register(thread, entry.obj, mask);
@@ -93,6 +103,7 @@ pub(super) fn object_wait(a: [u64; 6]) -> Reply {
     let w = in_process(|s, _, me| ksys::object_wait_check(s, me, a))?;
     let (h, mask, deadline) = (w.handle, w.mask, w.deadline);
     if deadline != 0 {
+        admit_caller()?;
         // A handle that stops naming anything ends the wait (the report below then says so).
         let me = thread::current();
         // (anything a kernel thread touched without committing goes first: a thread must not sleep
@@ -441,6 +452,7 @@ pub(super) fn pager_after_call(frame: &mut crate::trap::TrapFrame) {
 
 /// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),
 /// then report one in turn.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn port_wait(a: [u64; 6]) -> Reply {
     let (h, deadline) = ksys::port_wait_check(a).map_err(|e| (e, None, None))?;
     let poll = || in_process(|s, k, me| ksys::port_poll(s, k.jobs, me, h));
@@ -454,6 +466,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
         && irq::without(killed_now).is_none()
         && !irq::without(interrupted_now)
     {
+        admit_caller()?;
         // (the poll above may have touched the port; tell the wait table before sleeping, so that no
         // thread goes to sleep, and the lock is released, with signal changes still in the log)
         commit_wake();
@@ -491,6 +504,7 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
         && irq::without(killed_now).is_none()
         && !irq::without(interrupted_now)
     {
+        admit_caller()?;
         commit_wake();
         let me = thread::current();
         thread::wait_deadline_registered(
@@ -536,7 +550,8 @@ fn channel_call_inner(
     staged: Option<ksys::Staged>,
     deferred: &mut Option<ksys::Deferred>,
 ) -> Reply {
-    // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
+    admit_caller()?; // (before anything is sent: the wait below registers without allocating)
+                     // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
     let call = in_process(|s, k, me| {
         ksys::channel_call_send_staged(
             s,

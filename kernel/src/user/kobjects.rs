@@ -136,6 +136,7 @@ impl KernelEnd {
     pub fn wait_readable(&self, deadline: u64) -> bool {
         let h = self.handle;
         let me = thread::current();
+        crate::heap::nofail(|| locked_state(|s| s.waits.admit(me)).ok());
         commit_wake();
         let r = thread::wait_deadline_registered(
             || {
@@ -158,7 +159,10 @@ impl KernelEnd {
             },
             deadline,
         );
-        locked_state(|s| s.waits.forget(me));
+        locked_state(|s| {
+            s.waits.forget(me);
+            s.waits.retire(me);
+        });
         r
     }
 

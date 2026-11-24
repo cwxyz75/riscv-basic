@@ -1080,7 +1080,17 @@ fn prune_port(reg: &mut Kobjs, jobs: &mut Jobs, port_obj: ObjId) {
         .filter(|b| !reg.is_alive(b.obj))
         .count();
     let before = bindings.len();
-    bindings.retain(|b| reg.is_alive(b.obj));
+    // (kept in order, by swapping them down: a dead binding's pair leaves the index as it goes, which a `retain` closure could not do)
+    let mut keep = 0;
+    for i in 0..before {
+        if reg.is_alive(bindings[i].obj) {
+            bindings.swap(keep, i);
+            keep += 1;
+        } else {
+            reg.bound_remove(bindings[i].obj, port_obj);
+        }
+    }
+    bindings.truncate(keep);
     let removed = before - bindings.len();
     if let Some(KObj::Port(p)) = reg.get_mut(port_obj) {
         p.bindings = bindings;
@@ -1146,6 +1156,7 @@ pub fn port_bind_flags_in(
         return Err(Status::InvalidArgs);
     }
     p.bindings.try_reserve(1).map_err(|_| Status::NoMemory)?;
+    reg.bound_reserve().map_err(|_| Status::NoMemory)?;
     // a binding costs queued-data budget of the port's job, like a queued message would
     charge_bytes(reg, jobs, port_obj, BINDING_COST)?;
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
@@ -1161,6 +1172,7 @@ pub fn port_bind_flags_in(
     });
     reg.meter_add(BINDING_COST);
     reg.watch_adjust(oe.obj, 1);
+    reg.bound_add(oe.obj, port_obj);
     Ok(())
 }
 
@@ -1218,6 +1230,7 @@ pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjI
         }
         for o in &ended {
             reg.watch_adjust(*o, -1);
+            reg.bound_remove(*o, port);
         }
         reg.meter_sub(ended.len() * BINDING_COST);
         credit_bytes(reg, jobs, port, ended.len() * BINDING_COST);
@@ -1247,6 +1260,7 @@ pub fn port_unbind_in(
         p.next -= 1;
     }
     reg.watch_adjust(gone_obj, -1);
+    reg.bound_remove(gone_obj, port_obj);
     reg.meter_sub(BINDING_COST);
     credit_bytes(reg, jobs, port_obj, BINDING_COST);
     Ok(())

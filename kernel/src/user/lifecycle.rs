@@ -401,6 +401,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         let tid = thread::current();
         crate::fp::thread_gone(tid);
         // (the thread's record goes, and with it its flags, its suspend state, its register images and its pending interrupt)
+        s.waits.retire(tid);
         let rec = s.unregister_thread(tid);
         sync_interrupts(s);
         sync_suspends(s);
