@@ -126,6 +126,7 @@ pub mod fp {
 }
 
 pub mod irq {
+    pub static WINDOWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     pub fn save_and_disable() -> bool {
         unimplemented!()
     }
@@ -180,6 +181,7 @@ pub mod timer {
 }
 
 pub mod trap {
+    pub static WINDOW_TRAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     use crate::arch::UserTrap;
     use kcore::aspace::{Access, FaultError};
 
