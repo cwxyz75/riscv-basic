@@ -147,7 +147,7 @@ Phase 6b (`epic/phase-6b`, merged into `main` on its epic gate):
 
 - [x] **L18** the ASID allocator with generations; no flush at a switch to or from a user space (PRs 363 and 364; shootdowns stay whole-TLB, T205)
 - [x] **PL7** instruction-cache flush on executable mappings (PR 365; `process_protect` waits for MM7)
-- [x] **MM10** the sweep in slices (PR 366; teardown's and the near-cap sweep are still whole: T206, T76 stays open)
+- [x] **MM10** the sweep in slices (PR 366; teardown's and the near-cap sweep were whole until T206, closed 2026-11-24 on the epic smoke 45485830334)
 
 Phase 6c (`epic/phase-6c`, merged into `main` on its epic gate): the first two peels of the big lock.
 
