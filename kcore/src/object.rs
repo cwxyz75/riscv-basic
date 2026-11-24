@@ -143,6 +143,8 @@ pub struct Registry<T: Object> {
     swept: usize,
     /// The roots of the running sweep are still being shaded by the caller, a slice at a time (`sweep_begin_pending`): nothing is freed until it says done.
     roots_pending: bool,
+    /// A reference of a live object could not be followed for lack of memory (T177): the running sweep must free nothing.
+    mark_incomplete: bool,
 }
 
 /// The phases of an incremental sweep (MM10, KERNEL-V1-SPEC 4.6).
@@ -221,6 +223,7 @@ impl<T: Object> Registry<T> {
             scan: Vec::with_capacity(64),
             swept: 0,
             roots_pending: false,
+            mark_incomplete: false,
         }
     }
 
@@ -699,6 +702,7 @@ impl<T: Object> Registry<T> {
         self.epoch = self.epoch.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
         self.phase = Phase::Marking;
         self.mark_work.clear();
+        self.mark_incomplete = false;
         self.cursor = 0;
         self.swept = 0;
         for &r in roots {
@@ -769,11 +773,15 @@ impl<T: Object> Registry<T> {
             }
             let mut refs = core::mem::take(&mut self.scan);
             refs.clear();
-            self.slots[id.index as usize]
-                .obj
-                .as_ref()
-                .expect("live")
-                .held(&mut refs);
+            let obj = self.slots[id.index as usize].obj.as_ref().expect("live");
+            // (the room first: an object that holds more references than the buffer has room for cannot be followed under memory pressure, and
+            // an incomplete mark frees nothing)
+            if refs.try_reserve(obj.held_count()).is_err() {
+                self.mark_incomplete = true;
+                self.scan = refs;
+                continue;
+            }
+            obj.held(&mut refs);
             for &r in &refs {
                 self.shade(r);
             }
@@ -782,20 +790,38 @@ impl<T: Object> Registry<T> {
         if !self.mark_work.is_empty() || self.roots_pending {
             return SweepStep::More;
         }
+        if self.mark_incomplete {
+            // (T177: a reference could not be followed, so an unmarked object may be reachable: free nothing, and sweep again later)
+            self.mark_incomplete = false;
+            self.phase = Phase::Idle;
+            self.swept = 0;
+            return SweepStep::Done(0);
+        }
         self.phase = Phase::Freeing;
         // freeing
         let end = self.slots.len().min(self.cursor.saturating_add(left));
         let mut dropped_refs: Vec<ObjId> = Vec::new();
         let mut peers: Vec<ObjId> = Vec::new();
+        let mut abandoned = false;
         for index in self.cursor..end {
             let slot = &self.slots[index];
             if slot.obj.is_none() || slot.mark == self.epoch {
                 continue;
             }
+            // (T177: the room for what dooming this object collects, before it is doomed; without it the sweep stops between objects: what was
+            // doomed is fully processed below, the rest waits for the next sweep)
+            let need = slot.obj.as_ref().map_or(0, |o| o.held_count());
+            if dropped_refs.try_reserve(need).is_err() || peers.try_reserve(1).is_err() {
+                abandoned = true;
+                self.cursor = index;
+                break;
+            }
             self.swept += 1;
             self.doom_slot(index as u32, &mut dropped_refs, &mut peers);
         }
-        self.cursor = end;
+        if !abandoned {
+            self.cursor = end;
+        }
         for peer in peers {
             if let Some(p) = self.get_mut(peer) {
                 p.peer_destroyed();
@@ -805,6 +831,10 @@ impl<T: Object> Registry<T> {
             if self.is_alive(id) {
                 self.release(id);
             }
+        }
+        if abandoned {
+            self.phase = Phase::Idle;
+            return SweepStep::Done(self.swept);
         }
         if self.cursor < self.slots.len() {
             return SweepStep::More;
