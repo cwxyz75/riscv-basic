@@ -408,6 +408,7 @@ pub(crate) fn drain_dying() {
             return;
         }
         irq::without(|| {});
+        irq::window();
     }
 }
 

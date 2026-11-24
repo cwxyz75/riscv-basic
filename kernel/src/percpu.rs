@@ -103,6 +103,8 @@ pub struct PerHart {
     /// A wake or priority change on this hart designated another thread to run here: the switch happens at the next defined point
     /// (`thread::preempt_point`), never inside the wake (SCHED-SMP-SPEC X7). Written and read by this hart only, interrupts off.
     pub need_resched: AtomicBool,
+    /// T206: this hart is inside `irq::window()` (a syscall's interrupts-on gap); a trap taken then only sets `need_resched` (never switches or grows the heap on the syscall's stack).
+    pub syscall_window: AtomicBool,
     /// The attention epoch (`user::ATTENTION`) this hart last saw at a return to user mode: a trap from user mode that finds it
     /// unchanged has no kill or stop to look for and needs no big lock (L12b).
     pub attention_seen: AtomicU64,
@@ -283,6 +285,7 @@ impl PerHart {
             running: AtomicU64::new(0),
             prev: AtomicU64::new(0),
             need_resched: AtomicBool::new(false),
+            syscall_window: AtomicBool::new(false),
             attention_seen: AtomicU64::new(0),
             idle_wfi: AtomicU64::new(0),
             idle_suspend: AtomicU64::new(0),

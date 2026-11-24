@@ -209,7 +209,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
     let h = |i: usize| Handle(a[i]);
     let r: Reply = (|| match n {
         nr::HANDLE_CLOSE => handles
-            .close(objs, h(0))
+            .close_bounded(objs, h(0))
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
         nr::HANDLE_DUPLICATE => {

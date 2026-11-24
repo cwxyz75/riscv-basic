@@ -237,6 +237,7 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
         if done {
             break;
         }
+        irq::window(); // (T206: interrupts are taken between the slices)
     }
     // 2. anything still alive that nothing can reach (reference cycles): the sweep as the state machine of MM10, a slice per critical section. The roots
     // are shaded a process table per slice (T206), the kernel's own table last; a handle made or moved once the sweep has begun marks its object (that is
@@ -253,6 +254,7 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
         if began {
             break;
         }
+        irq::window();
     }
     while locked_state(|s| {
         s.objs.sweep_active()
@@ -260,9 +262,13 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
                 s.sweep_slice(TEARDOWN_SWEEP),
                 kcore::object::SweepStep::Done(_)
             )
-    }) {}
+    }) {
+        irq::window();
+    }
     // (T206: what the sweep's freeing left owed is paid before the process is over, a bounded slice per critical section)
-    while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {}
+    while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {
+        irq::window();
+    }
     // 3. the process is over
     locked_state(|s| {
         if let Some(obj) = process.obj {
@@ -306,6 +312,7 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
         if done {
             break;
         }
+        irq::window();
     }
     {
         // the tables go with a shootdown of their own, inside the locks, so no hart's walk cache outlives them

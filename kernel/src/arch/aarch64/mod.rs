@@ -147,6 +147,9 @@ pub mod irq {
     pub fn off<R>(f: impl FnOnce() -> R) -> R {
         unimplemented!()
     }
+    pub fn window() {
+        unimplemented!()
+    }
 }
 
 pub mod timer {

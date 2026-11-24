@@ -1050,6 +1050,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::PORT_REARM
             ) {
                 if n == nr::HANDLE_CLOSE {
+                    // (T206) what the close left owed (a chain it freed) is paid before the call returns, a slice per critical section
+                    while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {
+                        crate::irq::window();
+                    }
                     // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
                     locked_state(ksys::exception::reap_closed_job_channels);
                 }
@@ -1137,6 +1141,7 @@ fn sweep_before_create(n: usize) {
     while locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active())
     {
         locked_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
+        crate::irq::window(); // (T206: interrupts are taken between the slices)
     }
     if locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
         let began = locked_state(|s| s.sweep_start());
@@ -1147,7 +1152,9 @@ fn sweep_before_create(n: usize) {
                         s.sweep_slice(SWEEP_SLICE_BUDGET),
                         kcore::object::SweepStep::Done(_)
                     )
-            }) {}
+            }) {
+                crate::irq::window();
+            }
         }
     }
 }
