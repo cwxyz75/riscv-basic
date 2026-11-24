@@ -46,10 +46,15 @@ fn random_waits_wakes_and_forgets_agree_with_the_list() {
                         .map(|&(_, w)| w)
                         .collect();
                     model.retain(|&((p, _), _)| p != pid);
-                    let mut got = f.forget_process(pid);
-                    want.sort();
-                    got.sort();
-                    assert_eq!(got, want, "{ctx}");
+                    if rng.below(2) == 0 {
+                        let mut got = f.forget_process(pid);
+                        want.sort();
+                        got.sort();
+                        assert_eq!(got, want, "{ctx}");
+                    } else {
+                        // (the form that allocates nothing: the same state afterwards, which the checks below compare with the model)
+                        f.forget_process_quiet(pid);
+                    }
                 }
             }
             assert_eq!(f.len(), model.len(), "{ctx}");

@@ -128,9 +128,15 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
         }
     };
     // five little-endian words
-    let mut msg = alloc::vec::Vec::new();
-    for w in [f.kind as u64, tid, f.pc, f.address, f.cause] {
-        msg.extend_from_slice(&w.to_le_bytes());
+    // (an array, not a vector: a fault is delivered with memory short, and this must not allocate: T248)
+    let mut msg = [0u8; 40];
+    for (chunk, w) in
+        msg.as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip([f.kind as u64, tid, f.pc, f.address, f.cause])
+    {
+        *chunk = w.to_le_bytes();
     }
     match ipc::channel_write_in(objs, ktable, chan, &msg, &[th, eh], q.jobs) {
         Ok(()) => {

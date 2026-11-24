@@ -207,21 +207,27 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
         let live = |t: Tid| s.pid_of(t) == Some(me);
-        let r = futex_table().with_key(key, |f| {
-            let r = thread::pi_op(
-                |d| match f.pi.lock(d, &word, key, who, live, deadline != 0) {
-                    Ok(kcore::pifutex::Lock::Acquired) => (Ok(Some(true)), Vec::new()),
-                    Ok(kcore::pifutex::Lock::WouldBlock) => (Ok(None), Vec::new()),
-                    Ok(kcore::pifutex::Lock::Blocked { changes }) => (Ok(Some(false)), changes),
-                    Err(e) => (Err(e), Vec::new()),
-                },
-            );
-            // (waiters the call ended because the word and the record had come apart: woken with the bucket lock held)
-            let ended = f.pi.drain_wake();
-            if !ended.is_empty() {
-                thread::wake_many_quiet(&ended);
-            }
-            r
+        // (class N until the PI tables are prepaid: T248 PR B; a refused allocation here would be a panic)
+        let r = crate::heap::nofail(|| {
+            futex_table().with_key(key, |f| {
+                let r =
+                    thread::pi_op(
+                        |d| match f.pi.lock(d, &word, key, who, live, deadline != 0) {
+                            Ok(kcore::pifutex::Lock::Acquired) => (Ok(Some(true)), Vec::new()),
+                            Ok(kcore::pifutex::Lock::WouldBlock) => (Ok(None), Vec::new()),
+                            Ok(kcore::pifutex::Lock::Blocked { changes }) => {
+                                (Ok(Some(false)), changes)
+                            }
+                            Err(e) => (Err(e), Vec::new()),
+                        },
+                    );
+                // (waiters the call ended because the word and the record had come apart: woken with the bucket lock held)
+                let ended = f.pi.drain_wake();
+                if !ended.is_empty() {
+                    thread::wake_many_quiet(&ended);
+                }
+                r
+            })
         });
         match r {
             Ok(outcome) => {
@@ -253,7 +259,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
     let ended = irq::without(|| {
         futex_table().with_key(key, |f| {
             if f.pi.still_waiting(who) {
-                thread::pi_op(|d| ((), f.pi.cancel(d, who)));
+                crate::heap::nofail(|| thread::pi_op(|d| ((), f.pi.cancel(d, who))));
                 None
             } else {
                 f.pi.take_outcome(who)
@@ -282,21 +288,23 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
         };
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
-        let r = futex_table().with_key(key, |f| {
-            let r = thread::pi_op(|d| match f.pi.unlock(d, &word, key, who) {
-                Ok(kcore::pifutex::Unlock::Handed { to, changes }) => {
-                    // (the wake is issued with the bucket lock held, as `futex_wake` does)
-                    thread::wake_many_quiet(&[to]);
-                    (Ok(()), changes)
+        let r = crate::heap::nofail(|| {
+            futex_table().with_key(key, |f| {
+                let r = thread::pi_op(|d| match f.pi.unlock(d, &word, key, who) {
+                    Ok(kcore::pifutex::Unlock::Handed { to, changes }) => {
+                        // (the wake is issued with the bucket lock held, as `futex_wake` does)
+                        thread::wake_many_quiet(&[to]);
+                        (Ok(()), changes)
+                    }
+                    Ok(kcore::pifutex::Unlock::Free) => (Ok(()), Vec::new()),
+                    Err(e) => (Err(e), Vec::new()),
+                });
+                let ended = f.pi.drain_wake();
+                if !ended.is_empty() {
+                    thread::wake_many_quiet(&ended);
                 }
-                Ok(kcore::pifutex::Unlock::Free) => (Ok(()), Vec::new()),
-                Err(e) => (Err(e), Vec::new()),
-            });
-            let ended = f.pi.drain_wake();
-            if !ended.is_empty() {
-                thread::wake_many_quiet(&ended);
-            }
-            r
+                r
+            })
         });
         r.map(|()| (None, None))
             .map_err(|e| (pi_status(e), None, None))
@@ -374,13 +382,17 @@ pub fn futex_wake(pid: u64, a: [u64; 6]) -> Reply {
 /// tried again); `Err` with the pager's status when the page cannot be had.
 pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Result<(), Status> {
     let me = thread::current();
-    let begun = any_state(|s| {
-        let k = kmem::get();
-        ksys::pager::pager_wait_begin(s, k.vmos, k.jobs, me, need)
+    // (class N until the pager tables are prepaid per thread: T248 PR B; a fault has no status to return, and a refused allocation here would be a panic)
+    let (begun, woken) = crate::heap::nofail(|| {
+        let begun = any_state(|s| {
+            let k = kmem::get();
+            ksys::pager::pager_wait_begin(s, k.vmos, k.jobs, me, need)
+        });
+        // (a pager found dead while registering wakes the others through `pending_wake`)
+        let mut woken = any_state(|s| core::mem::take(&mut s.pending_wake));
+        woken.extend(begun.as_ref().map(|w| w.as_slice()).unwrap_or(&[]));
+        (begun, woken)
     });
-    // (a pager found dead while registering wakes the others through `pending_wake`)
-    let mut woken = any_state(|s| core::mem::take(&mut s.pending_wake));
-    woken.extend(begun.as_ref().map(|w| w.as_slice()).unwrap_or(&[]));
     thread::wake_many(&woken);
     begun?;
     // (the page came in since the call found it missing: nothing was registered)
@@ -413,9 +425,11 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
         if ended {
             break;
         }
-        let woken = with_state(|s| {
-            let k = kmem::get();
-            ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager)
+        let woken = crate::heap::nofail(|| {
+            with_state(|s| {
+                let k = kmem::get();
+                ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager)
+            })
         });
         thread::wake_many(&woken);
         commit_wake();

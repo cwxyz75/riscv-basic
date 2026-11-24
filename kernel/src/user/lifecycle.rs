@@ -206,7 +206,7 @@ pub(super) fn teardown_take(pid: u64) -> Option<kcore::fbox::FBox<Process>> {
         }
         // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
         // already; this is the backstop)
-        futex_table().forget_process(pid);
+        futex_table().forget_process_quiet(pid);
         process
     })
 }
