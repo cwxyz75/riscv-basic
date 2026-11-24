@@ -294,6 +294,21 @@ impl HandleTable {
         Ok(())
     }
 
+    /// `close`, but the cascade a last reference starts is paid in bounded slices (T206): this call looks at no more than `RELEASE_UNITS` references and
+    /// leaves the rest owed on the registry (`release_step` pays it).
+    pub fn close_bounded<T: Object>(
+        &mut self,
+        reg: &mut Registry<T>,
+        h: Handle,
+    ) -> Result<(), Status> {
+        let slot = self.decode(h).ok_or(Status::BadHandle)?;
+        let entry = self.remove(slot);
+        reg.touch_forced(entry.obj);
+        reg.handle_gone(entry.obj, self.id, h.0);
+        reg.release_bounded(entry.obj, crate::object::RELEASE_UNITS);
+        Ok(())
+    }
+
     fn resolve_rights(old: Rights, requested: Rights) -> Result<Rights, Status> {
         if requested == Rights::SAME {
             Ok(old)
