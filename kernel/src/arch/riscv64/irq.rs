@@ -82,6 +82,9 @@ pub fn without<R>(f: impl FnOnce() -> R) -> R {
 /// T206: a window in a syscall's long loop. Interrupts are taken here (one nested trap at most: the handler only records `need_resched` and returns with
 /// interrupts off, `trap.rs` `window_trap`), then the switch a wake or a tick asked for happens at this depth, as at any preempt point. Called with
 /// **no lock held** (the big lock, and every lock of the hart's held set) between the `without` sections of a sweep, a drain or a teardown.
+/// Windows made since boot (T206: `debug_stat(215)`).
+pub static WINDOWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[track_caller]
 pub fn window() {
     use core::sync::atomic::Ordering;
@@ -94,6 +97,7 @@ pub fn window() {
     if enabled() {
         return; // (not a trap context: the caller's own interrupts are on and a tick is taken anyway)
     }
+    WINDOWS.fetch_add(1, Ordering::Relaxed);
     me.syscall_window.store(true, Ordering::SeqCst);
     enable();
     save_and_disable();

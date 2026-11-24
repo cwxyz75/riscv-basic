@@ -3135,6 +3135,63 @@ fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
     check("the kill")
 }
 
+/// T206: closing the head of a chain of channels (each queues both ends of the next) is paid in slices with an interrupts window between them, and a
+/// timer tick taken in a window is recorded and handled at the window's own switch point (`irq::window`, `debug_stat(214)`): a few rounds of the close
+/// see at least one nested interrupt, every object is freed, and the stack budget check at the end of the boot (KT13) covers the depth.
+fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
+    const LINKS: usize = 1200;
+    static STOP: AtomicU32 = AtomicU32::new(0);
+    /// A hart's worth of work to compete with the closing thread, so that a scheduler tick is armed on every hart (a thread alone on a hart has none).
+    extern "C" fn spinner(_arg: usize) -> ! {
+        while STOP.load(Ordering::SeqCst) == 0 {
+            core::hint::spin_loop();
+        }
+        sys::thread_exit(0)
+    }
+    STOP.store(0, Ordering::SeqCst);
+    let harts = job_use(root_job()?, 7)?.0 as usize;
+    let mut spinners = Vec::new();
+    for _ in 0..=harts {
+        spinners.push(new_thread(spinner, 0)?);
+    }
+    let before_traps = sys::debug_stat(214);
+    let mut rounds = 0;
+    while sys::debug_stat(214) == before_traps && rounds < 40 {
+        let mut prev: Option<(u64, u64)> = None;
+        let mut head = (0, 0);
+        for _ in 0..LINKS {
+            let (a, b) = channel()?;
+            if let Some((pa, pb)) = prev {
+                let hs = [pa, pb];
+                ok(
+                    sys::channel_write(a, core::ptr::null(), 0, hs.as_ptr(), 2),
+                    "queue the previous pair",
+                )?;
+            }
+            prev = Some((a, b));
+            head = (a, b);
+        }
+        sys::handle_close(head.0);
+        sys::handle_close(head.1);
+        rounds += 1;
+    }
+    STOP.store(1, Ordering::SeqCst);
+    for t in spinners {
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(t);
+    }
+    ensure!(
+        sys::debug_stat(214) > before_traps,
+        "no interrupt was taken inside a window in {rounds} rounds of closing a chain ({} windows were made)",
+        sys::debug_stat(215)
+    );
+    // (everything is gone: a channel can be made again, and nothing of the chain is left to count against the budget)
+    let (a, b) = channel()?;
+    sys::handle_close(a);
+    sys::handle_close(b);
+    Ok(())
+}
+
 /// T207: while a chunked decommit is under way, a second decommit, a `vmo_set_size` and a `vmo_create_child` on the VMO are refused with SHOULD_WAIT
 /// (seen from a thread on another hart; with one hart nothing runs beside the call and the test passes without looking).
 fn a_decommit_under_way_refuses_the_calls_that_would_race_it() -> Outcome {
@@ -16953,6 +17010,10 @@ pub fn app_main() -> i32 {
         (
             "the_heap_gives_memory_back_when_it_is_freed",
             the_heap_gives_memory_back_when_it_is_freed,
+        ),
+        (
+            "a_close_that_frees_a_chain_takes_interrupts_between_its_slices",
+            a_close_that_frees_a_chain_takes_interrupts_between_its_slices,
         ),
         (
             "a_decommit_under_way_refuses_the_calls_that_would_race_it",
