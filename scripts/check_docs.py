@@ -401,6 +401,10 @@ def check_links():
             elif "/" in ref:
                 here = os.path.normpath(os.path.join(os.path.dirname(f), ref))
                 if not (os.path.exists(os.path.join(ROOT, ref)) or os.path.exists(os.path.join(ROOT, here))):
+                    # a closed work item's file is gone by design (`work.py done`); an old spec amendment may still name it, and a spec is not edited
+                    m = re.match(r"^work/([A-Za-z0-9-]+)\.md$", ref)
+                    if m and re.search(rf"(?m)^\|[^|]*\|\s*{re.escape(m.group(1))}\s*\|", read("docs/records/done.md")):
+                        continue
                     out.append(f"{f}:{line}: {ref} does not exist")
             elif base not in names and not re.match(r"^[a-z]", base):
                 out.append(f"{f}:{line}: {ref} does not exist anywhere in the tree")
