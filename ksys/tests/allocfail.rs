@@ -366,12 +366,16 @@ struct Named {
 fn all_names() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = scenarios().iter().map(|s| s.name).collect();
     v.extend(pscenarios().iter().map(|s| s.name));
+    v.extend(uscenarios().iter().map(|s| s.name));
     v
 }
 
 fn child(name: &str, n: usize, persist: bool) {
     if pscenarios().iter().any(|s| s.name == name) {
         return pchild(name, n, persist);
+    }
+    if uscenarios().iter().any(|s| s.name == name) {
+        return uchild(name, n, persist);
     }
     let sc = scenarios()
         .into_iter()
@@ -797,4 +801,236 @@ fn pchild(name: &str, n: usize, persist: bool) {
         );
     }
     println!("ALLOCS={}", COUNT.load(Ordering::Relaxed));
+}
+
+// ---- process_start and thread_spawn (T177): the calls that take a `UserState` ----
+
+const CODE: u64 = 0x40_0000;
+const REC: u64 = 0x50_0000;
+
+struct UW {
+    us: ksys::UserState,
+    mm: kcore::Mm<FakeMem>,
+    vmos: kcore::aspace::Vmos,
+    jobs: kcore::job::Jobs,
+    /// A handle in process 1 to process 2, with every right.
+    ph: u64,
+    waits: kcore::wait::WaitTable,
+}
+
+/// Process 1 is the caller (a record page at `REC`), process 2 the target (code and data at `CODE`), `Created` or `Running`.
+fn uworld(created: bool) -> UW {
+    use kcore::pagetable::{PageTable, Perms};
+    let mut mm = kcore::Mm {
+        db: kcore::frame::FrameDb::new(3000, 400),
+        mem: FakeMem::default(),
+    };
+    let kernel = PageTable::new(&mut mm).unwrap();
+    let mut us = ksys::UserState::new();
+    ksys::put_process(&mut us.procs, 1, pprocess(&mut mm, &kernel, 1));
+    ksys::put_process(&mut us.procs, 2, pprocess(&mut mm, &kernel, 2));
+    let mut vmos = kcore::aspace::Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
+    for (pid, at, perms) in [
+        (2, CODE, Perms::RX.user()),
+        (2, CODE + 0x10_000, Perms::RW.user()),
+        (1, REC, Perms::RW.user()),
+    ] {
+        let v = vmos.create(&mut jobs, 1);
+        us.procs
+            .get_mut(&pid)
+            .unwrap()
+            .aspace
+            .held_mut()
+            .map_region(&mut vmos, at, 1, v, 0, perms)
+            .unwrap();
+    }
+    let p = us.procs.get_mut(&1).unwrap();
+    let (h, _) = kcore::ipc::process_object_create_in(
+        &mut us.objs,
+        &mut p.handles,
+        2,
+        false,
+        &mut kcore::ipc::Quota {
+            jobs: &mut jobs,
+            job: Some(kcore::job::JobId::ROOT),
+        },
+    )
+    .unwrap();
+    if created {
+        us.procs.get_mut(&2).unwrap().state = ksys::ProcState::Created;
+    }
+    UW {
+        us,
+        mm,
+        vmos,
+        jobs,
+        ph: h.0,
+        waits: kcore::wait::WaitTable::new(),
+    }
+}
+
+impl UW {
+    fn cleanup(&mut self) {
+        for _ in 0..3 {
+            let mut dead = self.us.objs.drain_dead();
+            if dead.is_empty() {
+                break;
+            }
+            for o in dead.drain(..) {
+                match o {
+                    kcore::ipc::KObj::Vmo(id) => {
+                        let _ = self.vmos.release(&mut self.mm, &mut self.jobs, id);
+                    }
+                    kcore::ipc::KObj::Job(id) => self.jobs.release(id),
+                    _ => {}
+                }
+            }
+            self.us.objs.recycle(dead);
+        }
+        let d = self.us.objs.take_dirty();
+        self.us.objs.recycle_dirty(d);
+    }
+    /// A channel end in process 1 (both ends its own).
+    fn channel(&mut self) -> u64 {
+        let p = self.us.procs.get_mut(&1).unwrap();
+        kcore::ipc::channel_create_in(
+            &mut self.us.objs,
+            &mut p.handles,
+            &mut PW::quota(&mut self.jobs),
+        )
+        .unwrap()
+        .0
+         .0
+    }
+    fn record(&mut self, rec: [u64; 8]) {
+        let bytes: Vec<u8> = rec.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let p = self.us.procs.get_mut(&1).unwrap();
+        kcore::usercopy::copy_to_user(
+            p.aspace.held_mut(),
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            REC,
+            &bytes,
+        )
+        .unwrap();
+    }
+}
+
+/// The armed call, given what the setup made (a channel end's handle number).
+type UCall = fn(&mut UW, u64) -> Result<(), abi::status::Status>;
+
+struct UScenario {
+    name: &'static str,
+    created: bool,
+    /// Unarmed setup: the call and what it needs.
+    setup: fn(&mut UW) -> (UCall, u64),
+}
+
+fn uscenarios() -> Vec<UScenario> {
+    vec![
+        UScenario {
+            name: "process_start",
+            created: true,
+            setup: |w| {
+                let bh = w.channel();
+                (
+                    |w, bh| {
+                        let a = [w.ph, CODE, CODE + 0x10_000, bh, 99, 0];
+                        ksys::process_start(&mut w.us, &mut w.jobs, &mut ksys::NoMap, 1, a)
+                            .map(|_| ())
+                    },
+                    bh,
+                )
+            },
+        },
+        // admission is the one place a wait may fail; registering, forgetting and retiring after it allocate nothing (an allocation there aborts)
+        UScenario {
+            name: "wait_admit_then_register_and_retire",
+            created: false,
+            setup: |w| {
+                let e = w.channel();
+                let _ = e;
+                (
+                    |w, _| {
+                        let obj = w.us.procs[&1].handles.objects().next().unwrap();
+                        w.waits
+                            .admit(7)
+                            .map_err(|_| abi::status::Status::NoMemory)?;
+                        w.waits.register(7, obj, 1);
+                        w.waits.forget(7);
+                        w.waits.register_port(7, obj, 1);
+                        w.waits.forget(7);
+                        w.waits.register_call(7, obj, 3);
+                        w.waits.forget(7);
+                        w.waits.retire(7);
+                        Ok(())
+                    },
+                    0,
+                )
+            },
+        },
+        UScenario {
+            name: "thread_spawn",
+            created: false,
+            setup: |w| {
+                w.record([CODE, 7, 0x1234, 0, 0, 0, 0, 0]);
+                (
+                    |w, _| {
+                        let a = [w.ph, REC, 0, 0, 0, 0];
+                        ksys::thread_spawn(&mut w.us, &mut w.mm, &mut w.vmos, &mut w.jobs, 1, 10, a)
+                            .map(|_| ())
+                    },
+                    0,
+                )
+            },
+        },
+    ]
+}
+
+fn uchild(name: &str, n: usize, persist: bool) {
+    let sc = uscenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("scenario");
+    let mut w = uworld(sc.created);
+    let (call, aux) = (sc.setup)(&mut w);
+    PERSIST.store(usize::from(persist), Ordering::Relaxed);
+    start(n);
+    arm();
+    let r = call(&mut w, aux);
+    w.cleanup();
+    let made = disarm();
+    if n <= made {
+        // the failing allocation was reached: the call must say NO_MEMORY, and the same call made again, with memory, must succeed
+        assert_eq!(
+            r,
+            Err(abi::status::Status::NoMemory),
+            "scenario {name}, failing allocation {n}: the call returned {r:?}, not NO_MEMORY"
+        );
+        PERSIST.store(0, Ordering::Relaxed);
+        let again = call(&mut w, aux);
+        w.cleanup();
+        assert!(
+            again.is_ok(),
+            "scenario {name}, failing allocation {n}: after NO_MEMORY the same call, with memory, returned {again:?}: work was lost"
+        );
+    } else {
+        assert!(r.is_ok(), "scenario {name}: the call failed with {r:?}");
+    }
+    PERSIST.store(0, Ordering::Relaxed);
+    for p in w.us.procs.values_mut() {
+        p.handles.drain(&mut w.us.objs);
+    }
+    w.cleanup();
+    w.us.objs.sweep(&[]);
+    w.cleanup();
+    kcore::ipc::settle(&mut w.us.objs, &mut w.jobs);
+    assert_eq!(
+        w.us.objs.live(),
+        0,
+        "scenario {name}, failing allocation {n}: objects alive after every handle was closed"
+    );
+    println!("ALLOCS={made}");
 }
