@@ -256,6 +256,8 @@ pub struct Vmos {
     dma_pages: u64,
     /// The most pages DMA VMOs may hold together (the backstop, PL8).
     dma_total_cap: u64,
+    /// The generation a slot made from now on starts at (0, except in a test that reaches the end of the 32 bits: `set_first_generation`).
+    first_gen: u32,
     /// Pages that became visible, or were replaced, in a VMO that other mappings may reach through a family (`page_for`): (node, first page,
     /// count), neighbouring pages coalesced (a `vmo_commit` of a large VMO is one entry). The
     /// caller drains it with `invalidate_copies` (every address space drops what the new page makes stale) before the faulting thread runs on.
@@ -313,11 +315,17 @@ impl Vmos {
             self.free.push(i);
         }
         self.live += 1;
+        let gen = self.first_gen;
         self.slots.push(VmoSlot {
-            gen: 0,
+            gen,
             vmo: Some(vmo),
         });
-        self.slots.len() as u64
+        (u64::from(gen) << 32) | self.slots.len() as u64
+    }
+
+    /// For tests (CNT1): slots made from now on start at generation `gen`, so the retirement of an exhausted slot is reached in a few reuses.
+    pub fn set_first_generation(&mut self, gen: u32) {
+        self.first_gen = gen;
     }
 
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was bounds-checked by `get`
