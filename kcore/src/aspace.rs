@@ -92,9 +92,6 @@ pub enum FaultMapError {
     Fault(FaultError),
 }
 
-/// The largest region (1 GiB), so that unmapping one is bounded work.
-pub const MAX_REGION_PAGES: u64 = 1 << 18;
-
 /// What a protect changed (MM7): the caller owes the other harts a shootdown after a downgrade and an instruction-cache sync for new code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProtectStats {
@@ -1724,7 +1721,7 @@ impl Vmos {
     }
 
     /// Read bytes out of a VMO (uncommitted pages read as zeros and stay uncommitted).
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: offset + len was checked with checked_add against the VMO's size (pages <= MAX_VMO_PAGES, so the product is small); `done < len` bounds every slice
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: offset + len was checked with checked_add against the VMO's size (a VMO is at most the user half, so the product is small); `done < len` bounds every slice
     pub fn read<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -1886,7 +1883,8 @@ impl Vmos {
         if end > vmo.pages {
             return false;
         }
-        vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains(p))
+        vmo.kind == VmoKind::Device || vmo.committed.count_frames_in(first, end) == pages
+        // (leaves, not pages: a 2 GiB VMO costs what it holds)
     }
 
     /// Frames held by the pages of every live VMO, hidden nodes included (tests and audits): what the jobs' page usage must add up to.
@@ -2520,7 +2518,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
 
     /// Describe `pages` pages at `start` as a window onto `vmo` from `vmo_page`.
     /// Nothing is mapped until a fault asks for it.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked with checked_add and canonical-ness first; pages <= MAX_REGION_PAGES keeps the products small; `end - 1` cannot underflow because len > 0
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked with checked_add and canonical-ness first; the end is canonical, so the products are small; `end - 1` cannot underflow because len > 0
     pub fn map_region(
         &mut self,
         vmos: &mut Vmos,
@@ -2550,9 +2548,6 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         if !F::is_canonical(start) {
             return Err(RegionError::NonCanonical);
-        }
-        if pages > MAX_REGION_PAGES {
-            return Err(RegionError::BadRange);
         }
         let len = pages
             .checked_mul(PAGE_SIZE)
@@ -3153,8 +3148,10 @@ impl<F: PageTableFormat> AddressSpace<F> {
             if r.vmo != vmo {
                 continue; // (a region protected read-only mid-way through a chunked protect may still hold writable translations: the PTE decides)
             }
-            for p in 0..r.pages {
-                let va = start + p * PAGE_SIZE;
+            // (by the entries that exist: the work is what is mapped, not the length of the region)
+            let end = start + r.pages * PAGE_SIZE;
+            let mut at = start;
+            while let Some(va) = self.table.next_mapped(mm, at, end) {
                 if let Some(t) = self.table.translate(mm, va) {
                     if t.perms.write {
                         let ro = Perms {
@@ -3166,6 +3163,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                         }
                     }
                 }
+                at = va + PAGE_SIZE;
             }
         }
         changed

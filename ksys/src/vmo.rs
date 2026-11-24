@@ -44,10 +44,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
     let r: Reply = (|| match n {
         nr::VMO_CREATE => {
             // (a0 is a size in bytes, rounded up to whole pages)
-            if a[0] == 0
-                || a[0].div_ceil(4096) > abi::limits::MAX_VMO_PAGES
-                || a[2] & !abi::vmo_flags::RESIZABLE != 0
-            {
+            if a[0] == 0 || a[0] > abi::user::TOP || a[2] & !abi::vmo_flags::RESIZABLE != 0 {
                 return fail(Status::InvalidArgs);
             }
             let pages = a[0].div_ceil(4096);
@@ -82,7 +79,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             // (pager, key, bytes): a VMO whose pages the pager supplies (MM9); the memory is charged to the caller's job
             let pager =
                 ipc::pager_of(objs, handles, h(0), Rights::MANAGE).map_err(|e| (e, None, None))?;
-            if a[2] == 0 || !a[2].is_multiple_of(4096) || a[2] / 4096 > abi::limits::MAX_VMO_PAGES {
+            if a[2] == 0 || !a[2].is_multiple_of(4096) || a[2] > abi::user::TOP {
                 return fail(Status::InvalidArgs);
             }
             vmos.reserve_one().map_err(|e| (e, None, None))?;

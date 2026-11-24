@@ -1736,6 +1736,8 @@ pub fn wake_stat(which: u64) -> u64 {
         // 8: the longest interrupts-off span seen (cycles; 0 unless built with `latency-trace`)
         8 => crate::latency::irq_off_max().0,
         7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
+        // 14: the longest big-lock hold so far (in the units of 8), and the trace starts again from zero (the log says both figures) (T207 PR 4: a test measures what it does alone; 0 unless built with `latency-trace`)
+        14 => crate::latency::take_window(),
         // 9: 1 if the kernel command line has `net=lossy` (the harness runs the guest behind the lossy relay, S9-SPEC Q30)
         9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
         // 13: which part of the suite the kernel line asks for: 0 all of it, 1 `shard=a` (the larger part), 2

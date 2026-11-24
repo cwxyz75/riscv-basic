@@ -407,7 +407,7 @@ fn setup(frames: usize) -> (Mm<FakeMem>, Vmos, AddressSpace) {
 
 #[test]
 fn region_arguments_are_checked_with_specific_errors() {
-    use kcore::aspace::{RegionError, MAX_REGION_PAGES};
+    use kcore::aspace::RegionError;
     let (mut mm, mut vmos, mut a) = setup(40);
     let mut jobs = kcore::job::Jobs::new();
     let id = vmos.create(&mut jobs, 8);
@@ -427,7 +427,7 @@ fn region_arguments_are_checked_with_specific_errors() {
         Err(RegionError::BadRange)
     );
     assert_eq!(
-        r(&mut a, BASE, MAX_REGION_PAGES + 1, id, 0, Perms::R),
+        r(&mut a, BASE, 1 << 40, id, 0, Perms::R),
         Err(RegionError::BadRange)
     );
     assert_eq!(

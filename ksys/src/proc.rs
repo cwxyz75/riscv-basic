@@ -257,7 +257,7 @@ pub fn vmo_range_begin<M: PhysMem, X: Machine>(
             return Err(Status::AccessDenied);
         }
         let bytes = a[1];
-        if bytes == 0 || !bytes.is_multiple_of(4096) || bytes / 4096 > abi::limits::MAX_VMO_PAGES {
+        if bytes == 0 || !bytes.is_multiple_of(4096) || bytes > abi::user::TOP {
             return Err(Status::InvalidArgs);
         }
         let new = bytes / 4096;

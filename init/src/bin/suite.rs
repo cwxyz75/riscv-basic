@@ -1573,9 +1573,9 @@ fn vmo_basics() -> Outcome {
         "a VMO of no pages"
     );
     ensure_eq!(
-        st(sys::vmo_create(16385)),
+        st(sys::vmo_create(abi_top_pages() + 1)),
         Some(S::InvalidArgs),
-        "over 64 MiB"
+        "above the user half"
     );
     ensure_eq!(
         st(sys::vmo_write(v, 0, 0x10 as *const u8, 4)),
@@ -3048,6 +3048,159 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
     unsafe { core::ptr::write_volatile(0x500_1000 as *mut u32, 1) };
     ensure_eq!(st(sys::process_unmap(me, 0x500_0000)), Some(S::Ok), "unmap");
     Ok(())
+}
+
+/// T207 PR 4 (B1): at 4 GiB of RAM, a 2 GiB VMO is committed whole (in slices), mapped and touched, unmapped, decommitted,
+/// committed again, and last held by a process that is killed. Each operation is chunked, so no big-lock hold grows past 20 ms (B1's smoke
+/// bound, applied to the hold), which a kernel built with `latency-trace` reports (`debug_stat` 14, in 100 ns, and starts its window
+/// again; interrupts stay off through a call that nothing else wants the hart for, so the hold is what chunking bounds). Without 3 GiB of RAM it does nothing (the machine cannot hold the VMO).
+fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
+    const BASE: u64 = 0x10_0000_0000;
+    const GIB2: u64 = 2 << 30;
+    // (slices of 64 pages, not `MAX_COMMIT_PAGES`: a commit zeroes its pages with the big lock held, and 1024 of them is the milliseconds B1 names as its
+    // known worst case; this test is about what T207 chunked)
+    const SLICE: u64 = 64 * 4096;
+    if sys::debug_stat(102) * 4096 < 3 << 30 {
+        return Ok(());
+    }
+    let bound_ns = 20_000_000u64;
+    let at_start = sys::debug_stat(14); // (the boot's own figures are not this test's: the window starts again here)
+    let check = |what: &str| -> Outcome {
+        let at = sys::debug_stat(14); // (the window ends here: the log says where its longest span began)
+        ensure!(
+            at == 0 || at * 100 <= bound_ns,
+            "the longest big-lock hold after {what} is {} us (the boot's span was {} us)",
+            at / 10,
+            at_start / 10
+        );
+        Ok(())
+    };
+    let me = me()?;
+    let root = root_job()?;
+    let base = job_use(root, 2)?.0;
+    let v = ok(sys::vmo_create_flags(GIB2 / 4096, 0, 0), "a 2 GiB VMO")?.a1 as u64;
+    let commit_all = |v: u64| -> Outcome {
+        let mut off = 0;
+        while off < GIB2 {
+            ensure_eq!(
+                st(sys::vmo_commit(v, off, SLICE)),
+                Some(S::Ok),
+                "commit slice at {off}"
+            );
+            off += SLICE;
+        }
+        Ok(())
+    };
+    commit_all(v)?;
+    check("the commit")?;
+    ensure_eq!(
+        job_use(root, 2)?.0 - base,
+        GIB2 / 4096,
+        "all of it is charged"
+    );
+    ensure_eq!(
+        st(sys::process_map(me, v, BASE, 0, GIB2, PF_R | PF_W)),
+        Some(S::Ok),
+        "map all of it"
+    );
+    for i in 0..GIB2 / (1 << 20) {
+        // SAFETY: BASE..BASE + 2 GiB is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((BASE + i * (1 << 20)) as *mut u64, i + 1) };
+    }
+    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap all");
+    check("the unmap")?;
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, GIB2)),
+        Some(S::Ok),
+        "decommit all"
+    );
+    check("the decommit")?;
+    ensure_eq!(job_use(root, 2)?.0, base, "the pages are all back");
+    // the last holder dies: a process that never started maps it, and is killed
+    commit_all(v)?;
+    let child = proc_create()?;
+    ensure_eq!(
+        st(sys::process_map(child, v, BASE, 0, GIB2, PF_R | PF_W)),
+        Some(S::Ok),
+        "map it into a child"
+    );
+    sys::handle_close(v);
+    ensure_eq!(
+        st(sys::process_kill(child, 1)),
+        Some(S::Ok),
+        "kill the holder"
+    );
+    sys::handle_close(child);
+    job_use_settles(root, 2, base, 20_000)?;
+    check("the kill")
+}
+
+/// T207 PR 4 (MM6): there is no size cap below the user half. A 2 GiB VMO is created, mapped whole and touched one page per 2 MiB (1024 pages
+/// committed, and a page table each), read back, then decommitted whole in one call; the job's page usage is back where it started, and a page
+/// read afterwards is a fresh zero.
+fn a_two_gib_sparse_vmo_is_mapped_touched_and_given_back() -> Outcome {
+    const BASE: u64 = 0x10_0000_0000;
+    const GIB2: u64 = 2 << 30;
+    const STEP: u64 = 2 << 20;
+    let me = me()?;
+    let root = root_job()?;
+    let before = job_use(root, 2)?.0;
+    let v = ok(
+        sys::vmo_create_flags(GIB2 / 4096, 0, rt::abi::vmo_flags::RESIZABLE),
+        "a 2 GiB VMO",
+    )?
+    .a1 as u64;
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, GIB2, "its size");
+    ensure_eq!(
+        st(sys::process_map(me, v, BASE, 0, GIB2, PF_R | PF_W)),
+        Some(S::Ok),
+        "map all of it"
+    );
+    let n = GIB2 / STEP;
+    for i in 0..n {
+        // SAFETY: BASE..BASE + 2 GiB is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((BASE + i * STEP) as *mut u64, i + 1) };
+    }
+    // (the pages, and a page table each: they are charged to this process's job, and the frames to the VMO's)
+    let touched = job_use(root, 2)?.0 - before;
+    ensure!(touched >= n, "a page per touch is charged");
+    for i in 0..n {
+        // SAFETY: as above.
+        let got = unsafe { core::ptr::read_volatile((BASE + i * STEP) as *const u64) };
+        ensure_eq!(got, i + 1, "page {i} reads back");
+    }
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, GIB2)),
+        Some(S::Ok),
+        "decommit all of it"
+    );
+    ensure_eq!(
+        touched - (job_use(root, 2)?.0 - before),
+        n,
+        "the frames are credited back (the tables stay while the mapping does)"
+    );
+    // SAFETY: as above (a decommitted page faults in again, as zeros).
+    let got = unsafe { core::ptr::read_volatile((BASE + 5 * STEP) as *const u64) };
+    ensure_eq!(got, 0, "a decommitted page reads zero");
+    ensure_eq!(
+        st(sys::vmo_set_size(v, STEP)),
+        Some(S::Ok),
+        "shrink to 2 MiB (the tail goes in batches)"
+    );
+    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap");
+    job_use_settles(root, 2, before + 1, 20_000)
+        .or_else(|_| job_use_settles(root, 2, before, 20_000))?;
+    ensure_eq!(
+        st(sys::vmo_create_flags(abi_top_pages() + 1, 0, 0)),
+        Some(S::InvalidArgs),
+        "above the user half"
+    );
+    sys::handle_close(v);
+    Ok(())
+}
+
+fn abi_top_pages() -> u64 {
+    rt::abi::user::TOP / 4096
 }
 
 /// MM6: `vmo_decommit` and `vmo_set_size` from user mode. A resizable VMO is mapped and written; a decommitted range reads zero through
@@ -16065,6 +16218,10 @@ fn instruction_counts_report() -> Outcome {
 pub fn app_main() -> i32 {
     let mut failed = 0;
     let tests: &[Test] = &[
+        (
+            "a_two_gib_vmo_committed_whole_stays_within_the_latency_bound",
+            a_two_gib_vmo_committed_whole_stays_within_the_latency_bound,
+        ),
         ("user_mode_runs_and_prints", user_mode_runs_and_prints),
         ("clock_advances_in_user_mode", clock_advances_in_user_mode),
         ("unknown_syscalls_are_refused", unknown_syscalls_are_refused),
@@ -16598,6 +16755,10 @@ pub fn app_main() -> i32 {
         (
             "a_write_to_a_protected_page_ends_the_process",
             a_write_to_a_protected_page_ends_the_process,
+        ),
+        (
+            "a_two_gib_sparse_vmo_is_mapped_touched_and_given_back",
+            a_two_gib_sparse_vmo_is_mapped_touched_and_given_back,
         ),
         (
             "vmo_decommit_and_resize_from_user_mode",
