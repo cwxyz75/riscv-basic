@@ -22,14 +22,17 @@ pub struct Spawn {
     pub token: usize,
     pub handle: u64,
     pub prio: u8,
-    /// The thread was made SUSPENDED: the caller records its suspend state once it has the tid (`thread_spawned_suspended`).
+    /// The thread was made SUSPENDED: its spawner registers it stopped (`thread_registered_by_spawner`).
     pub suspended: bool,
-    /// For a SUSPENDED thread: what the caller records once it has the tid (`thread_spawned_suspended`): the process, the thread object and the
-    /// register image the thread will start from.
+    /// What the spawner records once it has the tid (`thread_registered_by_spawner`): the process, the thread object, the stack, round robin, and
+    /// the register image the thread will start from (made, with the rest of the room, before anything changed: KT9).
     pub pid: u64,
     pub obj: Option<ObjId>,
-    /// 32 words (made only for a SUSPENDED thread: the record is on the system-call path's stack, KT13).
-    pub image: Option<alloc::boxed::Box<[u64]>>,
+    pub stack: Option<crate::SpawnStack>,
+    pub rr: bool,
+    /// Does `a1` carry the tid (a spawned thread) or 0 (a process's first thread)?
+    pub spawned: bool,
+    pub image: Option<kcore::fbox::FBox<[u64; 32]>>,
 }
 
 /// The register image (GENERAL layout: x1 to x31, then pc) a new thread starts from: `sp` in x2, `tp` in x4, `arg` in a0 and `a1` in a1.
@@ -83,7 +86,7 @@ pub fn new_start(
 ) -> usize {
     let token = us.next_token;
     us.next_token += 1;
-    us.starts.insert(
+    us.starts.insert_reserved(
         token,
         crate::ThreadStart {
             pid,
@@ -210,13 +213,10 @@ pub fn thread_spawn<M: PhysMem>(
         prio_req as u8
     };
     let detached = flags & sp::DETACHED != 0;
-    // (the register image of a SUSPENDED thread, with room made before anything is charged: KT9)
-    let mut image_room: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    if flags & sp::SUSPENDED != 0 {
-        image_room
-            .try_reserve_exact(32)
-            .map_err(|_| Status::NoMemory)?;
-    }
+    // (KT9: every allocation the registration needs is made here, before anything is charged or changed: the thread's record, its start, its
+    // place in the process, and its register image)
+    let mut image = kcore::fbox::FBox::try_new([0u64; 32]).map_err(|_| Status::NoMemory)?;
+    us.reserve_thread(tpid)?;
     charge_thread(jobs, tjob).map_err(crate::job_status)?;
     let UserState { objs, procs, .. } = us;
     // the thread's object and handle (not for a detached thread)
@@ -322,6 +322,10 @@ pub fn thread_spawn<M: PhysMem>(
     if let (true, Some((_, o))) = (suspended, made) {
         ipc::thread_set_suspended(&mut us.objs, o, true);
     }
+    *image = initial_general(entry, top, arg, tp, 0);
+    if let Some(w) = image.get_mut(11) {
+        *w = lib_base; // (`a2`: AB7)
+    }
     Ok(Spawn {
         token,
         handle: made.map_or(0, |(h, _)| h.0),
@@ -329,14 +333,10 @@ pub fn thread_spawn<M: PhysMem>(
         suspended,
         pid: tpid,
         obj: made.map(|(_, o)| o),
-        image: if suspended {
-            let mut regs = initial_general(entry, top, arg, tp, 0);
-            regs[11] = lib_base;
-            image_room.extend_from_slice(&regs);
-            Some(image_room.into_boxed_slice())
-        } else {
-            None
-        },
+        stack,
+        rr: flags & sp::ROUND_ROBIN != 0,
+        spawned: true,
+        image: Some(image),
     })
 }
 
@@ -351,7 +351,7 @@ pub fn process_start(
     map: &mut dyn crate::StartMap,
     me: u64,
     a: [u64; 6],
-) -> Result<(usize, u8), Status> {
+) -> Result<Spawn, Status> {
     let (ph, bh) = (Handle(a[0]), Handle(a[3]));
     let (entry, sp, arg, features) = (a[1], a[2], a[4], a[5]);
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
@@ -384,6 +384,10 @@ pub fn process_start(
     if total_threads(us) >= us.backstops.user_threads {
         return Err(Status::NoMemory);
     }
+    // (KT9: the first thread's record, start and register image are made before anything changes)
+    let mut image = kcore::fbox::FBox::try_new([0u64; 32]).map_err(|_| Status::NoMemory)?;
+    us.reserve_thread(tpid)?;
+    let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
     let entry_ok = target
         .aspace
         .held_ref()
@@ -473,7 +477,22 @@ pub fn process_start(
     if let Some(t) = us.starts.get_mut(&token) {
         t.a2 = lib.base;
     }
-    Ok((token, prio))
+    *image = initial_general(entry, sp, arg, 0, 0);
+    if let Some(w) = image.get_mut(11) {
+        *w = lib.base; // (`a2`: the system library's base, AB7)
+    }
+    Ok(Spawn {
+        token,
+        handle: 0,
+        prio,
+        suspended: false,
+        pid: tpid,
+        obj: None,
+        stack: None,
+        rr: false,
+        spawned: false,
+        image: Some(image),
+    })
 }
 
 // ---- EX1: thread_suspend, thread_resume, thread state ----
@@ -482,9 +501,10 @@ use kcore::suspend::{AtReturn, Resumed, Suspend};
 
 /// The thread object of a live thread of `tid`, or `BadState`.
 fn thread_obj(us: &UserState, pid: u64, tid: kcore::sched::Tid) -> Result<ObjId, Status> {
-    us.procs
-        .get(&pid)
-        .and_then(|p| p.thread_objs.get(&tid).copied())
+    us.threads
+        .get(&tid)
+        .filter(|t| t.pid == pid)
+        .and_then(|t| t.obj)
         .ok_or(Status::BadState)
 }
 
@@ -501,8 +521,8 @@ pub fn thread_suspend(
     let (tid, pid) = crate::thread_target(&us.objs, &us.procs, me, current, h, Rights::MANAGE)?;
     let obj = thread_obj(us, pid, tid)?;
     let blocked = blocked(tid);
-    let parked = us.parked_tids.contains(&tid);
-    let entry = us.suspends.entry(tid).or_default();
+    let parked = us.threads.get(&tid).is_some_and(|t| t.parked);
+    let entry = us.suspend_entry(tid).ok_or(Status::BadState)?;
     let mut raise = entry.suspend(blocked).ok_or(Status::NoMemory)?;
     if parked {
         // asleep in the park at the return to user mode (a stopped process, or a thread that was resumed and has not run yet to leave it): it is
@@ -527,12 +547,12 @@ pub fn thread_resume(
 ) -> Result<(kcore::sched::Tid, bool), Status> {
     let (tid, pid) = crate::thread_target(&us.objs, &us.procs, me, current, h, Rights::MANAGE)?;
     let obj = thread_obj(us, pid, tid)?;
-    let entry = us.suspends.get_mut(&tid).ok_or(Status::BadState)?;
+    let entry = us.suspend_of_mut(tid).ok_or(Status::BadState)?;
     let r = entry.resume().ok_or(Status::BadState)?;
     match r {
         Resumed::Still => Ok((tid, false)),
         Resumed::Running { clear, wake } => {
-            us.suspends.remove(&tid);
+            us.suspend_remove(tid);
             if clear {
                 ipc::thread_set_suspended(&mut us.objs, obj, false);
             }
@@ -543,7 +563,7 @@ pub fn thread_resume(
 
 /// The thread `tid` of `pid` reached the return to user mode: does it park (and has SUSPENDED risen)? Called by the thread itself.
 pub fn thread_at_return(us: &mut UserState, pid: u64, tid: kcore::sched::Tid) -> AtReturn {
-    let Some(entry) = us.suspends.get_mut(&tid) else {
+    let Some(entry) = us.suspend_of_mut(tid) else {
         return AtReturn::Run;
     };
     let r = entry.return_to_user();
@@ -557,7 +577,7 @@ pub fn thread_at_return(us: &mut UserState, pid: u64, tid: kcore::sched::Tid) ->
 
 /// The thread is about to block in a call with a suspend pending and SUSPENDED not yet up: it has stopped where it is.
 pub fn thread_blocks(us: &mut UserState, pid: u64, tid: kcore::sched::Tid) -> bool {
-    let Some(entry) = us.suspends.get_mut(&tid) else {
+    let Some(entry) = us.suspend_of_mut(tid) else {
         return false;
     };
     let raise = entry.blocks();
@@ -571,20 +591,19 @@ pub fn thread_blocks(us: &mut UserState, pid: u64, tid: kcore::sched::Tid) -> bo
 
 /// Is the thread suspended (its count is above 0)?
 pub fn thread_is_suspended(us: &UserState, tid: kcore::sched::Tid) -> bool {
-    us.suspends.get(&tid).is_some_and(|s| s.active())
+    us.suspend_of(tid).is_some_and(|s| s.active())
 }
 
 /// Is the thread suspended with SUSPENDED not up (a resume and a new suspend came before the woken thread ran)? A parked thread that finds this
 /// leaves its sleep and parks again, which raises the signal.
 pub fn thread_stop_pending(us: &UserState, tid: kcore::sched::Tid) -> bool {
-    us.suspends
-        .get(&tid)
+    us.suspend_of(tid)
         .is_some_and(|s| s.active() && !s.stopped())
 }
 
 /// A thread that was parked leaves the return to user mode (woken with a count of 0, or killed).
 pub fn thread_unparked(us: &mut UserState, tid: kcore::sched::Tid) {
-    if let Some(s) = us.suspends.get_mut(&tid) {
+    if let Some(s) = us.suspend_of_mut(tid) {
         s.unparked();
     }
 }
@@ -603,7 +622,7 @@ pub fn thread_state_target(
         return Err(Status::BadState);
     }
     let (tid, pid) = crate::thread_target(&us.objs, &us.procs, me, current, h, Rights::MANAGE)?;
-    let s = us.suspends.get(&tid).ok_or(Status::BadState)?;
+    let s = us.suspend_of(tid).ok_or(Status::BadState)?;
     if !s.stopped() {
         return Err(Status::BadState);
     }
@@ -613,58 +632,44 @@ pub fn thread_state_target(
     Ok((tid, pid))
 }
 
-/// A thread that ends takes its suspend state with it.
+/// A thread that ends takes its record, and with it its suspend state, its register images and its flags.
 #[inline(never)]
 pub fn thread_suspend_forget(us: &mut UserState, tid: kcore::sched::Tid) {
-    us.suspends.remove(&tid);
-    us.initial_regs.remove(&tid);
-    us.pending_regs.remove(&tid);
-    us.parked_tids.remove(&tid);
-    us.exc_pending.remove(&tid);
+    us.unregister_thread(tid);
 }
 
-/// A thread made with the SUSPENDED flag: stopped before it ever runs.
-pub fn thread_start_suspended(us: &mut UserState, tid: kcore::sched::Tid) {
-    us.suspends.entry(tid).or_insert_with(|| {
+/// The spawner's registration of a new thread, once it has the tid (EX1, KT9): the record goes in with the room `thread_spawn` made, so the
+/// thread is known to `thread_suspend`, kill and the rest from the moment the call returns and nothing here can fail. A SUSPENDED thread is
+/// stopped, with its register image, before the handle that can resume it is handed back (it has not run: it is where a thread parked at the
+/// return to user mode is).
+#[inline(never)]
+pub fn thread_registered_by_spawner(us: &mut UserState, tid: kcore::sched::Tid, sp: &mut Spawn) {
+    let mut rec = crate::UThread {
+        pid: sp.pid,
+        obj: sp.obj,
+        sched_flags: u8::from(sp.rr),
+        ..Default::default()
+    };
+    if let Some(mut image) = sp.image.take() {
+        if sp.spawned {
+            if let Some(w) = image.get_mut(10) {
+                *w = tid; // (`a1` is the tid for a spawned thread)
+            }
+        }
+        rec.initial_regs = Some(image);
+    }
+    if sp.suspended {
         let mut s = Suspend::new();
         let _ = s.suspend(true);
-        // (it has not run: it is where a thread parked at the return to user mode is)
         let _ = s.return_to_user();
-        s
-    });
-}
-
-/// The spawner's half of a SUSPENDED thread, once it has the tid. The thread registers itself too when it first runs (`thread_start_suspended`);
-/// both orders leave the same state, and a resume before either is impossible: it needs the handle this call is about to return.
-pub fn thread_spawned_suspended(us: &mut UserState, tid: kcore::sched::Tid, sp: &Spawn) {
-    thread_start_suspended(us, tid);
-    // a1 is the tid for a spawned thread
-    if let Some(src) = sp.image.as_deref() {
-        let mut image = [0u64; 32];
-        image.copy_from_slice(src);
-        image[10] = tid;
-        us.initial_regs.entry(tid).or_insert(image);
+        rec.suspend = Some(s);
+        us.n_suspended = us.n_suspended.saturating_add(1);
     }
-    us.thread_pid.insert(tid, sp.pid);
-    if let Some(p) = us.procs.get_mut(&sp.pid) {
-        p.live_tids.insert(tid);
-        if let Some(o) = sp.obj {
-            p.thread_objs.insert(tid, o);
-        }
-    }
+    us.register_thread(tid, rec, sp.stack);
     if let Some(o) = sp.obj {
-        ipc::thread_set_suspended(&mut us.objs, o, true);
-    }
-}
-
-/// The spawner's registration of any new thread, once it has the tid (EX1): the thread is known to `thread_suspend` and the rest from the moment
-/// `thread_spawn` returns, not only after it first runs. The thread registers itself too (idempotent).
-pub fn thread_registered_by_spawner(us: &mut UserState, tid: kcore::sched::Tid, sp: &Spawn) {
-    us.thread_pid.insert(tid, sp.pid);
-    if let Some(p) = us.procs.get_mut(&sp.pid) {
-        p.live_tids.insert(tid);
-        if let Some(o) = sp.obj {
-            p.thread_objs.insert(tid, o);
+        ipc::thread_set_tid(&mut us.objs, o, tid);
+        if sp.suspended {
+            ipc::thread_set_suspended(&mut us.objs, o, true);
         }
     }
 }

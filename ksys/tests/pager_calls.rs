@@ -12,7 +12,6 @@ use kcore::pagetable::PageTable;
 use kcore::Mm;
 use ksys::pager::*;
 use ksys::{Machine, ProcState, Process, UserState};
-use std::collections::BTreeMap;
 
 mod common;
 use common::FakeMem;
@@ -64,11 +63,10 @@ fn world() -> W {
             killed: None,
             stopped: false,
             threads_alive: 0,
-            thread_objs: BTreeMap::new(),
             job: JobId::ROOT,
             table_charge: kcore::fmap::FMap::new(),
             charge_end: kcore::fmap::FMap::new(),
-            stacks: BTreeMap::new(),
+            stacks: Default::default(),
             stack_hint: 0,
             privileged: false,
             libsys: Default::default(),

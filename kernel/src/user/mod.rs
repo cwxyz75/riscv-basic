@@ -19,7 +19,6 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::user::{MAX_DEBUG_WRITE, STACK_PAGES, STACK_TOP};
 use abi::Handle;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -297,8 +296,16 @@ pub(crate) fn dump_state() {
             out,
             "##SCHED user: job exception channels {:?}, suspends {:?}, parked {:?}",
             s.job_exc.keys().collect::<alloc::vec::Vec<_>>(),
-            s.suspends.keys().collect::<alloc::vec::Vec<_>>(),
-            s.parked_tids
+            s.threads
+                .iter()
+                .filter(|(_, t)| t.suspend.is_some())
+                .map(|(tid, _)| *tid)
+                .collect::<alloc::vec::Vec<_>>(),
+            s.threads
+                .iter()
+                .filter(|(_, t)| t.parked)
+                .map(|(tid, _)| *tid)
+                .collect::<alloc::vec::Vec<_>>()
         );
         for (pid, p) in s.procs.iter() {
             if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {

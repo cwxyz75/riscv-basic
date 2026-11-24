@@ -5641,7 +5641,7 @@ fn kernel_allocation_failure_sweep() -> Outcome {
     if stat(203, 0) == 0 {
         return Ok(());
     }
-    let scenarios: [(&str, fn()); 7] = [
+    let scenarios: [(&str, fn()); 9] = [
         ("channel", || {
             let r = sys::channel_create();
             if r.status != 0 {
@@ -5725,6 +5725,30 @@ fn kernel_allocation_failure_sweep() -> Outcome {
             if p.status == 0 {
                 sys::handle_close(p.a1 as u64);
             }
+        }),
+        ("thread spawn and join", || {
+            // (a failed spawn is NO_MEMORY with nothing left behind; one that works ends and is joined)
+            // (a stack the kernel provisions: the program's own would be a VMO and a handle of its own to lose)
+            let me = sys::process_self();
+            if me.status == 0 {
+                let rec = rt::SpawnArgs {
+                    entry: worker_set as *const () as usize as u64,
+                    arg: 3,
+                    ..rt::SpawnArgs::default()
+                };
+                let t = sys::thread_spawn(me.a1 as u64, &rec);
+                if t.status == 0 {
+                    sys::object_wait(t.a1 as u64, sig::TERMINATED, sys::clock_get() + 20_000);
+                    sys::handle_close(t.a1 as u64);
+                }
+                sys::handle_close(me.a1 as u64);
+            }
+        }),
+        ("futex wait and wake", || {
+            // (the word is 0 and so is `expected`: the wait queues and times out, or says NO_MEMORY with nothing queued; the wake finds nobody or reports it)
+            static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            sys::futex_wait(WORD.as_ptr(), 0, sys::clock_get() + 2);
+            sys::futex_wake(WORD.as_ptr(), 1);
         }),
         ("map and touch", || {
             let me = sys::process_self();

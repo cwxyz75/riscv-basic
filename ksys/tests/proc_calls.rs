@@ -14,7 +14,6 @@ use kcore::pagetable::PageTable;
 use kcore::usercopy::{copy_from_user, copy_to_user};
 use kcore::Mm;
 use ksys::{proc_call, Machine, PCtx, ProcState, Process, Reply};
-use std::collections::BTreeMap;
 
 mod common;
 use common::FakeMem;
@@ -86,11 +85,10 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: BTreeMap::new(),
         job,
         table_charge: kcore::fmap::FMap::new(),
         charge_end: kcore::fmap::FMap::new(),
-        stacks: BTreeMap::new(),
+        stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
         libsys: Default::default(),
@@ -522,8 +520,8 @@ fn thread_and_process_info_report_cpu_time() {
         )
         .unwrap();
         let t = w.procs.get_mut(&target).unwrap();
-        t.live_tids.insert(tid);
-        t.thread_objs.insert(tid, o);
+        t.live_tids.try_insert(tid).unwrap();
+        ipc::thread_set_tid(&mut w.objs, o, tid);
         (h.0, o)
     };
     let (h7, o7) = make(&mut w, 7);
@@ -543,7 +541,6 @@ fn thread_and_process_info_report_cpu_time() {
     {
         let p = w.procs.get_mut(&target).unwrap();
         p.live_tids.remove(&7);
-        p.thread_objs.remove(&7);
     }
     ipc::thread_cpu_final(&mut w.objs, Some(o7), Some(pobj), 5000);
     ipc::thread_mark_terminated(&mut w.objs, o7, 0);
@@ -800,7 +797,13 @@ fn thread_target_and_set_sched_rows() {
         Err(Status::BadState),
         "never started"
     );
-    w.procs.get_mut(&2).unwrap().thread_objs.insert(other, tobj);
+    w.procs
+        .get_mut(&2)
+        .unwrap()
+        .live_tids
+        .try_insert(other)
+        .unwrap();
+    ipc::thread_set_tid(&mut w.objs, tobj, other);
     assert_eq!(
         ksys::thread_target(&w.objs, &w.procs, 1, me_tid, th.0, Rights::MANAGE),
         Ok((other, 2))

@@ -11,7 +11,6 @@ use kcore::job::{JobId, Limits, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::Mm;
 use ksys::{ProcState, Process, UserState};
-use std::collections::BTreeMap;
 
 mod common;
 use common::FakeMem;
@@ -40,11 +39,10 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: BTreeMap::new(),
         job,
         table_charge: kcore::fmap::FMap::new(),
         charge_end: kcore::fmap::FMap::new(),
-        stacks: BTreeMap::new(),
+        stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
         libsys: Default::default(),
@@ -132,6 +130,7 @@ impl W {
             1,
             [ph, entry, sp, bh, arg, 0],
         )
+        .map(|s| (s.token, s.prio))
     }
     fn threads(&self, job: JobId) -> u64 {
         self.jobs.usage(job).unwrap().get(Resource::Threads)
@@ -312,14 +311,15 @@ fn the_system_library_is_mapped_recorded_charged_and_passed_in_a2() {
         unmaps: 0,
         fail: None,
     };
-    let (token, _) = ksys::process_start(
+    let token = ksys::process_start(
         &mut w.us,
         &mut w.jobs,
         &mut lib,
         1,
         [w.ph, CODE, SP, bh, 0, 0],
     )
-    .unwrap();
+    .unwrap()
+    .token;
     assert_eq!((lib.maps, lib.unmaps), (1, 0));
     let t = &w.us.procs[&2];
     assert_eq!(t.libsys.base, 0x4_0000_0000);

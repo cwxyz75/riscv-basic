@@ -48,3 +48,11 @@ impl<T> DerefMut for FBox<T> {
         &mut self.0[0]
     }
 }
+
+impl<T: PartialEq> PartialEq for FBox<T> {
+    fn eq(&self, o: &Self) -> bool {
+        **self == **o
+    }
+}
+
+impl<T: Eq> Eq for FBox<T> {}

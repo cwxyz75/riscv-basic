@@ -2,7 +2,7 @@
 //! syscall functions that act on it take `&mut UserState` and what the machine provides, so they run on the host.
 
 use crate::proc::SpawnStack;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use kcore::handle::HandleTable;
@@ -27,6 +27,34 @@ pub struct ThreadStart {
     pub a2: u64,
 }
 
+/// Everything the kernel keeps about one user thread (KT9, T177). Made by the spawner (a reserved insert), dropped when the thread ends.
+#[derive(Default)]
+pub struct UThread {
+    pub pid: u64,
+    /// The thread's object (none for a detached thread), to mark it TERMINATED when it ends.
+    pub obj: Option<kcore::object::ObjId>,
+    /// The `channel_call` the thread is waiting in, by call number (L22): set when the request is sent, cleared when the call ends. A server that
+    /// reads a request is lent the caller's priority only while this still says the caller waits in **that** call.
+    pub call: Option<u64>,
+    /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`.
+    pub sched_flags: u8,
+    /// The suspend state (EX1): present exactly while the thread is suspended or stopped by it.
+    pub suspend: Option<kcore::suspend::Suspend>,
+    /// The GENERAL register image (`abi::thread_state`) of a thread that has not entered user mode yet (EX1): `thread_read_state` and
+    /// `thread_write_state` act on it, and the thread starts from it. Made by the spawner.
+    pub initial_regs: Option<kcore::fbox::FBox<[u64; 32]>>,
+    /// Register writes for a thread parked at the return to user mode, applied by the thread itself to its own frame when it wakes (EX1).
+    pub pending_regs: Option<kcore::fbox::FBox<PendingRegs>>,
+    /// The exception serial the thread waits for, if it is stopped for one (EX2).
+    pub exc_pending: Option<u64>,
+    /// Asleep in the park at the return to user mode, so that a suspend that finds it there knows it is not blocked in a call.
+    pub parked: bool,
+    /// A pending `thread_interrupt`: the next blocking wait that would sleep returns INTERRUPTED and takes the flag.
+    pub interrupt: bool,
+    /// Inside `cleanup_dead` (a per-thread recursion guard, T63).
+    pub cleaning: bool,
+}
+
 /// What `thread_write_state` leaves for a parked thread to apply to its own frame when it wakes.
 #[derive(Default, Clone, Copy)]
 pub struct PendingRegs {
@@ -47,27 +75,13 @@ pub struct UserState {
     /// Vacant address-space cells, made at boot (KT9, T177: an `Arc` cannot be made fallibly, so `process_create` arms one of these and teardown gives it
     /// back). Its capacity never changes after `fill_as_pool`.
     pub as_pool: Vec<alloc::sync::Arc<klock::aslock::AsCell>>,
-    pub thread_pid: BTreeMap<Tid, u64>,
-    /// The `channel_call` each thread is waiting in, by call number (L22): set when the request is sent, cleared when the call ends. A server that
-    /// reads a request is lent the caller's priority only while this still says the caller waits in **that** call.
-    pub calls: BTreeMap<Tid, u64>,
     /// The next call number.
     pub next_call: u64,
-    /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
-    pub sched_flags: BTreeMap<Tid, u8>,
     pub next_pid: u64,
     /// The address-space identifier allocator (L18): every process holds a tag from it.
     pub asids: kcore::asid::Asids,
     /// The generation new handle tables start their slots at (0; `ff=handlegen:` in test builds).
     pub first_handle_gen: u64,
-    /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
-    /// hart skip the cleanup while one cleaner was preempted).
-    pub cleaning: BTreeSet<Tid>,
-    /// The suspend state of every thread with a suspend count above 0 (EX1): present exactly while a thread is suspended or stopped by it.
-    pub suspends: BTreeMap<Tid, kcore::suspend::Suspend>,
-    /// The GENERAL register image (`abi::thread_state`) of every user thread that has not entered user mode yet, from its registration until the
-    /// jump (EX1): `thread_read_state` and `thread_write_state` act on it, and the thread starts from it.
-    pub initial_regs: BTreeMap<Tid, [u64; 32]>,
     /// Pagers and the threads waiting for their pages (MM9).
     pub pagers: kcore::pager::Pagers,
     /// The kernel's end (a handle in `ktable`) of each pager's request channel, by pager id.
@@ -78,20 +92,19 @@ pub struct UserState {
     pub pending_wake: Vec<Tid>,
     /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
     pub job_exc: BTreeMap<kcore::job::JobId, abi::Handle>,
-    /// The exception each stopped thread waits for, by its serial (EX2); a decision about any other (an older one, a resolved one) does nothing.
-    pub exc_pending: BTreeMap<Tid, u64>,
     /// The next exception serial.
     pub next_exc: u64,
-    /// Register writes for threads parked at the return to user mode, applied by the thread itself to its own frame when it wakes (EX1: nobody
-    /// else writes a frame its owner holds a `&mut` to).
-    pub pending_regs: BTreeMap<Tid, PendingRegs>,
-    /// Threads asleep in the park at the return to user mode (a stopped process, or a suspend), so that a suspend that finds one there knows it
-    /// is parked at the return and not blocked in a call.
-    pub parked_tids: BTreeSet<Tid>,
-    /// Threads with a pending `thread_interrupt`: the next blocking wait that would sleep returns INTERRUPTED and takes the flag.
-    pub interrupts: BTreeSet<Tid>,
     /// Thread starts waiting for their thread to run, by token.
-    pub starts: BTreeMap<usize, ThreadStart>,
+    pub starts: kcore::fmap::FMap<usize, ThreadStart>,
+    /// One record per user thread, from the moment its spawner registers it until it ends (KT9, T177: everything a thread's later life
+    /// writes is a field here, so nothing after the spawn can fail for want of memory).
+    pub threads: kcore::fmap::FMap<Tid, UThread>,
+    /// The kernel threads (no record in `threads`) that are inside `cleanup_dead`.
+    pub kernel_cleaning: kcore::fmap::FSet<Tid>,
+    /// How many threads have `suspend`, `interrupt` and `pending_regs` set (the lock-free probes read these counts).
+    pub n_suspended: usize,
+    pub n_interrupts: usize,
+    pub n_pending_regs: usize,
     pub next_token: usize,
     /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
     pub ktable: HandleTable,
@@ -193,28 +206,23 @@ impl UserState {
             objs: Kobjs::new(),
             procs: kcore::fmap::FMap::new(),
             as_pool: Vec::new(),
-            thread_pid: BTreeMap::new(),
-            calls: BTreeMap::new(),
             next_call: 1,
-            sched_flags: BTreeMap::new(),
             next_pid: 1,
             asids: kcore::asid::Asids::new(16),
             first_handle_gen: 0,
-            cleaning: BTreeSet::new(),
             root_scan: Vec::new(),
-            suspends: BTreeMap::new(),
-            initial_regs: BTreeMap::new(),
             job_exc: BTreeMap::new(),
             pagers: kcore::pager::Pagers::new(),
             pager_ends: BTreeMap::new(),
             next_pager: 1,
             pending_wake: Vec::new(),
-            exc_pending: BTreeMap::new(),
             next_exc: 1,
-            pending_regs: BTreeMap::new(),
-            parked_tids: BTreeSet::new(),
-            interrupts: BTreeSet::new(),
-            starts: BTreeMap::new(),
+            starts: kcore::fmap::FMap::new(),
+            threads: kcore::fmap::FMap::new(),
+            kernel_cleaning: kcore::fmap::FSet::new(),
+            n_suspended: 0,
+            n_interrupts: 0,
+            n_pending_regs: 0,
             next_token: 1,
             // (one end of each process's and job's exception channel lives here, and the creators' ends of bootstrap channels: bounded by the
             // object cap, whose charges the objects themselves carry)
@@ -229,6 +237,187 @@ impl UserState {
         // (the host tests' worlds and the kernel until it knows its RAM: a few vacant cells; the kernel refills to its process backstop)
         s.fill_as_pool(16);
         s
+    }
+}
+
+impl UserState {
+    /// The process a user thread belongs to (none: not a registered user thread).
+    pub fn pid_of(&self, tid: Tid) -> Option<u64> {
+        self.threads.get(&tid).map(|t| t.pid)
+    }
+
+    /// The record of a registered user thread.
+    pub fn thread(&self, tid: Tid) -> Option<&UThread> {
+        self.threads.get(&tid)
+    }
+
+    pub fn thread_mut(&mut self, tid: Tid) -> Option<&mut UThread> {
+        self.threads.get_mut(&tid)
+    }
+
+    /// The thread's suspend state, if it has one.
+    pub fn suspend_of(&self, tid: Tid) -> Option<&kcore::suspend::Suspend> {
+        self.threads.get(&tid).and_then(|t| t.suspend.as_ref())
+    }
+
+    pub fn suspend_of_mut(&mut self, tid: Tid) -> Option<&mut kcore::suspend::Suspend> {
+        self.threads.get_mut(&tid).and_then(|t| t.suspend.as_mut())
+    }
+
+    /// The thread's suspend state, made if it has none (the thread must be registered: false otherwise).
+    pub fn suspend_entry(&mut self, tid: Tid) -> Option<&mut kcore::suspend::Suspend> {
+        let t = self.threads.get_mut(&tid)?;
+        if t.suspend.is_none() {
+            self.n_suspended = self.n_suspended.saturating_add(1);
+        }
+        Some(t.suspend.get_or_insert_with(Default::default))
+    }
+
+    /// The thread begins `cleanup_dead`: false if it is already inside one (the guard against recursing into itself, T63). A kernel thread has no
+    /// record, so its flag is a set entry; if that cannot be made the cleanup runs unguarded (it only guards a recursion).
+    pub fn begin_cleaning(&mut self, tid: Tid) -> bool {
+        if let Some(t) = self.threads.get_mut(&tid) {
+            return !core::mem::replace(&mut t.cleaning, true);
+        }
+        self.kernel_cleaning.try_insert(tid).unwrap_or(true)
+    }
+
+    pub fn end_cleaning(&mut self, tid: Tid) {
+        if let Some(t) = self.threads.get_mut(&tid) {
+            t.cleaning = false;
+        } else {
+            self.kernel_cleaning.remove(&tid);
+        }
+    }
+
+    /// Drop the thread's suspend state.
+    pub fn suspend_remove(&mut self, tid: Tid) {
+        if let Some(t) = self.threads.get_mut(&tid) {
+            if t.suspend.take().is_some() {
+                self.n_suspended = self.n_suspended.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Set or clear the thread's pending-interrupt flag; true if it was set.
+    pub fn set_interrupt(&mut self, tid: Tid, on: bool) -> bool {
+        let Some(t) = self.threads.get_mut(&tid) else {
+            return false;
+        };
+        let had = core::mem::replace(&mut t.interrupt, on);
+        if had != on {
+            if on {
+                self.n_interrupts = self.n_interrupts.saturating_add(1);
+            } else {
+                self.n_interrupts = self.n_interrupts.saturating_sub(1);
+            }
+        }
+        had
+    }
+
+    pub fn interrupt_pending(&self, tid: Tid) -> bool {
+        self.threads.get(&tid).is_some_and(|t| t.interrupt)
+    }
+
+    /// Take the thread's pending register writes.
+    pub fn take_pending_regs(&mut self, tid: Tid) -> Option<PendingRegs> {
+        let t = self.threads.get_mut(&tid)?;
+        let p = t.pending_regs.take()?;
+        self.n_pending_regs = self.n_pending_regs.saturating_sub(1);
+        Some(p.into_inner())
+    }
+
+    /// The thread's pending register writes, made if it has none (an allocation: an R point, NO_MEMORY when it fails).
+    pub fn pending_regs_entry(
+        &mut self,
+        tid: Tid,
+    ) -> Result<&mut PendingRegs, abi::status::Status> {
+        let t = self
+            .threads
+            .get_mut(&tid)
+            .ok_or(abi::status::Status::BadState)?;
+        if t.pending_regs.is_none() {
+            let b = kcore::fbox::FBox::try_new(PendingRegs::default())
+                .map_err(|_| abi::status::Status::NoMemory)?;
+            t.pending_regs = Some(b);
+            self.n_pending_regs = self.n_pending_regs.saturating_add(1);
+        }
+        t.pending_regs
+            .as_deref_mut()
+            .ok_or(abi::status::Status::BadState)
+    }
+
+    /// Register a thread: its record goes in with the room `reserve_thread` made. The record of a tid already there is replaced.
+    #[inline(never)]
+    pub fn register_thread(&mut self, tid: Tid, t: UThread, stack: Option<SpawnStack>) {
+        let pid = t.pid;
+        self.threads.insert_reserved(tid, t);
+        if let Some(p) = self.procs.get_mut(&pid) {
+            p.live_tids.insert_reserved(tid);
+            if let Some(st) = stack {
+                p.stacks.insert_reserved(tid, st);
+            }
+        }
+    }
+
+    /// Register a bare thread record (the tests' stand-in for a spawner: no image, no stack). Makes its own room.
+    pub fn add_thread(
+        &mut self,
+        tid: Tid,
+        pid: u64,
+        obj: Option<kcore::object::ObjId>,
+    ) -> Result<(), abi::status::Status> {
+        self.reserve_thread(pid)?;
+        self.register_thread(
+            tid,
+            UThread {
+                pid,
+                obj,
+                ..Default::default()
+            },
+            None,
+        );
+        if let Some(o) = obj {
+            kcore::ipc::thread_set_tid(&mut self.objs, o, tid);
+        }
+        Ok(())
+    }
+
+    /// Drop a thread's record (it ended), keeping the counts.
+    #[inline(never)]
+    pub fn unregister_thread(&mut self, tid: Tid) -> Option<UThread> {
+        let t = self.threads.remove(&tid)?;
+        if t.suspend.is_some() {
+            self.n_suspended = self.n_suspended.saturating_sub(1);
+        }
+        if t.interrupt {
+            self.n_interrupts = self.n_interrupts.saturating_sub(1);
+        }
+        if t.pending_regs.is_some() {
+            self.n_pending_regs = self.n_pending_regs.saturating_sub(1);
+        }
+        Some(t)
+    }
+
+    /// Room, before a call changes anything, for one more thread record, one more `live_tids` entry of `pid` and one more start.
+    pub fn reserve_thread(&mut self, pid: u64) -> Result<(), abi::status::Status> {
+        self.threads
+            .reserve(1)
+            .map_err(|_| abi::status::Status::NoMemory)?;
+        self.starts
+            .reserve(1)
+            .map_err(|_| abi::status::Status::NoMemory)?;
+        match self.procs.get_mut(&pid) {
+            Some(p) => {
+                p.live_tids
+                    .reserve(1)
+                    .map_err(|_| abi::status::Status::NoMemory)?;
+                p.stacks
+                    .reserve(1)
+                    .map_err(|_| abi::status::Status::NoMemory)
+            }
+            None => Ok(()),
+        }
     }
 }
 

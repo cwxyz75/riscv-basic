@@ -19,7 +19,7 @@ fn random_waits_wakes_and_forgets_agree_with_the_list() {
                     let existed = model.iter().any(|&(_, w)| w == who);
                     model.retain(|&(_, w)| w != who);
                     model.push((key, who));
-                    assert_eq!(f.wait(key, who), !existed, "{ctx}");
+                    assert_eq!(f.wait(key, who).unwrap(), !existed, "{ctx}");
                 }
                 2 => {
                     let n = rng.below(4);
@@ -30,7 +30,7 @@ fn random_waits_wakes_and_forgets_agree_with_the_list() {
                         .take(n as usize)
                         .collect();
                     model.retain(|&(_, w)| !want.contains(&w));
-                    assert_eq!(f.wake(key, n), want, "{ctx}");
+                    assert_eq!(f.wake(key, n).unwrap(), want, "{ctx}");
                 }
                 3 => {
                     let who = rng.below(12);

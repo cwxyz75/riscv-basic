@@ -30,7 +30,7 @@ fn wait_if_equal(table: &Mutex<Futexes>, word: &AtomicU32, expected: u32, who: u
     if word.load(Ordering::SeqCst) != expected {
         return false;
     }
-    t.wait(KEY, who);
+    t.wait(KEY, who).unwrap();
     true
 }
 
@@ -41,7 +41,7 @@ fn store_then_wake_is_never_lost() {
     let (t2, w2) = (table.clone(), word.clone());
     let waker = thread::spawn(move || {
         w2.store(1, Ordering::SeqCst); // user-mode store, no lock
-        let woken = t2.lock().unwrap().wake(KEY, 1); // the futex_wake syscall
+        let woken = t2.lock().unwrap().wake(KEY, 1).unwrap(); // the futex_wake syscall
         woken.len()
     });
     let slept = wait_if_equal(&table, &word, 0, 7);
@@ -80,7 +80,7 @@ fn one_wake_wakes_one() {
         t.len()
     };
     assert_eq!(first, 2);
-    let woken = table.lock().unwrap().wake(KEY, 1);
+    let woken = table.lock().unwrap().wake(KEY, 1).unwrap();
     assert_eq!(woken.len(), 1);
     let left = table.lock().unwrap().len();
     assert_eq!(left, 1);
@@ -150,7 +150,7 @@ fn prepared_waiter_is_never_left_blocked(prepare_first: bool) {
     let (t2, w2, p2) = (table.clone(), word.clone(), park.clone());
     let waker = thread::spawn(move || {
         w2.store(1, Ordering::SeqCst);
-        let woken = t2.lock().unwrap().wake(KEY, 1);
+        let woken = t2.lock().unwrap().wake(KEY, 1).unwrap();
         if !woken.is_empty() {
             notify(&p2); // (the kernel does this with the bucket lock held: the dequeue is first either way)
         }
@@ -171,9 +171,9 @@ fn prepared_waiter_is_never_left_blocked(prepare_first: bool) {
 /// A timeout (`forget`) races a wake: exactly one of them takes the sleeper out of the table.
 fn timeout_and_wake_take_the_sleeper_once() {
     let table = Arc::new(Mutex::new(Futexes::new()));
-    table.lock().unwrap().wait(KEY, 7);
+    table.lock().unwrap().wait(KEY, 7).unwrap();
     let t2 = table.clone();
-    let waker = thread::spawn(move || t2.lock().unwrap().wake(KEY, 1).len());
+    let waker = thread::spawn(move || t2.lock().unwrap().wake(KEY, 1).unwrap().len());
     let timed_out = table.lock().unwrap().forget(7);
     let woken = waker.join().unwrap();
     assert_eq!(usize::from(timed_out) + woken, 1, "taken out once, by one");
@@ -184,10 +184,10 @@ fn timeout_and_wake_take_the_sleeper_once() {
 fn kill_and_wake_take_each_sleeper_once() {
     let table = Arc::new(Mutex::new(Futexes::new()));
     for w in [7, 8] {
-        table.lock().unwrap().wait(KEY, w);
+        table.lock().unwrap().wait(KEY, w).unwrap();
     }
     let t2 = table.clone();
-    let waker = thread::spawn(move || t2.lock().unwrap().wake(KEY, 1));
+    let waker = thread::spawn(move || t2.lock().unwrap().wake(KEY, 1).unwrap());
     let killed = table.lock().unwrap().forget_process(KEY.0);
     let woken = waker.join().unwrap();
     let mut all: Vec<u64> = killed.into_iter().chain(woken).collect();

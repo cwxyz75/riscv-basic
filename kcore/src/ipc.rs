@@ -75,6 +75,8 @@ pub struct ProcessObj {
 /// A user thread, as a kernel object: what a thread handle names.
 pub struct ThreadObj {
     pub pid: u64,
+    /// The kernel thread behind it, once the spawner has registered it (KT9: the lookup from a handle to its thread).
+    pub tid: Option<u64>,
     pub terminated: bool,
     /// Stopped by `thread_suspend` (EX1): raises SUSPENDED.
     pub suspended: bool,
@@ -1687,6 +1689,13 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
 }
 
 /// Record that the thread behind `obj` has stopped for `thread_suspend` or runs again (raises or clears SUSPENDED).
+/// Record the kernel thread a thread object stands for.
+pub fn thread_set_tid(reg: &mut Kobjs, obj: ObjId, tid: u64) {
+    if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
+        t.tid = Some(tid);
+    }
+}
+
 pub fn thread_set_suspended(reg: &mut Kobjs, obj: ObjId, suspended: bool) {
     if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
         t.suspended = suspended && !t.terminated;
@@ -1778,6 +1787,7 @@ pub fn thread_object_create_in(
     let obj = reg.create_charged(
         KObj::Thread(ThreadObj {
             pid,
+            tid: None,
             terminated: false,
             suspended: false,
             exit_code: 0,

@@ -5,7 +5,6 @@ use crate::{ProcState, Process, UserState};
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::aspace::AddressSpace;
 use kcore::fbox::FBox;
@@ -156,11 +155,10 @@ fn new_process(
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: BTreeMap::new(),
         job,
         table_charge,
         charge_end: kcore::fmap::FMap::new(),
-        stacks: BTreeMap::new(),
+        stacks: kcore::fmap::FMap::new(),
         stack_hint,
         privileged: false,
         libsys: Default::default(),

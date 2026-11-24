@@ -417,16 +417,25 @@ pub mod faultalloc {
     }
 }
 
-/// Run `f` (a syscall epilogue whose allocations cannot fail yet: T246) outside the allocation-failure sweep; just `f()` in every other build.
+/// Run `f`, whose allocations cannot be refused because nobody could be told (KT9, T177 class N: the scheduler core, which allocates on every spawn,
+/// sleep and wake, and teardown), outside the allocation-failure sweep; just `f()` in every other build. Each use is counted by the docs check
+/// (`scripts/check_docs.py`), so the class cannot grow silently; what stands behind it (an allocator reserve that class R cannot consume) is T177's
+/// remaining part.
 #[cfg(feature = "fault-alloc")]
-pub fn epilogue<R>(f: impl FnOnce() -> R) -> R {
+pub fn nofail<R>(f: impl FnOnce() -> R) -> R {
     faultalloc::exempt(f)
 }
 /// See the `fault-alloc` version.
 #[cfg(not(feature = "fault-alloc"))]
 #[inline(always)]
-pub fn epilogue<R>(f: impl FnOnce() -> R) -> R {
+pub fn nofail<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// The syscall epilogue whose allocations cannot fail yet (T246): `nofail` under its older name, until the epilogue is made allocation-free.
+#[inline(always)]
+pub fn epilogue<R>(f: impl FnOnce() -> R) -> R {
+    nofail(f)
 }
 
 #[global_allocator]

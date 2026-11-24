@@ -25,10 +25,10 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
 /// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
 fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
     let pending = any_state(|s| {
-        if s.pending_regs.is_empty() {
+        if s.n_pending_regs == 0 {
             return None;
         }
-        s.pending_regs.remove(&thread::current())
+        s.take_pending_regs(thread::current())
     });
     let Some(p) = pending else {
         return;
@@ -61,10 +61,10 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
             let UserState {
                 asids,
                 procs,
-                thread_pid,
+                threads,
                 ..
             } = s;
-            let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
+            let pid = threads.get(&thread::current()).map_or(0, |t| t.pid);
             crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
             let p = procs.get_mut(&pid);
             let (ls, le) = p
@@ -746,7 +746,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             let va = fault.address;
             let mut pager_need = None;
             let mut resolved = {
-                let pid = with_state(|s| s.thread_pid.get(&thread::current()).copied());
+                let pid = with_state(|s| s.pid_of(thread::current()));
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
                         // (the address space is cloned out of the section: a reference count, no allocation)
@@ -869,7 +869,7 @@ fn fault_or_exit(fault: &crate::arch::Fault) {
 fn raise_fault(f: ksys::exception::Fault) {
     let delivered = any_state(|s| {
         let tid = thread::current();
-        let Some(&pid) = s.thread_pid.get(&tid) else {
+        let Some(pid) = s.pid_of(tid) else {
             return false;
         };
         if !ksys::exception::deliver(s, kmem::jobs().jobs, pid, tid, &f, None) {
@@ -1052,7 +1052,7 @@ fn lend_to_reader() {
     locked_state(|s| {
         let read = s.objs.take_dequeued_calls();
         for (caller, call) in read {
-            if s.calls.get(&(caller as Tid)) == Some(&call) {
+            if s.thread(caller as Tid).and_then(|t| t.call) == Some(call) {
                 thread::pi_donate(caller as Tid, me);
             }
         }
@@ -1159,7 +1159,7 @@ fn dispatch_in(
     deferred: &mut Option<ksys::Deferred>,
 ) -> Reply {
     let tid = thread::current();
-    let Some(&pid) = s.thread_pid.get(&tid) else {
+    let Some(pid) = s.pid_of(tid) else {
         return fail(Status::BadState);
     };
     let UserState {
