@@ -260,7 +260,8 @@ pub(super) fn process_kill(a: [u64; 6]) -> Reply {
     if tpid == me {
         exit_process(code);
     }
-    request_kill(tpid, code);
+    // (class N around the kill only: the self-kill above diverges, and a `nofail` that never returns would leave the hart in class N for good)
+    crate::heap::nofail(|| request_kill(tpid, code));
     Ok((None, None))
 }
 
@@ -766,13 +767,24 @@ pub(super) fn job_kill(a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
         Ok((job, me_inside, me))
     })?;
-    // (a cursor by process id, one victim per step: no list is made, so nothing here can be refused for want of memory)
+    // (a cursor by process id, one victim per step: no list is made, so nothing here can be refused for want of memory. The handle is looked at
+    // again at every step: a victim's teardown can let go of the big lock, the caller's other threads can close the handle, and a job id is
+    // reused once its job is gone)
     let mut after = 0u64;
-    while let Some(pid) =
-        locked_state(|s| ksys::job_kill_next(&s.procs, kmem::jobs().jobs, job, me, after))
-    {
+    while let Some(pid) = locked_state(|s| {
+        ksys::job_kill_next(
+            &s.objs,
+            &s.procs,
+            kmem::jobs().jobs,
+            me,
+            Handle(a[0]),
+            job,
+            after,
+        )
+    }) {
         after = pid;
-        request_kill(pid, code);
+        // (class N around each kill only: the caller's own exit below diverges)
+        crate::heap::nofail(|| request_kill(pid, code));
     }
     if me_inside {
         exit_process(code);

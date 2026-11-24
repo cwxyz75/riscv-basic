@@ -1314,9 +1314,12 @@ pub fn pi_register(tid: Tid) {
         let base = sched().priority(tid).unwrap_or(1);
         let mut d = PI.lock();
         if d.eff(tid).is_none() {
-            // (a thread the spawner registered is registered again by itself: the first stands; a spawner reserved the room: `pi_reserve_thread`. A thread
-            // that finds no room stays out of the graph, which donates nothing to it and for it)
-            let _ = d.add_thread(tid, base);
+            // (the spawner reserved the room, `pi_reserve_thread`; the boot loader's thread finds room in an empty table)
+            let added = d.add_thread(tid, base);
+            debug_assert!(
+                added.is_ok(),
+                "a thread found no room in the donation graph"
+            );
         }
     });
 }

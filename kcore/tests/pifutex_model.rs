@@ -165,7 +165,8 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                     for w in &ended {
                         assert_eq!(pi.take_outcome(*w), Some(Outcome::Died), "{ctx}");
                     }
-                    let mut got = pi.drain_wake();
+                    let mut got = Vec::new();
+                    pi.drain_wake_into(|w| got.extend_from_slice(w));
                     got.sort();
                     let mut want = ended.clone();
                     want.sort();
@@ -221,7 +222,8 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                         for w in &ended {
                             assert_eq!(pi.take_outcome(*w), Some(Outcome::Died), "{ctx}");
                         }
-                        let mut got = pi.drain_wake();
+                        let mut got = Vec::new();
+                        pi.drain_wake_into(|w| got.extend_from_slice(w));
                         got.sort();
                         let mut want = ended.clone();
                         want.sort();
@@ -319,7 +321,8 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                         got, want,
                         "{ctx}: exactly the waiters of its futexes are woken"
                     );
-                    let mut sw = pi.drain_wake();
+                    let mut sw = Vec::new();
+                    pi.drain_wake_into(|w| sw.extend_from_slice(w));
                     sw.sort();
                     stale_woken.sort();
                     assert_eq!(

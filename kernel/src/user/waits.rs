@@ -329,7 +329,7 @@ pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
             let found =
                 thread::pi_op_vec(|d| f.pi.owner_died(d, tid, |key| words.get(&key).copied()));
             dead.extend(found);
-            ended.extend(f.pi.drain_wake());
+            f.pi.drain_wake_into(|w| ended.extend_from_slice(w));
         });
         for (key, woken) in dead {
             // poison the word (if its page is still there), then wake the waiters

@@ -67,14 +67,21 @@ pub fn job_kill_begin(
 }
 
 /// The next process inside `job` (and below it) other than `me`, after process id `after` (ids are never reused: a cursor by id survives the
-/// teardown each kill may start).
+/// teardown each kill may start). `None` when there is none, **or when `jh` no longer names `job` with KILL for the caller** (job ids are reused
+/// once a job is gone, so the loop must not outlive the caller's authority).
 pub fn job_kill_next(
+    objs: &Kobjs,
     procs: &crate::ProcTable,
     jobs: &Jobs,
-    job: JobId,
     me: u64,
+    jh: Handle,
+    job: JobId,
     after: u64,
 ) -> Option<u64> {
+    let caller = procs.get(&me)?;
+    if ipc::job_of(objs, &caller.handles, jh, Rights::KILL).ok() != Some(job) {
+        return None;
+    }
     procs
         .range(after.saturating_add(1)..)
         .find(|(&pid, p)| pid != me && jobs.is_within(p.job, job))

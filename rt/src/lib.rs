@@ -544,6 +544,7 @@ pub mod sys {
     }
     /// Take the priority-inheritance futex at `addr` (the slow path: user code first tries a compare-and-swap of 0 to its tid, bits 0 to 29 of the
     /// word); `deadline` in milliseconds as `futex_wait`. OK when the caller owns it. While it waits the owner runs at least at the caller's priority.
+    /// NO_MEMORY (the kernel could not make room to queue the caller; nothing changed) means try again.
     pub fn futex_lock_pi(addr: *const u32, deadline: u64) -> Ret {
         futex_lock_pi_ns(addr, deadline_ns(deadline))
     }
