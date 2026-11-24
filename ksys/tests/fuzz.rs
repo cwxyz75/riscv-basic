@@ -64,7 +64,12 @@ fn kind_of(w: &World, h: u64) -> Kind {
 /// One sequence. Returns a hash of every call and its reply (two runs of a seed must agree), or the first problem.
 fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result<u64, String> {
     at.set(("setup", 0));
-    let mut w = world_with(256);
+    // (one seed in four runs short of frames, so a commit that cannot get one rolls back: T176)
+    let mut w = if seed % 4 == 3 {
+        world_with_frames(256, 24 + (seed as usize / 4) % 20)
+    } else {
+        world_with(256)
+    };
     // a handle to the root job, to give the job calls something to act on (the generator never closes it or sets limits on it)
     let jh = {
         let mut q = Quota {

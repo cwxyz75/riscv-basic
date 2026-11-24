@@ -92,9 +92,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         lib = range;
         Ok(())
     })();
-    let (pid, tag, first_gen) = (|| {
+    let (pid, tag, first_gen) = with_state(|s| {
         {
-            let s = state_locked();
             let pid = s.next_pid;
             // (CNT1: the counter never wraps or repeats: at its end no process is started)
             // (the process backstop: the syscall layer checks it, and so does this)
@@ -102,7 +101,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
                 && pid.checked_add(1).map(|n| s.next_pid = n).is_some();
             (ok.then_some(pid), s.asids.alloc(), s.first_handle_gen)
         }
-    })();
+    });
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
     if let Err(e) = built {
@@ -141,8 +140,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
-    let made = (|| -> bool {
-        let s = state_locked();
+    let made = with_state(|s| -> bool {
         let Ok((kernel_end, process_end)) = ipc::channel_create_in(
             &mut s.objs,
             &mut s.ktable,
@@ -170,7 +168,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         // (AB3, test builds: the generations the later handles start at; the bootstrap handle above is value 1 by the ABI)
         process.handles.set_first_generation(first_gen);
         true
-    })();
+    });
     if !made {
         klock::aslock::AsCell::take(process.aspace).destroy_user(k.mm, k.vmos, k.jobs);
         for id in process.vmos {
@@ -178,9 +176,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         }
         return Err(LoadError::NoMemory);
     }
-    let token = (|| {
+    let token = with_state(|s| {
         {
-            let s = state_locked();
             let (entry, arg) = (process.entry, process.arg);
             // (the root job has no limits: these charges only keep its usage honest)
             let jobs = &mut *k.jobs;
@@ -193,7 +190,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             }
             token
         }
-    })();
+    });
     // (the thread's stack comes from the same locks)
     drop(k);
     // user threads may run on any hart (kernel threads stay on the boot hart by default)

@@ -749,11 +749,12 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                 let pid = with_state(|s| s.thread_pid.get(&thread::current()).copied());
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
-                        let p = state_locked().procs.get_mut(&pid).expect("process exists");
-                        let _as = klock::aslock::AsCell::hold(&p.aspace);
+                        // (the address space is cloned out of the section: a reference count, no allocation)
+                        let aspace = with_state(|s| s.procs.get(&pid).map(|p| p.aspace.clone()))
+                            .expect("process exists");
+                        let _as = klock::aslock::AsCell::hold(&aspace);
                         let k = kmem::get();
-                        let r = p
-                            .aspace
+                        let r = aspace
                             .held_mut()
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
@@ -1140,8 +1141,24 @@ pub(super) fn dispatch(
     staged: Option<ksys::Staged>,
     deferred: &mut Option<ksys::Deferred>,
 ) -> Reply {
+    with_state(|s| dispatch_in(s, n, a, staged, deferred))
+}
+
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `dispatch`
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+// INVARIANT: as `dispatch`
+fn dispatch_in(
+    s: &mut UserState,
+    n: usize,
+    a: [u64; 6],
+    staged: Option<ksys::Staged>,
+    deferred: &mut Option<ksys::Deferred>,
+) -> Reply {
     let tid = thread::current();
-    let s = state_locked();
     let Some(&pid) = s.thread_pid.get(&tid) else {
         return fail(Status::BadState);
     };

@@ -58,8 +58,13 @@ pub struct World {
 }
 
 pub fn world_with(handles: usize) -> World {
+    world_with_frames(handles, 400)
+}
+
+/// `world_with` with `frames` managed frames (a small number makes the commits run out of memory: the rollback paths).
+pub fn world_with_frames(handles: usize, frames: usize) -> World {
     let mut mm = Mm {
-        db: FrameDb::new(3000, 400),
+        db: FrameDb::new(3000, frames),
         mem: FakeMem::default(),
     };
     let kernel = PageTable::new(&mut mm).unwrap();
