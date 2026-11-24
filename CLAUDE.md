@@ -94,6 +94,9 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
   versioned; a change is a dated amendment appended at the end, never a rewrite of the body),
   reference (`docs/reference/`: SYSCALLS, INVARIANTS, TESTING, changed in place with the code)
   and records (`docs/records/`: reviews, decisions, measurements, notes; append-only).
+- **Spec files are off limits.** Agents are strictly forbidden from modifying anything under `docs/specs/` (or any other spec file) without
+  the user's explicit permission, for any reason, including a dated amendment, a typo fix or keeping a spec in step with the code. If a spec
+  looks wrong or out of date, say so in the reply and record it in `work/`, and leave the spec alone.
 - **Work lists and documentation are separate.** Plans, to-dos, progress and "not built yet"
   go in `work/` and `WORK-PLAN.md`, never in a spec. A spec describes the end state; it has
   no opinion about how far the build has got.
