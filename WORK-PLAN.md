@@ -163,7 +163,7 @@ Phase 6d (`epic/phase-6d`, merged into `main` on its epic gate): the wait tables
 
 Phase 6e (`epic/phase-6e`, merged into `main` on its epic gate): the first steps of the end of the big lock.
 
-- [ ] **PL8** (part a built, PRs 423 to 425) the five system-wide backstops derived from RAM (`kcore::limits::Backstops`; the registry grows its tables as objects are made instead of reserving for its cap; the process backstop is held to 64 until T214); part b (the per-process ceilings as job quotas) waits for the `Limits` flag day of phase 12 and for L20, see `work/PL8.md`
+- [x] **PL8** (part a built, PRs 423 to 425) the five system-wide backstops derived from RAM (`kcore::limits::Backstops`; the registry grows its tables as objects are made instead of reserving for its cap; the process backstop is held to 64 until T214); part b (the per-process ceilings as job quotas) waits for the `Limits` flag day of phase 12 and for L20
 - [ ] **L19** (parts: PR 418 chunked teardown; PR 426 the kernel's thread table as a real `TT` lock; PRs 427 and 428 `futex_wait` with no big lock: the quiet entry, the thread's own `UserBinding`, the allocator's published generation) the rest: `PROCS` (the process table out of `UserState`), the handle drain and sweep of teardown (T206)
 - [ ] **T213** (built in L19's PR 427: `futex_wait` runs with no big lock on a quiet return; scaling 0.25 measured in a debug build, not the 3.0 target: what is left is written in `work/T213.md`)
 
@@ -172,7 +172,7 @@ Phase 6f (`epic/phase-6f`, merged into `main` on its epic gate): the end of the 
 - [x] **L19** `PROCS` and `TT` (PRs 418, 426, 444, 447: the thread table is the `TT` lock, the process table lives inside the object lock `OBJ`, a process's teardown frees its memory in chunks and closes its handles and sweeps in slices, each its own critical section; T206 keeps the roots collected whole)
 - [ ] **L20** the end of the big kernel lock: built in four steps (PRs 446, 447, 448 and the sweep and VMO-copy PR 449): a syscall from user mode runs without the lock across the call, `LEGACY` is `OBJ` (class 1) and guards only the object domain, `irq::off` for the scheduler's and the thread table's sections, the kernel page table, the stack slots and the heap window have locks of their own (T224), the commit to the waiters is part of ending a section, the user state is reached only through `with_state`, `vmo_read`, `vmo_write` and `vmo_commit` copy outside the object lock, a creating call's sweep is a series of slices. **Message and stream copies of 1 KiB or more are outside the object lock** (T215, phase 6g). **Left:** `channel_call`'s copies (T215), the reentrancy (the root scan is sliced: T206's last piece, built in phase 6g) of `OBJ`, the unchecked accessors (T225), and the acceptance that only the owner's soak gives (the whole budget of 3.12, `pair_scaling` for channels)
 - [ ] **T213** (the quiet `futex_wait`, built in phase 6e; scaling 0.25 measured in a debug build)
-- [ ] **PL8** (part a built in phase 6e) part b: the per-process ceilings as job quotas
+- [x] **PL8** (part a built in phase 6e) part b: the per-process ceilings as job quotas
 
 The order of L14 to L19 is the default of SCHED-SMP-SPEC 7.2. If the lock profile after L12 says another class of syscalls
 holds the big lock longest, reorder on that evidence and record it below.
