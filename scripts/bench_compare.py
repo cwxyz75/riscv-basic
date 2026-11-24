@@ -3,6 +3,8 @@
 
     bench_compare.py RUN.tsv [BASELINE.tsv] [--max-ratio R]   exit 1 if any benchmark is more than R times slower
     bench_compare.py --self-test                               check that a 3x slowdown is caught
+    ... --scaling-floor FILE                                   also fail if a pair_scaling ratio is below its floor in FILE (a TSV of
+                                                               `label <TAB> series <TAB> N <TAB> floor`, e.g. `smp4 pair_scaling_futex 4 0.7`)
     ... --prefix count_                                        only the rows whose name starts so (the instruction counts of KT5)
 
 A TSV row is `label <TAB> name <TAB> value <TAB> unit` (the label is the hart count, `smp1`, `smp4`). Every
@@ -63,6 +65,28 @@ def scaling(run):
     return ratios
 
 
+def check_floors(ratios, path):
+    """T252: each recorded floor is a tripwire for the scaling collapsing, not the design's goal (3.0 futex, 2.5 channel_call, not gates:
+    SCHED-SMP-SPEC amendment of 2026-11-24). A floor whose series was not run is an error."""
+    problems = []
+    for line in open(path):
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 4:
+            raise SystemExit(f"{path}: malformed row {line!r}")
+        label, kind, n, floor = parts[0], parts[1], int(parts[2]), float(parts[3])
+        got = ratios.get((label, kind, n))
+        if got is None:
+            problems.append(f"{label} {kind} n{n}: a scaling floor is recorded but the series did not run")
+        elif got < floor:
+            problems.append(f"{label} {kind} n{n}: scaling x{got:.2f} is below the floor x{floor:.2f}")
+        else:
+            print(f"{label:6} {kind:28} n{n} scaling x{got:5.2f} (floor x{floor:.2f})")
+    return problems
+
+
 def self_test():
     base = {("smp1", "thread_create_join"): (1000, "ns"), ("smp4", "wake_latency_event"): (500, "ns")}
     same = dict(base)
@@ -75,6 +99,18 @@ def self_test():
     assert len(missing) == 2, missing
     r = scaling({("smp4", "pair_scaling_futex_n1"): (900, "ns"), ("smp4", "pair_scaling_futex_n4"): (300, "ns")})
     assert r == {("smp4", "pair_scaling_futex", 1): 1.0, ("smp4", "pair_scaling_futex", 4): 3.0}, r
+    import os
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False) as f:
+        f.write("# floors\nsmp4\tpair_scaling_futex\t4\t2.0\nsmp4\tpair_scaling_futex\t2\t0.5\n")
+    try:
+        assert check_floors(r, f.name) == ["smp4 pair_scaling_futex n2: a scaling floor is recorded but the series did not run"], "a missing series"
+        low = {("smp4", "pair_scaling_futex", 4): 1.5}
+        assert len(check_floors(low, f.name)) == 2, "a scaling below its floor"
+        assert check_floors({("smp4", "pair_scaling_futex", 4): 2.0, ("smp4", "pair_scaling_futex", 2): 0.5}, f.name) == []
+    finally:
+        os.unlink(f.name)
     print("bench_compare self-test passed")
 
 
@@ -90,13 +126,19 @@ def main(argv):
     if "--max-ratio" in argv:
         max_ratio = float(argv[argv.index("--max-ratio") + 1])
         args = [a for a in args if a != argv[argv.index("--max-ratio") + 1]]
+    floors = None
+    if "--scaling-floor" in argv:
+        floors = argv[argv.index("--scaling-floor") + 1]
+        args = [a for a in args if a != floors]
     if not 1 <= len(args) <= 2:
         print(__doc__, file=sys.stderr)
         return 2
     run = load(args[0], prefix)
     base = load(args[1] if len(args) == 2 else "bench/baseline.tsv", prefix)
     problems = compare(run, base, max_ratio)
-    scaling(run)
+    ratios = scaling(run)
+    if floors:
+        problems += check_floors(ratios, floors)
     if problems:
         print("\nbenchmark problems:", *problems, sep="\n  ", file=sys.stderr)
         return 1

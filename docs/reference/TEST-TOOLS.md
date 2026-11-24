@@ -145,7 +145,7 @@ benchmarks at a tenth of the iterations with sanity assertions only, so they can
 them in full at one and four harts and compares with `bench/baseline.tsv` through `scripts/bench_compare.py`: a
 threefold slowdown fails. The numbers are costs of the emulated machine and move with the host: read the ratios.
 `pair_scaling_<kind>_n<N>` (futex and `channel_call` pairs, one, two and four) is the cost per round trip over all pairs;
-`bench_compare.py` prints the scaling, the cost at one pair over the cost at N. `rt_latency_p99` and `rt_latency_max` are the
+`bench_compare.py` prints the scaling, the cost at one pair over the cost at N, and `--scaling-floor bench/scaling.tsv` (on in `make os-bench` and `make os-latency`) fails if a ratio falls below its recorded floor. The floors are tripwires for a collapse (about 60% of the lowest of three full runs), not the design's goals of 3.0 and 2.5, which are not gates (SCHED-SMP-SPEC amendment of 2026-11-24, T252); the measured figures at four harts are futex 0.5 to 1.3 (it swings with the pair's placement) and `channel_call` 0.8. `rt_latency_p99` and `rt_latency_max` are the
 real-time probe's lateness, printed by the kernel's scheduler test.
 
 **The latency trace.** `make os-latency` (soak) builds the kernel with the `latency-trace` feature, runs the suite at
