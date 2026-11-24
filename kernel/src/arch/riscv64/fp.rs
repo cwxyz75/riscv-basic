@@ -319,6 +319,11 @@ fn claim<R>(t: &mut kcore::fp::UnitThread<R>, harts: &mut [FpHart], tid: u64, h:
             }
         }
     }
+    // (T188: a claim names a hart whose register file holds the thread's latest state: `claim` is called right after the save or the load that made it so)
+    debug_assert!(
+        harts.get(h).is_some_and(|f| f.holds(t)),
+        "a claim for thread {tid} on hart {h} that does not hold its state"
+    );
     t.set_holder(Some(h));
     let (c, b) = cells(h);
     b.store(t.regs_ptr().map_or(0, |p| p as usize), Release);
