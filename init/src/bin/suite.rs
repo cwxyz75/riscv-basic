@@ -5989,7 +5989,7 @@ fn kernel_allocation_failure_sweep() -> Outcome {
     if stat(203, 0) == 0 {
         return Ok(());
     }
-    let scenarios: [(&str, fn()); 10] = [
+    let scenarios: [(&str, fn()); 11] = [
         ("channel", || {
             let r = sys::channel_create();
             if r.status != 0 {
@@ -6123,6 +6123,17 @@ fn kernel_allocation_failure_sweep() -> Outcome {
                     sys::handle_close(c.a1 as u64);
                 }
                 sys::handle_close(src);
+            }
+        }),
+        ("job set sched", || {
+            let root = sys::job_root();
+            if root.status == 0 {
+                let j = sys::job_create(root.a1 as u64, &[u64::MAX; 6]);
+                if j.status == 0 {
+                    let _ = sys::job_set_sched(j.a1 as u64, 10, 0, 0);
+                    sys::handle_close(j.a1 as u64);
+                }
+                sys::handle_close(root.a1 as u64);
             }
         }),
         ("map and touch", || {
