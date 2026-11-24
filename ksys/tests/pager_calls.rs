@@ -40,9 +40,10 @@ fn world() -> W {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut us = UserState::new();
-    us.procs.insert(
+    ksys::put_process(
+        &mut us.procs,
         1,
-        Box::new(Process {
+        Process {
             live_tids: Default::default(),
             aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
                 1,
@@ -65,13 +66,13 @@ fn world() -> W {
             threads_alive: 0,
             thread_objs: BTreeMap::new(),
             job: JobId::ROOT,
-            table_charge: BTreeMap::new(),
-            charge_end: BTreeMap::new(),
+            table_charge: kcore::fmap::FMap::new(),
+            charge_end: kcore::fmap::FMap::new(),
             stacks: BTreeMap::new(),
             stack_hint: 0,
             privileged: false,
             libsys: Default::default(),
-        }),
+        },
     );
     let mut jobs = Jobs::new();
     let (pager, chan) = pager_create(&mut us, &mut jobs, 1).unwrap();

@@ -93,13 +93,30 @@ fn random_walks_agree_with_the_btreemap() {
         let span = 8 + r.next() % 600;
         for step in 0..1500 {
             let k = r.next() % span;
-            match r.next() % 8 {
+            match r.next() % 9 {
                 0..=3 => {
                     let n = 1 + (r.next() % 3) as usize;
                     m.reserve(n).unwrap();
                     assert_eq!(m.insert_reserved(k, step), o.insert(k, step));
                 }
                 4 | 5 => assert_eq!(m.remove(&k), o.remove(&k)),
+                8 => {
+                    // move a key one step in either direction if the order allows (a region's start moving up in its gap)
+                    let new = if r.next().is_multiple_of(2) {
+                        k + 1
+                    } else {
+                        k.wrapping_sub(1)
+                    };
+                    let ok = o.contains_key(&k)
+                        && !o.contains_key(&new)
+                        && o.range(..k).next_back().is_none_or(|(p, _)| *p < new)
+                        && o.range(k + 1..).next().is_none_or(|(n, _)| *n > new);
+                    assert_eq!(m.rekey(&k, new), ok);
+                    if ok {
+                        let v = o.remove(&k).unwrap();
+                        o.insert(new, v);
+                    }
+                }
                 6 => {
                     assert_eq!(m.get(&k), o.get(&k));
                     if let Some(v) = m.get_mut(&k) {

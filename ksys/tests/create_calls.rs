@@ -34,8 +34,7 @@ fn world(frames: usize) -> W {
     let first = ksys::process_create(&mut us, &mut mm, &mut jobs, &kernel, true, 0, 0, [0; 6]);
     // (no creator yet: process 0 does not exist)
     assert_eq!(first, Err(Status::BadState));
-    us.procs
-        .insert(1, Box::new(blank(&mut mm, &kernel, JobId::ROOT)));
+    ksys::put_process(&mut us.procs, 1, blank(&mut mm, &kernel, JobId::ROOT));
     W {
         us,
         jobs,

@@ -246,18 +246,17 @@ pub fn thread_spawn<M: PhysMem>(
     let mut top = caller_sp;
     if let Some(region) = place {
         let tables = stack_len / 4096 / 512 + 4;
-        let undo =
-            |made: Option<(Handle, ObjId)>,
-             procs: &mut alloc::collections::BTreeMap<u64, alloc::boxed::Box<crate::Process>>,
-             objs: &mut kcore::ipc::Kobjs,
-             jobs: &mut Jobs| {
-                if let Some((h, _)) = made {
-                    if let Some(c) = procs.get_mut(&me) {
-                        let _ = c.handles.close(objs, h);
-                    }
+        let undo = |made: Option<(Handle, ObjId)>,
+                    procs: &mut crate::ProcTable,
+                    objs: &mut kcore::ipc::Kobjs,
+                    jobs: &mut Jobs| {
+            if let Some((h, _)) = made {
+                if let Some(c) = procs.get_mut(&me) {
+                    let _ = c.handles.close(objs, h);
                 }
-                credit_thread(jobs, tjob);
-            };
+            }
+            credit_thread(jobs, tjob);
+        };
         if let Err(e) = jobs.charge(tjob, Resource::Pages, tables) {
             undo(made, procs, objs, jobs);
             return Err(crate::job_status(e));
@@ -266,6 +265,18 @@ pub fn thread_spawn<M: PhysMem>(
             undo(made, procs, objs, jobs);
             jobs.credit(tjob, Resource::Pages, tables);
             return Err(e);
+        }
+        // (KT9: the room for the stack's page-table charge record, before the VMO exists)
+        if procs
+            .get_mut(&tpid)
+            .expect("target exists")
+            .table_charge
+            .reserve(1)
+            .is_err()
+        {
+            undo(made, procs, objs, jobs);
+            jobs.credit(tjob, Resource::Pages, tables);
+            return Err(Status::NoMemory);
         }
         let vmo = vmos.create_in(jobs, stack_len / 4096, tjob);
         let perms = Perms {
@@ -291,7 +302,7 @@ pub fn thread_spawn<M: PhysMem>(
                 _ => Status::InvalidArgs,
             });
         }
-        t.table_charge.insert(region, tables);
+        t.table_charge.insert_reserved(region, tables);
         t.stack_hint = region + stack_len;
         stack = Some(crate::SpawnStack { region, vmo });
         top = region + stack_len;
@@ -387,15 +398,13 @@ pub fn process_start(
     // was (SYSCALLS.md: on any error nothing changes), or a retry would find handle 1 taken.
     charge_thread(jobs, tjob).map_err(crate::job_status)?;
     // (room in the target's table first, in memory: the handle is moved only when its arrival cannot fail)
-    if let Err(e) = us
-        .procs
-        .get_mut(&tpid)
-        .expect("target exists")
-        .handles
-        .reserve(1)
     {
-        credit_thread(jobs, tjob);
-        return Err(e);
+        let t = us.procs.get_mut(&tpid).expect("target exists");
+        // (and, KT9, the records of the library's page-table charge: made after the mapping, with nothing to allocate)
+        if let Err(e) = t.handles.reserve(1).and_then(|()| t.reserve_charge()) {
+            credit_thread(jobs, tjob);
+            return Err(e);
+        }
     }
     // AB7: the system library goes into the address space now, while an error can still undo it (the charge for its page tables as the mappings of
     // `process_map` are charged: its span's worth, recorded like theirs).
@@ -454,10 +463,7 @@ pub fn process_start(
     target.start_sp = sp;
     target.libsys = lib;
     if tables > 0 {
-        target.table_charge.insert(lib.base, tables);
-        target
-            .charge_end
-            .insert(lib.base, lib.base.saturating_add(span));
+        target.add_charge(lib.base, tables, lib.base.saturating_add(span));
     }
     target.state = crate::ProcState::Running;
     target.threads_alive = 1;

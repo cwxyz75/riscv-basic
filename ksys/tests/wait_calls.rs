@@ -73,7 +73,7 @@ fn world() -> W {
         libsys: Default::default(),
     };
     let mut us = UserState::new();
-    us.procs.insert(1, Box::new(p));
+    ksys::put_process(&mut us.procs, 1, p);
     W {
         us,
         vmos,

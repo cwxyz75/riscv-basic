@@ -41,8 +41,8 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         threads_alive: 0,
         thread_objs: BTreeMap::new(),
         job,
-        table_charge: BTreeMap::new(),
-        charge_end: BTreeMap::new(),
+        table_charge: kcore::fmap::FMap::new(),
+        charge_end: kcore::fmap::FMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
@@ -69,10 +69,8 @@ fn world() -> W {
     let mut us = UserState::new();
     let mut jobs = kcore::job::Jobs::new();
     let child = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    us.procs
-        .insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
-    us.procs
-        .insert(2, Box::new(process(&mut mm, &kernel, child)));
+    ksys::put_process(&mut us.procs, 1, process(&mut mm, &kernel, JobId::ROOT));
+    ksys::put_process(&mut us.procs, 2, process(&mut mm, &kernel, child));
     fn q(jobs: &mut kcore::job::Jobs) -> Quota<'_> {
         Quota {
             jobs,

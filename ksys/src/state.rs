@@ -1,8 +1,7 @@
 //! The state of user mode (TS3): the kernel objects, the processes, the threads' starts, the wait tables, and the kernel's own handles. The
 //! syscall functions that act on it take `&mut UserState` and what the machine provides, so they run on the host.
 
-use crate::proc::{Process, SpawnStack};
-use alloc::boxed::Box;
+use crate::proc::SpawnStack;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -44,7 +43,10 @@ pub struct UserState {
     /// The system-wide ceilings (PL8): processes and user threads are checked against them, the object and IPC ones live in the registry.
     pub backstops: kcore::limits::Backstops,
     pub objs: Kobjs,
-    pub procs: BTreeMap<u64, Box<Process>>,
+    pub procs: crate::ProcTable,
+    /// Vacant address-space cells, made at boot (KT9, T177: an `Arc` cannot be made fallibly, so `process_create` arms one of these and teardown gives it
+    /// back). Its capacity never changes after `fill_as_pool`.
+    pub as_pool: Vec<alloc::sync::Arc<klock::aslock::AsCell>>,
     pub thread_pid: BTreeMap<Tid, u64>,
     /// The `channel_call` each thread is waiting in, by call number (L22): set when the request is sent, cleared when the call ends. A server that
     /// reads a request is lent the caller's priority only while this still says the caller waits in **that** call.
@@ -109,6 +111,23 @@ pub struct UserState {
 }
 
 impl UserState {
+    /// Make `n` vacant address-space cells for `process_create` (boot, and the host tests' worlds: an allocation failure there is a failure to start).
+    pub fn fill_as_pool(&mut self, n: usize) {
+        self.as_pool
+            .reserve_exact(n.saturating_sub(self.as_pool.len()));
+        while self.as_pool.len() < n {
+            self.as_pool
+                .push(alloc::sync::Arc::new(klock::aslock::AsCell::vacant()));
+        }
+    }
+
+    /// Give a cell back to the pool (its space was taken out: `AsCell::vacate`). The pool's capacity was made by `fill_as_pool`, so this allocates nothing.
+    pub fn return_as_cell(&mut self, cell: alloc::sync::Arc<klock::aslock::AsCell>) {
+        if self.as_pool.len() < self.as_pool.capacity() {
+            self.as_pool.push(cell);
+        }
+    }
+
     /// Start a sweep with its roots to be shaded a process table per slice (T206; `sweep_slice` does it): false if one runs.
     pub fn sweep_start(&mut self) -> bool {
         // (T177: the room first; with none, no sweep starts, which is safe: it only means garbage floats until the next one)
@@ -170,9 +189,10 @@ impl UserState {
     }
 
     pub fn new() -> UserState {
-        UserState {
+        let mut s = UserState {
             objs: Kobjs::new(),
-            procs: BTreeMap::new(),
+            procs: kcore::fmap::FMap::new(),
+            as_pool: Vec::new(),
             thread_pid: BTreeMap::new(),
             calls: BTreeMap::new(),
             next_call: 1,
@@ -205,7 +225,10 @@ impl UserState {
             line: String::new(),
             pass: 0,
             fail: 0,
-        }
+        };
+        // (the host tests' worlds and the kernel until it knows its RAM: a few vacant cells; the kernel refills to its process backstop)
+        s.fill_as_pool(16);
+        s
     }
 }
 

@@ -1168,7 +1168,7 @@ fn dispatch_in(
         irq_objs,
         ..
     } = s;
-    let p = procs.get_mut(&pid).expect("process exists");
+    let p: &mut ksys::Process = procs.get_mut(&pid).expect("process exists");
     let h = |i: usize| Handle(a[i]);
     // The syscall layer that needs no machine is in the `ksys` crate (TS3): the width check of the 32-bit arguments first, then the calls
     // on handles, events, channels, sockets and ports, over this machine's memory.

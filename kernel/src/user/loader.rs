@@ -131,8 +131,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         threads_alive: 1,
         thread_objs: BTreeMap::new(),
         job: JobId::ROOT,
-        table_charge: BTreeMap::new(),
-        charge_end: BTreeMap::new(),
+        table_charge: kcore::fmap::FMap::new(),
+        charge_end: kcore::fmap::FMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: super::calls::random_stack_hint(),
         privileged: true,
@@ -183,7 +183,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             let jobs = &mut *k.jobs;
             let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
             let _ = charge_thread(jobs, JobId::ROOT);
-            s.procs.insert(pid, Box::new(process));
+            ksys::put_process(&mut s.procs, pid, process);
             let token = new_start(s, pid, entry, stack_top, arg, None);
             if let Some(t) = s.starts.get_mut(&token) {
                 t.a2 = lib.base;

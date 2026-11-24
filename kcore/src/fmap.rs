@@ -219,6 +219,41 @@ impl<K: Ord + Copy, V> FMap<K, V> {
         }
     }
 
+    /// Change the key of an entry in place (never allocates). `new` must keep the order: it lies between the keys on either side of `old`, as when
+    /// a region's start moves up inside its own gap. Returns false (nothing changed) if `old` is absent or `new` would break the order.
+    pub fn rekey(&mut self, old: &K, new: K) -> bool {
+        let Some((ci, i)) = self.find(old) else {
+            return false;
+        };
+        let prev = if i > 0 {
+            self.chunks[ci].get(i - 1).map(|e| e.0)
+        } else if ci > 0 {
+            self.chunks[ci - 1].last().map(|e| e.0)
+        } else {
+            None
+        };
+        let next = self.chunks[ci]
+            .get(i + 1)
+            .map(|e| e.0)
+            .or_else(|| self.chunks.get(ci + 1).and_then(|c| c.first()).map(|e| e.0));
+        if prev.is_some_and(|p| p >= new) || next.is_some_and(|n| n <= new) {
+            return false;
+        }
+        self.chunks[ci][i].0 = new;
+        true
+    }
+
+    /// Every entry, mutably, in key order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.chunks
+            .iter_mut()
+            .flat_map(|c| c.iter_mut().map(|e| (&e.0, &mut e.1)))
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.iter_mut().map(|(_, v)| v)
+    }
+
     pub fn clear(&mut self) {
         while let Some(c) = self.chunks.pop() {
             self.give_back(c);
@@ -343,5 +378,14 @@ impl<K: Ord + Copy> FSet<K> {
     }
     pub fn clear(&mut self) {
         self.0.clear()
+    }
+}
+
+impl<K: Ord + Copy, V> core::ops::Index<&K> for FMap<K, V> {
+    type Output = V;
+    /// The value for `k`; panics if there is none (as `BTreeMap`'s index does).
+    #[allow(clippy::expect_used)] // INVARIANT: the documented contract of an index
+    fn index(&self, k: &K) -> &V {
+        self.get(k).expect("no entry for the key")
     }
 }

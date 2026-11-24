@@ -16,7 +16,6 @@ use crate::job::{JobId, Jobs, Resource};
 use crate::pagemap::{Entry, PageMap};
 use crate::pagetable::{MapError, PageTable, PageTableFormat, Perms, PhysMem, Sv39};
 use crate::Mm;
-use alloc::collections::BTreeMap;
 
 /// The kind of access that faulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1830,7 +1829,7 @@ impl Reservation {
 /// A page table plus the regions that say what its holes mean.
 pub struct AddressSpace<F: PageTableFormat = Sv39> {
     table: PageTable<F>,
-    regions: BTreeMap<u64, Region>,
+    regions: crate::fmap::FMap<u64, Region>,
     /// The prepaid pages the fault path spends (L16).
     reserve: Reservation,
     /// The generation the next region gets (see `Region::gen`).
@@ -1842,10 +1841,15 @@ pub struct AddressSpace<F: PageTableFormat = Sv39> {
 }
 
 impl<F: PageTableFormat> AddressSpace<F> {
+    /// An address space with a vacant table and no regions (the placeholder of a pooled cell, see `PageTable::vacant`).
+    pub fn vacant() -> AddressSpace<F> {
+        AddressSpace::new(PageTable::vacant())
+    }
+
     pub fn new(table: PageTable<F>) -> AddressSpace<F> {
         AddressSpace {
             table,
-            regions: BTreeMap::new(),
+            regions: crate::fmap::FMap::new(),
             reserve: Reservation::default(),
             next_gen: 1,
             replaced: 0,
@@ -1933,6 +1937,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if self.regions.len() >= self.region_limit {
             return Err(RegionError::TooMany);
         }
+        // (KT9: the room for the entry before anything changes; no memory is `TooMany` as well, and reaches the caller as NO_MEMORY just the same)
+        self.regions.reserve(1).map_err(|_| RegionError::TooMany)?;
         // Overlap with the previous region or any region starting inside this one.
         if let Some((&s, r)) = self.regions.range(..=start).next_back() {
             if s + r.pages * PAGE_SIZE > start {
@@ -1944,7 +1950,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         // (the region holds a reference on its VMO until it goes: L15)
         vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
-        self.regions.insert(
+        self.regions.insert_reserved(
             start,
             Region {
                 pages,
@@ -2074,6 +2080,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         let lower_pages = (va - start) / PAGE_SIZE;
         let (vmo, vmo_page, perms, max_perms, pages) =
             (r.vmo, r.vmo_page, r.perms, r.max_perms, r.pages);
+        self.regions.reserve(1).map_err(|_| RegionError::TooMany)?;
         vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
         let (lower_gen, upper_gen) = (self.next_gen, self.next_gen.saturating_add(1));
         self.next_gen = self.next_gen.saturating_add(2);
@@ -2081,7 +2088,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
             low.pages = lower_pages;
             low.gen = lower_gen;
         }
-        self.regions.insert(
+        self.regions.insert_reserved(
             va,
             Region {
                 pages: pages - lower_pages,
@@ -2652,15 +2659,18 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 }
             }
             budget -= n;
-            let Some(mut region) = self.regions.remove(&start) else {
+            let Some(r) = self.regions.get_mut(&start) else {
                 return true;
             };
-            if n == region.pages {
-                let _ = vmos.release(mm, jobs, region.vmo);
+            if n == r.pages {
+                if let Some(region) = self.regions.remove(&start) {
+                    let _ = vmos.release(mm, jobs, region.vmo);
+                }
             } else {
-                region.pages -= n;
-                region.vmo_page += n;
-                self.regions.insert(start + n * PAGE_SIZE, region);
+                r.pages -= n;
+                r.vmo_page += n;
+                // (the region's start moves up inside its own gap: the same entry under a new key, which allocates nothing)
+                self.regions.rekey(&start, start + n * PAGE_SIZE);
             }
         }
         self.regions.is_empty()

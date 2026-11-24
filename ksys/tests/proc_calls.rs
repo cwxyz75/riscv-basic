@@ -57,7 +57,7 @@ impl Machine for Tlb {
 
 struct W {
     objs: Kobjs,
-    procs: BTreeMap<u64, Box<Process>>,
+    procs: ksys::ProcTable,
     mm: Mm<FakeMem>,
     vmos: Vmos,
     jobs: kcore::job::Jobs,
@@ -88,8 +88,8 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         threads_alive: 0,
         thread_objs: BTreeMap::new(),
         job,
-        table_charge: BTreeMap::new(),
-        charge_end: BTreeMap::new(),
+        table_charge: kcore::fmap::FMap::new(),
+        charge_end: kcore::fmap::FMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
@@ -104,9 +104,9 @@ fn world() -> (W, u64) {
         mem: FakeMem::default(),
     };
     let kernel = PageTable::new(&mut mm).unwrap();
-    let mut procs = BTreeMap::new();
-    procs.insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
-    procs.insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
+    let mut procs = kcore::fmap::FMap::new();
+    ksys::put_process(&mut procs, 1, process(&mut mm, &kernel, JobId::ROOT));
+    ksys::put_process(&mut procs, 2, process(&mut mm, &kernel, JobId::ROOT));
     let mut w = W {
         objs: Kobjs::new(),
         procs,
