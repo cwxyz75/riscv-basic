@@ -170,6 +170,8 @@ pub enum VmoError {
     NotSuppliable,
     /// Make the child of a device or DMA VMO: their frames are fixed.
     NotCopyable,
+    /// A chunked decommit or shrink of the VMO is under way (T207 PR 3a): try again.
+    Busy,
 }
 
 /// A chain of children is at most this deep (KERNEL-V1-SPEC 4.3).
@@ -212,6 +214,19 @@ pub enum VmoKind {
     Dma,
 }
 
+/// The pages one step of a chunked decommit takes at most.
+pub const RANGE_STEP: usize = 64;
+
+/// What one `range_step` did: it took the pages `lo .. next` (`n` frames, in the caller's batch), and `done` when nothing is left.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeStep {
+    pub lo: u64,
+    pub next: u64,
+    pub n: usize,
+    pub done: bool,
+    pub err: Option<VmoError>,
+}
+
 struct Vmo {
     kind: VmoKind,
     /// The job charged for this VMO's committed pages (it holds one use of it).
@@ -240,6 +255,9 @@ struct Vmo {
     /// The regions that map this VMO (T207 ML1): (the address space's owner id, the region's base) to what the region maps. Kept by `AddressSpace`
     /// under its own lock and the VMO store's, so a holder of either sees its side stable. `refs` counts one reference for each entry.
     maps: crate::fmap::FMap<(u64, u64), MapRef>,
+    /// A chunked `decommit` or shrink is under way (T207 PR 3a): the pages from `.0` to `.1` are still to go. The VMO is refused to another such call,
+    /// to a child, to a supply and to a foreign mapping until it ends (`Vmos::range_end`).
+    busy: Option<(u64, u64)>,
 }
 
 impl Vmo {
@@ -546,6 +564,7 @@ impl Vmos {
             hidden: false,
             had_parent: false,
             maps: crate::fmap::FMap::new(),
+            busy: None,
             pager: None,
             inherit: 0,
         })
@@ -568,6 +587,7 @@ impl Vmos {
             hidden: false,
             had_parent: false,
             maps: crate::fmap::FMap::new(),
+            busy: None,
             pager: None,
             inherit: 0,
         })
@@ -624,6 +644,7 @@ impl Vmos {
             hidden: false,
             had_parent: false,
             maps: crate::fmap::FMap::new(),
+            busy: None,
             pager: None,
             inherit: 0,
         }))
@@ -780,6 +801,9 @@ impl Vmos {
             return Err(VmoError::NotSuppliable);
         }
         let s = self.vmo(src).ok_or(VmoError::Gone)?;
+        if d.busy.is_some() || s.busy.is_some() {
+            return Err(VmoError::Busy);
+        }
         if s.kind != VmoKind::Plain
             || s.pager.is_some()
             || s.parent.is_some()
@@ -1027,6 +1051,9 @@ impl Vmos {
         if src.kind != VmoKind::Plain || src.hidden {
             return Err(VmoError::NotCopyable);
         }
+        if src.busy.is_some() {
+            return Err(VmoError::Busy);
+        }
         let end = offset.checked_add(pages).ok_or(VmoError::OutOfRange)?;
         if pages == 0 || end > src.pages {
             return Err(VmoError::OutOfRange);
@@ -1089,6 +1116,7 @@ impl Vmos {
             hidden: false,
             had_parent: false,
             maps: crate::fmap::FMap::new(),
+            busy: None,
             pager: None,
             inherit: 0,
         }))
@@ -1158,6 +1186,7 @@ impl Vmos {
                         hidden: true,
                         had_parent: old_parent.is_some(),
                         maps: crate::fmap::FMap::new(),
+                        busy: None,
                         pager: None,
                         inherit: old_inherit,
                     });
@@ -1688,11 +1717,152 @@ impl Vmos {
         self.vmo(id).is_some_and(|v| v.resizable)
     }
 
+    /// Is a chunked decommit or shrink of the VMO under way?
+    pub fn is_busy(&self, id: u64) -> bool {
+        self.vmo(id).is_some_and(|v| v.busy.is_some())
+    }
+
+    /// Start taking the pages `first .. end` from a plain VMO (a decommit), or, with `shrink_to`, change its size to that and take the tail
+    /// `first .. end` (`first` is the new size, `end` the old). Checks everything a call can be refused for and changes nothing on a refusal;
+    /// then, when there are pages to take, the VMO is **busy** until `range_end`. Growing (`first == end`) changes the size and takes nothing.
+    /// Returns whether there are pages to take. `Busy` when another such call is under way.
+    pub fn range_begin(
+        &mut self,
+        id: u64,
+        first: u64,
+        end: u64,
+        shrink_to: Option<u64>,
+    ) -> Result<bool, VmoError> {
+        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
+        match vmo.kind {
+            VmoKind::Device => return Err(VmoError::Device),
+            VmoKind::Dma => return Err(VmoError::Fixed),
+            VmoKind::Plain => {}
+        }
+        if shrink_to.is_some() {
+            if !vmo.resizable {
+                return Err(VmoError::NotResizable);
+            }
+            if !vmo.children.is_empty() {
+                return Err(VmoError::HasChildren);
+            }
+        } else if end > vmo.pages || first > end {
+            return Err(VmoError::OutOfRange);
+        }
+        if vmo.busy.is_some() {
+            return Err(VmoError::Busy);
+        }
+        let Some(v) = Self::vmo_in(&mut self.slots, id) else {
+            return Err(VmoError::Gone);
+        };
+        if let Some(new) = shrink_to {
+            // (the new size is in force at once: a touch past it is refused; the pages past it go in the steps)
+            v.pages = new;
+            v.inherit = v.inherit.min(new);
+        }
+        if first < end {
+            v.busy = Some((first, end));
+        }
+        Ok(first < end)
+    }
+
+    /// One step of the call `range_begin` started: take at most `out.len()` of the pages from the cursor on. The frames the VMO held there leave
+    /// its index (and the leaves they emptied are credited) into `out`; **they are still allocated**: the caller unmaps `lo .. next` from every
+    /// address space, has every hart drop its translations, and then `range_free`s them, all before it lets go of its locks. A page of a VMO that
+    /// inherits, inside the window it inherits, becomes an explicit hole (it reads zeros whatever the parent shows now or later); any other page
+    /// goes with its slot. A hole that needs a new leaf may find no memory: the step stops there (`err`), with what it did.
+    pub fn range_step(
+        &mut self,
+        jobs: &mut Jobs,
+        id: u64,
+        out: &mut [Pfn],
+    ) -> Result<RangeStep, VmoError> {
+        let Some(v) = Self::vmo_in(&mut self.slots, id) else {
+            return Err(VmoError::Gone);
+        };
+        let Some((lo, end)) = v.busy else {
+            return Err(VmoError::OutOfRange);
+        };
+        // (read again at every step: a merge between two of them can change what the VMO inherits)
+        let (has_parent, inherit) = (v.parent.is_some(), v.inherit);
+        let mut n = 0usize;
+        let mut at = lo;
+        let mut err = None;
+        if has_parent && at < inherit {
+            let stop = end.min(inherit).min(at.saturating_add(out.len() as u64));
+            while at < stop {
+                if v.committed.entry(at) == Entry::None && v.put(jobs, at, None).is_err() {
+                    err = Some(VmoError::NoMemory);
+                    break;
+                }
+                if let Some(pfn) = v.committed.make_hole(at) {
+                    if let Some(slot) = out.get_mut(n) {
+                        *slot = pfn;
+                        n = n.saturating_add(1);
+                    }
+                }
+                at = at.saturating_add(1);
+            }
+        } else {
+            let mut entries = 0usize;
+            while at < end && entries < out.len() {
+                let Some((pg, _)) = v.committed.next_entry_at_or_after(at) else {
+                    at = end;
+                    break;
+                };
+                if pg >= end {
+                    at = end;
+                    break;
+                }
+                if let Entry::Frame(pfn) = v.clear_page(jobs, pg) {
+                    if let Some(slot) = out.get_mut(n) {
+                        *slot = pfn;
+                        n = n.saturating_add(1);
+                    }
+                }
+                entries = entries.saturating_add(1);
+                at = pg.saturating_add(1);
+            }
+        }
+        let done = err.is_none() && at >= end;
+        v.busy = Some((at, end));
+        Ok(RangeStep {
+            lo,
+            next: at,
+            n,
+            done,
+            err,
+        })
+    }
+
+    /// Give back the frames a step took (the caller has unmapped them everywhere and shot the translations down): the VMO's job is credited.
+    pub fn range_free<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+        frames: &[Pfn],
+    ) {
+        for &pfn in frames {
+            let _ = mm.db.dec(pfn);
+        }
+        if let Some(job) = self.vmo(id).map(|v| v.job) {
+            jobs.credit(job, Resource::Pages, frames.len() as u64);
+        }
+    }
+
+    /// The call is over (done, or stopped by an error): the VMO is free for the next. Harmless when the VMO is gone.
+    pub fn range_end(&mut self, id: u64) {
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            v.busy = None;
+        }
+    }
+
     /// Give back the committed pages of `first .. first + pages` (MM6): the VMO drops its reference on each frame and its job is credited.
     /// **The caller has already unmapped the range from every address space** (`AddressSpace::unmap_vmo_pages`) and shot the other harts'
     /// translations down: a frame a mapping still holds would otherwise stay readable and survive. The pages read as zeros afterwards (a
     /// fresh page is committed on the next touch). Returns how many pages were freed. Plain VMOs only (device memory and DMA frames are
-    /// fixed).
+    /// fixed). Done in steps of `RANGE_STEP` pages; a hole that finds no memory stops the call with `NoMemory`, the pages before it done.
     pub fn decommit<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -1701,64 +1871,40 @@ impl Vmos {
         first: u64,
         pages: u64,
     ) -> Result<u64, VmoError> {
-        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
-        match vmo.kind {
-            VmoKind::Device => return Err(VmoError::Device),
-            VmoKind::Dma => return Err(VmoError::Fixed),
-            VmoKind::Plain => {}
-        }
         let end = first.checked_add(pages).ok_or(VmoError::OutOfRange)?;
-        if end > vmo.pages {
-            return Err(VmoError::OutOfRange);
+        if !self.range_begin(id, first, end, None)? {
+            return Ok(0);
         }
-        let (job, has_parent, inherit) = (vmo.job, vmo.parent.is_some(), vmo.inherit);
-        // A page of a VMO that inherits, inside the window it inherits, becomes an explicit hole: it reads zeros whatever the parent
-        // shows now or later (and costs nothing). Any other page just goes. Holes that need a new slot are made first, so that the
-        // call is all or nothing.
-        let in_window = |p: u64| has_parent && p < inherit;
-        let mut made: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        if has_parent {
-            let needed = (first..end.min(inherit))
-                .filter(|&p| {
-                    self.vmo(id)
-                        .is_some_and(|v| v.committed.entry(p) == Entry::None)
-                })
-                .count();
-            made.try_reserve_exact(needed)
-                .map_err(|_| VmoError::NoMemory)?;
-            for page in first..end.min(inherit) {
-                let Some(v) = Self::vmo_in(&mut self.slots, id) else {
-                    return Err(VmoError::Gone);
-                };
-                if v.committed.entry(page) == Entry::None {
-                    if v.put(jobs, page, None).is_err() {
-                        for p in made {
-                            v.clear_page(jobs, p);
-                        }
-                        return Err(VmoError::NoMemory);
-                    }
-                    made.push(page);
-                }
-            }
-        }
+        self.range_run(mm, jobs, id)
+    }
+
+    /// Run the steps of a call `range_begin` started to the end (nothing to unmap: the caller did it, or the VMO is not mapped).
+    fn range_run<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+    ) -> Result<u64, VmoError> {
         let mut freed = 0u64;
-        let Some(vmo) = Self::vmo_in(&mut self.slots, id) else {
-            return Err(VmoError::Gone);
-        };
-        for page in first..end {
-            // (a hole stays a hole inside the window and its leaf stays; outside, a frame goes and its leaf with it when it was the last)
-            let frame = if in_window(page) {
-                vmo.committed.make_hole(page)
-            } else {
-                vmo.clear_page(jobs, page).frame()
-            };
-            if let Some(pfn) = frame {
-                let _ = mm.db.dec(pfn);
-                freed = freed.saturating_add(1);
+        let mut batch = [0 as Pfn; RANGE_STEP];
+        let r = loop {
+            match self.range_step(jobs, id, &mut batch) {
+                Ok(st) => {
+                    let got = batch.get(..st.n).unwrap_or(&[]);
+                    self.range_free(mm, jobs, id, got);
+                    freed = freed.saturating_add(st.n as u64);
+                    if let Some(e) = st.err {
+                        break Err(e);
+                    }
+                    if st.done {
+                        break Ok(freed);
+                    }
+                }
+                Err(e) => break Err(e),
             }
-        }
-        jobs.credit(job, Resource::Pages, freed);
-        Ok(freed)
+        };
+        self.range_end(id);
+        r
     }
 
     /// Change the size of a resizable VMO to `pages` (MM6). Growing changes the size only (nothing is committed; what a grown child can
@@ -1772,38 +1918,11 @@ impl Vmos {
         id: u64,
         pages: u64,
     ) -> Result<(), VmoError> {
-        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
-        match vmo.kind {
-            VmoKind::Device => return Err(VmoError::Device),
-            VmoKind::Dma => return Err(VmoError::Fixed),
-            VmoKind::Plain => {}
+        let old = self.vmo(id).ok_or(VmoError::Gone)?.pages;
+        if !self.range_begin(id, pages.min(old), old, Some(pages))? {
+            return Ok(());
         }
-        if !vmo.resizable {
-            return Err(VmoError::NotResizable);
-        }
-        if !vmo.children.is_empty() {
-            return Err(VmoError::HasChildren);
-        }
-        let (job, old) = (vmo.job, vmo.pages);
-        let mut freed = 0u64;
-        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
-            let mut at = pages;
-            while at < old {
-                let Some((pg, _)) = v.committed.next_entry_at_or_after(at) else {
-                    break;
-                };
-                // (a hole past the new end goes as well: it shadows nothing there, and its leaf is charged)
-                if let Some(pfn) = v.clear_page(jobs, pg).frame() {
-                    let _ = mm.db.dec(pfn);
-                    freed = freed.saturating_add(1);
-                }
-                at = pg.saturating_add(1);
-            }
-            v.pages = pages;
-            v.inherit = v.inherit.min(pages);
-        }
-        jobs.credit(job, Resource::Pages, freed);
-        Ok(())
+        self.range_run(mm, jobs, id).map(|_| ())
     }
 
     /// The job a VMO's pages are charged to.
