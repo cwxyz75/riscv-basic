@@ -4,7 +4,6 @@ kind: slice
 title: Limits derived from RAM; per-process ceilings become quotas
 area: kernel
 horizon: long
-blocked_by: [MM4]
 refs: [KERNEL-V1-SPEC, OD135]
 ---
 
