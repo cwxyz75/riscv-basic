@@ -426,6 +426,7 @@ pub fn vmo_range_step<M: PhysMem, X: Machine>(
 }
 
 /// `vmo_decommit` / `vmo_set_size` without a switch point between the steps (the host tests, where nothing else runs).
+#[inline(never)] // (KT13: its batch and cursors would otherwise sit in the frame of `proc_call`, and so on the stack of every call)
 fn vmo_range_all<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, n: usize, a: [u64; 6]) -> Reply {
     let call = match vmo_range_begin(c, n, a) {
         Ok(Some(call)) => call,
@@ -568,6 +569,7 @@ pub fn process_unmap_end<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, call: U
 }
 
 /// `process_unmap` without a switch point between the steps (the host tests).
+#[inline(never)] // (KT13: its batch and cursors would otherwise sit in the frame of `proc_call`, and so on the stack of every call)
 fn process_unmap_all<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, a: [u64; 6]) -> Reply {
     let call = process_unmap_begin(c, a).map_err(e)?;
     let r = loop {
@@ -700,6 +702,7 @@ pub fn process_protect_end<M: PhysMem, X: Machine>(
     }
 }
 
+#[inline(never)] // (KT13: its batch and cursors would otherwise sit in the frame of `proc_call`, and so on the stack of every call)
 fn process_protect_all<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
     n: usize,

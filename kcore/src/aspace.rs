@@ -2487,10 +2487,24 @@ impl<F: PageTableFormat> AddressSpace<F> {
         self.owner
     }
 
-    /// `set_owner` for a space that has no region yet (a process being created).
+    /// `set_owner` for a space that has no region yet (the host tests; the kernel builds with `new_owned`).
     pub fn set_owner_fresh(&mut self, owner: u64) {
         debug_assert!(self.regions.is_empty());
         self.owner = owner;
+    }
+
+    /// A space whose owner id is the process id from the start (a process being created): built in one expression, so that a debug build does not
+    /// keep a second copy of the space on the stack of `process_create` (KT13: the deepest path in the system).
+    pub fn new_owned(table: PageTable<F>, owner: u64) -> AddressSpace<F> {
+        AddressSpace {
+            table,
+            regions: crate::fmap::FMap::new(),
+            reserve: Reservation::default(),
+            next_gen: 1,
+            replaced: 0,
+            region_limit: abi::limits::MAX_REGIONS,
+            owner,
+        }
     }
 
     /// Make the process id the owner id of this space (T207 PR 3d): a VMO's list of mappings then names processes. The mappings it has already

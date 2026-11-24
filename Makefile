@@ -209,7 +209,7 @@ os-ktest-4: kernel-main
 OS_KBIG_ELF := target/os-kbig/$(KERNEL_TARGET)/debug/kernel
 os-ktest-big: os-user
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-kbig
-	OS_RAM=4G OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=300 python3 scripts/os_boot_test.py $(OS_KBIG_ELF)
+	OS_RAM=4G OS_KFAST=1 OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=300 python3 scripts/os_boot_test.py $(OS_KBIG_ELF)
 
 OS_KREL_ELF := target/os-krelease/$(KERNEL_TARGET)/release/kernel
 os-ktest-release:
