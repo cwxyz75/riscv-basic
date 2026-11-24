@@ -1033,7 +1033,6 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
                 n,
                 nr::EXCEPTION_RESUME
                     | nr::THREAD_RESUME
-                    | nr::PAGER_CREATE
                     | nr::PAGER_SUPPLY
                     | nr::PAGER_FAIL
                     | nr::PAGER_QUERY_DIRTY
