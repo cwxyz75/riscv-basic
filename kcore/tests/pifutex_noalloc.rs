@@ -97,7 +97,7 @@ fn hand_over_cancel_and_death_allocate_nothing_once_queued() {
         let keys: Vec<(u64, u64)> = (0..3).map(|k| (1, 0x1000 + k * 8)).collect();
         for _ in 0..300 {
             let (t, k) = (rng.below(8) + 1, rng.below(3) as usize);
-            match rng.below(5) {
+            match rng.below(6) {
                 0 | 1 => {
                     // (lock may allocate: it is the reportable step; a queued thread is blocked and calls nothing)
                     if pi.still_waiting(t) {
@@ -131,6 +131,30 @@ fn hand_over_cancel_and_death_allocate_nothing_once_queued() {
                     // (the ended waiters take their outcomes, as the woken threads do)
                     for w in 1..=8 {
                         pi.take_outcome(w);
+                    }
+                }
+                5 => {
+                    // an owner dies: its records end one at a time, with the word as it is or as someone else's
+                    if pi.still_waiting(t) {
+                        continue;
+                    }
+                    while let Some(key) = pi.first_owned_key(t) {
+                        let word = keys
+                            .iter()
+                            .position(|k| *k == key)
+                            .map(|i| words[i].0.get());
+                        let at = allocs();
+                        let poison = pi.owner_died_one(&mut d, t, key, word, &mut |_| {});
+                        assert_eq!(allocs() - at, 0, "owner_died_one");
+                        if poison {
+                            if let Some(i) = keys.iter().position(|k| *k == key) {
+                                PiFutexes::poison(&words[i]);
+                            }
+                        }
+                        pi.drain_wake_into(|_| {});
+                        for w in 1..=8 {
+                            pi.take_outcome(w);
+                        }
                     }
                 }
                 _ => {

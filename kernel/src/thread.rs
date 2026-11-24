@@ -1240,17 +1240,6 @@ pub fn pi_op<R>(
     f(&mut d, &mut |c| pi_apply(c))
 }
 
-/// `pi_op` for an operation that returns a list it built (the owner's death): applied after `f`, under the same hold.
-pub fn pi_op_vec<R>(
-    f: impl FnOnce(&mut kcore::donate::Donations) -> (R, alloc::vec::Vec<kcore::donate::Change>),
-) -> R {
-    debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
-    let mut d = PI.lock();
-    let (r, changes) = f(&mut d);
-    pi_apply(&changes);
-    r
-}
-
 /// `pi_op` for a graph operation that returns its (fixed-size) change list: applied from the list itself, nothing allocated.
 fn pi_op_changes<R>(
     f: impl FnOnce(&mut kcore::donate::Donations) -> (R, kcore::donate::Changes),
