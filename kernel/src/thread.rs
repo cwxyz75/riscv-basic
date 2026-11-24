@@ -373,6 +373,44 @@ pub fn join_scheduler() -> ! {
 /// A hart whose next timer event is further away than this (or has none) suspends through the firmware instead of `wfi` (PM2).
 const SUSPEND_AFTER: u64 = MS;
 
+/// `debug_stat` 209 to 213 (T213): sums over every hart of the counters a benchmark reads before and after (209 reschedule IPIs received, 210 retentive
+/// suspends, 211 halt idles, 212 nanoseconds idle), and 213 the idle policy a boot argument asked for.
+#[inline(never)]
+fn idle_stat(which: u64) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if which == 213 {
+        return u64::from(idle_mode());
+    }
+    (0..crate::percpu::MAX_HARTS)
+        .map(|h| {
+            let p = crate::percpu::hart(h);
+            match which {
+                209 => p.resched_ipis.load(Relaxed),
+                210 => p.idle_suspend.load(Relaxed),
+                211 => p.idle_wfi.load(Relaxed),
+                _ => p.idle_ns.load(Relaxed),
+            }
+        })
+        .sum()
+}
+
+/// The idle policy (T213 M4, controls that separate the emulator's halt cost from the kernel's): 0 the normal one, 1 `idle=nosuspend` (never the firmware's
+/// suspend), 2 `idle=spin` (never halt). Read from the command line once.
+fn idle_mode() -> u8 {
+    static MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
+    let m = MODE.load(Ordering::Relaxed);
+    if m != 255 {
+        return m;
+    }
+    let m = if crate::dtb::boot_arg_present("idle=spin") {
+        2
+    } else {
+        u8::from(crate::dtb::boot_arg_present("idle=nosuspend"))
+    };
+    MODE.store(m, Ordering::Relaxed);
+    m
+}
+
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
@@ -396,12 +434,19 @@ fn idle_main(_: usize) {
             irq::off(crate::heap::service); // an idle hart is a safe point too
         }
         let ev = program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
+        if idle_mode() == 2 {
+            // (`idle=spin`: look again at once, never halting)
+            irq::restore(was);
+            core::hint::spin_loop();
+            continue;
+        }
         let idle_from = now_ns();
         let me = crate::percpu::this();
         // A long idle (the next event more than `SUSPEND_AFTER` away, or none) goes through the firmware's retentive suspend; a short
         // one, or firmware without it, uses `wfi` (PM2, KERNEL-V1-SPEC 5.5). Both return when an interrupt is pending, with interrupts
         // off, which is the point of the protocol above (the architecture resumes on any pending and individually enabled interrupt).
-        if ev.is_none_or(|e| e > idle_from.saturating_add(SUSPEND_AFTER))
+        if idle_mode() == 0
+            && ev.is_none_or(|e| e > idle_from.saturating_add(SUSPEND_AFTER))
             && crate::smp::suspend_retentive()
         {
             me.idle_suspend.fetch_add(1, Ordering::Relaxed);
@@ -1661,6 +1706,9 @@ pub fn wake_stat(which: u64) -> u64 {
             dump_sched();
             0
         }
+        // (T213 M2: sums over every hart of the counters a benchmark reads before and after: 209 reschedule IPIs received, 210 retentive suspends,
+        // 211 `wfi` idles, 212 nanoseconds idle; 213 the idle policy a boot argument asked for: 0 normal, 1 `idle=nosuspend`, 2 `idle=spin`)
+        209..=213 => idle_stat(which),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

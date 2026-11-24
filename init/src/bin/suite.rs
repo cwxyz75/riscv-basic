@@ -15771,6 +15771,8 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
         }
     }
     nap_ticks(3); // everyone is at the gate
+                  // (T213 M2: what the harts did while the pairs ran: IPIs received, retentive suspends, `wfi` idles, idle time)
+    let stat0 = [209, 210, 211, 212].map(sys::debug_stat);
     let t0 = cycles();
     PS_GO.store(1, Ordering::SeqCst);
     sys::futex_wake(PS_GO.as_ptr(), u32::MAX);
@@ -15779,8 +15781,26 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
         ensure_eq!(w.status, 0, "a pair thread ended");
     }
     let c = cycles() - t0;
+    let stat1 = [209, 210, 211, 212].map(sys::debug_stat);
     let name = alloc::format!("pair_scaling_{kind}_n{pairs}");
-    let ns = bench_line(&name, c, u64::from(rounds) * pairs as u64);
+    let trips = u64::from(rounds) * pairs as u64;
+    let ns = bench_line(&name, c, trips);
+    // (per thousand round trips, so that a rate below one is not rounded away)
+    for (i, (what, unit)) in [
+        ("ipis", "per_1000_rt"),
+        ("suspends", "per_1000_rt"),
+        ("wfis", "per_1000_rt"),
+        ("idle_ns", "per_1000_rt"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let d = stat1[i].saturating_sub(stat0[i]);
+        println!(
+            "##BENCH ps_{kind}_n{pairs}_{what} {} {unit}",
+            d * 1000 / trips.max(1)
+        );
+    }
     for t in threads {
         sys::handle_close(t);
     }
