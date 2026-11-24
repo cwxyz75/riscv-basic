@@ -407,6 +407,8 @@ pub mod faultalloc {
     static FAIL_AT: AtomicU64 = AtomicU64::new(0);
     static COUNT: AtomicU64 = AtomicU64::new(0);
     static FIRED: AtomicBool = AtomicBool::new(false);
+    /// Counting and failing are suspended (a scenario sets up and tears down with memory, and arms only the call under test: `debug_stat` 207).
+    static PAUSED: AtomicBool = AtomicBool::new(false);
     /// Every class-R allocation from the Nth on fails, not just the Nth (what exhaustion with the reserve in force looks like, KT9).
     static PERSIST: AtomicBool = AtomicBool::new(false);
 
@@ -424,9 +426,15 @@ pub mod faultalloc {
         ARMED.store(crate::thread::current().saturating_add(1), Relaxed);
     }
 
+    /// Suspend (`true`) or resume (`false`) the armed thread's counting and failing.
+    pub fn pause(on: bool) {
+        PAUSED.store(on, Relaxed);
+    }
+
     /// Disarm; whether the failure was injected.
     pub fn disarm() -> bool {
         ARMED.store(0, Relaxed);
+        PAUSED.store(false, Relaxed);
         PERSIST.store(false, Relaxed);
         FIRED.load(Relaxed)
     }
@@ -438,7 +446,8 @@ pub mod faultalloc {
 
     pub(super) fn should_fail() -> bool {
         let armed = ARMED.load(Relaxed);
-        if armed == 0 || crate::thread::current().saturating_add(1) != armed {
+        if armed == 0 || PAUSED.load(Relaxed) || crate::thread::current().saturating_add(1) != armed
+        {
             return false;
         }
         // (class N is not refused by the reserve, so it is not failed here either: inside `nofail`, or with a scheduler lock held; not counted either, so

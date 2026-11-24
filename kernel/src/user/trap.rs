@@ -416,6 +416,11 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
                 crate::heap::faultalloc::arm_persist(a[2]);
                 return Ok((Some(0), None));
             }
+            // 207: suspend (`a2` = 1) or resume (0) counting and failing, so that a scenario arms only the call under test
+            207 => {
+                crate::heap::faultalloc::pause(a[2] != 0);
+                return Ok((Some(0), None));
+            }
             201 => return Ok((Some(u64::from(crate::heap::faultalloc::disarm())), None)),
             202 => return Ok((Some(crate::heap::faultalloc::count()), None)),
             // 205: run a whole reachability sweep now (a destruction that found no memory leaks its objects until one runs: KT9)

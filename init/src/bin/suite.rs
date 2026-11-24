@@ -5616,28 +5616,33 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
 
 /// What the last run of the sweep's map scenario saw (statuses packed by the scenario: printing inside it would add allocations to the count).
 static TRACE: AtomicU64 = AtomicU64::new(0);
+/// Set by a sweep scenario that lost something the failing allocation must not lose (a wakeup).
+static SWEEP_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// `debug_stat` for the allocation-failure sweep and its scenarios (which are plain functions and cannot capture a closure).
+fn sweep_stat(which: u64, arg: u64) -> u64 {
+    use rt::abi::syscall as nr;
+    let r = rt::syscall(
+        nr::DEBUG_STAT,
+        [
+            rt::debug::handle() as usize,
+            which as usize,
+            arg as usize,
+            0,
+            0,
+            0,
+        ],
+    );
+    // (a refused call must not read as a zero: that would end a scenario early or skip the test)
+    assert_eq!(r.status, 0, "debug_stat {which} refused");
+    r.a1 as u64
+}
 
 /// KT9, the guest half: with the kernel built with `fault-alloc` (`make os-allocfail`), fail the Nth kernel heap allocation of each scenario, for N = 1, 2, ...
 /// until the scenario completes with no failure injected. Every call must return (an error or success); an infallible allocation on the path is a kernel panic,
 /// and the line printed before each run names the scenario and N. Without the feature the test passes at once.
 fn kernel_allocation_failure_sweep() -> Outcome {
-    use rt::abi::syscall as nr;
-    let stat = |which: u64, arg: u64| {
-        let r = rt::syscall(
-            nr::DEBUG_STAT,
-            [
-                rt::debug::handle() as usize,
-                which as usize,
-                arg as usize,
-                0,
-                0,
-                0,
-            ],
-        );
-        // (a refused call must not read as a zero: that would end a scenario early or skip the test)
-        assert_eq!(r.status, 0, "debug_stat {which} refused");
-        r.a1 as u64
-    };
+    let stat = sweep_stat;
     if stat(203, 0) == 0 {
         return Ok(());
     }
@@ -5787,6 +5792,11 @@ fn kernel_allocation_failure_sweep() -> Outcome {
             stat(200, n);
             run();
             let fired = stat(201, 0) != 0;
+            ensure_eq!(
+                SWEEP_LOST.load(Ordering::Relaxed),
+                0,
+                "scenario {name} with the allocation {n} failing lost a wakeup"
+            );
             // (a destruction that found no memory leaks its objects until a sweep reclaims them)
             stat(205, 0);
             ensure_eq!(
@@ -5828,6 +5838,11 @@ fn kernel_allocation_failure_sweep() -> Outcome {
         stat(208, 1);
         run();
         stat(201, 0);
+        ensure_eq!(
+            SWEEP_LOST.load(Ordering::Relaxed),
+            0,
+            "scenario {name} with every allocation failing lost a wakeup"
+        );
         stat(205, 0);
         ensure_eq!(
             stat(204, 0),
