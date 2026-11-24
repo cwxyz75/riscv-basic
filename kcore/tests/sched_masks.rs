@@ -135,3 +135,36 @@ fn pack_consolidates_onto_low_harts_and_spread_spreads() {
         assert!(!seen.contains(&0));
     }
 }
+
+#[test]
+fn an_idle_hart_that_is_about_to_sleep_looks_at_no_queue_while_no_hart_is_overloaded() {
+    // (T156: `idle_has_work` read every other hart's run queue under its lock; it reads the `overloaded` mask now)
+    let s = Sched2::new(16, FixedPrio::new);
+    s.adopt_current_on(0, attr(20), None).unwrap();
+    for h in 0..16 {
+        s.reschedule_on(h);
+    }
+    let before = s.pull_looks();
+    for h in 1..16 {
+        assert!(!s.idle_has_work(h), "hart {h}: nothing queued anywhere");
+    }
+    assert_eq!(s.pull_looks() - before, 0, "no queue was looked at");
+    // a thread waiting on hart 0 (it runs a thread of 20, the new one is 10 and pinned nowhere: an idle hart may take it)
+    for _ in 0..16 {
+        s.spawn_on(0, attr(10), None).unwrap();
+    }
+    for h in 0..16 {
+        s.reschedule_on(h);
+    }
+    let waiting = (0..16).filter(|&h| s.queued_on(h) > 0).count();
+    if waiting > 0 {
+        let before = s.pull_looks();
+        let any = (0..16).any(|h| s.idle_has_work(h));
+        assert!(any, "a hart can take what waits");
+        assert!(
+            s.pull_looks() > before,
+            "and found it by looking at the harts the mask names"
+        );
+    }
+    s.audit(true).unwrap();
+}

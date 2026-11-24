@@ -16183,7 +16183,7 @@ fn bench_channel_call(name: &str, n: u32, bystanders: u32) -> Result<u64, Detail
 // of 5.2 is the cost at N = 1 over the cost at N: how many times more round trips a second N pairs get through (`bench_compare.py`
 // prints it). On a boot with fewer harts than N it shows how little the pairs share, which is the point of running it at both counts.
 
-const PS_MAX: usize = 4;
+const PS_MAX: usize = 32;
 static PS_GO: AtomicU32 = AtomicU32::new(0);
 static PS_ROUNDS: AtomicU32 = AtomicU32::new(0);
 static PS_WORD: [AtomicU32; PS_MAX] = [const { AtomicU32::new(0) }; PS_MAX];
@@ -16307,7 +16307,12 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
 
 fn bench_pair_scaling(k: u32) -> Result<u64, Detail> {
     let mut last = 0;
-    for pairs in [1, 2, 4] {
+    // (SC2: the full run also measures one pair per hart at 8, 16 and 32 harts, where the machine has them; a boot with fewer harts measures 1, 2 and 4 as before)
+    let harts = job_use(root_job()?, 7)?.0 as usize;
+    for pairs in [1, 2, 4, 8, 16, 32] {
+        if pairs > 4 && (k < 10 || pairs > harts) {
+            continue;
+        }
         last = bench_pairs("futex", pairs, 500 * k)?;
         last += bench_pairs("channel_call", pairs, 250 * k)?;
     }
