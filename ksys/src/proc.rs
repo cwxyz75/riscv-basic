@@ -1236,11 +1236,11 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 }
                 None => ([0; 6], 0),
             };
-            let mut words = [[0u8; 8]; 6];
-            for (out, w) in words.iter_mut().zip(record.iter()) {
+            // (no allocation: `concat` would make a vector, which cannot fail here (T177))
+            let mut bytes = [0u8; 48];
+            for (out, w) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(record.iter()) {
                 *out = w.to_le_bytes();
             }
-            let bytes: [u8; 48] = words.concat().try_into().unwrap_or([0; 48]);
             let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
             kcore::usercopy::copy_to_user(caller.aspace.held_mut(), mm, vmos, jobs, buf, &bytes)
                 .map_err(|_| e(Status::InvalidArgs))?;
