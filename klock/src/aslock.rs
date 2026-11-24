@@ -97,6 +97,33 @@ impl AsCell {
         }
     }
 
+    /// A cell with no space in it, for the pool (KT9, T177: `Arc::new` cannot fail politely, so the cells are made at boot and armed when a process is made).
+    pub fn vacant() -> AsCell {
+        AsCell::new(0, AddressSpace::vacant())
+    }
+
+    /// Put `aspace` in a pooled cell nobody else holds (the pool's own reference is the only one), as process `pid`'s. Gives the space back if the cell is
+    /// shared, which a pool never lets happen.
+    pub fn arm(this: &mut Arc<AsCell>, pid: u64, aspace: AddressSpace) -> Result<(), AddressSpace> {
+        match Arc::get_mut(this) {
+            Some(cell) => {
+                *cell = AsCell::new(pid, aspace);
+                Ok(())
+            }
+            None => Err(aspace),
+        }
+    }
+
+    /// Take the space out of a cell nobody else holds (a process being torn down: its threads are gone) and leave the cell vacant, to go back to the pool.
+    /// Panics if the cell is shared, as `take` does.
+    #[allow(clippy::panic)] // INVARIANT: as `take`
+    pub fn vacate(this: &mut Arc<AsCell>) -> AddressSpace {
+        match Arc::get_mut(this) {
+            Some(cell) => core::mem::replace(cell, AsCell::vacant()).lock.into_inner(),
+            None => panic!("an address space torn down while another holder has it"),
+        }
+    }
+
     /// The page-table root of the space: fixed for its life, readable with no lock.
     pub fn root(&self) -> u64 {
         self.root

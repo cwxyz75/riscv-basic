@@ -19,7 +19,6 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::user::{MAX_DEBUG_WRITE, STACK_PAGES, STACK_TOP};
 use abi::Handle;
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -172,6 +171,8 @@ fn state() -> &'static mut UserState {
                 crate::kstack::MAX_SLOTS as usize,
             );
             s.backstops = b;
+            // (KT9, T177: the address-space cells `process_create` arms, one per process the backstop allows)
+            s.fill_as_pool(b.processes);
             s.objs.set_caps(b.objects, b.ipc_bytes);
             // (the kernel's own table holds one end per process and job: bounded by the object backstop, like the rest)
             s.ktable = kcore::handle::HandleTable::new(b.objects);
@@ -299,7 +300,7 @@ pub(crate) fn dump_state() {
             s.suspends.keys().collect::<alloc::vec::Vec<_>>(),
             s.parked_tids
         );
-        for (pid, p) in &s.procs {
+        for (pid, p) in s.procs.iter() {
             if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
                 continue;
             }

@@ -262,6 +262,15 @@ impl PageTable<Sv39> {
 }
 
 impl<F: PageTableFormat> PageTable<F> {
+    /// A table that is nothing: no root frame (frame 0), never installed and never walked. The placeholder of a pooled address-space cell (KT9, T177: the
+    /// cell is allocated at boot and armed with a real table when a process is made).
+    pub const fn vacant() -> PageTable<F> {
+        PageTable {
+            root: 0,
+            _format: core::marker::PhantomData,
+        }
+    }
+
     /// A fresh, empty table (one frame for the root).
     pub fn create<M: PhysMem>(mm: &mut Mm<M>) -> Option<PageTable<F>> {
         let root = mm.db.alloc()?;

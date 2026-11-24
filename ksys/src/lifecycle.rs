@@ -5,19 +5,15 @@
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::ipc::{self, Kobjs};
 use kcore::job::{JobId, Jobs, SchedError, SchedLimits};
 use kcore::sched::Tid;
 
-use crate::Process;
-
 /// `process_kill`: the pid to end. A process that has ended (or is gone) is BAD_STATE.
 pub fn kill_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     me: u64,
     ph: Handle,
 ) -> Result<u64, Status> {
@@ -33,7 +29,7 @@ pub fn kill_target(
 /// killed process is BAD_STATE. The caller bumps the attention epoch and, to stop, kicks the other harts.
 pub fn stop_target(
     objs: &mut Kobjs,
-    procs: &mut BTreeMap<u64, Box<Process>>,
+    procs: &mut crate::ProcTable,
     me: u64,
     ph: Handle,
     stop: bool,
@@ -55,7 +51,7 @@ pub fn stop_target(
 /// caller; the flag says whether the caller is inside too (and so ends last).
 pub fn job_kill_victims(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     jobs: &mut Jobs,
     me: u64,
     jh: Handle,
@@ -78,7 +74,7 @@ pub fn job_kill_victims(
 /// The kernel thread behind a thread handle with `need`, and the process it belongs to. Handle 0 is the calling thread.
 pub fn thread_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     me: u64,
     current: Tid,
     h: u64,
@@ -111,7 +107,7 @@ pub fn thread_target(
 /// not exceed the thread's job's `max_prio`.
 pub fn thread_set_sched_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     jobs: &Jobs,
     me: u64,
     current: Tid,
@@ -134,7 +130,7 @@ pub fn thread_set_sched_target(
 /// scheduling limits and returns the job (the caller then lowers the priorities of its threads above the new maximum).
 pub fn job_set_sched(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     jobs: &mut Jobs,
     me: u64,
     a: [u64; 6],

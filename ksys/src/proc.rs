@@ -7,7 +7,6 @@ use abi::rights::Rights;
 use abi::status::Status;
 use abi::syscall as nr;
 use abi::Handle;
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::aspace::AddressSpace;
@@ -57,13 +56,27 @@ pub trait Machine {
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
 pub struct PCtx<'a, M: PhysMem, X: Machine> {
     pub objs: &'a mut Kobjs,
-    pub procs: &'a mut BTreeMap<u64, Box<Process>>,
+    pub procs: &'a mut crate::ProcTable,
     /// The calling process.
     pub me: u64,
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
     pub jobs: &'a mut Jobs,
     pub machine: &'a mut X,
+}
+
+/// The process table: ordered by process id, with fallible growth (KT9: `FMap`, and a process record in an `FBox`, so that making a process can say no).
+pub type ProcTable = kcore::fmap::FMap<u64, kcore::fbox::FBox<Process>>;
+
+/// Put a process in the table (the boot loader and the host tests, which have nobody to tell). Panics when there is no memory.
+#[allow(clippy::expect_used)] // INVARIANT: boot and test setup only: allocation failure there is a failure to start
+pub fn put_process(procs: &mut ProcTable, pid: u64, p: Process) {
+    let b = kcore::fbox::FBox::try_new(p)
+        .ok()
+        .expect("memory for a process record");
+    procs
+        .try_insert(pid, b)
+        .expect("memory for a process table entry");
 }
 
 pub struct Process {
@@ -112,11 +125,11 @@ pub struct Process {
     /// worst-case estimate per mapped region, plus the root table), by region start; credited
     /// when the region goes or the process ends. Table frames are not VMO pages, so without this
     /// a program could spend memory the page limit never sees.
-    pub table_charge: BTreeMap<u64, u64>,
+    pub table_charge: kcore::fmap::FMap<u64, u64>,
     /// Where each `process_map` charge in `table_charge` ends (its key is where it starts): the charge is credited when no region is left in
     /// that span, not when the region that started there goes (a range unmap or a protect can split a mapping: the tables of what stays
     /// must stay charged, MM7).
-    pub charge_end: BTreeMap<u64, u64>,
+    pub charge_end: kcore::fmap::FMap<u64, u64>,
     /// The stacks `thread_spawn` provisioned, by thread: freed when the thread ends (or with the process).
     pub stacks: BTreeMap<Tid, SpawnStack>,
     /// Where the next stack search in the arena starts (just above the last stack handed out).
@@ -126,6 +139,32 @@ pub struct Process {
     pub privileged: bool,
     /// Where the system library (AB7) is mapped in this process: its base and its text range (all zero when it is not).
     pub libsys: LibRange,
+}
+
+impl Process {
+    /// Room, before anything changes, for one more `table_charge` and `charge_end` entry (KT9: the entries are made by `add_charge` after the mapping
+    /// they account for has succeeded, and that step allocates nothing).
+    pub fn reserve_charge(&mut self) -> Result<(), Status> {
+        self.table_charge.reserve(1).map_err(|_| Status::NoMemory)?;
+        self.charge_end.reserve(1).map_err(|_| Status::NoMemory)
+    }
+
+    /// Record `tables` pages charged for a mapping that starts at `vaddr` and ends at `end` (a key that is there already is a mapping that was split and
+    /// whose start has been mapped again: its charge stays, and this one adds). Uses the room `reserve_charge` made.
+    pub fn add_charge(&mut self, vaddr: u64, tables: u64, end: u64) {
+        match self.table_charge.get_mut(&vaddr) {
+            Some(c) => *c = c.saturating_add(tables),
+            None => {
+                self.table_charge.insert_reserved(vaddr, tables);
+            }
+        }
+        match self.charge_end.get_mut(&vaddr) {
+            Some(x) => *x = (*x).max(end),
+            None => {
+                self.charge_end.insert_reserved(vaddr, end);
+            }
+        }
+    }
 }
 
 /// Where the system library lies in a process: the base the kernel chose, and the text range (the only place `ecall` is allowed from, AB8).
@@ -259,7 +298,7 @@ fn resolve_map_args(
 /// Drop what the copy log makes stale in every address space and have every hart drop its translations (COW1): after any call or fault
 /// that may have made a page of a VMO family visible or replaced it. One atomic load when nothing is pending.
 pub fn cow_sync<M: PhysMem, X: Machine>(
-    procs: &mut BTreeMap<u64, Box<Process>>,
+    procs: &mut crate::ProcTable,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
     machine: &mut X,
@@ -278,7 +317,7 @@ pub fn cow_sync<M: PhysMem, X: Machine>(
 /// A SNAPSHOT moved the pages of VMO `vmo` to a node it shares with the child: take the write permission off every translation of it, and
 /// have every hart drop what it cached, before anything runs (COW1; the negative control `fault-skip-cow-protect` leaves it out).
 fn snapshot_protect<M: PhysMem, X: Machine>(
-    procs: &mut BTreeMap<u64, Box<Process>>,
+    procs: &mut crate::ProcTable,
     mm: &mut Mm<M>,
     machine: &mut X,
     vmo: u64,
@@ -394,6 +433,8 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             // Page tables for this region, worst case: one leaf table per 512 pages it spans (plus one for each end not aligned to
             // them) and two interior ones.
             let tables = length / 4096 / 512 + 4;
+            // (KT9: the room for the charge's records before anything is charged or mapped)
+            target.reserve_charge().map_err(e)?;
             jobs.charge(target.job, Resource::Pages, tables)
                 .map_err(|x| e(crate::job_status(x)))?;
             if let Err(x) = target.aspace.held_mut().map_region_max(
@@ -412,10 +453,8 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 });
             }
             // (a key that is already there is a mapping that was split and whose start has been mapped again: its charge stays, and this one adds)
-            *target.table_charge.entry(vaddr).or_default() += tables;
             let end = vaddr + length;
-            let extent = target.charge_end.entry(vaddr).or_insert(end);
-            *extent = (*extent).max(end);
+            target.add_charge(vaddr, tables, end);
             // a mapping that touches one of the same VMO with the same permissions becomes part of it (fewer regions)
             target
                 .aspace
@@ -677,6 +716,14 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 .aspace
                 .held_mut()
                 .set_region_limit(jobs.region_limit(target.job));
+            // (KT9: the room for the charge's records before the mapping; with none the call undoes what it did and says NO_MEMORY)
+            if let Err(x) = target.reserve_charge() {
+                if let Some(c) = child {
+                    let _ = vmos.release(mm, jobs, c);
+                }
+                undo(jobs);
+                return Err(e(x));
+            }
             if let Err(x) = target.aspace.held_mut().map_region_max(
                 vmos,
                 vaddr,
@@ -695,9 +742,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     _ => e(Status::InvalidArgs),
                 });
             }
-            *target.table_charge.entry(vaddr).or_default() += tables;
-            let extent = target.charge_end.entry(vaddr).or_insert(end);
-            *extent = (*extent).max(end);
+            target.add_charge(vaddr, tables, end);
             target
                 .aspace
                 .held_mut()

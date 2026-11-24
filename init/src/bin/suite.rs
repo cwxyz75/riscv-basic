@@ -5641,7 +5641,7 @@ fn kernel_allocation_failure_sweep() -> Outcome {
     if stat(203, 0) == 0 {
         return Ok(());
     }
-    let scenarios: [(&str, fn()); 6] = [
+    let scenarios: [(&str, fn()); 7] = [
         ("channel", || {
             let r = sys::channel_create();
             if r.status != 0 {
@@ -5718,6 +5718,12 @@ fn kernel_allocation_failure_sweep() -> Outcome {
                 if s.a2 != 0 {
                     sys::handle_close(s.a2 as u64);
                 }
+            }
+        }),
+        ("process create", || {
+            let p = sys::process_create();
+            if p.status == 0 {
+                sys::handle_close(p.a1 as u64);
             }
         }),
         ("map and touch", || {

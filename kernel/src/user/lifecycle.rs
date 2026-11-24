@@ -218,7 +218,7 @@ pub(super) fn teardown(pid: u64) -> i32 {
 // (the three steps of `teardown` are functions of their own, never merged into one frame: the optimised kernel's stack budget, KT13, T173)
 
 #[inline(never)]
-pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
+pub(super) fn teardown_take(pid: u64) -> Option<kcore::fbox::FBox<Process>> {
     any_state(|s| {
         // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
         let process = s.procs.remove(&pid);
@@ -312,9 +312,11 @@ const TEARDOWN_CHUNK: u64 = 64;
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)]
-pub(super) fn teardown_memory(process: Box<Process>) {
-    let mut process = process;
-    let mut aspace = klock::aslock::AsCell::take(process.aspace);
+pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
+    let mut process = process.into_inner();
+    // (KT9, T177: the address-space cell goes back to the pool when the space is out of it)
+    let mut cell = process.aspace;
+    let mut aspace = klock::aslock::AsCell::vacate(&mut cell);
     // 1. the mappings, a chunk at a time. Each chunk is unmapped and shot down in one interrupts-off section under the memory locks (TLB2: nothing it
     // frees, a table or a VMO's last frame, can be reused before every hart has dropped what it cached; X6: the hart cannot change under the shootdown);
     // then a switch point (X4: a trap from user mode arrives here with interrupts off, so the chunk boundary is where a tick's switch is taken)
@@ -385,6 +387,8 @@ pub(super) fn teardown_memory(process: Box<Process>) {
     );
     k.jobs.credit(process.job, Resource::Processes, 1);
     k.jobs.release(process.job);
+    drop(k);
+    any_state(|s| s.return_as_cell(cell));
 }
 
 /// Unmap and free the stack `thread_spawn` gave thread `tid`, if it has one. The thread is in the kernel, on its

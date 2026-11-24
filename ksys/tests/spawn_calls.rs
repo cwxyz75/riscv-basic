@@ -44,8 +44,8 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         threads_alive: 0,
         thread_objs: BTreeMap::new(),
         job,
-        table_charge: BTreeMap::new(),
-        charge_end: BTreeMap::new(),
+        table_charge: kcore::fmap::FMap::new(),
+        charge_end: kcore::fmap::FMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
@@ -70,10 +70,8 @@ fn world() -> W {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut us = UserState::new();
-    us.procs
-        .insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
-    us.procs
-        .insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
+    ksys::put_process(&mut us.procs, 1, process(&mut mm, &kernel, JobId::ROOT));
+    ksys::put_process(&mut us.procs, 2, process(&mut mm, &kernel, JobId::ROOT));
     let mut vmos = Vmos::new();
     let mut jobs = kcore::job::Jobs::new();
     let code = vmos.create(&mut jobs, 1);
