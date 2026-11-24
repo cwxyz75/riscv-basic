@@ -316,10 +316,12 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
         irq::restore(was);
     }
     // 2. the VMOs the process owned: the pages of one that nothing else holds go back in chunks, then the VMO itself
-    let ids: alloc::vec::Vec<u64> = core::mem::take(&mut process.vmos)
-        .into_iter()
-        .chain(process.stacks.values().map(|st| st.vmo))
-        .collect();
+    let ids: alloc::vec::Vec<u64> = crate::heap::nofail(|| {
+        core::mem::take(&mut process.vmos)
+            .into_iter()
+            .chain(process.stacks.values().map(|st| st.vmo))
+            .collect()
+    });
     for id in ids {
         irq::without(|| {}); // a switch point (X4)
         {
@@ -407,7 +409,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         sync_suspends(s);
         let rec = rec?;
         let pid = rec.pid;
-        pi_thread_gone(s, tid, pid); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
+        crate::heap::nofail(|| pi_thread_gone(s, tid, pid)); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
         p.live_tids.remove(&tid);

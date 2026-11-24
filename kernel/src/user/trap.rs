@@ -936,7 +936,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, r);
         }
         nr::PORT_WAIT_MANY => {
-            let r = port_wait_many(a);
+            let r = crate::heap::nofail(|| port_wait_many(a)); // (its buffer is class N: T248)
             commit_wake();
             reply(frame, r);
         }
@@ -985,7 +985,29 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PAGER_FAIL
         | nr::PAGER_QUERY_DIRTY
         | nr::PAGER_WRITEBACK_DONE => {
-            let r = process_call(n, a);
+            // (the calls that end or deliver something for a process that exists cannot be refused for want of memory: class N, T248; the creating and
+            // mapping calls are reportable and stay outside)
+            let r = if matches!(
+                n,
+                nr::JOB_SET_SCHED
+                    | nr::JOB_KILL
+                    | nr::PROCESS_KILL
+                    | nr::THREAD_READ_STATE
+                    | nr::THREAD_WRITE_STATE
+                    | nr::PROCESS_EXCEPTION_CHANNEL
+                    | nr::JOB_EXCEPTION_CHANNEL
+                    | nr::EXCEPTION_RESUME
+                    | nr::THREAD_RESUME
+                    | nr::PAGER_CREATE
+                    | nr::PAGER_SUPPLY
+                    | nr::PAGER_FAIL
+                    | nr::PAGER_QUERY_DIRTY
+                    | nr::PAGER_WRITEBACK_DONE
+            ) {
+                crate::heap::nofail(|| process_call(n, a))
+            } else {
+                process_call(n, a)
+            };
             notify();
             reply(frame, r);
         }
