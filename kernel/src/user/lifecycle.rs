@@ -356,6 +356,8 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
         let k = kmem::mem();
         let _ = k.vmos.release(k.mm, k.jobs, id);
     }
+    // (a big VMO's pages go back in batches, with switch points between: no BKL is held here)
+    super::calls::drain_dying();
     // 3. what the process was charged
     let k = kmem::mem();
     let tables: u64 = process.table_charge.values().sum();

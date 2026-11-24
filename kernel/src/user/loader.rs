@@ -104,6 +104,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     });
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
+    // (T207 PR 3d: the lists of mappings name processes: the space's owner id is the process id)
+    aspace.set_owner(k.vmos, pid);
     if let Err(e) = built {
         aspace.destroy_user(k.mm, k.vmos, k.jobs);
         for id in vmo_ids {

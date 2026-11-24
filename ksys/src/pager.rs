@@ -134,11 +134,9 @@ pub fn pager_supply<M: PhysMem>(
     // V1: a process of another job than the source's holds its mapping on the promise that touching it never fails; taking pages from under
     // it would break that (as `vmo_decommit` refuses)
     let src_job = vmos.job_of(src).ok_or(Status::BadHandle)?;
-    if us
-        .procs
-        .values()
-        .any(|p| p.job != src_job && p.aspace.held_ref().maps_vmo_range(src, sfirst, count))
-    {
+    if vmos.maps_other_job(src, sfirst, count, src_job, &|o| {
+        us.procs.get(&o).map(|p| p.job)
+    }) {
         return Err(Status::BadState);
     }
     // (refused for what is wrong with the VMOs before any mapping is touched)

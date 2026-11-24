@@ -273,10 +273,9 @@ pub fn vmo_range_begin<M: PhysMem, X: Machine>(
         // VMO's job and never ends it; taking pages from under such a mapping would break that (a touch would charge the VMO's job, or
         // fault past a new end). The holder's own job may take pages back; a stranger's mapping stops the call.
         let vmo_job = c.vmos.job_of(id).ok_or(Status::BadHandle)?;
-        if c.procs
-            .values()
-            .any(|p| p.job != vmo_job && p.aspace.held_ref().maps_vmo_range(id, first, count))
-        {
+        if c.vmos.maps_other_job(id, first, count, vmo_job, &|o| {
+            c.procs.get(&o).map(|p| p.job)
+        }) {
             return Err(Status::BadState);
         }
     }
@@ -290,59 +289,133 @@ pub fn vmo_range_begin<M: PhysMem, X: Machine>(
     }
 }
 
-/// One step of the call `vmo_range_begin` started: take at most a batch of the pages, unmap them from every address space that shows them (the VMO's
-/// descendants' too: a PRIVATE child shows the pages of its source through its own mappings), have every hart drop its translations, and only then
-/// let the VMO give the frames back (TLB2). `Ok(true)` when the call is done. After an `Err` the call is over as well (the caller ends it).
-pub fn vmo_range_step<M: PhysMem, X: Machine>(
+/// One batch of a chunked decommit or shrink, in the three parts the kernel runs under different locks (T207 PR 3d): `vmo_range_take` (A: the frames
+/// leave the VMO's index and are counted as detached), `vmo_range_unmap_owner` for each process that maps the span (B: one address space at a time),
+/// `vmo_range_finish` (C: every hart drops its translations, then the frames are freed and credited).
+pub struct RangeBatch {
+    frames: [kcore::frame::Pfn; kcore::aspace::RANGE_STEP],
+    lo: u64,
+    next: u64,
+    n: usize,
+    /// The step took the last pages of the range.
+    pub done: bool,
+    err: Option<kcore::aspace::VmoError>,
+    /// The greatest process id that maps the VMO or a node below it when the batch was taken: a mapping made later cannot reach a detached frame.
+    bound: u64,
+    /// The last process whose space was cleared (the walk goes up from it).
+    cursor: u64,
+    cleared: u64,
+}
+
+/// A: take the next batch out of the VMO's index. Needs the memory locks only.
+pub fn vmo_range_take<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    call: RangeCall,
+) -> Result<RangeBatch, Status> {
+    let PCtx { vmos, jobs, .. } = c;
+    let mut b = RangeBatch {
+        frames: [0; kcore::aspace::RANGE_STEP],
+        lo: 0,
+        next: 0,
+        n: 0,
+        done: false,
+        err: None,
+        bound: 0,
+        cursor: 0,
+        cleared: 0,
+    };
+    let st = vmos
+        .range_step(jobs, call.id, &mut b.frames)
+        .map_err(range_status)?;
+    (b.lo, b.next, b.n, b.done, b.err) = (st.lo, st.next, st.n, st.done, st.err);
+    b.bound = vmos.max_mapper(call.id);
+    Ok(b)
+}
+
+/// The next process (above the last one cleared) that maps the batch's span, if any.
+pub fn vmo_range_next_owner<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    call: RangeCall,
+    batch: &RangeBatch,
+) -> Option<u64> {
+    if batch.next <= batch.lo {
+        return None;
+    }
+    c.vmos.next_mapper(call.id, batch.cursor, batch.bound)
+}
+
+/// B: clear the batch's span in the address space of process `owner` (the caller holds it, and no other), for the VMO and every node below it.
+pub fn vmo_range_unmap_owner<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    call: RangeCall,
+    batch: &mut RangeBatch,
+    owner: u64,
+) {
+    let PCtx {
+        procs, mm, vmos, ..
+    } = c;
+    batch.cursor = owner;
+    let Some(p) = procs.get_mut(&owner) else {
+        return; // (a process that is gone holds its own frame references; its teardown drops them)
+    };
+    let (first, count) = (batch.lo, batch.next.saturating_sub(batch.lo));
+    let mut cleared = 0u64;
+    vmos.for_each_below(call.id, 0, &mut |d, base| {
+        if let Some(f) = first
+            .checked_sub(base)
+            .or((first.saturating_add(count) > base).then_some(0))
+        {
+            let k = first
+                .saturating_add(count)
+                .saturating_sub(base)
+                .saturating_sub(f);
+            cleared = cleared.saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, d, f, k));
+        }
+    });
+    batch.cleared = batch.cleared.saturating_add(cleared);
+}
+
+/// C: other harts may still cache the translations of what was just unmapped: they drop them before any frame is freed (TLB2); then the VMO gives the
+/// frames back. (When nothing was mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.) Returns
+/// the status the take stopped with, if any.
+pub fn vmo_range_finish<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
     n: usize,
     call: RangeCall,
+    batch: &mut RangeBatch,
 ) -> Result<bool, Status> {
     let PCtx {
-        procs,
         mm,
         vmos,
         jobs,
         machine,
         ..
     } = c;
-    let mut batch = [0 as kcore::frame::Pfn; kcore::aspace::RANGE_STEP];
-    let st = vmos
-        .range_step(jobs, call.id, &mut batch)
-        .map_err(range_status)?;
-    let (first, count) = (st.lo, st.next.saturating_sub(st.lo));
-    if count > 0 {
-        let mut cleared = 0u64;
-        vmos.for_each_below(call.id, 0, &mut |d, base| {
-            if let Some(f) = first
-                .checked_sub(base)
-                .or((first.saturating_add(count) > base).then_some(0))
-            {
-                let k = first
-                    .saturating_add(count)
-                    .saturating_sub(base)
-                    .saturating_sub(f);
-                for p in procs.values_mut() {
-                    cleared =
-                        cleared.saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, d, f, k));
-                }
-            }
-        });
-        // other harts may still cache the translations of what was just unmapped: before any frame is freed. (When nothing was
-        // mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.)
-        if cleared > 0 {
-            if !machine.skip_shootdown(n) {
-                machine.shootdown();
-            }
-            machine.flush_tlb();
+    if batch.cleared > 0 {
+        if !machine.skip_shootdown(n) {
+            machine.shootdown();
         }
+        machine.flush_tlb();
     }
-    let got = batch.get(..st.n).unwrap_or(&[]);
+    let got = batch.frames.get(..batch.n).unwrap_or(&[]);
     vmos.range_free(mm, jobs, call.id, got);
-    match st.err {
+    match batch.err {
         Some(e) => Err(range_status(e)),
-        None => Ok(st.done),
+        None => Ok(batch.done),
     }
+}
+
+/// One whole step (the host tests, where nothing runs between its parts).
+pub fn vmo_range_step<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    n: usize,
+    call: RangeCall,
+) -> Result<bool, Status> {
+    let mut batch = vmo_range_take(c, call)?;
+    while let Some(owner) = vmo_range_next_owner(c, call, &batch) {
+        vmo_range_unmap_owner(c, call, &mut batch, owner);
+    }
+    vmo_range_finish(c, n, call, &mut batch)
 }
 
 /// `vmo_decommit` / `vmo_set_size` without a switch point between the steps (the host tests, where nothing else runs).
@@ -571,10 +644,15 @@ pub fn process_protect_begin<M: PhysMem, X: Machine>(
 /// One step: bring a batch of page-table entries to the permissions of their regions. `Ok(true)` when the range is done.
 pub fn process_protect_step<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
+    n: usize,
     call: &mut ProtectCall,
 ) -> Result<bool, Status> {
     let PCtx {
-        procs, mm, vmos, ..
+        procs,
+        mm,
+        vmos,
+        machine,
+        ..
     } = c;
     let target = procs.get_mut(&call.tpid).ok_or(Status::BadState)?;
     if target.exit_code.is_some() || target.killed.is_some() {
@@ -590,6 +668,14 @@ pub fn process_protect_step<M: PhysMem, X: Machine>(
     );
     call.downgraded |= st.downgraded;
     call.exec_pages = call.exec_pages.saturating_add(st.exec_pages);
+    if st.downgraded {
+        // a permission taken away may be cached by every hart, and the locks drop before the next step: a SNAPSHOT's write-protect (COW1) and any
+        // other reader of the table must not see a writable translation the table no longer holds
+        if !machine.skip_shootdown(n) {
+            machine.shootdown();
+        }
+        machine.flush_tlb();
+    }
     Ok(done)
 }
 
@@ -600,13 +686,8 @@ pub fn process_protect_end<M: PhysMem, X: Machine>(
     n: usize,
     call: ProtectCall,
 ) {
+    let _ = n;
     let machine = &mut c.machine;
-    if call.downgraded {
-        if !machine.skip_shootdown(n) {
-            machine.shootdown();
-        }
-        machine.flush_tlb();
-    }
     if call.exec_pages > 0 {
         machine.icache_sync(call.exec_pages);
     }
@@ -619,10 +700,13 @@ fn process_protect_all<M: PhysMem, X: Machine>(
 ) -> Reply {
     let mut call = process_protect_begin(c, a).map_err(e)?;
     loop {
-        match process_protect_step(c, &mut call) {
+        match process_protect_step(c, n, &mut call) {
             Ok(true) => break,
             Ok(false) => {}
-            Err(s) => return Err(e(s)),
+            Err(s) => {
+                process_protect_end(c, n, call);
+                return Err(e(s));
+            }
         }
     }
     process_protect_end(c, n, call);
@@ -921,9 +1005,8 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 }
                 // V1: a process of another job maps the source on the promise that a write never fails on the VMO's job; a SNAPSHOT
                 // would make its next write a copy charged to that job
-                if procs.values().any(|p| {
-                    p.job != vmo_job && p.aspace.held_ref().maps_vmo_range(id, 0, u64::MAX)
-                }) {
+                if vmos.maps_other_job(id, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job))
+                {
                     return bad(Status::BadState);
                 }
             }
@@ -1013,9 +1096,8 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     return bad(Status::AccessDenied);
                 }
                 // (V1, as `vmo_create_child`)
-                if procs.values().any(|p| {
-                    p.job != vmo_job && p.aspace.held_ref().maps_vmo_range(vid, 0, u64::MAX)
-                }) {
+                if vmos.maps_other_job(vid, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job))
+                {
                     return bad(Status::BadState);
                 }
             } else if vmo_job != caller_job

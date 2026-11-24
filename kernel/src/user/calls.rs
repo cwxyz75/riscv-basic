@@ -126,18 +126,25 @@ impl ksys::Machine for KernelMachine {
     }
 }
 
-/// `vmo_decommit` and `vmo_set_size` (T207 PR 3a): the pages go a batch at a time, each batch under the locks (every address space, then the memory)
-/// and the switch point between two batches, so that a range of any size holds them for a bounded time and a runnable thread can take the hart. The VMO
-/// is busy from the first part to the last (`Vmos::range_end`, always run); a failure in the middle leaves the batches before it done.
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
+/// `vmo_decommit` and `vmo_set_size` (T207 PR 3a, 3d): the pages go a batch at a time, and each batch in three parts under different locks, with nothing
+/// held between them: **A** the frames leave the VMO's index (memory locks only; from here a fault sees zeros), **B** each process that maps the span
+/// has it cleared, one address space at a time, found by the VMO's list of mappings, **C** every hart drops its translations and the frames go back.
+/// There is a switch point between batches. The VMO is busy from the first part to the last (`Vmos::range_end`, always run); a failure in the middle
+/// leaves the batches before it done.
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`: the batch of frames is on this frame
 fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
-    let mut call: Option<ksys::RangeCall> = None;
-    // one part of the call under the locks: `begin` when `call` is empty, a step otherwise
-    let part = |call: &mut Option<ksys::RangeCall>| -> Result<bool, Status> {
-        locked_state(|s| -> Result<bool, Status> {
+    // one part under the locks the part needs: `own` is the address space to hold (none for A and C); `f` gets the call's context
+    fn section<R>(
+        own: Option<u64>,
+        f: impl FnOnce(&mut ksys::PCtx<'_, kmem::DirectMap, KernelMachine>) -> R,
+    ) -> Result<R, Status> {
+        locked_state(|s| -> Result<R, Status> {
             let me = caller_pid(s)?;
             let mut machine = KernelMachine::default();
-            let _as = AsLocks::all(s)?;
+            let _as = match own {
+                Some(pid) => AsLocks::one(s, pid),
+                None => AsLocks::none(),
+            };
             let k = kmem::get();
             let mut ctx = ksys::PCtx {
                 objs: &mut s.objs,
@@ -148,26 +155,48 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
                 jobs: k.jobs,
                 machine: &mut machine,
             };
-            match *call {
-                None => {
-                    *call = ksys::vmo_range_begin(&mut ctx, n, a)?;
-                    Ok(call.is_none())
-                }
-                Some(c) => ksys::vmo_range_step(&mut ctx, n, c),
-            }
+            Ok(f(&mut ctx))
         })
+    }
+    let call = match section(None, |ctx| ksys::vmo_range_begin(ctx, n, a)) {
+        Ok(Ok(Some(c))) => c,
+        Ok(Ok(None)) => return Ok((None, None)),
+        Ok(Err(e)) | Err(e) => return bad(e),
     };
-    let mut r = part(&mut call);
-    while r == Ok(false) {
+    let r: Result<(), Status> = (|| loop {
+        // A
+        let mut batch = section(None, |ctx| ksys::vmo_range_take(ctx, call))??;
+        // B (a failure here stops the walk, not the batch: C still runs, or the frames taken would never go back)
+        let mut walked: Result<(), Status> = Ok(());
+        loop {
+            let owner = match section(None, |ctx| ksys::vmo_range_next_owner(ctx, call, &batch)) {
+                Ok(Some(o)) => o,
+                Ok(None) => break,
+                Err(e) => {
+                    walked = Err(e);
+                    break;
+                }
+            };
+            if let Err(e) = section(Some(owner), |ctx| {
+                ksys::vmo_range_unmap_owner(ctx, call, &mut batch, owner)
+            }) {
+                walked = Err(e);
+                break;
+            }
+        }
+        // C
+        let done = section(None, |ctx| ksys::vmo_range_finish(ctx, n, call, &mut batch))??;
+        walked?;
+        if done {
+            return Ok(());
+        }
         // (the switch point: nothing is held; another hart takes the locks, and a thread that was woken runs)
         irq::without(|| {});
-        r = part(&mut call);
-    }
-    if let Some(c) = call {
-        locked_state(|_| kmem::get().vmos.range_end(c.id, r.is_ok()));
-    }
+    })();
+    let ok = r.is_ok();
+    locked_state(|_| kmem::get().vmos.range_end(call.id, ok));
     match r {
-        Ok(_) => Ok((None, None)),
+        Ok(()) => Ok((None, None)),
         Err(e) => bad(e),
     }
 }
@@ -279,7 +308,7 @@ fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
                 ksys::process_protect_end(&mut ctx, n, *call);
                 Ok(true)
             } else {
-                ksys::process_protect_step(&mut ctx, call)
+                ksys::process_protect_step(&mut ctx, n, call)
             }
         })
     };
@@ -293,7 +322,11 @@ fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
             let _ = part(&mut call, true);
             Ok((None, None))
         }
-        Err(e) => bad(e),
+        Err(e) => {
+            // (what was changed before the refusal still reaches every instruction fetch: M9)
+            let _ = part(&mut call, true);
+            bad(e)
+        }
     }
 }
 
@@ -350,7 +383,7 @@ pub(crate) fn cow_sync() {
 
 /// Give back the pages of the VMOs whose last reference went (T207 PR 3c), a batch at a time under the memory locks, with the switch point between
 /// batches; nothing is held at it. Run at the tail of every call and fault, so no thread is back in user mode with its VMO still draining.
-fn drain_dying() {
+pub(crate) fn drain_dying() {
     loop {
         let was = irq::save_and_disable();
         let more = {
@@ -358,7 +391,8 @@ fn drain_dying() {
             k.vmos.drain_dying(k.mm, k.jobs, kcore::aspace::RANGE_STEP)
         };
         irq::restore(was);
-        if !more {
+        // (the switch point takes the BKL: a caller that already holds it leaves the rest for the next call, which finds DRAIN_PENDING still set)
+        if !more || crate::bkl::holds() {
             return;
         }
         irq::without(|| {});
