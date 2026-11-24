@@ -1341,22 +1341,34 @@ pub fn port_poll_many_in(
 ) -> Result<Vec<(u64, u32)>, Status> {
     let port_obj = port_of(reg, table, port, Rights::WAIT)?;
     prune_port(reg, jobs, port_obj);
-    let picked: Vec<(usize, u64, u32, ObjId)> = match reg.get(port_obj) {
+    // (both lists are reserved before anything is taken: NO_MEMORY here leaves the port as it was, T248)
+    let mut picked: Vec<(usize, u64, u32, ObjId)> = Vec::new();
+    let mut observed: Vec<(u64, u32)> = Vec::new();
+    match reg.get(port_obj) {
         Some(KObj::Port(p)) => {
             let n = p.bindings.len();
-            (0..n)
-                .map(|i| (p.next + i) % n)
-                .filter(|&i| binding_ready(reg, &p.bindings[i]))
-                .take(max)
-                .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj))
-                .collect()
+            let room = n.min(max);
+            picked
+                .try_reserve_exact(room)
+                .map_err(|_| Status::NoMemory)?;
+            observed
+                .try_reserve_exact(room)
+                .map_err(|_| Status::NoMemory)?;
+            picked.extend(
+                (0..n)
+                    .map(|i| (p.next + i) % n)
+                    .filter(|&i| binding_ready(reg, &p.bindings[i]))
+                    .take(max)
+                    .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj)),
+            );
         }
         _ => return Err(Status::BadHandle),
-    };
-    let observed: Vec<(u64, u32)> = picked
-        .iter()
-        .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask)))
-        .collect();
+    }
+    observed.extend(
+        picked
+            .iter()
+            .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask))),
+    );
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
         return Err(Status::BadHandle);
     };

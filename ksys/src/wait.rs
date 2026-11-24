@@ -135,8 +135,10 @@ pub fn port_poll_many<M: PhysMem>(
         Status::ShouldWait => Status::ShouldWait,
         _ => Status::InvalidArgs,
     })?;
+    // (the buffer is reserved before the poll takes anything: NO_MEMORY consumes no packet, T248)
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| Status::NoMemory)?;
     let got = ipc::port_poll_many_in(objs, &p.handles, h, jobs, cap)?;
-    let mut bytes = Vec::with_capacity(got.len() * abi::limits::PORT_PACKET_BYTES);
     for &(key, observed) in &got {
         bytes.extend_from_slice(&key.to_le_bytes());
         bytes.extend_from_slice(&observed.to_le_bytes());

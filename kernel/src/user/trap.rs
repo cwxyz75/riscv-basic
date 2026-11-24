@@ -941,7 +941,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, r);
         }
         nr::PORT_WAIT_MANY => {
-            let r = crate::heap::nofail(|| port_wait_many(a)); // (its buffer is class N: T248)
+            let r = port_wait_many(a);
             commit_wake();
             reply(frame, r);
         }

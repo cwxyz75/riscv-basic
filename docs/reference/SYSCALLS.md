@@ -855,7 +855,7 @@ block, `u64::MAX`: none) until at least one binding is ready, then takes every r
 successive `port_wait` calls would have given them (the port's rotation moves past the last one taken, and a delivered one-shot binding disarms exactly as it
 does for `port_wait`). `count` is how many records were written. Rights: WAIT. Errors: INVALID_ARGS (`capacity` 0 or above 64, or `buffer` not writable user
 memory for `capacity` records; checked before anything is taken, and again in the step that takes the packets, so a packet is never taken and lost); BAD_HANDLE
-(also if the handle stops naming anything while waiting); WRONG_TYPE; ACCESS_DENIED; INTERRUPTED (as `port_wait`); TIMED_OUT. `port_wait` stays until the system
+(also if the handle stops naming anything while waiting); WRONG_TYPE; ACCESS_DENIED; INTERRUPTED (as `port_wait`); TIMED_OUT; NO_MEMORY (the buffers of the step that takes the packets are made first, so no packet is taken: nothing changed). `port_wait` stays until the system
 library wraps it (AB7). Tests: `port_wait_many_*`; `a_batch_wait_equals_that_many_single_waits` (host model).
 
 ## Entry template
