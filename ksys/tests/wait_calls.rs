@@ -426,7 +426,7 @@ fn send(w: &mut W, a: [u64; 6], interrupted: bool) -> Result<ksys::Call, Status>
         1,
         7,
         a,
-        || interrupted,
+        |_, _| interrupted,
     )
 }
 
@@ -493,7 +493,7 @@ fn a_call_sends_waits_for_its_transaction_id_and_takes_the_reply() {
         &mut w.jobs,
         1,
         &call,
-        || false,
+        |_, _| false,
     );
     assert_eq!(r, Ok((Some(7), Some(0))));
     assert_eq!(w.peek(MEM + 0x400, 7), mine);
@@ -561,7 +561,7 @@ fn the_reply_half_reports_by_what_is_there() {
             &mut w.jobs,
             1,
             &call,
-            || false
+            |_, _| false
         ),
         Err((Status::TimedOut, None, None))
     );
@@ -573,7 +573,7 @@ fn the_reply_half_reports_by_what_is_there() {
             &mut w.jobs,
             1,
             &call,
-            || true
+            |_, _| true
         ),
         Err((Status::Interrupted, None, None))
     );
@@ -597,7 +597,7 @@ fn the_reply_half_reports_by_what_is_there() {
             &mut w.jobs,
             1,
             &call,
-            || false
+            |_, _| false
         ),
         Err((Status::BufferTooSmall, Some(104), Some(0)))
     );
@@ -615,7 +615,7 @@ fn the_reply_half_reports_by_what_is_there() {
             &mut w.jobs,
             1,
             &c2,
-            || false
+            |_, _| false
         ),
         Err((Status::InvalidArgs, None, None))
     );
@@ -628,7 +628,7 @@ fn the_reply_half_reports_by_what_is_there() {
             &mut w.jobs,
             1,
             &c2,
-            || false
+            |_, _| false
         ),
         Ok((Some(104), Some(0))),
         "the message was still there"
@@ -663,7 +663,7 @@ fn a_big_call_takes_its_request_staged_and_leaves_its_reply_to_copy_out() {
         7,
         a,
         Some(staged),
-        || false,
+        |_, _| false,
     )
     .expect("the staged bytes are used, not the pointer");
     assert_eq!(call.txid, 7);
@@ -695,7 +695,7 @@ fn a_big_call_takes_its_request_staged_and_leaves_its_reply_to_copy_out() {
         &big,
         &mut deferred,
         true,
-        || false,
+        |_, _| false,
     );
     assert_eq!(r, Ok((Some(2048), Some(0))));
     let d = deferred.expect("a big reply is left for the caller");

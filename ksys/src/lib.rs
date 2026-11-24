@@ -43,7 +43,7 @@ pub use proc::{
     LibRange, Machine, NoMap, PCtx, ProcState, ProcTable, Process, ProtectCall, RangeBatch,
     RangeCall, SpawnStack, StartMap, UnmapCall,
 };
-pub use state::{PendingRegs, ThreadStart, UThread, UserState};
+pub use state::{set_interrupt_in, PendingRegs, ThreadStart, Threads, UThread, UserState};
 pub use thread::{
     charge_thread, clamp_prio, credit_thread, initial_general, new_start, process_start,
     thread_at_return, thread_blocks, thread_is_suspended, thread_registered_by_spawner,

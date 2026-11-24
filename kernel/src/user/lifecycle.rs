@@ -532,14 +532,12 @@ pub(super) fn settle_handle_table(growth_at_entry: u64) {
     });
 }
 
-/// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
-pub(super) fn take_interrupt_held() -> bool {
-    // (not `with_state`: the caller holds the memory locks, and the object lock comes before them in the order; it holds the object lock too)
-    with_state(|s| {
-        let had = s.set_interrupt(thread::current(), false);
-        sync_interrupts(s);
-        had
-    })
+/// `take_interrupt` for `ksys`'s two channel-call functions, which hold the user state's fields by name (`threads`, `n_interrupts`) while they call it: it
+/// works on those two and opens nothing (KT14: the old version opened `with_state` again under the caller's live `&mut UserState`).
+pub(super) fn take_interrupt_in(threads: &mut ksys::Threads, n_interrupts: &mut usize) -> bool {
+    let had = ksys::set_interrupt_in(threads, n_interrupts, thread::current(), false);
+    INTERRUPT_FLAGS.store(*n_interrupts, Ordering::Release);
+    had
 }
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.

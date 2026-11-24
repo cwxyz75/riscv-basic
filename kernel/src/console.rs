@@ -110,8 +110,14 @@ fn with_uart<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Set once the UART lock has been broken (the panic path): from then on `Console` drops its output, so that a hart that was inside `with_uart` when the lock
+/// was broken is the only one that can still hold `&mut LINE` (KT14: a second hart taking the freed lock would form a second one). The panicking hart writes
+/// through `PanicConsole`.
+static BROKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Break the UART lock (the panic path: whoever held it may never release it).
 pub fn break_lock() {
+    BROKEN.store(true, core::sync::atomic::Ordering::SeqCst);
     UART_OWNER.store(0, core::sync::atomic::Ordering::SeqCst);
 }
 
@@ -168,8 +174,13 @@ impl fmt::Write for Console {
 
     fn write_str(&mut self, s: &str) -> fmt::Result {
         with_uart(|| {
-            // SAFETY: the UART lock is held (`with_uart`), which makes this the only access to `LINE` on any hart: the panic and fatal-trap paths no longer
-            // reach it (they write through `PanicConsole`, which has a line state of its own, T240), so breaking the lock cannot alias this reference.
+            if BROKEN.load(core::sync::atomic::Ordering::SeqCst) {
+                return; // (the lock was broken by a panic: this hart may not take `LINE`, see `BROKEN`)
+            }
+            // SAFETY: the UART lock is held (`with_uart`) and has not been broken (`BROKEN`, checked just above), which makes this the only access to `LINE` on any
+            // hart: the panic and fatal-trap paths write through `PanicConsole` (a line state of its own, T240), and once they break the lock every later
+            // `Console` write returns before this line. A hart already past the check when the lock is broken keeps its reference until it leaves `with_uart`;
+            // no other hart can form one meanwhile, because the flag stops them (KT14).
             let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
             line.kernel_text(s.as_bytes(), &mut put);
         });
@@ -182,7 +193,10 @@ impl fmt::Write for Console {
 #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn write_user(bytes: &[u8]) {
     with_uart(|| {
-        // SAFETY: the UART lock is held, and `LINE` is touched only under it (see `write_str`).
+        if BROKEN.load(core::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        // SAFETY: the UART lock is held and not broken, and `LINE` is touched only under it (see `write_str`, `BROKEN`).
         let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
         for &b in bytes {
             line.user_byte(b, &mut put);

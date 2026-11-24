@@ -205,7 +205,7 @@ ATOMICS = {
     "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),
     "kernel/src/entropy.rs": (8, "whether the pool was keyed from a real seed, its first output for the boot tests (HD1), and the test-build flag `aslr=off` (HD2)"),
     "kernel/src/arch/riscv64/sbi.rs": (4, "whether the firmware has the debug console extension, probed once; the count of calls to the IPI extension (stays 0, PL6)"),
-    "kernel/src/console.rs": (10, "the console's panic flag and line state, and the UART's address, the firmware-console switch and its two counters (PL5b)"),
+    "kernel/src/console.rs": (12, "the console's panic flag and line state, the lock-broken flag that stops other harts' output after a panic (KT14), and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
     "kernel/src/sched_tests.rs": (49, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile)"),

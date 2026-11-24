@@ -15,7 +15,8 @@ use klock::aslock::{AsCell, AsHold};
 struct Scratch(core::cell::UnsafeCell<Vec<AsHold>>);
 
 // SAFETY: touched only with the big (object) lock held (`AsLocks::all` and `Drop` run inside `locked_state` or `with_state`), so no two harts use it at
-// once; a held address space is released by the hart that took it, before the lock is.
+// once; a held address space is released by the hart that took it, before the lock is. An `AsLocks` is always a local of such a closure, dropped inside it, and never
+// returned, stored or held across a sleep (KT14: that is what keeps `Drop`'s put-back inside the lock).
 unsafe impl Sync for Scratch {}
 
 static SCRATCH: Scratch = Scratch(core::cell::UnsafeCell::new(Vec::new()));

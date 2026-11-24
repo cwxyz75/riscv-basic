@@ -148,7 +148,12 @@ pub(crate) fn any_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
 /// `with_state` for the code that does not hold the object lock yet (a kernel thread, a boot-time check): it takes the lock for the closure.
 #[track_caller]
 pub(crate) fn locked_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
-    irq::without(|| f(state()))
+    irq::without(|| {
+        // (KT14: the debug guard of `with_state` covers this entry too, so a closure of either kind that opens the other is caught)
+        #[cfg(debug_assertions)]
+        let _one = StateOpen::enter();
+        f(state())
+    })
 }
 
 #[track_caller]
@@ -159,7 +164,7 @@ fn state() -> &'static mut UserState {
         "user state touched without the big kernel lock"
     );
     // SAFETY: the object lock is held (debug-checked), so no other hart has the state; every caller drops the reference before any context switch, and
-    // `with_state` never nests (a debug guard panics on a second open while one is live: T239), so no two live `&mut` alias.
+    // `with_state` and `locked_state` never nest (a debug guard panics on a second open of either while one is live: T239, KT14), so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
         slot.get_or_insert_with(|| {

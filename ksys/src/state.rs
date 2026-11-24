@@ -322,18 +322,7 @@ impl UserState {
 
     /// Set or clear the thread's pending-interrupt flag; true if it was set.
     pub fn set_interrupt(&mut self, tid: Tid, on: bool) -> bool {
-        let Some(t) = self.threads.get_mut(&tid) else {
-            return false;
-        };
-        let had = core::mem::replace(&mut t.interrupt, on);
-        if had != on {
-            if on {
-                self.n_interrupts = self.n_interrupts.saturating_add(1);
-            } else {
-                self.n_interrupts = self.n_interrupts.saturating_sub(1);
-            }
-        }
-        had
+        set_interrupt_in(&mut self.threads, &mut self.n_interrupts, tid, on)
     }
 
     pub fn interrupt_pending(&self, tid: Tid) -> bool {
@@ -450,4 +439,29 @@ impl Default for UserState {
     fn default() -> Self {
         UserState::new()
     }
+}
+
+/// The per-thread records.
+pub type Threads = kcore::fmap::FMap<Tid, UThread>;
+
+/// `UserState::set_interrupt` on the two fields it touches, for a caller that holds them by name while the rest of the state is borrowed (KT14: a callback that
+/// opened the whole state again aliased the `&mut` the caller held).
+pub fn set_interrupt_in(
+    threads: &mut Threads,
+    n_interrupts: &mut usize,
+    tid: Tid,
+    on: bool,
+) -> bool {
+    let Some(t) = threads.get_mut(&tid) else {
+        return false;
+    };
+    let had = core::mem::replace(&mut t.interrupt, on);
+    if had != on {
+        if on {
+            *n_interrupts = n_interrupts.saturating_add(1);
+        } else {
+            *n_interrupts = n_interrupts.saturating_sub(1);
+        }
+    }
+    had
 }
