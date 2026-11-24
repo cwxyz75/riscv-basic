@@ -742,8 +742,10 @@ static void rva23(void) {
     printf("vector loop: sum %u\n", sum);
     static unsigned char page[4096] __attribute__((aligned(4096)));
     memset(page, 0xff, sizeof page);
-#ifdef __riscv_zicboz
-    __asm__ volatile("cbo.zero 0(%0)" : : "r"(page) : "memory");
+#ifdef __riscv
+    /* `cbo.zero 0(rs1)` as its raw encoding (MISC-MEM, funct3 2, imm 4), whatever the compiler was told: no compiler macro decides whether it runs,
+     * and `scripts/check_vector_codegen.py` requires it in the archive (T188 item 4). */
+    __asm__ volatile(".insn i 0x0f, 2, x0, %0, 4" : : "r"(page) : "memory");
 #else
     memset(page, 0, 64);
 #endif

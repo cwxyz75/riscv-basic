@@ -137,3 +137,4 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-23 | AB9 | The contract written down: `abi-conformance`, `SYSCALLS.md` as the reference of the system library, the versioning rule | conformance program and library versioning rule, verified at smoke |
 | 2026-11-23 | T13 | Hand-tuned caps | limits are derived from RAM and set as job quotas (PL8) |
 | 2026-11-23 | T79 | Many hard limits assume QEMU as the target machine | limits are derived from RAM and set as job quotas (PL8) |
+| 2026-11-24 | T246 | The syscall epilogue allocates infallibly, so the guest allocation-failure sweep does not count it | The epilogue is counted by the guest sweep (heap::epilogue removed, class N with the allocator reserve); epic smoke green (run 45333578956) (PR 520) |
