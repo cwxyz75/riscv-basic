@@ -8095,6 +8095,59 @@ fn runtime_startup_heap_and_stdio() -> Outcome {
     Ok(())
 }
 
+/// T207 PR 5 (MM6): a program that allocates and frees 64 MiB ends with its job's page usage near where it started (the heap gives an arena
+/// back when nothing in it is live), and the memory is there to be made again. Run in this process, whose heap is the same `rt` heap.
+fn the_heap_gives_memory_back_when_it_is_freed() -> Outcome {
+    let root = root_job()?;
+    // (one warm-up round, so that the first arenas and the spare exist before the baseline is read)
+    {
+        let _warm: Vec<u8> = vec![1u8; 1 << 20];
+    }
+    let before = job_use(root, 2)?.0;
+    let mut peak = 0;
+    for round in 0..2 {
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..64 {
+            let mut b: Vec<u8> = Vec::new();
+            ensure!(
+                b.try_reserve_exact(1 << 20).is_ok(),
+                "block {i} of round {round}"
+            );
+            b.resize(1 << 20, i as u8);
+            blocks.push(b);
+        }
+        peak = job_use(root, 2)?.0 - before;
+        ensure!(peak >= 64 * 256, "64 MiB held is charged ({peak} pages)");
+        for (i, b) in blocks.iter().enumerate() {
+            ensure!(
+                b[0] == i as u8 && b[(1 << 20) - 1] == i as u8,
+                "block {i} intact"
+            );
+        }
+    }
+    let after = job_use(root, 2)?.0;
+    // (what stays is a spare arena of at most 1 MiB and the tables of what it holds)
+    ensure!(
+        after <= before + 300,
+        "the job holds {} pages more than at the start, after 64 MiB were freed (peak {peak})",
+        after as i64 - before as i64
+    );
+    Ok(())
+}
+
+/// T207 PR 5: in a child, memory made and freed three times over (the heap trims between), the cap is still a null allocation and not a fault.
+fn runtime_heap_stops_at_its_cap_after_giving_memory_back() -> Outcome {
+    let (p, in_w, out_r) = start_hello(&[b"hello", b"trim"])?;
+    let _ = (out_r, in_w);
+    wait_ended(p, 60_000)?;
+    let blocks = sys::process_info(p).a1 as i64;
+    ensure!(
+        (64..=128).contains(&blocks),
+        "the heap gave {blocks} MiB before refusing after three trims (cap 128 MiB; an exit code of 94 is an allocation that failed too soon)"
+    );
+    Ok(())
+}
+
 fn runtime_heap_stops_at_its_cap() -> Outcome {
     let (p, in_w, out_r) = start_hello(&[b"hello", b"hog"])?;
     let _ = out_r;
@@ -16617,6 +16670,10 @@ pub fn app_main() -> i32 {
             runtime_heap_stops_at_its_cap,
         ),
         (
+            "runtime_heap_stops_at_its_cap_after_giving_memory_back",
+            runtime_heap_stops_at_its_cap_after_giving_memory_back,
+        ),
+        (
             "runtime_refuses_a_bad_startup_message",
             runtime_refuses_a_bad_startup_message,
         ),
@@ -16755,6 +16812,10 @@ pub fn app_main() -> i32 {
         (
             "a_write_to_a_protected_page_ends_the_process",
             a_write_to_a_protected_page_ends_the_process,
+        ),
+        (
+            "the_heap_gives_memory_back_when_it_is_freed",
+            the_heap_gives_memory_back_when_it_is_freed,
         ),
         (
             "a_two_gib_sparse_vmo_is_mapped_touched_and_given_back",
