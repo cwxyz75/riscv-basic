@@ -165,8 +165,8 @@ fn state() -> &'static mut UserState {
         !irq::enabled() && crate::bkl::held(),
         "user state touched without the big kernel lock"
     );
-    // SAFETY: the big kernel lock is held (debug-checked); every caller drops the reference
-    // before any context switch, so no two live `&mut` alias.
+    // SAFETY: the object lock is held (debug-checked), so no other hart has the state; every caller drops the reference before any context switch, and
+    // `with_state` never nests (a debug guard panics on a second open while one is live: T239), so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
         slot.get_or_insert_with(|| {

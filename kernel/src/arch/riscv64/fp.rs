@@ -95,7 +95,8 @@ fn state() -> &'static mut FpState {
         crate::bkl::held(),
         "FP state touched without the big kernel lock"
     );
-    // SAFETY: the big kernel lock is held, and no caller keeps the reference across a context switch.
+    // SAFETY: the object lock is held (debug-checked), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
+    // that holds one passes it down (`drop_claim` takes `s`) instead of calling `state()` again, so no two live `&mut` alias on this hart (T239).
     unsafe {
         let cell = &mut *STATE.0.get();
         if cell.is_none() {
@@ -678,8 +679,7 @@ pub fn read_fp(tid: u64) -> [u64; 33] {
 }
 
 /// Make the registers of the hart that holds `tid`'s state stale (its claim is dropped, so the return to user mode loads from the saved copy).
-fn drop_claim(tid: u64, fp: bool) {
-    let s = state();
+fn drop_claim(s: &mut FpState, tid: u64, fp: bool) {
     let holder = if fp {
         s.threads.get(&tid).and_then(|t| t.holder())
     } else {
@@ -718,7 +718,7 @@ pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
     ) {
         return false;
     }
-    drop_claim(tid, true);
+    drop_claim(s, tid, true);
     let mut f = [0u64; 32];
     f.copy_from_slice(&w[..32]);
     let regs = FpRegs {
@@ -762,7 +762,7 @@ pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
     ) {
         return false;
     }
-    drop_claim(tid, false);
+    drop_claim(s, tid, false);
     let word = |i: usize| {
         let mut b = [0u8; 8];
         b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);

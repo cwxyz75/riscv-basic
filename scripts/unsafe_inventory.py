@@ -112,8 +112,7 @@ def problems(root=ROOT, path=AUDIT):
         seen.add((rel, h))
         if (rel, h) not in have:
             out.append(f"KT14: {rel}:{line} ({kind}, {h}) is not in the audit list (docs/records/reviews/kt14-unsafe-audit.tsv): audit it, then add its row: {first}")
-    for key in sorted(set(have) - seen):
-        out.append(f"KT14: the audit list has {key[0]} {key[1]} and no such block exists any more: remove the row")
+    # (a row whose block is gone or changed stays: `docs/records` is append-only, so the list is a history and the later row of a block wins)
     return out
 
 
@@ -142,7 +141,7 @@ def main():
             open(f, "a").write("fn g() {\n    unsafe { core::ptr::read(&2u8) };\n}\n")
             assert len(problems(tmp, a)) == 1, "a new block is refused"
             open(f, "w").write("fn f() {\n    // SAFETY: fine.\n    unsafe { core::ptr::read(&3u8) };\n}\n")
-            assert len(problems(tmp, a)) == 2, "a changed block is refused (and its old row is stale)"
+            assert len(problems(tmp, a)) == 1, "a changed block is refused (its old row stays as history)"
         finally:
             shutil.rmtree(tmp)
         print("unsafe_inventory self-test passed")

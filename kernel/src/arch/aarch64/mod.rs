@@ -306,6 +306,8 @@ pub mod cpu {
     pub fn aspace_current() -> u64 {
         unimplemented!()
     }
+    /// # Safety
+    /// `token` names a live address space's root with an ASID of the current generation; the caller has interrupts off. (The stub does nothing: AR1c.)
     pub unsafe fn aspace_install(token: u64) {
         unimplemented!()
     }
@@ -315,6 +317,8 @@ pub mod cpu {
     pub fn asid_bits() -> u32 {
         unimplemented!()
     }
+    /// # Safety
+    /// As `aspace_install`, and no flush is done: the ASID's translations are tagged, so the caller has refreshed the tag after any generation turn. (A stub: AR1c.)
     pub unsafe fn aspace_install_noflush(token: u64) {
         unimplemented!()
     }
@@ -345,9 +349,13 @@ pub mod cpu {
     pub fn thread_pointer() -> usize {
         unimplemented!()
     }
+    /// # Safety
+    /// `p` is the address of this hart's per-CPU record, alive for as long as the hart runs. (A stub: AR1c.)
     pub unsafe fn set_thread_pointer(p: usize) {
         unimplemented!()
     }
+    /// # Safety
+    /// Interrupts are off on this hart, and no live code of this hart uses the floating-point or vector unit. (A stub: AR1c.)
     pub unsafe fn lazy_units_off() {
         unimplemented!()
     }
@@ -364,12 +372,16 @@ pub mod switch {
             unimplemented!()
         }
     }
+    /// # Safety
+    /// `old` is the running thread's context slot and `new` a context that was saved by `switch` or made by `Context::new`, neither borrowed elsewhere; interrupts are off. (A stub: AR1c.)
     pub unsafe fn switch(old: *mut Context, new: *const Context) {
         unimplemented!()
     }
 }
 
 pub mod usermode {
+    /// # Safety
+    /// `frame` is this hart's static entry frame, `token` an address-space token of the thread's process, `kernel_top` the thread's own kernel stack top; interrupts are off and no lock is held. (A stub: AR1c.)
     pub unsafe fn enter_user_frame_raw(
         frame: *const super::trap::TrapFrame,
         token: u64,
