@@ -125,12 +125,6 @@ impl PiFutexes {
         }
     }
 
-    /// The waiters that a call woke on its own (`Outcome::Died`): to be woken by the caller, with the bucket lock still held. The vector's room is
-    /// kept: `drain_wake_into` hands them out without giving it up.
-    pub fn drain_wake(&mut self) -> Vec<Tid> {
-        core::mem::take(&mut self.to_wake)
-    }
-
     /// The waiters that a call ended on its own, handed to `f` (nothing allocated; the room stays).
     pub fn drain_wake_into(&mut self, f: impl FnOnce(&[Tid])) {
         if !self.to_wake.is_empty() {
@@ -456,6 +450,13 @@ impl PiFutexes {
         }
         if seen != self.len() {
             return Err(format!("{} queued, {} indexed", seen, self.len()));
+        }
+        if self.to_wake.capacity() < self.waiting.len() {
+            return Err(format!(
+                "the wake list has room for {}, {} are queued",
+                self.to_wake.capacity(),
+                self.waiting.len()
+            ));
         }
         Ok(())
     }

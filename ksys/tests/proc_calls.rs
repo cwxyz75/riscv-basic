@@ -735,7 +735,7 @@ fn kill_and_stop_name_their_target_and_refuse_the_ended() {
 fn job_kill_victims(w: &mut W, me: u64, jh: abi::Handle) -> Result<(Vec<u64>, bool), Status> {
     let (job, inside) = ksys::job_kill_begin(&w.objs, &w.procs, &mut w.jobs, me, jh)?;
     let (mut v, mut after) = (Vec::new(), 0);
-    while let Some(p) = ksys::job_kill_next(&w.procs, &w.jobs, job, me, after) {
+    while let Some(p) = ksys::job_kill_next(&w.objs, &w.procs, &w.jobs, me, jh, job, after) {
         v.push(p);
         after = p;
     }

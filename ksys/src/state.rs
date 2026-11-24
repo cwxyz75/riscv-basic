@@ -2,7 +2,6 @@
 //! syscall functions that act on it take `&mut UserState` and what the machine provides, so they run on the host.
 
 use crate::proc::SpawnStack;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use kcore::handle::HandleTable;
@@ -85,13 +84,13 @@ pub struct UserState {
     /// Pagers and the threads waiting for their pages (MM9).
     pub pagers: kcore::pager::Pagers,
     /// The kernel's end (a handle in `ktable`) of each pager's request channel, by pager id.
-    pub pager_ends: BTreeMap<u64, abi::Handle>,
+    pub pager_ends: kcore::fmap::FMap<u64, abi::Handle>,
     /// The next pager id.
     pub next_pager: u64,
     /// Threads a call that failed has to wake anyway (a partly done supply): the kernel takes them after the call.
     pub pending_wake: Vec<Tid>,
     /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
-    pub job_exc: BTreeMap<kcore::job::JobId, abi::Handle>,
+    pub job_exc: kcore::fmap::FMap<kcore::job::JobId, abi::Handle>,
     /// The next exception serial.
     pub next_exc: u64,
     /// Thread starts waiting for their thread to run, by token.
@@ -236,9 +235,9 @@ impl UserState {
             first_handle_gen: 0,
             root_scan: Vec::new(),
             root_cursor: 0,
-            job_exc: BTreeMap::new(),
+            job_exc: kcore::fmap::FMap::new(),
             pagers: kcore::pager::Pagers::new(),
-            pager_ends: BTreeMap::new(),
+            pager_ends: kcore::fmap::FMap::new(),
             next_pager: 1,
             pending_wake: Vec::new(),
             next_exc: 1,

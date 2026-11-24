@@ -97,7 +97,7 @@ fn hand_over_cancel_and_death_allocate_nothing_once_queued() {
         let keys: Vec<(u64, u64)> = (0..3).map(|k| (1, 0x1000 + k * 8)).collect();
         for _ in 0..300 {
             let (t, k) = (rng.below(8) + 1, rng.below(3) as usize);
-            match rng.below(4) {
+            match rng.below(5) {
                 0 | 1 => {
                     // (lock may allocate: it is the reportable step; a queued thread is blocked and calls nothing)
                     if pi.still_waiting(t) {
@@ -116,6 +116,22 @@ fn hand_over_cancel_and_death_allocate_nothing_once_queued() {
                         pi.take_outcome(to);
                     }
                     pi.drain_wake_into(|_| {});
+                }
+                3 => {
+                    // user code rewrites the word outside the protocol (to the caller itself), then unlocks: the stale record is dissolved, which
+                    // must not allocate either
+                    if pi.still_waiting(t) {
+                        continue;
+                    }
+                    words[k].0.set(t as u32);
+                    let at = allocs();
+                    let r = pi.unlock(&mut d, &words[k], keys[k], t, &mut |_| {});
+                    assert_eq!(allocs() - at, 0, "stale unlock {r:?}");
+                    pi.drain_wake_into(|_| {});
+                    // (the ended waiters take their outcomes, as the woken threads do)
+                    for w in 1..=8 {
+                        pi.take_outcome(w);
+                    }
                 }
                 _ => {
                     let at = allocs();

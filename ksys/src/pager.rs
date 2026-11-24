@@ -38,6 +38,7 @@ pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64
         .handles
         .reserve(2)
         .map_err(|_| Status::NoMemory)?;
+    us.pager_ends.reserve(1).map_err(|_| Status::NoMemory)?;
     let id = us.next_pager;
     let UserState {
         objs,
@@ -67,7 +68,7 @@ pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64
         Ok((ph, _)) => {
             us.next_pager = id.saturating_add(1);
             pagers.create(id);
-            pager_ends.insert(id, kernel_end);
+            pager_ends.insert_reserved(id, kernel_end);
             Ok((ph.0, ch.0))
         }
         Err(e) => {

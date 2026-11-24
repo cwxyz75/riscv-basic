@@ -994,11 +994,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             // mapping calls are reportable and stay outside)
             let r = if matches!(
                 n,
-                nr::JOB_KILL
-                    | nr::PROCESS_KILL
-                    | nr::PROCESS_EXCEPTION_CHANNEL
-                    | nr::JOB_EXCEPTION_CHANNEL
-                    | nr::EXCEPTION_RESUME
+                nr::EXCEPTION_RESUME
                     | nr::THREAD_RESUME
                     | nr::PAGER_CREATE
                     | nr::PAGER_SUPPLY
