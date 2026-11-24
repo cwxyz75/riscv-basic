@@ -303,51 +303,46 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
     if PI_USED.load(Ordering::Relaxed) {
-        // the PI futexes with waiters that it owns, and what their words say now (read outside the bucket locks: the memory locks are after them)
-        let mut keys: Vec<kcore::pifutex::Key> = Vec::new();
-        futex_table().for_each_bucket(|f| keys.extend(f.pi.owned_keys(tid)));
-        let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = {
-            let _as = AsLocks::one(s, pid);
-            let k = kmem::get();
-            let mut out = alloc::collections::BTreeMap::new();
-            for key in &keys {
+        // the PI futexes with waiters that it owns, one at a time (nothing is collected): what the word says now is read outside the bucket
+        // locks (the memory locks are after them), the record ends under its bucket's lock, and the word is poisoned outside it again
+        loop {
+            let mut next = None;
+            futex_table().for_each_bucket(|f| {
+                if next.is_none() {
+                    next = f.pi.first_owned_key(tid);
+                }
+            });
+            let Some(key) = next else {
+                break;
+            };
+            let (pa, value) = {
+                let _as = AsLocks::one(s, pid);
+                let k = kmem::get();
                 match ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, pid, key.1) {
-                    Ok(w) => {
-                        out.insert(*key, kcore::pifutex::Word::load(&kmem::PhysWord(w.pa)));
-                    }
+                    Ok(w) => (
+                        Some(w.pa),
+                        Some(kcore::pifutex::Word::load(&kmem::PhysWord(w.pa))),
+                    ),
                     Err(_) => {
                         // (a page of a pager's VMO that is not there sets the slot a syscall's copy reads: this thread is leaving and reads nothing)
                         let _ = k.vmos.take_need();
+                        (None, None)
                     }
                 }
-            }
-            out
-        };
-        let mut dead: Vec<(kcore::pifutex::Key, Vec<u64>)> = Vec::new();
-        let mut ended: Vec<u64> = Vec::new();
-        futex_table().for_each_bucket(|f| {
-            let found =
-                thread::pi_op_vec(|d| f.pi.owner_died(d, tid, |key| words.get(&key).copied()));
-            dead.extend(found);
-            f.pi.drain_wake_into(|w| ended.extend_from_slice(w));
-        });
-        for (key, woken) in dead {
-            // poison the word (if its page is still there), then wake the waiters
-            if words.contains_key(&key) {
-                {
-                    let _as = AsLocks::one(s, pid);
-                    let w = {
-                        let k = kmem::get();
-                        ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, pid, key.1).ok()
-                    };
-                    if let Some(w) = w {
-                        kcore::pifutex::PiFutexes::poison(&kmem::PhysWord(w.pa));
-                    }
+            };
+            let mut poison = false;
+            futex_table().for_each_bucket(|f| {
+                if f.pi.first_owned_key(tid) == Some(key) {
+                    poison = thread::pi_op(|d, sink| f.pi.owner_died_one(d, tid, key, value, sink));
+                    f.pi.drain_wake_into(thread::wake_many_quiet);
+                }
+            });
+            if poison {
+                if let Some(pa) = pa {
+                    kcore::pifutex::PiFutexes::poison(&kmem::PhysWord(pa));
                 }
             }
-            thread::wake_many(&woken);
         }
-        thread::wake_many(&ended);
     }
     thread::pi_gone(tid);
 }

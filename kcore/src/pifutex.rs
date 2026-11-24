@@ -350,6 +350,46 @@ impl PiFutexes {
             .collect()
     }
 
+    /// The key of one PI futex with waiters that `owner` owns (none when there is none): the owner's death takes them one at a time, allocating
+    /// nothing.
+    pub fn first_owned_key(&self, owner: Tid) -> Option<Key> {
+        self.recs
+            .iter()
+            .find(|(_, r)| r.owner == owner)
+            .map(|(&k, _)| k)
+    }
+
+    /// Thread `dead` has gone: the record of `key` (which it owns) ends. `word` is the word's value now (`None` if its page is gone). The waiters
+    /// end with `Died`, their donations are revoked (to `sink`) and they are in `drain_wake`. Returns whether the word is to be poisoned (`OWNER_DIED`:
+    /// the word still names the dead thread or is gone); a word that names someone else is left alone (the record is dissolved). Allocates nothing.
+    pub fn owner_died_one(
+        &mut self,
+        d: &mut Donations,
+        dead: Tid,
+        key: Key,
+        word: Option<u32>,
+        sink: Sink<'_>,
+    ) -> bool {
+        if self.recs.get(&key).is_none_or(|r| r.owner != dead) {
+            return false;
+        }
+        if word.is_some_and(|v| Tid::from(v & OWNER_MASK) != dead) {
+            self.dissolve(d, key, sink);
+            return false;
+        }
+        let Some(rec) = self.recs.remove(&key) else {
+            return false;
+        };
+        for t in rec.waiters {
+            if let Some(w) = self.waiting.get_mut(&t) {
+                w.outcome = Some(Outcome::Died);
+            }
+            self.to_wake.push(t);
+            sink(d.revoke(t).as_slice());
+        }
+        true
+    }
+
     /// Thread `dead` has gone: every PI futex it owned that has waiters is poisoned. `word_of(key)` is the word's current value (or `None` if its
     /// page is gone). Returns, for each, its key and the waiters to wake (they leave the queue, their donations are revoked), and the priorities
     /// that moved. The caller sets `OWNER_DIED` in the words (`poison`).

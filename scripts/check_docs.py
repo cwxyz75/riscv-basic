@@ -191,7 +191,6 @@ ATOMICS = {
     "kernel/src/arch/riscv64/aia.rs": (14, "interrupt controller statistics and masks, and the per-source aimed-hart table sized at boot (PL5c)"),
     "kernel/src/thread.rs": (36, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread); and the count of donations the graph refused (L22)"),
     "kernel/src/arch/riscv64/timer.rs": (6, "the clock's zero (the counter value at the first tick), and the counter's frequency and fixed-point multiplier (PL4b), set once at boot and read by `now_ns`"),
-    "kernel/src/user/waits.rs": (2, "a pager wait's registration and flush: stopgaps until the tables are prepaid (T248 PR B)"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
     "kernel/src/user/mod.rs": (7, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot); `STATE_OPEN` (debug builds: the open-closure flag of T239); `USER_READY`: the user state exists, read by the commit-on-drop of `irq::without` before it touches the state (L20)"),
     "kernel/src/user/trap.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch); the pointer to the allocator's published generation (L19), set once at boot; the count of `clock_get` calls the kernel answers (AB7: a test reads it to see that the library's clock does not enter the kernel)"),
@@ -241,7 +240,7 @@ def check_atomics():
 NOFAIL = {
     "kernel/src/thread.rs": (2, "the scheduler's spawn tail and the kernel thread registration"),
     "kernel/src/user/lifecycle.rs": (1, "a thread's exit from its PI futexes"),
-    "kernel/src/user/trap.rs": (1, "the calls that end or deliver something for a process that exists (kill, exception, pager, thread state: T248)"),
+    "kernel/src/user/trap.rs": (1, "the calls that end or deliver something for a process that exists (kill, exception resume, thread resume, the pager calls): their own tables are prepaid, what they reach is the scheduler's and teardown's (class N)"),
     "kernel/src/user/calls.rs": (2, "the kill of a process and of each process of a job (the caller's own exit, which does not return, is outside)"),
     "kernel/src/user/kobjects.rs": (1, "a kernel thread's admission to the wait table"),
     "kernel/src/user/waits.rs": (1, "the wake of the threads a pager step ended (a wake cannot be refused); the pager tables themselves are prepaid per thread (T248)"),
