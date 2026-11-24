@@ -115,7 +115,7 @@ pub(super) fn cleanup_dead() {
 #[allow(clippy::indexing_slicing)] // INVARIANT: as above
 fn cleanup_dead_held() {
     let me = thread::current();
-    if !with_state(|s| s.cleaning.insert(me)) {
+    if !with_state(|s| s.begin_cleaning(me)) {
         return; // a cleanup is already running further up this thread's stack; it will see our work
     }
     loop {
@@ -124,7 +124,7 @@ fn cleanup_dead_held() {
             // (the empty vector goes back too: a drain leaves the twin without capacity until it does, and the next burial would allocate: KT9)
             with_state(|s| {
                 s.objs.recycle(dead);
-                s.cleaning.remove(&me)
+                s.end_cleaning(me)
             });
             return;
         }

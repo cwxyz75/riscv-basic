@@ -87,16 +87,12 @@ pub fn thread_target(
     let handle = Handle(h);
     ipc::thread_of(objs, &caller.handles, handle, need)?;
     let obj = caller.handles.get(handle)?.obj;
-    let pid = match objs.get(obj) {
-        Some(ipc::KObj::Thread(t)) => t.pid,
+    let (pid, tid) = match objs.get(obj) {
+        Some(ipc::KObj::Thread(t)) => (t.pid, t.tid),
         _ => return Err(Status::WrongType),
     };
-    let tid = procs.get(&pid).and_then(|p| {
-        p.thread_objs
-            .iter()
-            .find(|(_, o)| **o == obj)
-            .map(|(t, _)| *t)
-    });
+    // (live: registered by its spawner and not yet ended)
+    let tid = tid.filter(|t| procs.get(&pid).is_some_and(|p| p.live_tids.contains(t)));
     match tid {
         Some(t) => Ok((t, pid)),
         None => Err(Status::BadState), // the thread has ended (or never started)

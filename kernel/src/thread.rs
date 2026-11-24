@@ -561,11 +561,6 @@ pub fn user_thread_ids_left() -> bool {
     sched().tid_headroom(4096)
 }
 
-/// Like `spawn_detached`, free to run on any hart.
-pub fn spawn_free_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
-    spawn_with_affinity(name, prio, entry, arg, true, None)
-}
-
 /// Create a thread that may run on any hart, whatever the default is.
 pub fn spawn_free(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
     spawn_with_affinity(name, prio, entry, arg, false, None)
@@ -575,7 +570,6 @@ fn spawn_with(name: &'static str, prio: Prio, entry: fn(usize), arg: usize, deta
     spawn_with_affinity(name, prio, entry, arg, detached, default_affinity())
 }
 
-#[allow(clippy::expect_used)] // INVARIANT: the priority passed by kernel code is valid (it was chosen in this crate)
 fn spawn_with_affinity(
     name: &'static str,
     prio: Prio,
@@ -585,6 +579,18 @@ fn spawn_with_affinity(
     affinity: Option<usize>,
 ) -> Tid {
     let thread = new_kthread(name, entry, arg, detached);
+    register_kthread(thread, prio, affinity)
+}
+
+#[allow(clippy::expect_used)] // INVARIANT: the priority passed by kernel code is valid (it was chosen in this crate)
+fn register_kthread(thread: KThread, prio: Prio, affinity: Option<usize>) -> Tid {
+    // (class N: the scheduler's queues, timers and maps grow here, and a thread that has been made cannot be refused; `prepare_user_thread` made the
+    // room that can be refused: the stack)
+    heap::nofail(|| register_kthread_inner(thread, prio, affinity))
+}
+
+#[allow(clippy::expect_used)] // INVARIANT: as above
+fn register_kthread_inner(thread: KThread, prio: Prio, affinity: Option<usize>) -> Tid {
     irq::off(|| {
         let mut k = kernel();
         let tid = sched()
@@ -596,11 +602,45 @@ fn spawn_with_affinity(
     })
 }
 
+/// A user thread's kernel stack, made before the call that creates the thread changes anything (KT9, T177: running out of stack memory is
+/// `NO_MEMORY` for `thread_spawn` and `process_start`, with nothing done). Dropping it frees the stack.
+pub struct PreparedThread(crate::kstack::KStack);
+
+pub fn prepare_user_thread() -> Option<PreparedThread> {
+    crate::kstack::alloc().map(PreparedThread)
+}
+
+/// Spawn a detached thread that may run on any hart, on the stack `prepare_user_thread` made.
+pub fn spawn_prepared(
+    p: PreparedThread,
+    name: &'static str,
+    prio: Prio,
+    entry: fn(usize),
+    arg: usize,
+) -> Tid {
+    // (class N from here: the stack was the room that could be refused)
+    heap::nofail(|| {
+        let thread = kthread_on(p.0, name, entry, arg, true);
+        register_kthread(thread, prio, None)
+    })
+}
+
 /// A kernel thread's stack and first context. The stack comes from frames, not the heap, and has a guard page below it
 /// (`kstack.rs`).
-#[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: memory for a kernel thread's stack at boot or at thread creation by kernel code: running out is the kernel's own bug (the user thread limit and the job's stack charge are checked first); GUARD_WORDS is far below the stack's length
+#[allow(clippy::expect_used)] // INVARIANT: memory for a kernel thread's stack at boot or at thread creation by kernel code that did not prepare one: running out is the kernel's own bug
 fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool) -> KThread {
-    let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
+    let stack = crate::kstack::alloc().expect("memory for a kernel stack");
+    kthread_on(stack, name, entry, arg, detached)
+}
+
+#[allow(clippy::indexing_slicing)] // INVARIANT: GUARD_WORDS is far below the stack's length
+fn kthread_on(
+    mut stack: crate::kstack::KStack,
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    detached: bool,
+) -> KThread {
     stack[..GUARD_WORDS].fill(CANARY);
     let top = stack.top();
     let ctx = Context::new(entry, arg, top);

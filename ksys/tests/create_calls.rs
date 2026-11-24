@@ -65,7 +65,6 @@ fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process 
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: Default::default(),
         job,
         table_charge: Default::default(),
         charge_end: Default::default(),

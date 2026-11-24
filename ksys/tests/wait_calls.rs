@@ -63,7 +63,6 @@ fn world() -> W {
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: Default::default(),
         job: JobId::ROOT,
         table_charge: Default::default(),
         charge_end: Default::default(),

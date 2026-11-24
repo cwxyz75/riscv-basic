@@ -72,12 +72,11 @@ impl KernelMachine {
             } else if let Ok((obj, pid, ..)) =
                 ipc::thread_cpu_info(&s.objs, &caller.handles, h, Rights::INSPECT)
             {
-                let tid = s.procs.get(&pid).and_then(|p| {
-                    p.thread_objs
-                        .iter()
-                        .find(|(_, &o)| o == obj)
-                        .map(|(&t, _)| t)
-                });
+                let tid = match s.objs.get(obj) {
+                    Some(ipc::KObj::Thread(t)) => t.tid,
+                    _ => None,
+                }
+                .filter(|t| s.procs.get(&pid).is_some_and(|p| p.live_tids.contains(t)));
                 if let Some(t) = tid {
                     self.cpu.push((t, thread::cpu_ns(t)));
                 }
@@ -86,7 +85,7 @@ impl KernelMachine {
             ipc::process_cpu_info(&s.objs, &caller.handles, h, Rights::INSPECT)
         {
             if let Some(p) = s.procs.get(&pid) {
-                for &t in &p.live_tids {
+                for &t in p.live_tids.iter() {
                     self.cpu.push((t, thread::cpu_ns(t)));
                 }
             }
@@ -201,10 +200,7 @@ fn cow_sync_held() {
 }
 
 pub(super) fn caller_pid(s: &UserState) -> Result<u64, Status> {
-    s.thread_pid
-        .get(&thread::current())
-        .copied()
-        .ok_or(Status::BadState)
+    s.pid_of(thread::current()).ok_or(Status::BadState)
 }
 
 pub(super) fn process_create(a: [u64; 6]) -> Reply {
@@ -227,24 +223,30 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn process_start(a: [u64; 6]) -> Reply {
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
     }
-    let (started, first_prio) = locked_state(|s| -> Result<(usize, u8), ReplyErr> {
+    // The kernel stack is made first (NO_MEMORY with nothing changed), the thread is spawned in the same critical section that makes its start
+    // and registers it (its first act is to take the object lock, so it cannot run before that is done: L20), and a refusal frees the stack.
+    locked_state(|s| -> Result<(), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let _as = AsLocks::all(s).map_err(|e| (e, None, None))?;
-        let mut k = kmem::get();
-        super::syslib::ensure(&mut k);
-        let mut lib = super::syslib::KernelLib {
-            mm: &mut *k.mm,
-            vmos: &mut *k.vmos,
+        let prepared = thread::prepare_user_thread().ok_or((Status::NoMemory, None, None))?;
+        // (the memory locks are let go before the spawn: a kernel stack comes from the frames, and the object lock comes before them)
+        let started = {
+            let mut k = kmem::get();
+            super::syslib::ensure(&mut k);
+            let mut lib = super::syslib::KernelLib {
+                mm: &mut *k.mm,
+                vmos: &mut *k.vmos,
+            };
+            ksys::process_start(s, k.jobs, &mut lib, me, a).map_err(|e| (e, None, None))?
         };
-        ksys::process_start(s, k.jobs, &mut lib, me, a).map_err(|e| (e, None, None))
+        spawn_registered(s, prepared, started);
+        Ok(())
     })?;
-    // The new thread (registered by itself once it runs). Spawned after the state borrow is
-    // gone: spawning can switch to it at once.
-    thread::spawn_free_detached("user", first_prio, user_thread_main, started);
     Ok((None, None))
 }
 
@@ -286,33 +288,46 @@ pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     Ok((None, None))
 }
 
+/// Spawn the kernel thread a call made a start for, on the stack prepared for it, and register it (EX1): known to `thread_suspend` and the rest from
+/// the moment the call returns, a SUSPENDED one stopped, with its register image, before the handle that can resume it is handed back. Cannot fail.
+#[inline(never)]
+fn spawn_registered(
+    s: &mut UserState,
+    prepared: thread::PreparedThread,
+    mut spawn: ksys::Spawn,
+) -> Tid {
+    let tid = thread::spawn_prepared(prepared, "user", spawn.prio, user_thread_main, spawn.token);
+    ksys::thread_registered_by_spawner(s, tid, &mut spawn);
+    // (class N: the donation graph's node)
+    crate::heap::nofail(|| thread::pi_register(tid)); // (the donation graph, L23)
+    if spawn.suspended {
+        sync_suspends(s);
+    }
+    tid
+}
+
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
     }
-    let spawn = locked_state(|s| -> Result<ksys::Spawn, ReplyErr> {
+    // One critical section (KT9): the kernel stack first (NO_MEMORY with nothing changed), the call, the spawn and the spawner's half of the registration.
+    // The new thread's first act is to take the object lock, so it cannot run a line of `user_thread_main` (or exit) before that half is done (L20).
+    let (handle, tid) = locked_state(|s| -> Result<(u64, Tid), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let creator = creator_prio(s);
         let _as = AsLocks::all(s).map_err(|e| (e, None, None))?;
+        let prepared = thread::prepare_user_thread().ok_or((Status::NoMemory, None, None))?;
         let k = kmem::get();
-        ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a).map_err(|e| (e, None, None))
+        let spawn = ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a)
+            .map_err(|e| (e, None, None))?;
+        drop(k);
+        let handle = spawn.handle;
+        let tid = spawn_registered(s, prepared, spawn);
+        Ok((handle, tid))
     })?;
-    // Spawned after the state borrow is gone, and in the same critical section as the spawner's half of the registration: the new thread's first act is to
-    // take the object lock, so it cannot run a line of `user_thread_main` (or exit) before that half is done (L20: nothing else makes the two atomic now).
-    let tid = locked_state(|s| {
-        let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-        // (EX1) the thread is known to `thread_suspend` and the rest from the moment this call returns; a SUSPENDED one is stopped, with its
-        // register image, before the handle that can resume it is handed back
-        ksys::thread_registered_by_spawner(s, tid, &spawn);
-        thread::pi_register(tid); // (the donation graph, L23)
-        if spawn.suspended {
-            ksys::thread_spawned_suspended(s, tid, &spawn);
-            sync_suspends(s);
-        }
-        tid
-    });
-    Ok((Some(spawn.handle), Some(tid)))
+    Ok((Some(handle), Some(tid)))
 }
 
 /// `thread_interrupt(thread)` (T56, SCHED-SMP-SPEC task 26): set the thread's interrupt flag and wake it. The next blocking
@@ -323,7 +338,7 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
     let tid = locked_state(|s| -> Result<Tid, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, _) = thread_target(s, me, a[0], Rights::MANAGE)?;
-        s.interrupts.insert(tid);
+        s.set_interrupt(tid, true);
         sync_interrupts(s);
         Ok(tid)
     })?;
@@ -466,11 +481,15 @@ fn general_of(
     tid: Tid,
     frame: Option<*mut crate::trap::TrapFrame>,
 ) -> Option<[u64; 32]> {
-    if let Some(image) = s.initial_regs.get(&tid) {
+    if let Some(image) = s.thread(tid).and_then(|t| t.initial_regs.as_deref()) {
         return Some(*image);
     }
     // (a write the thread has not applied yet is what it will have)
-    if let Some(g) = s.pending_regs.get(&tid).and_then(|p| p.general) {
+    if let Some(g) = s
+        .thread(tid)
+        .and_then(|t| t.pending_regs.as_deref())
+        .and_then(|p| p.general)
+    {
         return Some(g);
     }
     // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved registers and is mapped.
@@ -549,7 +568,7 @@ fn state_write(
     };
     // A thread that has not run is written through its starting image. One that has is parked at the return to user mode holding a `&mut` to its
     // own frame, so nobody else writes the frame: the write is left for it (`pending_regs`) and it applies it itself when it wakes.
-    let ran = !s.initial_regs.contains_key(&tid);
+    let ran = !s.thread(tid).is_some_and(|t| t.initial_regs.is_some());
     let _ = frame_ptr;
     match kind {
         ts::GENERAL => {
@@ -559,28 +578,49 @@ fn state_write(
             if !(abi::user::BASE..abi::user::TOP).contains(&g[31]) || g[31] & 1 != 0 {
                 return bad(Status::InvalidArgs);
             }
-            if let Some(image) = s.initial_regs.get_mut(&tid) {
+            if let Some(image) = s
+                .thread_mut(tid)
+                .and_then(|t| t.initial_regs.as_deref_mut())
+            {
                 *image = g;
             } else {
-                s.pending_regs.entry(tid).or_default().general = Some(g);
+                // (the record is made at an R point: no room is NO_MEMORY, with nothing written)
+                match s.pending_regs_entry(tid) {
+                    Ok(p) => p.general = Some(g),
+                    Err(e) => return bad(e),
+                }
             }
         }
         ts::FP => {
             let mut g = [0u64; 33];
             g.copy_from_slice(&w);
+            if ran {
+                if let Err(e) = s.pending_regs_entry(tid) {
+                    return bad(e);
+                }
+            }
             if !crate::fp::write_fp(tid, &g) {
                 return bad(Status::NoMemory);
             }
             if ran {
-                s.pending_regs.entry(tid).or_default().fp = true;
+                if let Ok(p) = s.pending_regs_entry(tid) {
+                    p.fp = true;
+                }
             }
         }
         _ => {
+            if ran {
+                if let Err(e) = s.pending_regs_entry(tid) {
+                    return bad(e);
+                }
+            }
             if !crate::fp::write_vec(tid, &data) {
                 return bad(Status::NoMemory);
             }
             if ran {
-                s.pending_regs.entry(tid).or_default().vec = true;
+                if let Ok(p) = s.pending_regs_entry(tid) {
+                    p.vec = true;
+                }
             }
         }
     }
@@ -623,7 +663,7 @@ fn state_read(
 /// the default (10).
 pub(super) fn creator_prio(s: &UserState) -> u8 {
     let me = thread::current();
-    if s.thread_pid.contains_key(&me) {
+    if s.threads.contains_key(&me) {
         thread::priority_of(me).unwrap_or(10)
     } else {
         10
@@ -656,7 +696,9 @@ pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
             a,
         )
         .map_err(|e| (e, None, None))?;
-        s.sched_flags.insert(tid, flags);
+        if let Some(t) = s.thread_mut(tid) {
+            t.sched_flags = flags;
+        }
         thread::set_priority(tid, prio);
         Ok((None, None))
     })
@@ -670,7 +712,7 @@ pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
         let (tid, _) = thread_target(s, me, a[0], Rights::INSPECT)?;
         let prio = u64::from(thread::priority_of(tid).ok_or((Status::BadState, None, None))?);
         let eff = u64::from(thread::effective_priority_of(tid).unwrap_or(prio as u8));
-        let flags = u64::from(s.sched_flags.get(&tid).copied().unwrap_or(0));
+        let flags = u64::from(s.thread(tid).map_or(0, |t| t.sched_flags));
         Ok((Some(prio | flags << 8 | eff << 16), Some(tid)))
     })
 }
@@ -689,10 +731,10 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
             thread::job_sched().sync_budgets(jobs.jobs); // (the scheduler's mirror of every job's RT budget)
                                                          // PR1: the threads of the job and everything below it, with the maximum their own job now allows
             let candidates: Vec<(Tid, u8)> = s
-                .thread_pid
+                .threads
                 .iter()
-                .filter_map(|(&tid, pid)| {
-                    let pj = s.procs.get(pid)?.job;
+                .filter_map(|(&tid, t)| {
+                    let pj = s.procs.get(&t.pid)?.job;
                     let max = jobs.jobs.sched(pj)?.max_prio;
                     jobs.jobs.is_within(pj, job).then_some((tid, max))
                 })

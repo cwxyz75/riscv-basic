@@ -79,7 +79,7 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
     let UserState {
         objs,
         ktable,
-        procs,
+        threads,
         ..
     } = us;
     if ipc::channel_peer_closed(objs, ktable, chan) {
@@ -91,9 +91,9 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
     };
     // the thread: its object if it has one (the handle takes a reference of its own, so closing it never destroys the spawner's object), else one
     // made now (a thread started by `process_start` has none, or its object is gone)
-    let existing = procs
-        .get(&pid)
-        .and_then(|p| p.thread_objs.get(&tid).copied())
+    let existing = threads
+        .get(&tid)
+        .and_then(|t| t.obj)
         .filter(|&obj| objs.retain(obj));
     let (th, tobj) = match existing {
         Some(obj) => match ktable.insert(objs, obj, Rights::THREAD) {
@@ -135,12 +135,15 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
     match ipc::channel_write_in(objs, ktable, chan, &msg, &[th, eh], q.jobs) {
         Ok(()) => {
             if made_obj {
-                if let Some(p) = procs.get_mut(&pid) {
-                    p.thread_objs.insert(tid, tobj);
+                if let Some(t) = threads.get_mut(&tid) {
+                    t.obj = Some(tobj);
+                    ipc::thread_set_tid(objs, tobj, tid);
                 }
             }
             us.next_exc = serial.saturating_add(1);
-            us.exc_pending.insert(tid, serial);
+            if let Some(t) = us.threads.get_mut(&tid) {
+                t.exc_pending = Some(serial);
+            }
             true
         }
         Err(_) => {
@@ -157,27 +160,28 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
 /// The thread of an exception is stopped (its suspend count goes up and SUSPENDED is raised when it parks): the faulting thread calls this
 /// after `deliver` took the exception.
 pub fn stop_thread(us: &mut UserState, tid: Tid) {
-    let _ = us
-        .suspends
-        .entry(tid)
-        .or_default()
-        .stop_for_exception(false);
+    if let Some(s) = us.suspend_entry(tid) {
+        let _ = s.stop_for_exception(false);
+    }
 }
 
 /// Let the thread of a retried exception go: its suspend count falls; returns whether it is parked and to be woken.
 fn release_thread(us: &mut UserState, pid: u64, tid: Tid) -> bool {
-    us.exc_pending.remove(&tid);
-    let Some(s) = us.suspends.get_mut(&tid) else {
+    if let Some(t) = us.threads.get_mut(&tid) {
+        t.exc_pending = None;
+    }
+    let Some(s) = us.suspend_of_mut(tid) else {
         return false;
     };
     match s.release_exception() {
         Some(kcore::suspend::Resumed::Running { clear, wake }) => {
-            us.suspends.remove(&tid);
+            us.suspend_remove(tid);
             if clear {
                 if let Some(obj) = us
-                    .procs
-                    .get(&pid)
-                    .and_then(|p| p.thread_objs.get(&tid).copied())
+                    .threads
+                    .get(&tid)
+                    .filter(|t| t.pid == pid)
+                    .and_then(|t| t.obj)
                 {
                     ipc::thread_set_suspended(&mut us.objs, obj, false);
                 }
@@ -194,7 +198,8 @@ fn alive(p: Option<&Process>) -> bool {
 
 /// Is `e` the exception its thread is stopped for, in a process that lives?
 fn current(us: &UserState, e: &ExceptionObj) -> bool {
-    alive(us.procs.get(&e.pid).map(|p| &**p)) && us.exc_pending.get(&e.tid) == Some(&e.serial)
+    alive(us.procs.get(&e.pid).map(|p| &**p))
+        && us.threads.get(&e.tid).and_then(|t| t.exc_pending) == Some(e.serial)
 }
 
 /// Act on a decision for exception `e` (not yet resolved, its process alive).

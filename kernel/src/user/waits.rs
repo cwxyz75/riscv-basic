@@ -5,11 +5,8 @@ use super::*;
 /// The signal word of `h` in the calling process (0 if it names nothing). Interrupts off.
 pub(super) fn signals_now(h: Handle) -> Result<u32, Status> {
     with_state(|s| {
-        let pid = s
-            .thread_pid
-            .get(&thread::current())
-            .ok_or(Status::BadState)?;
-        let p = s.procs.get(pid).ok_or(Status::BadState)?;
+        let pid = s.pid_of(thread::current()).ok_or(Status::BadState)?;
+        let p = s.procs.get(&pid).ok_or(Status::BadState)?;
         ipc::signals_of(&s.objs, &p.handles, h)
     })
 }
@@ -42,7 +39,7 @@ pub(super) fn touch_port_of(h: Handle) {
 
 fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
     with_state(|s| {
-        let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        let Some(pid) = s.pid_of(thread) else {
             return;
         };
         let Some(p) = s.procs.get(&pid) else {
@@ -67,7 +64,7 @@ fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
 /// Register `thread` to wait for the reply with `txid` on the channel end the calling process's handle `h` names (a `channel_call`, L21d).
 pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
     with_state(|s| {
-        let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        let Some(pid) = s.pid_of(thread) else {
             return;
         };
         let Some(p) = s.procs.get(&pid) else {
@@ -198,7 +195,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
         };
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
-        let live = |t: Tid| s.thread_pid.get(&t) == Some(&me);
+        let live = |t: Tid| s.pid_of(t) == Some(me);
         let r = futex_table().with_key(key, |f| {
             let r = thread::pi_op(
                 |d| match f.pi.lock(d, &word, key, who, live, deadline != 0) {
@@ -524,7 +521,9 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
     locked_state(|s| {
         // (one section with the server's donation, `lend_to_reader`: after it, no donation for this call can be made)
-        s.calls.remove(&me);
+        if let Some(t) = s.thread_mut(me) {
+            t.call = None;
+        }
         thread::pi_revoke(me);
     });
     super::trap::finish_out(r, deferred)
@@ -556,10 +555,10 @@ fn channel_call_inner(
     let me = thread::current();
     let ready = || {
         with_state(|s| {
-            let Some(&pid) = s.thread_pid.get(&thread::current()) else {
+            let Some(pid) = s.pid_of(thread::current()) else {
                 return true;
             };
-            let interrupted = s.interrupts.contains(&thread::current());
+            let interrupted = s.interrupt_pending(thread::current());
             ksys::channel_call_ready(s, pid, &call, interrupted)
         })
     };

@@ -245,11 +245,11 @@ pub fn futex_wait_enqueue<M: PhysMem, B: Buckets>(
             },
         );
     }
-    let queued = table.wait_if((me, w.addr), who, || read_word(mem, w.pa) == w.expected);
-    if queued {
-        FutexCheck::Sleep
-    } else {
-        FutexCheck::Done(Status::ShouldWait) // the word changed: do not sleep
+    match table.wait_if((me, w.addr), who, || read_word(mem, w.pa) == w.expected) {
+        Ok(true) => FutexCheck::Sleep,
+        Ok(false) => FutexCheck::Done(Status::ShouldWait), // the word changed: do not sleep
+        // (KT9: the queue entry could not be made, so the thread is not asleep: a call that decides to sleep is where running out is reported)
+        Err(_) => FutexCheck::Done(Status::NoMemory),
     }
 }
 
@@ -329,7 +329,9 @@ pub fn futex_wake<B: Buckets>(
     wake: impl FnOnce(&[u64]),
 ) -> Result<usize, Status> {
     let (addr, count) = futex_wake_args(a)?;
-    Ok(table.wake_with((me, addr), count, wake))
+    table
+        .wake_with((me, addr), count, wake)
+        .map_err(|_| Status::NoMemory)
 }
 
 // ---- channel_call ----
@@ -393,7 +395,7 @@ pub fn channel_call_send_staged<M: PhysMem>(
     let UserState {
         objs,
         procs,
-        calls,
+        threads,
         next_call,
         ..
     } = us;
@@ -466,7 +468,9 @@ pub fn channel_call_send_staged<M: PhysMem>(
         Some((caller, call)),
     )?;
     // (from here until the call ends, a server that reads the request lends it the caller's priority: L22)
-    calls.insert(caller, call);
+    if let Some(t) = threads.get_mut(&caller) {
+        t.call = Some(call);
+    }
     Ok(Call {
         ch,
         txid: le32(&data, 0),

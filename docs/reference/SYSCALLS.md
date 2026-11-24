@@ -525,7 +525,7 @@ time in nanoseconds: `0` polls (equal: TIMED_OUT at once, no sleep), `u64::MAX` 
 sleeper left the table because of a `futex_wake`); spurious wakeups are allowed, so callers re-check.
 Errors, in order: INVALID_ARGS (`address` not 4-aligned, outside user memory, not readable or not
 mappable; `expected` wider than 32 bits); SHOULD_WAIT (the word differs from `expected`: nothing
-slept); TIMED_OUT (the deadline passed, never earlier, or a poll of an equal word). A kill ends the
+slept); NO_MEMORY (the kernel has no room to queue the sleeper: it did not sleep, and callers that loop re-check as for a spurious wakeup); TIMED_OUT (the deadline passed, never earlier, or a poll of an equal word). A kill ends the
 sleep; the sleeper leaves the table whichever way it ends. No rights are involved: a futex is a
 (process, address) pair and naming one grants nothing the process could not do with its own memory.
 
@@ -533,7 +533,7 @@ sleep; the sleeper leaves the table whichever way it ends. No rights are involve
 
 Wake up to `count` sleepers on `address` **in the caller's process**, oldest first (FIFO); `woken` is
 how many. Another process sleeping on the same address number is not touched. `count` 0 wakes
-nobody. INVALID_ARGS if `address` is not 4-aligned or outside user memory. (The address need not be
+nobody. INVALID_ARGS if `address` is not 4-aligned or outside user memory; NO_MEMORY if the kernel has no room for the list of those it would wake (nobody was woken: retry). (The address need not be
 mapped: nobody can be sleeping on an address the sleeper could not read.)
 
 ### interrupt_create(resource, source) -> status, handle

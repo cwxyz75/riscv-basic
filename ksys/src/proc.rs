@@ -7,7 +7,6 @@ use abi::rights::Rights;
 use abi::status::Status;
 use abi::syscall as nr;
 use abi::Handle;
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::aspace::AddressSpace;
 use kcore::aspace::Vmos;
@@ -83,7 +82,7 @@ pub struct Process {
     /// The user threads of this process that have started and not ended (T191): what a kill, a suspend or a teardown walks, instead of every thread
     /// in the system. Kept in step with `UserState::thread_pid` (the same threads, keyed the other way): a thread is added when it registers
     /// itself on its first run and removed when it ends or its process is torn down.
-    pub live_tids: alloc::collections::BTreeSet<Tid>,
+    pub live_tids: kcore::fmap::FSet<Tid>,
     /// The address space behind its `AS` lock (L17): shared by `Arc` so a syscall can hold the locks of the spaces it touches ([`klock::aslock::AsCell::hold`])
     /// while the process table is borrowed as the pure code likes.
     pub aspace: alloc::sync::Arc<klock::aslock::AsCell>,
@@ -116,8 +115,6 @@ pub struct Process {
     /// User threads that exist and have not ended (counted from `thread_spawn`, before the
     /// thread first runs). The process is torn down when this reaches 0.
     pub threads_alive: usize,
-    /// The thread objects of the live threads, to mark them TERMINATED when they end.
-    pub thread_objs: BTreeMap<Tid, kcore::object::ObjId>,
     /// The job this process is charged to (it holds one use of it): its process, its threads
     /// and, through the VMOs made for it, its memory.
     pub job: JobId,
@@ -130,8 +127,8 @@ pub struct Process {
     /// that span, not when the region that started there goes (a range unmap or a protect can split a mapping: the tables of what stays
     /// must stay charged, MM7).
     pub charge_end: kcore::fmap::FMap<u64, u64>,
-    /// The stacks `thread_spawn` provisioned, by thread: freed when the thread ends (or with the process).
-    pub stacks: BTreeMap<Tid, SpawnStack>,
+    /// The stacks `thread_spawn` provisioned, by thread: freed when the thread ends (or with the process). Entered at the spawn with room `reserve_thread` made.
+    pub stacks: kcore::fmap::FMap<Tid, SpawnStack>,
     /// Where the next stack search in the arena starts (just above the last stack handed out).
     pub stack_hint: u64,
     /// Started by the kernel (`start`): may ask for the root job (`job_root`). Nothing a program
@@ -198,7 +195,7 @@ impl StartMap for NoMap {
 }
 
 /// The stack a `thread_spawn` provisioned: its region in the address space and the VMO behind it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnStack {
     pub region: u64,
     pub vmo: u64,
@@ -944,12 +941,11 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             if terminated {
                 return Ok((Some(final_ns), None));
             }
-            let tid = procs.get(&pid).and_then(|p| {
-                p.thread_objs
-                    .iter()
-                    .find(|(_, &o)| o == obj)
-                    .map(|(&t, _)| t)
-            });
+            let tid = match objs.get(obj) {
+                Some(ipc::KObj::Thread(t)) => t.tid,
+                _ => None,
+            }
+            .filter(|t| procs.get(&pid).is_some_and(|p| p.live_tids.contains(t)));
             Ok((Some(tid.map_or(0, |t| machine.thread_cpu_ns(t))), None))
         })(),
         nr::THREAD_INFO if a[1] != 0 => fail(Status::InvalidArgs),

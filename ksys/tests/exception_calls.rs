@@ -12,7 +12,6 @@ use kcore::pagetable::PageTable;
 use kcore::Mm;
 use ksys::exception::{self, Fault, Resolved, Target};
 use ksys::{ProcState, Process, UserState};
-use std::collections::BTreeMap;
 
 mod common;
 use common::FakeMem;
@@ -39,11 +38,10 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: BTreeMap::new(),
         job,
         table_charge: kcore::fmap::FMap::new(),
         charge_end: kcore::fmap::FMap::new(),
-        stacks: BTreeMap::new(),
+        stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
         libsys: Default::default(),
@@ -71,6 +69,7 @@ fn world() -> W {
     let child = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
     ksys::put_process(&mut us.procs, 1, process(&mut mm, &kernel, JobId::ROOT));
     ksys::put_process(&mut us.procs, 2, process(&mut mm, &kernel, child));
+    us.add_thread(5, 2, None).unwrap();
     fn q(jobs: &mut kcore::job::Jobs) -> Quota<'_> {
         Quota {
             jobs,
@@ -147,7 +146,7 @@ fn a_fault_goes_to_the_process_channel_and_is_resolved_once() {
     ));
     exception::stop_thread(&mut w.us, 5);
     // (the thread parks as it returns to user mode)
-    let _ = w.us.suspends.get_mut(&5).unwrap().return_to_user();
+    let _ = w.us.suspend_of_mut(5).unwrap().return_to_user();
     let (data, handles) = w.read(ch);
     assert_eq!(data.len(), abi::exception::MESSAGE_BYTES);
     let words: Vec<u64> = data
@@ -174,7 +173,7 @@ fn a_fault_goes_to_the_process_channel_and_is_resolved_once() {
         Err(Status::BadState),
         "an exception is resolved once"
     );
-    assert!(!w.us.suspends.contains_key(&5), "the thread is released");
+    assert!(w.us.suspend_of(5).is_none(), "the thread is released");
 }
 
 #[test]
@@ -367,7 +366,7 @@ fn the_thread_handle_in_a_message_takes_its_own_reference_and_closing_it_leaves_
         };
         ipc::thread_object_create_in(&mut w.us.objs, &mut p2.handles, 2, &mut q).unwrap()
     };
-    w.us.procs.get_mut(&2).unwrap().thread_objs.insert(5, tobj);
+    w.us.add_thread(5, 2, Some(tobj)).unwrap();
     assert!(exception::deliver(
         &mut w.us,
         &mut w.jobs,
@@ -457,7 +456,7 @@ fn thread_resume_does_not_release_a_thread_stopped_for_an_exception() {
         None
     ));
     exception::stop_thread(&mut w.us, 5);
-    let _ = w.us.suspends.get_mut(&5).unwrap().return_to_user();
+    let _ = w.us.suspend_of_mut(5).unwrap().return_to_user();
     let (_, h) = w.read(ch);
     // `thread_resume` from the handler: the thread is not suspended (BAD_STATE) and stays stopped
     assert_eq!(

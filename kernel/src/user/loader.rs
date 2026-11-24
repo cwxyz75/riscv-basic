@@ -129,11 +129,10 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         killed: None,
         stopped: false,
         threads_alive: 1,
-        thread_objs: BTreeMap::new(),
         job: JobId::ROOT,
         table_charge: kcore::fmap::FMap::new(),
         charge_end: kcore::fmap::FMap::new(),
-        stacks: BTreeMap::new(),
+        stacks: kcore::fmap::FMap::new(),
         stack_hint: super::calls::random_stack_hint(),
         privileged: true,
         libsys: lib,
@@ -176,24 +175,44 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         }
         return Err(LoadError::NoMemory);
     }
-    let token = with_state(|s| {
-        {
-            let (entry, arg) = (process.entry, process.arg);
-            // (the root job has no limits: these charges only keep its usage honest)
-            let jobs = &mut *k.jobs;
-            let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
-            let _ = charge_thread(jobs, JobId::ROOT);
-            ksys::put_process(&mut s.procs, pid, process);
-            let token = new_start(s, pid, entry, stack_top, arg, None);
-            if let Some(t) = s.starts.get_mut(&token) {
-                t.a2 = lib.base;
-            }
-            token
-        }
-    });
     // (the thread's stack comes from the same locks)
+    // (the root job has no limits: these charges only keep its usage honest)
+    let jobs = &mut *k.jobs;
+    let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
+    let _ = charge_thread(jobs, JobId::ROOT);
+    // (the memory locks are let go before the spawn: a kernel stack comes from the frames, and the object lock comes before them)
     drop(k);
-    // user threads may run on any hart (kernel threads stay on the boot hart by default)
-    let tid = thread::spawn_free("user", 10, user_thread_main, token);
+    // One critical section: the process goes in, the thread is spawned (user threads may run on any hart; kernel threads stay on the boot hart by
+    // default) and registered, as `thread_spawn` does (its first act is to take the object lock). Boot: running out of memory here is a failure to start.
+    let tid = with_state(|s| {
+        let (entry, arg) = (process.entry, process.arg);
+        ksys::put_process(&mut s.procs, pid, process);
+        s.reserve_thread(pid)
+            .expect("memory for the first thread's record");
+        let token = new_start(s, pid, entry, stack_top, arg, None);
+        if let Some(t) = s.starts.get_mut(&token) {
+            t.a2 = lib.base;
+        }
+        let mut image =
+            kcore::fbox::FBox::try_new(ksys::initial_general(entry, stack_top, arg, 0, 0))
+                .expect("memory for the first thread's registers");
+        image[11] = lib.base; // (`a2`: the system library's base, AB7)
+        let mut spawn = ksys::Spawn {
+            token,
+            handle: 0,
+            prio: 10,
+            suspended: false,
+            pid,
+            obj: None,
+            stack: None,
+            rr: false,
+            spawned: false,
+            image: Some(image),
+        };
+        let tid = thread::spawn_free("user", 10, user_thread_main, token);
+        ksys::thread_registered_by_spawner(s, tid, &mut spawn);
+        crate::heap::nofail(|| thread::pi_register(tid)); // (the donation graph, L23)
+        tid
+    });
     Ok((pid, tid))
 }
