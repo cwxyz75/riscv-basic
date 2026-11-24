@@ -520,6 +520,9 @@ pub fn channel_write_from(
             .iter()
             .map(|&h| table.remove_for_transfer(reg, h).expect("validated")),
     );
+    for e in &entries {
+        reg.debug_assert_not_white(e.obj);
+    }
     if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
         p.queue.push_back(Message {
             data: bytes,

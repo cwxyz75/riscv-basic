@@ -261,6 +261,8 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
                 kcore::object::SweepStep::Done(_)
             )
     }) {}
+    // (T206: what the sweep's freeing left owed is paid before the process is over, a bounded slice per critical section)
+    while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {}
     // 3. the process is over
     locked_state(|s| {
         if let Some(obj) = process.obj {

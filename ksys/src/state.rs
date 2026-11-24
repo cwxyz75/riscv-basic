@@ -110,6 +110,8 @@ pub struct UserState {
     pub ktable: HandleTable,
     /// The processes whose handle tables a running sweep has yet to shade (T206): taken from the end, the kernel's own table last.
     pub root_scan: Vec<u64>,
+    /// The slot of the process table (the last of `root_scan`, or the kernel's own) a root scan has reached (T206).
+    pub root_cursor: usize,
     /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
     /// signals match, instead of by the global queue.
     pub waits: kcore::wait::WaitTable,
@@ -153,6 +155,7 @@ impl UserState {
         }
         scan.extend(self.procs.keys().rev().copied());
         self.root_scan = scan;
+        self.root_cursor = 0;
         true
     }
 
@@ -160,20 +163,41 @@ impl UserState {
     /// kernel's own; after that, `Registry::sweep_step`. A handle made or moved while this runs shades its object (`HandleTable::insert`,
     /// `remove_for_transfer`).
     pub fn sweep_slice(&mut self, budget: usize) -> kcore::object::SweepStep {
+        // (T206: references an earlier slice left owed are paid first, a bounded number per slice)
+        if !self.objs.release_step(kcore::object::RELEASE_UNITS) {
+            return kcore::object::SweepStep::More;
+        }
         if self.objs.sweep_active() && self.objs.roots_are_pending() {
-            match self.root_scan.pop() {
+            // (T206: at most `budget` slots of one table per slice, the cursor kept between slices; a table with thousands of slots is not one section)
+            let from = self.root_cursor;
+            match self.root_scan.last().copied() {
                 Some(pid) => {
+                    let len = self.procs.get(&pid).map_or(0, |q| q.handles.slot_count());
+                    let to = len.min(from.saturating_add(budget));
                     if let Some(q) = self.procs.get(&pid) {
-                        for o in q.handles.objects() {
+                        for o in q.handles.objects_in(from, to) {
                             self.objs.shade(o);
                         }
                     }
+                    if to >= len {
+                        self.root_scan.pop();
+                        self.root_cursor = 0;
+                    } else {
+                        self.root_cursor = to;
+                    }
                 }
                 None => {
-                    for o in self.ktable.objects() {
+                    let len = self.ktable.slot_count();
+                    let to = len.min(from.saturating_add(budget));
+                    for o in self.ktable.objects_in(from, to) {
                         self.objs.shade(o);
                     }
-                    self.objs.sweep_roots_done();
+                    if to >= len {
+                        self.root_cursor = 0;
+                        self.objs.sweep_roots_done();
+                    } else {
+                        self.root_cursor = to;
+                    }
                 }
             }
             return kcore::object::SweepStep::More;
@@ -211,6 +235,7 @@ impl UserState {
             asids: kcore::asid::Asids::new(16),
             first_handle_gen: 0,
             root_scan: Vec::new(),
+            root_cursor: 0,
             job_exc: BTreeMap::new(),
             pagers: kcore::pager::Pagers::new(),
             pager_ends: BTreeMap::new(),
