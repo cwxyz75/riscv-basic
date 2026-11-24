@@ -129,3 +129,9 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-23 | HD4 | No ambient debug calls; a release kernel with no test-only code | DebugResource (earlier), release content, and the k shard on a release-content kernel (PR 480); the shipped build's embedding is T235 (PR 480) |
 | 2026-11-23 | T240 | KT14: panic-path defects (console `LINE` is shared after `break_lock`; the panic trace may read through a guard page) | the panic handler writes through PanicConsole (its own line state) and the trace is bounded to one stack slot; the gate's panic controls (fail-demo, smoke) pass on the epic (PRs 497, 490) (PR 497) |
 | 2026-11-23 | T239 | KT14: aliased `&mut` through nested `with_state` and the FP tables' `state()` (undefined behaviour by the language rules; no machine-level corruption found) | with_state never nests (debug guard) and the FP tables' drop_claim takes s; the shards and the gate run with the guard (PR 496) |
+| 2026-11-23 | AB7 | The system library: `libsys.so` in the kernel image, mapped into every process; `rt` and the C library call through it | AB8 (PR AB9) |
+| 2026-11-23 | PL8 | Limits derived from RAM; per-process ceilings become quotas | per-job region quota (job_set_region_limit), thread limit from the job, verified at epic/phase-12b smoke (PR 504) |
+| 2026-11-23 | AB8 | Entry enforcement: an `ecall` from outside the system library is an exception; shuffled syscall numbers in soak | entry enforcement and shuffled numbers, verified at smoke |
+| 2026-11-23 | AB9 | The contract written down: `abi-conformance`, `SYSCALLS.md` as the reference of the system library, the versioning rule | conformance program and library versioning rule, verified at smoke |
+| 2026-11-23 | T13 | Hand-tuned caps | limits are derived from RAM and set as job quotas (PL8) |
+| 2026-11-23 | T79 | Many hard limits assume QEMU as the target machine | limits are derived from RAM and set as job quotas (PL8) |
