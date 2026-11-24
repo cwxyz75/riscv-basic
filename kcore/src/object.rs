@@ -470,6 +470,11 @@ impl<T: Object> Registry<T> {
         self.slot(id)?.job
     }
 
+    /// The credits still owed, without applying them (an audit reads them: a job's usage minus these is what live objects hold).
+    pub fn pending_credits(&self) -> &[(JobId, usize)] {
+        &self.credits
+    }
+
     /// The same credits, drained in place: the vector keeps its capacity, so the next destruction of a charged object does not allocate.
     pub fn drain_credits(&mut self) -> alloc::vec::Drain<'_, (JobId, usize)> {
         self.credits.drain(..)

@@ -265,8 +265,9 @@ pub fn audit(w: &mut World) -> Result<(), String> {
             ));
         }
     }
-    // the ledger: after the credits of destroyed objects are applied, a job's usage is exactly what live objects charged to it or below hold
-    ipc::settle(&mut w.objs, &mut w.jobs);
+    // the ledger: a job's usage, less the credits of destroyed objects that are still owed (the audit does not apply them: a call that forgot to settle must not pass),
+    // is exactly what live objects charged to it or below hold
+    let owed: Vec<(JobId, usize)> = w.objs.pending_credits().to_vec();
     let mut charged: Vec<(JobId, usize)> = Vec::new();
     let mut jobs = vec![JobId::ROOT, w.job];
     for &id in &ids {
@@ -293,6 +294,13 @@ pub fn audit(w: &mut World) -> Result<(), String> {
         let (used, used_bytes) = u.map_or((0, 0), |u| {
             (u.get(Resource::Objects), u.get(Resource::IpcBytes))
         });
+        let owing = owed.iter().filter(|c| w.jobs.is_within(c.0, j));
+        let (owed_objects, owed_bytes) =
+            owing.fold((0u64, 0u64), |a, c| (a.0 + 1, a.1 + c.1 as u64));
+        let (used, used_bytes) = (
+            used.saturating_sub(owed_objects),
+            used_bytes.saturating_sub(owed_bytes),
+        );
         if used != held {
             return Err(format!("job {j:?}: the ledger says {used} objects, {held} are alive and charged to it or below"));
         }

@@ -209,6 +209,40 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                 }
             }
         }
+        // (T176 2: `port_wait` lives in the kernel, so the harness polls the ports the process holds the way the wait does, one binding or a batch: the cursor,
+        // the one-shot disarm and the pruning of bindings whose object went all run, and what comes back must be a delivered signal)
+        if i % 5 == 2 {
+            at.set(("poll", i));
+            let ports: Vec<u64> = model
+                .live()
+                .iter()
+                .filter(|&&(_, k)| k == Kind::Port)
+                .map(|&(h, _)| h)
+                .collect();
+            if let Some(&p) = ports.get(i / 5 % ports.len().max(1)) {
+                if i % 10 == 2 {
+                    if let Ok(Some((key, seen))) =
+                        ipc::port_poll_in(&mut w.objs, &w.handles, Handle(p), &mut w.jobs)
+                    {
+                        if seen == 0 {
+                            return Err(format!("seed {seed}, call {i}: a poll of port {p} delivered key {key} with no signal"));
+                        }
+                    }
+                } else if let Ok(got) = ipc::port_poll_many_in(
+                    &mut w.objs,
+                    &w.handles,
+                    Handle(p),
+                    &mut w.jobs,
+                    1 + i % 4,
+                ) {
+                    if got.len() > 1 + i % 4 || got.iter().any(|&(_, seen)| seen == 0) {
+                        return Err(format!(
+                            "seed {seed}, call {i}: a batch poll of port {p} gave {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
         at.set(("cleanup", i));
         cleanup(&mut w);
         at.set(("audit", i));
