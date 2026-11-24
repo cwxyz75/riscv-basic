@@ -222,16 +222,32 @@ pub(super) fn wake_threads_of(pid: u64) {
 }
 
 fn wake_threads_of_held(pid: u64) {
-    // (the process's own set of live threads: not a walk of every thread in the system, T191)
-    crate::heap::nofail(|| {
-        let tids: Vec<Tid> = with_state(|s| {
-            s.procs
-                .get(&pid)
-                .map(|p| p.live_tids.iter().copied().collect())
-                .unwrap_or_default()
+    // (the process's own set of live threads: not a walk of every thread in the system, T191). Sixteen at a time into an array, from the thread
+    // after the last one woken: no list is made, so a kill cannot be refused for want of memory (T248); what is left in class N is the wake
+    const BATCH: usize = 16;
+    let mut after = 0;
+    loop {
+        let (batch, n) = with_state(|s| {
+            let mut batch = [0; BATCH];
+            let mut n: usize = 0;
+            if let Some(p) = s.procs.get(&pid) {
+                for (slot, &t) in batch
+                    .iter_mut()
+                    .zip(p.live_tids.iter().skip_while(|&&t| t <= after))
+                {
+                    *slot = t;
+                    n = n.saturating_add(1);
+                }
+            }
+            (batch, n)
         });
-        thread::wake_many(&tids);
-    });
+        if n == 0 {
+            return;
+        }
+        let woken: &[Tid] = batch.get(..n).unwrap_or(&[]);
+        after = woken.last().copied().unwrap_or(after);
+        crate::heap::nofail(|| thread::wake_many(woken));
+    }
 }
 
 pub(super) fn request_kill(pid: u64, code: i32) {
