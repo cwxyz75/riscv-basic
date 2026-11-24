@@ -1108,8 +1108,10 @@ fn churn(seed: u64) -> i32 {
                     return 111;
                 }
                 let at = 0x31_0000_0000 + rnd(8) * 0x2_0000;
-                if rt::sys::process_map(me, vmo, at, 0, 4 * 4096, 3).status != 0 {
-                    return 112;
+                let m = rt::sys::process_map(me, vmo, at, 0, 4 * 4096, 3);
+                if m.status != 0 {
+                    // (the status is in the code: a failure seen once in CI, T251)
+                    return 1100 + (-(m.status as i64)) as i32;
                 }
                 // SAFETY: the page at `at` was just mapped read-write.
                 unsafe { core::ptr::write_volatile(at as *mut u64, 7) };
