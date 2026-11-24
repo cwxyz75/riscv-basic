@@ -16,10 +16,10 @@ use linked_list_allocator::Heap;
 
 /// Start of the reserved range (below `STACK_TOP`, away from the program image).
 pub const HEAP_BASE: u64 = 0x08_0000_0000;
-/// Largest heap: 128 MiB of address space (committed only as touched, and charged to the job). Lua's
+/// Largest heap: 128 MiB of address space (the arenas are committed when made, and charged to the job). Lua's
 /// stack-overflow test alone needs about 70 MiB here (S7e).
 pub const HEAP_LIMIT: usize = 128 * 1024 * 1024;
-/// Growth granule: 256 KiB (64 pages, committed lazily).
+/// Smallest arena: 256 KiB (64 pages, committed when it is made).
 const CHUNK: usize = 256 * 1024;
 
 const PROT_RW: u64 = 1 | 2;
@@ -33,8 +33,8 @@ struct Arena {
 
 /// Most arenas at once (the range over the smallest arena).
 const MAX_ARENAS: usize = HEAP_LIMIT / CHUNK;
-/// An emptied arena up to this size is kept, one at a time, for the next allocation; a bigger one goes back at once.
-const KEEP_MAX: usize = 4 * CHUNK;
+/// An emptied arena up to this size (8 MiB) is kept, one at a time, for the next allocation, so a loop of allocate and free of a big buffer does not make and unmake a VMO each time; a bigger one goes back at once.
+const KEEP_MAX: usize = 32 * CHUNK;
 
 struct State {
     arenas: [Option<Arena>; MAX_ARENAS],
@@ -201,7 +201,7 @@ impl State {
         let Some(a) = self.arenas[slot].take() else {
             return;
         };
-        if sys::process_unmap(self.me, self.base + a.at as u64).status != 0 {
+        if sys::process_unmap_range(self.me, self.base + a.at as u64, a.len as u64).status != 0 {
             // (cannot happen: the range is ours; keep the arena rather than hand its memory out as free)
             self.arenas[slot] = Some(a);
             return;
@@ -259,7 +259,7 @@ impl State {
     }
 }
 
-// SAFETY: allocations come from one linked-list heap guarded by a lock; memory is mapped
+// SAFETY: allocations come from the linked-list heap of one arena, all under one lock; memory is mapped
 // before it is handed out; `dealloc` returns blocks to the same heap.
 unsafe impl GlobalAlloc for UserHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

@@ -205,11 +205,11 @@ os-ktest-4: kernel-main
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 # The kernel-only boot at 4 GiB of RAM (T207 PR 4, B1): the Kernel tests at four harts on a kernel built with `latency-trace`; the first test commits a
-# 2 GiB VMO whole, unmaps, decommits and kills its last holder, and fails when the longest interrupts-off span is over B1's smoke bound (20 ms).
+# 2 GiB VMO whole, unmaps, decommits and kills its last holder, and fails when the longest big-lock hold (debug_stat 14) is over B1's smoke bound (20 ms). The test covers the holds of the calls; the teardown chunks and the drain run under the memory locks without it.
 OS_KBIG_ELF := target/os-kbig/$(KERNEL_TARGET)/debug/kernel
 os-ktest-big: os-user
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-kbig
-	OS_RAM=4G OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=400 python3 scripts/os_boot_test.py $(OS_KBIG_ELF)
+	OS_RAM=4G OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=300 python3 scripts/os_boot_test.py $(OS_KBIG_ELF)
 
 OS_KREL_ELF := target/os-krelease/$(KERNEL_TARGET)/release/kernel
 os-ktest-release:
