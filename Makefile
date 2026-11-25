@@ -322,7 +322,7 @@ os-boot-test-smp-neg: kernel os-interactive
 	cd kernel && cargo build --features fault-skip-kill-ipi --target-dir ../target/os-fault-killipi
 	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) user_threads_run_in_parallel,kill_a_spinner_on_another_hart
 	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave
-	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFPSAVE_ELF) fp_state_is_private_to_each_thread_and_process
+	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFPSAVE_ELF) user_threads_run_in_parallel,fp_state_is_private_to_each_thread_and_process
 	cd kernel && cargo build --features fault-skip-cbze --target-dir ../target/os-fault-cbze
 	OS_SMP=1 python3 scripts/os_boot_test.py --neg $(OS_NOCBZE_ELF) vector_state_is_private_to_each_thread_and_process
 	cd kernel && cargo build --features fault-skip-forced-touch --target-dir ../target/os-fault-forced
