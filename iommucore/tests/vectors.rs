@@ -715,7 +715,8 @@ fn a_pointer_at_the_last_level_is_not_a_leaf_and_not_followed() {
     // A misaligned address is refused by unmap, not rounded to its page.
     assert_eq!(t.unmap(&mem, &mut frames, 0x1008), None);
     assert_eq!(t.translate(&mem, 0x1008, iopt::Op::Read), Ok(0x8765_4008));
-    // Destroy does not follow the pointer either (FakeFrames panics on a frame it never gave).
+    // Destroy does not follow such a pointer either (FakeFrames panics on a frame it never gave).
+    mem.write(l0 + 4 * 8, (0x9000_0000u64 >> 12) << 10 | 1);
     t.destroy(&mem, &mut frames);
     assert_eq!(frames.live(), 0);
 }

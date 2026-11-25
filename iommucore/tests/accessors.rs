@@ -228,6 +228,8 @@ fn small_accessors() {
     // An MSI entry is valid by bit 0 only.
     assert!(MsiPte::mrif(1 << 56, 0x2800_0000, 77).is_err()); // past the entry's 47-bit file field
     assert!(MsiPte::mrif((1 << 56) - 512, 0x2800_0000, 77).is_ok());
+    assert!(MsiPte::mrif(0x8300_0200, 1 << 56, 77).is_err()); // the notice page too
+    assert!(MsiPte::mrif(0x8300_0200, (1 << 56) - 4096, 77).is_ok());
     let e = MsiPte::mrif(0x8300_0200, 0x2800_0000, 77).unwrap();
     assert!(e.is_valid());
     assert!(!MsiPte::invalid().is_valid());

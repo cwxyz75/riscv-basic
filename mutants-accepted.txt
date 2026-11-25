@@ -45,7 +45,6 @@ iommucore/src/regs.rs: replace | with ^ in tr_req_ctl  # equivalent: GO, NW and 
 iommucore/src/iopt.rs: replace | with ^ in Iopt::walk_leaves  # equivalent: R, W and X are distinct bits
 iommucore/src/faultq.rs: replace + with - in FaultQueue::pop  # equivalent: the record's second doubleword is reserved and `decode` ignores it
 iommucore/src/msi.rs: replace |= with ^= in pext  # equivalent: each output bit is set once, from clear
-iommucore/src/msi.rs: replace != with == in pext  # detected as a timeout: the loop over the mask's bits never ends
 iommucore/src/msi.rs: replace << with >>  # equivalent: PTE_V is 1 << 0 (every other constant's mutant is killed)
 iommucore/src/msi.rs: replace & with | in Mrif::stray  # equivalent: the read only skips a fetch_and that would change nothing
 iommucore/src/regs.rs: replace | with ^ in Fqcsr::acknowledge  # equivalent: the enable bits and the error bits are disjoint
@@ -83,3 +82,4 @@ iommucore/src/iova.rs: replace Iova::scan -> u64 with 0  # detected as a timeout
 iommucore/src/iova.rs: replace Iova::scan -> u64 with 1  # detected as a timeout: the allocation loop never ends
 iommucore/src/iova.rs: replace > with == in Iova::alloc  # detected as a timeout: the allocation loop never ends
 iommucore/src/iova.rs: replace + with * in Iova::alloc  # detected as a timeout: the allocation loop never ends
+iommucore/src/iova.rs: replace | with ^ in Iova::occupied  # equivalent: a page is never both live and pending
