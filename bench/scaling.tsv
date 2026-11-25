@@ -2,6 +2,8 @@
 # These are tripwires for a collapse, not the design goals (3.0 futex, 2.5 channel_call: not gates). Set at about 60% of the lowest of three full runs at four harts
 # (debug kernel, QEMU TCG, a loaded laptop, 2026-11-24): futex n4 0.97, 1.27, 0.51 (it swings with where the pair is placed, T231, T232); channel_call n4 0.85, 0.82, 0.82.
 # Change a floor on purpose, with the runs that justify it.
-smp4	pair_scaling_futex	4	0.3
+smp4	pair_scaling_futex	4	0.15
 smp4	pair_scaling_channel_call	2	0.6
 smp4	pair_scaling_channel_call	4	0.5
+# 2026-11-24 soak (run 45526124119, hosted runner): futex n4 0.34 against the old floor 0.30, so the floor is 0.15 (about half of the lowest runner figure). The futex ratio swings with placement (T231, T232).
+# `bench/scaling-latency.tsv` holds the floors `make os-latency` enforces: the latency-trace kernel's futex n4 is 0.02 on every run (trace overhead on a wake-heavy path), so only channel_call is checked there.
