@@ -389,7 +389,7 @@ os-latency: kernel-main
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
 	rm -f target/latency.tsv
 	OS_BENCH=target/latency.tsv OS_BENCH_FULL=1 OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
-	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling.tsv
+	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling-latency.tsv
 
 os-boot-test-aia: kernel
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
