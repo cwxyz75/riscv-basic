@@ -102,8 +102,8 @@ be host-testable, fuzzable and covered before that starts.
 - [x] **KT12** (PR 282) the checked release build
 - [x] **KT13** (PR 283) the kernel stack budget
 - [x] **KT5** (PR 290) instruction-count checks
-- [ ] **KT8** syscall fuzzing (host and guest): the host half is merged (PR 291; the guest `kfuzz` program is merged (PR 514); T176 closed: the host fuzzer reaches the items it listed)
-- [ ] **KT9** the allocation-failure sweep: the host half is merged (PR 292; the guest sweep with a failing kernel allocator is not built; T177 lists what is not yet swept)
+- [x] **KT8** syscall fuzzing (host and guest): the host half is merged (PR 291; the guest `kfuzz` program is merged (PR 514); T176 closed: the host fuzzer reaches the items it listed) Closed on the green epic smoke (run 45517480510).
+- [x] **KT9** the allocation-failure sweep: the host half is merged (PR 292; the guest sweep with a failing kernel allocator is not built; T177 lists what is not yet swept) Closed on the green epic smoke (run 45517480510): host scenarios for the process calls, start, spawn and waits, the guest sweep, `pager_create` reportable; the class-N conversions are T248.
 - [x] **KT11** (PR 289) coverage report
 
 ### Phase 4: the architecture boundary, then the platform as it really is
@@ -220,7 +220,7 @@ Phase 11 (`epic/phase-11`, merged into `main` on its epic gate as a **partial** 
 - [x] **AB7** (#487) the system library: `libsys` (generated from the call table, built and checked by the kernel's build script), the kernel maps it into every process at a random place and passes the base in `a2`, `rt` calls through it, `clock_get` is computed in user mode, `check_ecall.py`; built on a feature branch of phase 12, open for its epic's smoke and review (tidy items T236, T237)
 - [x] **AB8** (#488) entry enforcement (`sepc` inside the library, ABI1, `fault-skip-entry-check`), shuffled numbers (`ABI_SHUFFLE_SEED`, `make os-ktest-shuffle`); feature branch of phase 12, one seed in CI (more are the owner's soak)
 - [x] **AB9** (#489) the conformance program (`abi_conformance`, libsys only, run by the suite), `SYSCALLS.md` rewritten around the library, the versioning rule (`sys_abi_version`, `libsys/symbols-v1.txt`); verified at the epic's smoke
-- [ ] **KT14** the audit of every `unsafe` block
+- [x] **KT14** the audit of every `unsafe` block Closed on the green epic smoke (run 45517480510): second independent review of the changed blocks, T253 for what stays weak.
 - [ ] **FZ1** the freeze: the last review, three green soak and long runs **that the owner starts**, the declaration, **and a
   report to the owner**
 
