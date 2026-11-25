@@ -6,7 +6,7 @@ Usage:
   work.py next PREFIX           the next unused number for a prefix (T, L, ...), counting closed items too
   work.py blocked              items waiting on another item, with what they wait on
   work.py decisions             decisions waiting on the owner (kind: decision)
-  work.py list [--kind K] [--area A] [--horizon H] [--fixed-by ID]
+  work.py list [--kind K] [--area A] [--horizon H] [--fixed-by ID] [--complexity L|M|H] [--change-risk L|M|H]
   work.py show ID [ID...]       print items in full
   work.py areas                 item counts per area
   work.py graph                 the blocked-by / fixed-by graph as Mermaid
@@ -43,7 +43,7 @@ AREAS = {
     "testing": "test harness, CI, flaky tests, oracles",
     "platform": "boot, build, hardware assumptions",
 }
-FIELDS = ["id", "kind", "title", "area", "horizon", "risk", "blocked_by", "fixed_by", "refs"]
+FIELDS = ["id", "kind", "title", "area", "horizon", "risk", "complexity", "change_risk", "blocked_by", "fixed_by", "refs"]
 REQUIRED = ["id", "kind", "title", "area", "horizon"]
 LIST_FIELDS = {"blocked_by", "fixed_by", "refs"}
 NEAR_CAP = 15  # the near horizon is what WORK-PLAN.md orders; keep it short enough to read every session
@@ -125,6 +125,9 @@ def check(items):
             out.append(f"{name}: area {it.area!r} is not one of {sorted(AREAS)}")
         if it.risk and it.risk not in RISKS:
             out.append(f"{name}: risk {it.risk!r} is not one of {RISKS}")
+        for f in ("complexity", "change_risk"):
+            if getattr(it, f) and getattr(it, f) not in RISKS:
+                out.append(f"{name}: {f} {getattr(it, f)!r} is not one of {RISKS}")
         for f in ("blocked_by", "fixed_by"):
             for ref in getattr(it, f):
                 if ref == it.id:
