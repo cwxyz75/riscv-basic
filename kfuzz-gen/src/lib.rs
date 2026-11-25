@@ -177,6 +177,8 @@ enum Class {
 pub struct Gen {
     state: u64,
     window: Window,
+    /// The last call made, for the repeat operator (a full queue needs the same write many times).
+    last: Option<Call>,
 }
 
 /// Every call the generator can make (the ones the syscall layer handles on the host).
@@ -232,6 +234,7 @@ impl Gen {
         Gen {
             state: if z == 0 { 1 } else { z },
             window,
+            last: None,
         }
     }
 
@@ -286,13 +289,32 @@ impl Gen {
 
     /// The next call, given what the process is believed to hold.
     pub fn next(&mut self, m: &Model) -> Call {
-        match self.class() {
+        // (one call in twelve is the last one again: a write repeated until the queue is full, a read until it is empty)
+        if self.below(12) == 0 {
+            if let Some(c) = &self.last {
+                return c.clone();
+            }
+        }
+        let c = match self.class() {
             Class::Valid => self.valid(m),
             Class::Near => {
                 let c = self.valid(m);
                 self.mutate(m, c)
             }
             Class::Garbage => self.garbage(),
+        };
+        self.last = Some(c.clone());
+        c
+    }
+
+    /// A size for a message or a socket transfer: mostly up to `small`, some up to a kilobyte, some at the edges (0, 1, a page, the largest message),
+    /// a few anywhere below it, so that full queues, partial writes and the byte ceilings are reached (T176).
+    fn size(&mut self, small: u64) -> u64 {
+        match self.below(20) {
+            0..=13 => self.below(small + 1),
+            14..=16 => self.below(1025),
+            17 => [0, 1, 4096, 32767][self.below(4) as usize],
+            _ => self.below(32768),
         }
     }
 
@@ -344,8 +366,8 @@ impl Gen {
             }
             nr::VMO_CREATE => {
                 let pages = match self.below(10) {
-                    0 => abi::limits::MAX_VMO_PAGES,
-                    1 => abi::limits::MAX_VMO_PAGES + 1,
+                    0 => abi::user::TOP / 4096,
+                    1 => abi::user::TOP / 4096 + 1,
                     _ => 1 + self.below(8),
                 };
                 // charged to a job the process holds (three times in ten), else to its own
@@ -360,7 +382,7 @@ impl Gen {
                 c.args = [pages * 4096, job, flags, 0, 0, 0];
             }
             nr::CHANNEL_WRITE => {
-                let len = self.below(65);
+                let len = self.size(64);
                 let body = self.ptr(len.max(1));
                 let list = self.ptr2(16);
                 let nh = self.below(3).min(m.live().len() as u64);
@@ -382,33 +404,38 @@ impl Gen {
                 c.pokes.push((list, raw));
             }
             nr::CHANNEL_READ => {
+                let max = self.size(128);
                 c.args = [
                     handle,
-                    self.ptr(128),
-                    self.below(129),
+                    self.ptr(max.max(1)),
+                    max,
                     self.ptr2(16),
                     self.below(5),
                     0,
                 ]
             }
             nr::CHANNEL_READ_TXID => {
+                let max = self.size(128);
                 c.args = [
                     handle,
                     self.below(8),
-                    self.ptr(128),
-                    self.below(129),
+                    self.ptr(max.max(1)),
+                    max,
                     self.ptr2(16),
                     self.below(5),
                 ]
             }
             nr::SOCKET_WRITE => {
-                let len = self.below(129);
+                let len = self.size(128);
                 let at = self.ptr(len.max(1));
                 c.args = [handle, at, len, 0, 0, 0];
                 c.pokes
                     .push((at, (0..len).map(|i| (i * 3) as u8).collect()));
             }
-            nr::SOCKET_READ => c.args = [handle, self.ptr(128), self.below(129), 0, 0, 0],
+            nr::SOCKET_READ => {
+                let max = self.size(128);
+                c.args = [handle, self.ptr(max.max(1)), max, 0, 0, 0]
+            }
             nr::EVENT_SIGNAL => {
                 c.args = [
                     handle,

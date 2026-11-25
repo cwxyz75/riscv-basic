@@ -35,6 +35,9 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
         let mut tables = [HandleTable::new(300), HandleTable::new(300)];
         // the tables whose roots a pending sweep has yet to shade (T206)
         let mut unscanned: Vec<usize> = Vec::new();
+        let mut root_cursor = 0usize;
+        // a process that has died and whose table is being closed in slices: out of the roots (T206 plan 1, item 6), its handles still hold objects
+        let mut dying: Option<HandleTable> = None;
         for step in 0..1500 {
             let ctx = format!("seed {seed} step {step}");
             let ti = rng.below(2) as usize;
@@ -44,7 +47,7 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                 v
             };
             let pick = |rng: &mut Rng| handles[rng.below(handles.len() as u64) as usize];
-            match rng.below(14) {
+            match rng.below(16) {
                 0 => {
                     let _ = event_create(&mut reg, &mut tables[ti]);
                 }
@@ -92,9 +95,21 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                                 reg.shade(o);
                             }
                         }
+                        root_cursor = 0;
                         reg.sweep_roots_done();
                         let roots: Vec<_> = tables.iter().flat_map(|t| t.objects()).collect();
                         reg.sweep(&roots);
+                    }
+                }
+                14 if dying.is_none() => {
+                    // a process dies: its table leaves the roots, and is closed a few slots at a time from now on
+                    dying = Some(std::mem::replace(&mut tables[ti], HandleTable::new(300)));
+                }
+                15 => {
+                    if let Some(t) = dying.as_mut() {
+                        if t.drain_some(&mut reg, 1 + rng.below(3) as usize) {
+                            dying = None;
+                        }
                     }
                 }
                 _ => {
@@ -112,12 +127,21 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                         }
                     }
                     // (a pending sweep's roots arrive one table per slice)
-                    if let Some(ti) = unscanned.pop() {
-                        for o in tables[ti].objects() {
+                    if let Some(&ti) = unscanned.last() {
+                        // (T206: a table's slots a few at a time, the cursor kept between slices)
+                        let len = tables[ti].slot_count();
+                        let to = len.min(root_cursor + 1 + rng.below(4) as usize);
+                        for o in tables[ti].objects_in(root_cursor, to) {
                             reg.shade(o);
                         }
-                        if unscanned.is_empty() {
-                            reg.sweep_roots_done();
+                        if to >= len {
+                            unscanned.pop();
+                            root_cursor = 0;
+                            if unscanned.is_empty() {
+                                reg.sweep_roots_done();
+                            }
+                        } else {
+                            root_cursor = to;
                         }
                     }
                     let budget = 1 + rng.below(4) as usize;
@@ -125,6 +149,10 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                 }
             }
             assert_reachable_is_alive(&reg, &[&tables[0], &tables[1]], &ctx);
+        }
+        // (the dying table's closes go on: a stale id of an object the sweep freed first is skipped, never another object's)
+        if let Some(t) = dying.as_mut() {
+            t.drain(&mut reg);
         }
         // everything is closed: what counting cannot free, two sweeps do
         for t in tables.iter_mut() {
@@ -170,4 +198,60 @@ fn an_object_made_while_a_sweep_runs_is_born_marked() {
     // the next sweep, started after its birth, finds it unreachable
     assert_eq!(reg.sweep(&[]), 1);
     assert!(reg.get(id).is_none());
+}
+
+/// T206 B: closing the head of a chain of 3,000 channels (each queues both ends of the next) is many bounded sections, not one: no call destroys
+/// more than twice the unit budget (the owed references of the last call, then the one it was given), the owed list shrinks to nothing, and
+/// everything is freed at the end. A stale owed id (a sweep freed the object first) is skipped.
+#[test]
+fn a_close_that_frees_a_chain_is_paid_in_bounded_slices() {
+    for with_sweep in [false, true] {
+        let n = 3000;
+        let mut reg = Kobjs::new();
+        let mut t = HandleTable::new(16);
+        let mut next: Option<(Handle, Handle)> = None;
+        for _ in 0..n {
+            let (a, b) = channel_create(&mut reg, &mut t).unwrap();
+            if let Some((na, nb)) = next {
+                channel_write(&mut reg, &mut t, a, b"", &[na, nb]).unwrap();
+            }
+            // (the table keeps only the head of what it has built so far: the previous pair is in `b`'s queue)
+            if let Some((na, nb)) = next {
+                let _ = (na, nb);
+            }
+            next = Some((a, b));
+        }
+        let created = reg.live();
+        assert_eq!(created, 2 * n);
+        let mut calls = 0;
+        loop {
+            if with_sweep && calls == 3 {
+                // a sweep (no roots but this table's objects) runs between the slices: it may free owed targets first
+                let roots: Vec<_> = t.objects().collect();
+                reg.sweep(&roots);
+            }
+            let before = reg.live();
+            let done = t.drain_some(&mut reg, 4);
+            calls += 1;
+            let freed = before.saturating_sub(reg.live());
+            assert!(
+                reg.last_units() <= kcore::object::RELEASE_UNITS,
+                "a step looked at {} references",
+                reg.last_units()
+            );
+            assert!(
+                freed <= 2 * kcore::object::RELEASE_UNITS,
+                "freed {freed} in one call"
+            );
+            if done && reg.owed() == 0 {
+                break;
+            }
+            assert!(calls < 10_000, "no progress");
+        }
+        assert!(
+            with_sweep || calls > created / (2 * kcore::object::RELEASE_UNITS),
+            "{calls} calls for a chain of {created}"
+        );
+        assert_eq!(reg.live(), 0);
+    }
 }

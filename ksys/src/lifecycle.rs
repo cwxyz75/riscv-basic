@@ -5,19 +5,14 @@
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use kcore::ipc::{self, Kobjs};
 use kcore::job::{JobId, Jobs, SchedError, SchedLimits};
 use kcore::sched::Tid;
 
-use crate::Process;
-
 /// `process_kill`: the pid to end. A process that has ended (or is gone) is BAD_STATE.
 pub fn kill_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     me: u64,
     ph: Handle,
 ) -> Result<u64, Status> {
@@ -33,7 +28,7 @@ pub fn kill_target(
 /// killed process is BAD_STATE. The caller bumps the attention epoch and, to stop, kicks the other harts.
 pub fn stop_target(
     objs: &mut Kobjs,
-    procs: &mut BTreeMap<u64, Box<Process>>,
+    procs: &mut crate::ProcTable,
     me: u64,
     ph: Handle,
     stop: bool,
@@ -51,34 +46,52 @@ pub fn stop_target(
     Ok(tpid)
 }
 
-/// `job_kill`: forbid new processes and threads in the job (their limits become 0) and name the processes inside it other than the
-/// caller; the flag says whether the caller is inside too (and so ends last).
-pub fn job_kill_victims(
+/// `job_kill`, the first step: forbid new processes and threads in the job (their limits become 0). Returns the job and whether the caller is inside
+/// it (and so ends last). The victims are then taken one at a time with `job_kill_next`: nothing is collected, so the call cannot fail for want of
+/// memory (T248).
+pub fn job_kill_begin(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     jobs: &mut Jobs,
     me: u64,
     jh: Handle,
-) -> Result<(Vec<u64>, bool), Status> {
+) -> Result<(JobId, bool), Status> {
     let caller = procs.get(&me).ok_or(Status::BadState)?;
     let job = ipc::job_of(objs, &caller.handles, jh, Rights::KILL)?;
     let mut limits = jobs.limits(job).ok_or(Status::BadState)?;
     limits.processes = 0;
     limits.threads = 0;
     let _ = jobs.set_limits(job, limits);
-    let inside: Vec<u64> = procs
-        .iter()
-        .filter(|(_, p)| jobs.is_within(p.job, job))
+    let me_inside = procs.get(&me).is_some_and(|p| jobs.is_within(p.job, job));
+    Ok((job, me_inside))
+}
+
+/// The next process inside `job` (and below it) other than `me`, after process id `after` (ids are never reused: a cursor by id survives the
+/// teardown each kill may start). `None` when there is none, **or when `jh` no longer names `job` with KILL for the caller** (job ids are reused
+/// once a job is gone, so the loop must not outlive the caller's authority).
+pub fn job_kill_next(
+    objs: &Kobjs,
+    procs: &crate::ProcTable,
+    jobs: &Jobs,
+    me: u64,
+    jh: Handle,
+    job: JobId,
+    after: u64,
+) -> Option<u64> {
+    let caller = procs.get(&me)?;
+    if ipc::job_of(objs, &caller.handles, jh, Rights::KILL).ok() != Some(job) {
+        return None;
+    }
+    procs
+        .range(after.saturating_add(1)..)
+        .find(|(&pid, p)| pid != me && jobs.is_within(p.job, job))
         .map(|(&pid, _)| pid)
-        .collect();
-    let me_inside = inside.contains(&me);
-    Ok((inside.into_iter().filter(|&p| p != me).collect(), me_inside))
 }
 
 /// The kernel thread behind a thread handle with `need`, and the process it belongs to. Handle 0 is the calling thread.
 pub fn thread_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     me: u64,
     current: Tid,
     h: u64,
@@ -91,16 +104,12 @@ pub fn thread_target(
     let handle = Handle(h);
     ipc::thread_of(objs, &caller.handles, handle, need)?;
     let obj = caller.handles.get(handle)?.obj;
-    let pid = match objs.get(obj) {
-        Some(ipc::KObj::Thread(t)) => t.pid,
+    let (pid, tid) = match objs.get(obj) {
+        Some(ipc::KObj::Thread(t)) => (t.pid, t.tid),
         _ => return Err(Status::WrongType),
     };
-    let tid = procs.get(&pid).and_then(|p| {
-        p.thread_objs
-            .iter()
-            .find(|(_, o)| **o == obj)
-            .map(|(t, _)| *t)
-    });
+    // (live: registered by its spawner and not yet ended)
+    let tid = tid.filter(|t| procs.get(&pid).is_some_and(|p| p.live_tids.contains(t)));
     match tid {
         Some(t) => Ok((t, pid)),
         None => Err(Status::BadState), // the thread has ended (or never started)
@@ -111,7 +120,7 @@ pub fn thread_target(
 /// not exceed the thread's job's `max_prio`.
 pub fn thread_set_sched_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     jobs: &Jobs,
     me: u64,
     current: Tid,
@@ -134,7 +143,7 @@ pub fn thread_set_sched_target(
 /// scheduling limits and returns the job (the caller then lowers the priorities of its threads above the new maximum).
 pub fn job_set_sched(
     objs: &Kobjs,
-    procs: &BTreeMap<u64, Box<Process>>,
+    procs: &crate::ProcTable,
     jobs: &mut Jobs,
     me: u64,
     a: [u64; 6],

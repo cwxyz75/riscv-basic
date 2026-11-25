@@ -143,10 +143,15 @@ fn run(seed: u64) {
             .collect();
         let woken = waits.commit(
             |id| signals_of_object(&reg, id),
-            |id| port_bound_objects(&reg, id),
+            |id, f| reg.for_each_binder(id, f),
             |_, _| false,
             dirty,
         );
+        audit_bound_index(&reg).unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+        waits
+            .audit(|o| reg.get(o).is_some())
+            .unwrap_or_else(|e| panic!("seed {seed} step {step}: audit: {e}"));
+        let _ = &woken;
         // the ports that woke a waiter in this commit (the baton, L21b): the woken thread polls, which logs the port, so the next commit looks at
         // it again; the model does the same
         let mut baton: BTreeMap<ObjId, usize> = BTreeMap::new();
@@ -215,13 +220,16 @@ fn run(seed: u64) {
                     if s & mask == 0 {
                         if is_port(&reg, obj) {
                             if rng.chance(70) {
-                                waits.register_poller(t, obj, mask, port_bound_objects(&reg, obj));
+                                waits.admit(t).unwrap();
+                                waits.register_poller(t, obj, mask);
                                 pollers.insert(t);
                             } else {
-                                waits.register_port(t, obj, mask, port_bound_objects(&reg, obj));
+                                waits.admit(t).unwrap();
+                                waits.register_port(t, obj, mask);
                                 pollers.remove(&t);
                             }
                         } else {
+                            waits.admit(t).unwrap();
                             waits.register(t, obj, mask);
                             pollers.remove(&t);
                         }
@@ -255,29 +263,21 @@ fn register_replaces_and_forget_is_idempotent() {
     let b = event_create(&mut reg, &mut t).unwrap();
     let (oa, ob) = (t.get(a).unwrap().obj, t.get(b).unwrap().obj);
     let mut w = WaitTable::new();
+    w.admit(1).unwrap();
     w.register(1, oa, 1 << 24);
+    w.admit(1).unwrap();
     w.register(1, ob, 1 << 25); // a thread waits on one object at a time
     assert_eq!(w.len(), 1);
     reg.take_dirty();
     event_signal(&mut reg, &t, a, 0, 1 << 24).unwrap(); // the old object: nobody waits there now
     let d = reg.take_dirty();
     assert!(w
-        .commit(
-            |i| signals_of_object(&reg, i),
-            |_| Vec::new(),
-            |_, _| false,
-            d
-        )
+        .commit(|i| signals_of_object(&reg, i), |_, _| {}, |_, _| false, d)
         .is_empty());
     event_signal(&mut reg, &t, b, 0, 1 << 25).unwrap();
     let d = reg.take_dirty();
     assert_eq!(
-        w.commit(
-            |i| signals_of_object(&reg, i),
-            |_| Vec::new(),
-            |_, _| false,
-            d
-        ),
+        w.commit(|i| signals_of_object(&reg, i), |_, _| {}, |_, _| false, d),
         vec![1]
     );
     assert!(!w.forget(1));
@@ -290,6 +290,7 @@ fn an_overflowed_log_releases_every_registration() {
     let e = event_create(&mut reg, &mut t).unwrap();
     let obj = t.get(e).unwrap().obj;
     let mut w = WaitTable::new();
+    w.admit(7).unwrap();
     w.register(7, obj, 1 << 24);
     reg.take_dirty();
     // (the cap is a safety net the kernel's per-syscall drain never reaches; force the flag directly)
@@ -299,7 +300,7 @@ fn an_overflowed_log_releases_every_registration() {
     };
     let woken = w.commit(
         |i| signals_of_object(&reg, i),
-        |_| Vec::new(),
+        |_, _| {},
         |_, _| false,
         overflowed,
     );
@@ -327,12 +328,8 @@ fn a_port_waiter_costs_an_unrelated_commit_nothing() {
     }
     let other = event_create(&mut reg, &mut t).unwrap();
     let mut w = WaitTable::new();
-    w.register_port(
-        1,
-        pobj,
-        abi::signals::READABLE,
-        port_bound_objects(&reg, pobj),
-    );
+    w.admit(1).unwrap();
+    w.register_port(1, pobj, abi::signals::READABLE);
     reg.take_dirty();
     let calls = Cell::new(0usize);
     let commit = |w: &mut WaitTable, reg: &mut Kobjs| {
@@ -343,7 +340,7 @@ fn a_port_waiter_costs_an_unrelated_commit_nothing() {
                 calls.set(calls.get() + 1);
                 signals_of_object(reg, i)
             },
-            |i| port_bound_objects(reg, i),
+            |i, f| reg.for_each_binder(i, f),
             |_, _| false,
             d,
         )
@@ -361,8 +358,8 @@ fn a_port_waiter_costs_an_unrelated_commit_nothing() {
     assert_eq!(commit(&mut w, &mut reg), vec![1]);
     assert_eq!(calls.get(), 1, "one evaluation for one bound touch");
     assert!(
-        w.watchers_of(t.get(events[500]).unwrap().obj).is_empty(),
-        "the watch is gone with the waiter"
+        !w.is_registered(1),
+        "the registration is gone with the waiter"
     );
 }
 
@@ -379,12 +376,13 @@ fn a_call_waits_for_its_own_reply_not_for_any_message() {
         let d = reg.take_dirty();
         w.commit(
             |i| signals_of_object(reg, i),
-            |_| Vec::new(),
+            |_, _| {},
             |ch, tx| channel_has_txid(reg, ch, tx),
             d,
         )
     };
     reg.take_dirty();
+    w.admit(1).unwrap();
     w.register_call(1, oa, 7);
     // an unrelated message (transaction id 9) arrives on the end: READABLE is up, the call is not released
     channel_write(&mut reg, &mut t, b, &9u32.to_le_bytes(), &[]).unwrap();
@@ -400,6 +398,7 @@ fn a_call_waits_for_its_own_reply_not_for_any_message() {
         "the reply did not release the call"
     );
     // the peer closing releases a call that is still waiting
+    w.admit(2).unwrap();
     w.register_call(2, oa, 8);
     reg.take_dirty();
     t.close(&mut reg, b).unwrap();
@@ -426,31 +425,19 @@ fn a_port_wakes_one_waiter_and_the_poll_passes_the_baton() {
         let d = reg.take_dirty();
         w.commit(
             |i| signals_of_object(reg, i),
-            |i| port_bound_objects(reg, i),
+            |i, f| reg.for_each_binder(i, f),
             |_, _| false,
             d,
         )
     };
     reg.take_dirty();
-    w.register_poller(
-        1,
-        pobj,
-        abi::signals::READABLE,
-        port_bound_objects(&reg, pobj),
-    );
-    w.register_poller(
-        2,
-        pobj,
-        abi::signals::READABLE,
-        port_bound_objects(&reg, pobj),
-    );
+    w.admit(1).unwrap();
+    w.register_poller(1, pobj, abi::signals::READABLE);
+    w.admit(2).unwrap();
+    w.register_poller(2, pobj, abi::signals::READABLE);
     // (a plain wait on the port's READABLE, an `object_wait`, never polls: it is released with the first and takes no baton)
-    w.register_port(
-        3,
-        pobj,
-        abi::signals::READABLE,
-        port_bound_objects(&reg, pobj),
-    );
+    w.admit(3).unwrap();
+    w.register_port(3, pobj, abi::signals::READABLE);
     event_signal(&mut reg, &t, e, 0, 1 << 24).unwrap();
     let mut first = commit(&mut w, &mut reg);
     first.sort();
@@ -557,4 +544,45 @@ fn the_watch_count_of_a_bound_object_returns_to_zero_when_the_port_dies() {
     reg.sweep(&[eobj]);
     assert!(!reg.is_alive(pobj));
     assert_eq!(reg.watch_count(eobj), 0);
+}
+
+/// KT9 (T177): admission is the only place the table allocates. Registering, forgetting and committing, with many threads admitted after the table has
+/// rehashed, change nothing about its room; and a rehash keeps each object's registrations in arrival order (the baton of L21b depends on it).
+#[test]
+fn registering_forgetting_and_committing_allocate_nothing_and_a_rehash_keeps_order() {
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(64);
+    let ev = event_create(&mut reg, &mut t).unwrap();
+    let obj = t.get(ev).unwrap().obj;
+    let mut w = WaitTable::new();
+    // arrivals interleaved with admissions that grow the buckets, so a chain is moved at least twice
+    for th in 1..=40u64 {
+        w.admit(th).unwrap();
+        w.register(th, obj, 1 << 24);
+    }
+    w.audit(|o| reg.get(o).is_some()).unwrap();
+    assert_eq!(w.len(), 40);
+    event_signal(&mut reg, &t, ev, 0, 1 << 24).unwrap();
+    let d = reg.take_dirty();
+    let woken = w.commit(
+        |i| signals_of_object(&reg, i),
+        |i, f| reg.for_each_binder(i, f),
+        |_, _| false,
+        d,
+    );
+    assert_eq!(
+        woken,
+        (1..=40u64).collect::<Vec<_>>(),
+        "arrival order survives the rehashes"
+    );
+    w.audit(|o| reg.get(o).is_some()).unwrap();
+    w.recycle(woken);
+    // retire frees the record; a re-admitted id works again
+    w.retire(7);
+    assert_eq!(w.admitted(), 39);
+    w.admit(7).unwrap();
+    w.register(7, obj, 1 << 24);
+    assert!(w.forget(7));
+    assert!(!w.forget(7));
+    w.audit(|o| reg.get(o).is_some()).unwrap();
 }

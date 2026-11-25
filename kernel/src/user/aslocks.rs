@@ -9,55 +9,94 @@
 use super::*;
 use klock::aslock::{AsCell, AsHold};
 
-/// Address spaces held until this is dropped (released last taken first, the order the checker and the saved interrupt state expect).
-pub(super) struct AsLocks(Vec<AsHold>);
+/// The vector `AsLocks::all` fills, made once at boot with room for the most processes there can be (`AS_HELD_MOST`), so that taking every address
+/// space allocates nothing and cannot fail (KT9, T246: the copy-on-write sync after every call needs it). The big lock is held whenever it is taken or
+/// put back, so there is one user at a time.
+struct Scratch(core::cell::UnsafeCell<Vec<AsHold>>);
+
+// SAFETY: touched only with the big (object) lock held (`AsLocks::all` and `Drop` run inside `locked_state` or `with_state`), so no two harts use it at
+// once; a held address space is released by the hart that took it, before the lock is. An `AsLocks` is always a local of such a closure, dropped inside it, and never
+// returned, stored or held across a sleep (KT14: that is what keeps `Drop`'s put-back inside the lock).
+unsafe impl Sync for Scratch {}
+
+static SCRATCH: Scratch = Scratch(core::cell::UnsafeCell::new(Vec::new()));
+
+/// Make the scratch (once, at boot; an allocation failure there is a boot failure by design).
+pub fn reserve_scratch() {
+    // SAFETY: boot, one hart running, nothing holds the scratch.
+    let v = unsafe { &mut *SCRATCH.0.get() };
+    v.reserve_exact(kcore::limits::AS_HELD_MOST);
+}
+
+/// Take the scratch out (an empty vector, with no room, when it is already out: the caller then reserves with a fallible call).
+fn take_scratch() -> Vec<AsHold> {
+    // SAFETY: the big lock is held, see `Scratch`.
+    core::mem::take(unsafe { &mut *SCRATCH.0.get() })
+}
+
+/// Put the (empty) vector back, keeping the larger room.
+fn put_scratch(v: Vec<AsHold>) {
+    // SAFETY: the big lock is held, see `Scratch`.
+    let slot = unsafe { &mut *SCRATCH.0.get() };
+    if v.capacity() >= slot.capacity() {
+        *slot = v;
+    }
+}
+
+/// Address spaces held until this is dropped (released last taken first, the order the checker and the saved interrupt state expect). One space is held
+/// inline (no allocation: the common call); many are in a vector that is reserved with a fallible call (KT9: a failing allocation is `NoMemory`).
+pub(super) struct AsLocks {
+    one: Option<AsHold>,
+    many: Vec<AsHold>,
+}
 
 impl Drop for AsLocks {
     fn drop(&mut self) {
-        while let Some(h) = self.0.pop() {
+        while let Some(h) = self.many.pop() {
             drop(h);
         }
+        drop(self.one.take());
+        put_scratch(core::mem::take(&mut self.many));
     }
 }
 
 impl AsLocks {
-    /// The address spaces of the processes `pids` (any order, repeats and absent ones are fine), in ascending order. The big lock is held.
-    pub(super) fn of(s: &UserState, pids: &[u64]) -> AsLocks {
-        if let [me] = pids {
-            return match s.procs.get(me) {
-                Some(p) => AsLocks(alloc::vec![AsCell::hold(&p.aspace)]),
-                None => AsLocks::none(),
-            };
+    /// The address space of process `pid` (nothing when it is absent). The big lock is held. Allocates nothing.
+    pub(super) fn one(s: &UserState, pid: u64) -> AsLocks {
+        AsLocks {
+            one: s.procs.get(&pid).map(|p| AsCell::hold(&p.aspace)),
+            many: Vec::new(),
         }
-        let mut ids: Vec<u64> = pids.to_vec();
-        ids.sort_unstable();
-        ids.dedup();
-        let cells: Vec<alloc::sync::Arc<AsCell>> = ids
-            .iter()
-            .filter_map(|pid| s.procs.get(pid).map(|p| p.aspace.clone()))
-            .collect();
-        AsLocks(cells.iter().map(AsCell::hold).collect())
     }
 
     /// No address space (a call that touches none).
     pub(super) fn none() -> AsLocks {
-        AsLocks(Vec::new())
+        AsLocks {
+            one: None,
+            many: Vec::new(),
+        }
     }
 
-    /// The calling process's address space (one allocation).
+    /// The calling process's address space.
     pub(super) fn caller(s: &UserState) -> AsLocks {
-        match caller_pid(s).ok().and_then(|me| s.procs.get(&me)) {
-            Some(p) => AsLocks(alloc::vec![AsCell::hold(&p.aspace)]),
-            None => AsLocks::none(),
+        match caller_pid(s) {
+            Ok(me) => AsLocks::one(s, me),
+            Err(_) => AsLocks::none(),
         }
     }
 
     /// Every process's address space, ascending: for the calls that look at or change all of them (a decommit, a snapshot, a pager's
-    /// supply) and for the calls that name a process by a handle (resolving it first would repeat the call's own checks).
-    pub(super) fn all(s: &UserState) -> AsLocks {
-        let cells: Vec<alloc::sync::Arc<AsCell>> =
-            s.procs.values().map(|p| p.aspace.clone()).collect();
-        AsLocks(cells.iter().map(AsCell::hold).collect())
+    /// supply) and for the calls that name a process by a handle (resolving it first would repeat the call's own checks). `NoMemory` when the
+    /// list cannot be made.
+    pub(super) fn all(s: &UserState) -> Result<AsLocks, Status> {
+        let n = s.procs.len();
+        let mut many = take_scratch();
+        if many.try_reserve_exact(n).is_err() {
+            put_scratch(many);
+            return Err(Status::NoMemory);
+        }
+        many.extend(s.procs.values().map(|p| AsCell::hold(&p.aspace)));
+        Ok(AsLocks { one: None, many })
     }
 }
 

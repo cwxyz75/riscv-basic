@@ -183,6 +183,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     thread::init(MAIN_PRIO);
     // From here the big kernel lock is real: entry points assert that it is held.
     user::install_hooks(); // (the address-space locks run on this machine's interrupt state and order checker)
+    user::reserve_scratch();
     bkl::enforce();
     // The other harts join the scheduler (each adopts its boot context as its idle thread).
     {
@@ -192,6 +193,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
             core::hint::spin_loop();
         }
     }
+    heap::enable_reserve(); // (from here class R is refused below the reserve, KT9)
     timer::start();
     irq::enable_timer_interrupt();
     irq::enable();

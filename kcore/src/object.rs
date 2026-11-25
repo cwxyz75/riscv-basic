@@ -35,6 +35,13 @@ pub struct ObjId {
     gen: u64,
 }
 
+impl ObjId {
+    /// A word to hash the id by (the wait table's buckets).
+    pub fn hash_bits(self) -> u64 {
+        u64::from(self.index) ^ self.gen.rotate_left(32)
+    }
+}
+
 /// What the registry needs from the objects it stores.
 pub trait Object {
     /// The ids this object holds references to (queued handles, for a channel).
@@ -120,11 +127,16 @@ pub struct Registry<T: Object> {
     dirty_overflow: bool,
     /// Requests of `channel_call`s that were read since the last `take_dequeued_calls` (L22): the calling thread and the transaction id.
     dequeued_calls: Vec<(u64, u64)>,
+    /// Which ports bind which objects, kept from the bind to the unbind (KT9, T177: the wait table asks it which ports a touch of an object can release, so
+    /// a wait registers nothing about the ports it waits on): (object, port) to how many bindings of the port name the object.
+    bound_by: crate::fmap::FMap<(ObjId, ObjId), u32>,
     /// Handles removed since the last `take_gone` (L21c): the object, the identity of the table and the handle's value. Bindings of a port made through
     /// one of them end.
     gone: Vec<(ObjId, u64, u64)>,
     /// The work list of `release` (objects whose last reference just went), kept between calls so a release never allocates.
     work: Vec<ObjId>,
+    /// References the last `release_step` looked at (T206: the unit counter the host tests hold to the budget; a unit is one reference released).
+    last_units: usize,
     /// The dirty log's twin: `take_dirty` swaps it in (`recycle_dirty` gives the emptied log back), so taking the log allocates nothing.
     dirty_spare: Vec<(ObjId, bool)>,
     /// The graveyard's twin: `drain_dead` hands out one and keeps the other, so its capacity survives (`recycle` returns it).
@@ -143,6 +155,8 @@ pub struct Registry<T: Object> {
     swept: usize,
     /// The roots of the running sweep are still being shaded by the caller, a slice at a time (`sweep_begin_pending`): nothing is freed until it says done.
     roots_pending: bool,
+    /// A reference of a live object could not be followed for lack of memory (T177): the running sweep must free nothing.
+    mark_incomplete: bool,
 }
 
 /// The phases of an incremental sweep (MM10, KERNEL-V1-SPEC 4.6).
@@ -187,6 +201,9 @@ impl<T: Object> Default for Registry<T> {
     }
 }
 
+/// The references one section of a release or of a sweep's freeing slice pays (T206: 256 units at most).
+pub const RELEASE_UNITS: usize = 256;
+
 impl<T: Object> Registry<T> {
     pub fn new() -> Registry<T> {
         Registry {
@@ -209,9 +226,11 @@ impl<T: Object> Registry<T> {
             credits: Vec::with_capacity(PREALLOC_SLOTS),
             dirty: Vec::with_capacity(DIRTY_RESERVE),
             dirty_overflow: false,
+            bound_by: crate::fmap::FMap::new(),
             gone: Vec::new(),
             dequeued_calls: Vec::new(),
             work: Vec::with_capacity(PREALLOC_SLOTS),
+            last_units: 0,
             dirty_spare: Vec::with_capacity(DIRTY_RESERVE),
             spare: Vec::new(),
             phase: Phase::Idle,
@@ -221,6 +240,7 @@ impl<T: Object> Registry<T> {
             scan: Vec::with_capacity(64),
             swept: 0,
             roots_pending: false,
+            mark_incomplete: false,
         }
     }
 
@@ -308,6 +328,59 @@ impl<T: Object> Registry<T> {
         core::mem::take(&mut self.gone)
     }
 
+    /// Room for one more `bound_add` (an R point: `port_bind`).
+    pub fn bound_reserve(&mut self) -> Result<(), crate::fmap::NoMem> {
+        self.bound_by.reserve(1)
+    }
+
+    /// `port` binds `obj` once more (with the room `bound_reserve` made).
+    pub fn bound_add(&mut self, obj: ObjId, port: ObjId) {
+        let n = self.bound_by.get(&(obj, port)).copied().unwrap_or(0);
+        self.bound_by
+            .insert_reserved((obj, port), n.saturating_add(1));
+    }
+
+    /// `port` binds `obj` once less (removal never allocates).
+    pub fn bound_remove(&mut self, obj: ObjId, port: ObjId) {
+        match self.bound_by.get(&(obj, port)).copied() {
+            Some(n) if n > 1 => {
+                self.bound_by
+                    .insert_reserved((obj, port), n.saturating_sub(1));
+            }
+            Some(_) => {
+                self.bound_by.remove(&(obj, port));
+            }
+            None => {}
+        }
+    }
+
+    /// The ports that bind `obj`, each once.
+    pub fn for_each_binder(&self, obj: ObjId, f: &mut dyn FnMut(ObjId)) {
+        let lo = ObjId { index: 0, gen: 0 };
+        let hi = ObjId {
+            index: u32::MAX,
+            gen: u64::MAX,
+        };
+        for (&(_, port), _) in self.bound_by.range((obj, lo)..=(obj, hi)) {
+            f(port);
+        }
+    }
+
+    /// How many bindings of `port` name `obj`, as the index has them (audits).
+    pub fn bound_count(&self, obj: ObjId, port: ObjId) -> u32 {
+        self.bound_by.get(&(obj, port)).copied().unwrap_or(0)
+    }
+
+    /// Did an insert into the index find no reserved room (it must never: `bound_reserve` comes first)?
+    pub fn bound_short_inserts(&self) -> u32 {
+        self.bound_by.short_inserts()
+    }
+
+    /// How many (object, port) pairs are recorded (audits).
+    pub fn bound_pairs(&self) -> usize {
+        self.bound_by.len()
+    }
+
     /// One more (`delta` 1) or one fewer (`-1`) port binding names `obj`.
     pub fn watch_adjust(&mut self, obj: ObjId, delta: i32) {
         if let Some(s) = self.slot_mut(obj) {
@@ -370,6 +443,11 @@ impl<T: Object> Registry<T> {
     /// reuses.
     pub fn set_first_generation(&mut self, n: u64) {
         self.first_gen = n;
+    }
+
+    /// Did the dirty log run out of room since it was last taken (it then names nothing in particular: everything is to be looked at)?
+    pub fn dirty_overflowed(&self) -> bool {
+        self.dirty_overflow
     }
 
     /// Is anything waiting in the dirty log?
@@ -465,6 +543,11 @@ impl<T: Object> Registry<T> {
         self.slot(id)?.job
     }
 
+    /// The credits still owed, without applying them (an audit reads them: a job's usage minus these is what live objects hold).
+    pub fn pending_credits(&self) -> &[(JobId, usize)] {
+        &self.credits
+    }
+
     /// The same credits, drained in place: the vector keeps its capacity, so the next destruction of a charged object does not allocate.
     pub fn drain_credits(&mut self) -> alloc::vec::Drain<'_, (JobId, usize)> {
         self.credits.drain(..)
@@ -537,12 +620,36 @@ impl<T: Object> Registry<T> {
 
     /// Drop a reference; destroy the object, and whatever that frees in turn, when
     /// it was the last.
-    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released
     pub fn release(&mut self, id: ObjId) {
+        self.release_bounded(id, usize::MAX);
+    }
+
+    /// `release`, but looks at no more than `budget` references (the one given and the ones destroying objects frees in turn); what is left stays
+    /// on the registry's persistent list of owed references for `release_step` (T206: a close that frees a chain of thousands is many sections, not one).
+    /// Returns true when nothing is owed. An owed reference is a counted reference of an object already destroyed, so what it names only lives longer;
+    /// if a sweep dooms that first, the owed release finds a stale id and is skipped.
+    pub fn release_bounded(&mut self, id: ObjId, budget: usize) -> bool {
+        // (`reserve_for` made room for every live object: the push cannot allocate unless the caller skipped it, and then the reference is leaked for
+        // `sweep` to reclaim, as a failed push of a held reference is)
+        if self.work.try_reserve(1).is_ok() {
+            self.work.push(id);
+        }
+        self.release_step(budget)
+    }
+
+    /// References owed by earlier bounded releases.
+    pub fn owed(&self) -> usize {
+        self.work.len()
+    }
+
+    /// Drop up to `budget` owed references (see `release_bounded`). True when none remain.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released; units is at most budget
+    pub fn release_step(&mut self, budget: usize) -> bool {
         let mut work = core::mem::take(&mut self.work);
-        work.clear();
-        work.push(id);
-        while let Some(id) = work.pop() {
+        let mut units = 0usize;
+        while units < budget {
+            let Some(id) = work.pop() else { break };
+            units += 1;
             let Some(slot) = self.slot_mut(id) else {
                 continue;
             };
@@ -564,7 +671,10 @@ impl<T: Object> Registry<T> {
             }
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
-            obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
+            obj.for_each_watched(&mut |o| {
+                self.watch_adjust(o, -1);
+                self.bound_remove(o, id);
+            });
             // (room for the references the object held, before they are queued: if there is none they are leaked, which `sweep` reclaims later,
             // rather than failing a destruction: KT9)
             if work.try_reserve(obj.held_count()).is_ok() {
@@ -579,7 +689,15 @@ impl<T: Object> Registry<T> {
                 self.bury(obj);
             }
         }
+        let done = work.is_empty();
         self.work = work;
+        self.last_units = units;
+        done
+    }
+
+    /// How many references the last `release_step` (or `release_bounded`) looked at: never more than its budget.
+    pub fn last_units(&self) -> usize {
+        self.last_units
     }
 
     /// Hand a destroyed object that needs cleanup to the graveyard. The room was made by `reserve_one` (the graveyard holds at least one slot
@@ -630,6 +748,10 @@ impl<T: Object> Registry<T> {
         if v.capacity() > self.graveyard.capacity() {
             core::mem::swap(&mut self.graveyard, &mut v);
             self.graveyard.append(&mut v);
+        }
+        // (the twin: `drain_dead` leaves it empty, and a later drain would swap that empty vector in as the graveyard, so burying would allocate: KT9)
+        if v.capacity() > self.spare.capacity() {
+            self.spare = v;
         }
     }
 
@@ -685,6 +807,7 @@ impl<T: Object> Registry<T> {
         self.epoch = self.epoch.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
         self.phase = Phase::Marking;
         self.mark_work.clear();
+        self.mark_incomplete = false;
         self.cursor = 0;
         self.swept = 0;
         for &r in roots {
@@ -731,6 +854,19 @@ impl<T: Object> Registry<T> {
         self.mark_work.push(id);
     }
 
+    /// Debug check of the sweep's invariant (a) (T206): while a sweep runs, an object that goes into a queued message is not white (it was shaded
+    /// by `remove_for_transfer` or born during the sweep), or a black channel could hold the only path to an object the sweep then frees.
+    pub fn debug_assert_not_white(&self, id: ObjId) {
+        debug_assert!(
+            self.phase == Phase::Idle
+                || self
+                    .slots
+                    .get(id.index as usize)
+                    .is_none_or(|s| s.gen != id.gen || s.obj.is_none() || s.mark == self.epoch),
+            "a white object is going into a queued message during a sweep"
+        );
+    }
+
     /// One slice of the sweep: follow the references of up to `budget` marked objects, or (once everything reachable is marked) free the
     /// unmarked objects among the next `budget` slots. Between slices anything may happen to the object graph as long as new handles are
     /// shaded and nothing is unmarked. `More` until the last slice, which says how many objects the whole sweep freed.
@@ -755,11 +891,15 @@ impl<T: Object> Registry<T> {
             }
             let mut refs = core::mem::take(&mut self.scan);
             refs.clear();
-            self.slots[id.index as usize]
-                .obj
-                .as_ref()
-                .expect("live")
-                .held(&mut refs);
+            let obj = self.slots[id.index as usize].obj.as_ref().expect("live");
+            // (the room first: an object that holds more references than the buffer has room for cannot be followed under memory pressure, and
+            // an incomplete mark frees nothing)
+            if refs.try_reserve(obj.held_count()).is_err() {
+                self.mark_incomplete = true;
+                self.scan = refs;
+                continue;
+            }
+            obj.held(&mut refs);
             for &r in &refs {
                 self.shade(r);
             }
@@ -768,29 +908,53 @@ impl<T: Object> Registry<T> {
         if !self.mark_work.is_empty() || self.roots_pending {
             return SweepStep::More;
         }
+        if self.mark_incomplete {
+            // (T177: a reference could not be followed, so an unmarked object may be reachable: free nothing, and sweep again later)
+            self.mark_incomplete = false;
+            self.phase = Phase::Idle;
+            self.swept = 0;
+            return SweepStep::Done(0);
+        }
         self.phase = Phase::Freeing;
         // freeing
         let end = self.slots.len().min(self.cursor.saturating_add(left));
         let mut dropped_refs: Vec<ObjId> = Vec::new();
         let mut peers: Vec<ObjId> = Vec::new();
+        let mut abandoned = false;
         for index in self.cursor..end {
             let slot = &self.slots[index];
             if slot.obj.is_none() || slot.mark == self.epoch {
                 continue;
             }
+            // (T177: the room for what dooming this object collects, before it is doomed; without it the sweep stops between objects: what was
+            // doomed is fully processed below, the rest waits for the next sweep)
+            let need = slot.obj.as_ref().map_or(0, |o| o.held_count());
+            if dropped_refs.try_reserve(need).is_err() || peers.try_reserve(1).is_err() {
+                abandoned = true;
+                self.cursor = index;
+                break;
+            }
             self.swept += 1;
             self.doom_slot(index as u32, &mut dropped_refs, &mut peers);
         }
-        self.cursor = end;
+        if !abandoned {
+            self.cursor = end;
+        }
         for peer in peers {
             if let Some(p) = self.get_mut(peer) {
                 p.peer_destroyed();
             }
         }
+        // (T206: the references the doomed objects held are owed, and a bounded number are paid now; `owed` says what is left)
         for id in dropped_refs {
             if self.is_alive(id) {
-                self.release(id);
+                self.release_bounded(id, 0);
             }
+        }
+        self.release_step(RELEASE_UNITS);
+        if abandoned {
+            self.phase = Phase::Idle;
+            return SweepStep::Done(self.swept);
         }
         if self.cursor < self.slots.len() {
             return SweepStep::More;
@@ -829,7 +993,10 @@ impl<T: Object> Registry<T> {
         }
         self.live -= 1;
         self.meter = self.meter.saturating_sub(obj.meter());
-        obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
+        obj.for_each_watched(&mut |o| {
+            self.watch_adjust(o, -1);
+            self.bound_remove(o, id);
+        });
         // The references a doomed object holds go away with it. Those to other doomed
         // objects are moot; those to survivors must be given back, or the survivor
         // could never be freed.

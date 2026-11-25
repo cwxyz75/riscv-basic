@@ -75,6 +75,8 @@ pub struct ProcessObj {
 /// A user thread, as a kernel object: what a thread handle names.
 pub struct ThreadObj {
     pub pid: u64,
+    /// The kernel thread behind it, once the spawner has registered it (KT9: the lookup from a handle to its thread).
+    pub tid: Option<u64>,
     pub terminated: bool,
     /// Stopped by `thread_suspend` (EX1): raises SUSPENDED.
     pub suspended: bool,
@@ -518,6 +520,9 @@ pub fn channel_write_from(
             .iter()
             .map(|&h| table.remove_for_transfer(reg, h).expect("validated")),
     );
+    for e in &entries {
+        reg.debug_assert_not_white(e.obj);
+    }
     if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
         p.queue.push_back(Message {
             data: bytes,
@@ -731,6 +736,30 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
 /// wake path (slice W) and its tests.
 pub fn signals_of_object(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     object_signals(reg, obj)
+}
+
+/// Audit (KT9, T177): the index of which ports bind which objects (`Registry::bound_by`) holds, for every live port, at least the multiplicity of each of its
+/// bindings (a pair for a dead bound object may linger until the port prunes it), and no insert into it ever found no reserved room.
+pub fn audit_bound_index(reg: &Kobjs) -> Result<(), alloc::string::String> {
+    if reg.bound_short_inserts() != 0 {
+        return Err("the bound index took an insert with no room reserved".into());
+    }
+    for port in reg.live_ids() {
+        let Some(KObj::Port(p)) = reg.get(port) else {
+            continue;
+        };
+        for b in p.bindings.iter() {
+            let n = p.bindings.iter().filter(|c| c.obj == b.obj).count();
+            if (reg.bound_count(b.obj, port) as usize) < n {
+                return Err(alloc::format!(
+                    "port {port:?} binds {:?} {n} time(s), the index says {}",
+                    b.obj,
+                    reg.bound_count(b.obj, port)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The objects a port binds (empty for anything that is not a live port).
@@ -1078,7 +1107,17 @@ fn prune_port(reg: &mut Kobjs, jobs: &mut Jobs, port_obj: ObjId) {
         .filter(|b| !reg.is_alive(b.obj))
         .count();
     let before = bindings.len();
-    bindings.retain(|b| reg.is_alive(b.obj));
+    // (kept in order, by swapping them down: a dead binding's pair leaves the index as it goes, which a `retain` closure could not do)
+    let mut keep = 0;
+    for i in 0..before {
+        if reg.is_alive(bindings[i].obj) {
+            bindings.swap(keep, i);
+            keep += 1;
+        } else {
+            reg.bound_remove(bindings[i].obj, port_obj);
+        }
+    }
+    bindings.truncate(keep);
     let removed = before - bindings.len();
     if let Some(KObj::Port(p)) = reg.get_mut(port_obj) {
         p.bindings = bindings;
@@ -1144,6 +1183,7 @@ pub fn port_bind_flags_in(
         return Err(Status::InvalidArgs);
     }
     p.bindings.try_reserve(1).map_err(|_| Status::NoMemory)?;
+    reg.bound_reserve().map_err(|_| Status::NoMemory)?;
     // a binding costs queued-data budget of the port's job, like a queued message would
     charge_bytes(reg, jobs, port_obj, BINDING_COST)?;
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
@@ -1159,6 +1199,7 @@ pub fn port_bind_flags_in(
     });
     reg.meter_add(BINDING_COST);
     reg.watch_adjust(oe.obj, 1);
+    reg.bound_add(oe.obj, port_obj);
     Ok(())
 }
 
@@ -1216,6 +1257,7 @@ pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjI
         }
         for o in &ended {
             reg.watch_adjust(*o, -1);
+            reg.bound_remove(*o, port);
         }
         reg.meter_sub(ended.len() * BINDING_COST);
         credit_bytes(reg, jobs, port, ended.len() * BINDING_COST);
@@ -1245,6 +1287,7 @@ pub fn port_unbind_in(
         p.next -= 1;
     }
     reg.watch_adjust(gone_obj, -1);
+    reg.bound_remove(gone_obj, port_obj);
     reg.meter_sub(BINDING_COST);
     credit_bytes(reg, jobs, port_obj, BINDING_COST);
     Ok(())
@@ -1298,22 +1341,34 @@ pub fn port_poll_many_in(
 ) -> Result<Vec<(u64, u32)>, Status> {
     let port_obj = port_of(reg, table, port, Rights::WAIT)?;
     prune_port(reg, jobs, port_obj);
-    let picked: Vec<(usize, u64, u32, ObjId)> = match reg.get(port_obj) {
+    // (both lists are reserved before anything is taken: NO_MEMORY here leaves the port as it was, T248)
+    let mut picked: Vec<(usize, u64, u32, ObjId)> = Vec::new();
+    let mut observed: Vec<(u64, u32)> = Vec::new();
+    match reg.get(port_obj) {
         Some(KObj::Port(p)) => {
             let n = p.bindings.len();
-            (0..n)
-                .map(|i| (p.next + i) % n)
-                .filter(|&i| binding_ready(reg, &p.bindings[i]))
-                .take(max)
-                .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj))
-                .collect()
+            let room = n.min(max);
+            picked
+                .try_reserve_exact(room)
+                .map_err(|_| Status::NoMemory)?;
+            observed
+                .try_reserve_exact(room)
+                .map_err(|_| Status::NoMemory)?;
+            picked.extend(
+                (0..n)
+                    .map(|i| (p.next + i) % n)
+                    .filter(|&i| binding_ready(reg, &p.bindings[i]))
+                    .take(max)
+                    .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj)),
+            );
         }
         _ => return Err(Status::BadHandle),
-    };
-    let observed: Vec<(u64, u32)> = picked
-        .iter()
-        .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask)))
-        .collect();
+    }
+    observed.extend(
+        picked
+            .iter()
+            .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask))),
+    );
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
         return Err(Status::BadHandle);
     };
@@ -1687,6 +1742,13 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
 }
 
 /// Record that the thread behind `obj` has stopped for `thread_suspend` or runs again (raises or clears SUSPENDED).
+/// Record the kernel thread a thread object stands for.
+pub fn thread_set_tid(reg: &mut Kobjs, obj: ObjId, tid: u64) {
+    if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
+        t.tid = Some(tid);
+    }
+}
+
 pub fn thread_set_suspended(reg: &mut Kobjs, obj: ObjId, suspended: bool) {
     if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
         t.suspended = suspended && !t.terminated;
@@ -1778,6 +1840,7 @@ pub fn thread_object_create_in(
     let obj = reg.create_charged(
         KObj::Thread(ThreadObj {
             pid,
+            tid: None,
             terminated: false,
             suspended: false,
             exit_code: 0,

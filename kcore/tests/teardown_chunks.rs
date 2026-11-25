@@ -88,7 +88,7 @@ fn a_chunk_unmaps_no_more_than_its_budget() {
     let (mut mm, mut vmos, mut jobs, mut a, _ids) = world();
     let total: u64 = a.region_count() as u64;
     assert!(total >= 5);
-    // a budget of one page cannot remove two regions of 1 and 7 pages in one chunk: the regions go in order, a page at a time
+    // a budget of one mapping clears one page a chunk: the regions go in order
     let mut seen = a.region_count();
     let mut chunks = 0;
     while !a.destroy_user_chunk(&mut mm, &mut vmos, &mut jobs, 1) {
@@ -97,8 +97,9 @@ fn a_chunk_unmaps_no_more_than_its_budget() {
         seen = a.region_count();
         assert!(chunks < 1000);
     }
+    // (the budget counts mappings cleared, and a scan of 32 entries each: about sixty-three pages are mapped, so about that many chunks)
     assert!(
-        chunks > 100,
-        "a budget of one page took only {chunks} chunks for 178 pages"
+        chunks > 55,
+        "a budget of one mapping took only {chunks} chunks for 63 mapped pages"
     );
 }

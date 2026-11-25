@@ -373,6 +373,51 @@ pub fn join_scheduler() -> ! {
 /// A hart whose next timer event is further away than this (or has none) suspends through the firmware instead of `wfi` (PM2).
 const SUSPEND_AFTER: u64 = MS;
 
+/// `debug_stat` 209 to 213 (T213): sums over every hart of the counters a benchmark reads before and after (209 reschedule IPIs received, 210 retentive
+/// suspends, 211 halt idles, 212 nanoseconds idle), and 213 the idle policy a boot argument asked for.
+#[inline(never)]
+fn idle_stat(which: u64) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if which == 213 {
+        return u64::from(idle_mode());
+    }
+    // (T206: 214 interrupts taken inside a syscall's `irq::window()` since boot, 215 the windows made)
+    if which == 214 {
+        return crate::trap::WINDOW_TRAPS.load(Relaxed);
+    }
+    if which == 215 {
+        return crate::irq::WINDOWS.load(Relaxed);
+    }
+    (0..crate::percpu::MAX_HARTS)
+        .map(|h| {
+            let p = crate::percpu::hart(h);
+            match which {
+                209 => p.resched_ipis.load(Relaxed),
+                210 => p.idle_suspend.load(Relaxed),
+                211 => p.idle_wfi.load(Relaxed),
+                _ => p.idle_ns.load(Relaxed),
+            }
+        })
+        .sum()
+}
+
+/// The idle policy (T213 M4, controls that separate the emulator's halt cost from the kernel's): 0 the normal one, 1 `idle=nosuspend` (never the firmware's
+/// suspend), 2 `idle=spin` (never halt). Read from the command line once.
+fn idle_mode() -> u8 {
+    static MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
+    let m = MODE.load(Ordering::Relaxed);
+    if m != 255 {
+        return m;
+    }
+    let m = if crate::dtb::boot_arg_present("idle=spin") {
+        2
+    } else {
+        u8::from(crate::dtb::boot_arg_present("idle=nosuspend"))
+    };
+    MODE.store(m, Ordering::Relaxed);
+    m
+}
+
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
@@ -396,12 +441,19 @@ fn idle_main(_: usize) {
             irq::off(crate::heap::service); // an idle hart is a safe point too
         }
         let ev = program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
+        if idle_mode() == 2 {
+            // (`idle=spin`: look again at once, never halting)
+            irq::restore(was);
+            core::hint::spin_loop();
+            continue;
+        }
         let idle_from = now_ns();
         let me = crate::percpu::this();
         // A long idle (the next event more than `SUSPEND_AFTER` away, or none) goes through the firmware's retentive suspend; a short
         // one, or firmware without it, uses `wfi` (PM2, KERNEL-V1-SPEC 5.5). Both return when an interrupt is pending, with interrupts
         // off, which is the point of the protocol above (the architecture resumes on any pending and individually enabled interrupt).
-        if ev.is_none_or(|e| e > idle_from.saturating_add(SUSPEND_AFTER))
+        if idle_mode() == 0
+            && ev.is_none_or(|e| e > idle_from.saturating_add(SUSPEND_AFTER))
             && crate::smp::suspend_retentive()
         {
             me.idle_suspend.fetch_add(1, Ordering::Relaxed);
@@ -561,11 +613,6 @@ pub fn user_thread_ids_left() -> bool {
     sched().tid_headroom(4096)
 }
 
-/// Like `spawn_detached`, free to run on any hart.
-pub fn spawn_free_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
-    spawn_with_affinity(name, prio, entry, arg, true, None)
-}
-
 /// Create a thread that may run on any hart, whatever the default is.
 pub fn spawn_free(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
     spawn_with_affinity(name, prio, entry, arg, false, None)
@@ -575,7 +622,6 @@ fn spawn_with(name: &'static str, prio: Prio, entry: fn(usize), arg: usize, deta
     spawn_with_affinity(name, prio, entry, arg, detached, default_affinity())
 }
 
-#[allow(clippy::expect_used)] // INVARIANT: the priority passed by kernel code is valid (it was chosen in this crate)
 fn spawn_with_affinity(
     name: &'static str,
     prio: Prio,
@@ -585,22 +631,72 @@ fn spawn_with_affinity(
     affinity: Option<usize>,
 ) -> Tid {
     let thread = new_kthread(name, entry, arg, detached);
+    register_kthread(thread, prio, affinity)
+}
+
+#[allow(clippy::expect_used)] // INVARIANT: the priority passed by kernel code is valid (it was chosen in this crate)
+fn register_kthread(thread: KThread, prio: Prio, affinity: Option<usize>) -> Tid {
+    // (class N: the scheduler's queues, timers and maps grow here, and a thread that has been made cannot be refused; `prepare_user_thread` made the
+    // room that can be refused: the stack)
+    register_kthread_inner(thread, prio, affinity)
+}
+
+#[allow(clippy::expect_used)] // INVARIANT: as above
+fn register_kthread_inner(thread: KThread, prio: Prio, affinity: Option<usize>) -> Tid {
     irq::off(|| {
-        let mut k = kernel();
-        let tid = sched()
-            .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
-            .expect("valid priority");
-        k.threads.insert(tid, thread);
-        note_resched();
-        tid
+        heap::nofail(|| {
+            let mut k = kernel();
+            let tid = sched()
+                .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
+                .expect("valid priority");
+            k.threads.insert(tid, thread);
+            note_resched();
+            tid
+        })
+    })
+}
+
+/// A user thread's kernel stack, made before the call that creates the thread changes anything (KT9, T177: running out of stack memory is
+/// `NO_MEMORY` for `thread_spawn` and `process_start`, with nothing done). Dropping it frees the stack.
+pub struct PreparedThread(crate::kstack::KStack);
+
+pub fn prepare_user_thread() -> Option<PreparedThread> {
+    // (the donation graph's room for the thread, made now, where a refusal is NO_MEMORY with nothing done: the registration after the spawn takes it)
+    pi_reserve_thread().ok()?;
+    crate::kstack::alloc().map(PreparedThread)
+}
+
+/// Spawn a detached thread that may run on any hart, on the stack `prepare_user_thread` made.
+pub fn spawn_prepared(
+    p: PreparedThread,
+    name: &'static str,
+    prio: Prio,
+    entry: fn(usize),
+    arg: usize,
+) -> Tid {
+    // (class N from here: the stack was the room that could be refused)
+    heap::nofail(|| {
+        let thread = kthread_on(p.0, name, entry, arg, true);
+        register_kthread(thread, prio, None)
     })
 }
 
 /// A kernel thread's stack and first context. The stack comes from frames, not the heap, and has a guard page below it
 /// (`kstack.rs`).
-#[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: memory for a kernel thread's stack at boot or at thread creation by kernel code: running out is the kernel's own bug (the user thread limit and the job's stack charge are checked first); GUARD_WORDS is far below the stack's length
+#[allow(clippy::expect_used)] // INVARIANT: memory for a kernel thread's stack at boot or at thread creation by kernel code that did not prepare one: running out is the kernel's own bug
 fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool) -> KThread {
-    let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
+    let stack = crate::kstack::alloc().expect("memory for a kernel stack");
+    kthread_on(stack, name, entry, arg, detached)
+}
+
+#[allow(clippy::indexing_slicing)] // INVARIANT: GUARD_WORDS is far below the stack's length
+fn kthread_on(
+    mut stack: crate::kstack::KStack,
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    detached: bool,
+) -> KThread {
     stack[..GUARD_WORDS].fill(CANARY);
     let top = stack.top();
     let ctx = Context::new(entry, arg, top);
@@ -642,6 +738,7 @@ fn switch_done() {
 /// The thread this hart replaced, if it has exited and nobody will join it, is dead now: its context is saved, so its stack is in
 /// nobody's use (SCHED-SMP-SPEC 3.6: `Dead`, then reap by the hart; the reaper thread this replaced needed a wake and a switch for
 /// every thread that ended). The big kernel lock is held, so the table is ours.
+#[inline(never)]
 fn reap_prev() {
     let prev = crate::percpu::this().prev.swap(0, Ordering::Relaxed);
     if prev != 0 {
@@ -651,6 +748,7 @@ fn reap_prev() {
 
 /// Free `tid` if it is an exited detached thread (a joined one is freed by its joiner). The caller has completed the switch away
 /// from it and holds the big kernel lock.
+#[inline(never)]
 fn reap_if_dead(tid: Tid) {
     let mut k = kernel();
     // (not while it is in transit: `prev` is consumed after the lock is taken again, which can wait, and by then the thread may have
@@ -667,10 +765,16 @@ fn reap_if_dead(tid: Tid) {
             // class, which comes before it in the order)
             let gone = k.threads.remove(&tid);
             drop(k);
-            if let Some(t) = gone {
-                note_stack_use(tid, &t);
-            }
+            drop_reaped(tid, gone);
         }
+    }
+}
+
+/// Record the stack use of a reaped thread and free it, in a frame of its own (the stack pages and their tables are released here).
+#[inline(never)]
+fn drop_reaped(tid: Tid, gone: Option<KThread>) {
+    if let Some(t) = gone {
+        note_stack_use(tid, &t);
     }
 }
 
@@ -1132,15 +1236,25 @@ fn pi_apply(changes: &[kcore::donate::Change]) {
     }
 }
 
-/// Run `f` on the donation graph with the `PI` lock held and apply the priority changes it returns before the lock is let go. Interrupts must
-/// be off, and the big lock need not be held (the PI futex calls this with a futex bucket's lock held: `FUTEX` is before `PI`).
+/// Run `f` on the donation graph with the `PI` lock held; `f` hands each list of priority changes it makes to the sink, which applies it to the
+/// run queues before the lock is let go. Interrupts must be off, and the big lock need not be held (the PI futex calls this with a futex bucket's
+/// lock held: `FUTEX` is before `PI`). Nothing is collected.
 pub fn pi_op<R>(
-    f: impl FnOnce(&mut kcore::donate::Donations) -> (R, alloc::vec::Vec<kcore::donate::Change>),
+    f: impl FnOnce(&mut kcore::donate::Donations, &mut dyn FnMut(&[kcore::donate::Change])) -> R,
+) -> R {
+    debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
+    let mut d = PI.lock();
+    f(&mut d, &mut |c| pi_apply(c))
+}
+
+/// `pi_op` for a graph operation that returns its (fixed-size) change list: applied from the list itself, nothing allocated.
+fn pi_op_changes<R>(
+    f: impl FnOnce(&mut kcore::donate::Donations) -> (R, kcore::donate::Changes),
 ) -> R {
     debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
     let mut d = PI.lock();
     let (r, changes) = f(&mut d);
-    pi_apply(&changes);
+    pi_apply(changes.as_slice());
     r
 }
 
@@ -1159,10 +1273,11 @@ pub fn push_owed() {
 
 /// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
 /// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
+#[allow(clippy::large_stack_frames)] // KT13: audited, the fixed change list (304 bytes) is moved a few times; T172 shrinks it
 pub fn pi_donate(from: Tid, to: Tid) {
     irq::off(|| {
-        pi_op(|d| match d.donate(from, to) {
-            Ok(ch) => ((), ch.as_slice().to_vec()),
+        pi_op_changes(|d| match d.donate(from, to) {
+            Ok(ch) => ((), ch),
             Err(e) => {
                 // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
                 if matches!(
@@ -1171,7 +1286,7 @@ pub fn pi_donate(from: Tid, to: Tid) {
                 ) {
                     DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
                 }
-                ((), alloc::vec::Vec::new())
+                ((), kcore::donate::Changes::default())
             }
         });
     });
@@ -1180,8 +1295,13 @@ pub fn pi_donate(from: Tid, to: Tid) {
 /// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
 pub fn pi_revoke(tid: Tid) {
     irq::off(|| {
-        pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
+        pi_op_changes(|d| ((), d.revoke(tid)));
     });
+}
+
+/// Room in the donation graph for one user thread: the spawner's reportable step, before it spawns (the `pi_register` that follows takes the room).
+pub fn pi_reserve_thread() -> Result<(), kcore::fmap::NoMem> {
+    irq::off(|| PI.lock().reserve_thread())
 }
 
 /// A user thread enters the donation graph at its base priority (when it registers, big lock held).
@@ -1190,7 +1310,12 @@ pub fn pi_register(tid: Tid) {
         let base = sched().priority(tid).unwrap_or(1);
         let mut d = PI.lock();
         if d.eff(tid).is_none() {
-            d.add_thread(tid, base); // (a thread the spawner registered is registered again by itself: the first stands)
+            // (the spawner reserved the room, `pi_reserve_thread`; the boot loader's thread finds room in an empty table)
+            let added = d.add_thread(tid, base);
+            debug_assert!(
+                added.is_ok(),
+                "a thread found no room in the donation graph"
+            );
         }
     });
 }
@@ -1198,7 +1323,7 @@ pub fn pi_register(tid: Tid) {
 /// A user thread leaves the graph (it has exited): the donations it made and received lapse. Big lock held.
 pub fn pi_gone(tid: Tid) {
     irq::off(|| {
-        pi_op(|d| ((), d.remove_thread(tid).as_slice().to_vec()));
+        pi_op_changes(|d| ((), d.remove_thread(tid)));
     });
 }
 
@@ -1597,12 +1722,17 @@ pub fn wake_stat(which: u64) -> u64 {
         // (HD2: is `aslr=off` in force?)
         128 => u64::from(crate::entropy::aslr_off()),
         131 => crate::user::clock_traps(),
+        // (KT9: 1 when this kernel has the allocation-failure hooks, `debug_stat` 200 to 202)
+        203 => u64::from(cfg!(feature = "fault-alloc")),
         // (T243, debug builds: print every hart's scheduler state and the record of every thread that is not idle, for a test that timed out)
         132 => {
             #[cfg(debug_assertions)]
             dump_sched();
             0
         }
+        // (T213 M2: sums over every hart of the counters a benchmark reads before and after: 209 reschedule IPIs received, 210 retentive suspends,
+        // 211 `wfi` idles, 212 nanoseconds idle; 213 the idle policy a boot argument asked for: 0 normal, 1 `idle=nosuspend`, 2 `idle=spin`)
+        209..=215 => idle_stat(which),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
@@ -1613,6 +1743,8 @@ pub fn wake_stat(which: u64) -> u64 {
         // 8: the longest interrupts-off span seen (cycles; 0 unless built with `latency-trace`)
         8 => crate::latency::irq_off_max().0,
         7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
+        // 14: the longest big-lock hold so far (in the units of 8), and the trace starts again from zero (the log says both figures) (T207 PR 4: a test measures what it does alone; 0 unless built with `latency-trace`)
+        14 => crate::latency::take_window(),
         // 9: 1 if the kernel command line has `net=lossy` (the harness runs the guest behind the lossy relay, S9-SPEC Q30)
         9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
         // 13: which part of the suite the kernel line asks for: 0 all of it, 1 `shard=a` (the larger part), 2
@@ -1759,7 +1891,7 @@ static STACK_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 #[cfg(not(kernel_optimized))]
 pub const STACK_BUDGET: usize = 8 * 1024;
 #[cfg(kernel_optimized)]
-pub const STACK_BUDGET: usize = 12 * 1024;
+pub const STACK_BUDGET: usize = 9 * 1024;
 
 /// The first thread seen over the budget: its stack use, or 0 while none is (the thread's id is in `OVER_BUDGET_TID`; atomics only, so the
 /// check at a thread's exit is lock-free).
@@ -1808,7 +1940,9 @@ pub fn exempt_from_stack_budget() {
 }
 static EXEMPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: i is below 16 (take(16)), so i % 8 * 8 is below 64 and the shift cannot overflow; the byte is shifted into its own lane
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: i is below 16 (take(16)), so i % 8 * 8 is below 64 and the shift cannot overflow; the byte is shifted into its own lane
+#[inline(never)]
 fn note_stack_use(tid: Tid, t: &KThread) {
     if let Some(stack) = t.stack.as_ref() {
         let used = stack_used(stack);

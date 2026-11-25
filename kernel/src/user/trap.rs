@@ -25,10 +25,10 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
 /// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
 fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
     let pending = any_state(|s| {
-        if s.pending_regs.is_empty() {
+        if s.n_pending_regs == 0 {
             return None;
         }
-        s.pending_regs.remove(&thread::current())
+        s.take_pending_regs(thread::current())
     });
     let Some(p) = pending else {
         return;
@@ -61,10 +61,10 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
             let UserState {
                 asids,
                 procs,
-                thread_pid,
+                threads,
                 ..
             } = s;
-            let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
+            let pid = threads.get(&thread::current()).map_or(0, |t| t.pid);
             crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
             let p = procs.get_mut(&pid);
             let (ls, le) = p
@@ -212,6 +212,44 @@ fn current_space() -> Option<&'static klock::aslock::AsCell> {
     Some(unsafe { &*cell })
 }
 
+/// The bytes one chunk of a big copy moves under one hold of the address-space and memory locks (T206 L4; 3.10: 16 KiB).
+const COPY_CHUNK: usize = 16 * 1024;
+
+/// `copy_from_user` of `len` bytes in `COPY_CHUNK` pieces: the address-space lock and the memory locks are taken and let go per piece, with an interrupts
+/// window between (T206), so no hold is proportional to the length. The destination is reserved first; any failure (a bad pointer, no memory, a page a
+/// pager owes, a sibling that unmapped the buffer between pieces) returns `None`, and the caller's own copy under the lock reports the error as always.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `stage_in`
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: done < len, so len - done and done + n (n <= len - done) cannot overflow
+fn copy_in_chunked(cell: &klock::aslock::AsCell, ptr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    let mut done = 0usize;
+    while done < len {
+        let n = COPY_CHUNK.min(len - done);
+        {
+            let _as = cell.lock();
+            let k = kmem::mem();
+            let saved = k.vmos.swap_need(None);
+            let r = copy_from_user(
+                cell.held_mut(),
+                k.mm,
+                k.vmos,
+                k.jobs,
+                ptr.checked_add(done as u64)?,
+                n,
+            );
+            let _ = k.vmos.swap_need(saved);
+            out.extend_from_slice(&r.ok()?);
+        }
+        done += n;
+        if done < len {
+            crate::irq::window();
+        }
+    }
+    Some(out)
+}
+
 /// The copy-in of a big `channel_write` or `socket_write`, before the object lock is taken (T215): the bytes come under the caller's address-space lock and the
 /// memory locks only. Any failure (a bad pointer, no memory, a page a pager owes) returns `None`, and the call then does its own copy under the lock, in
 /// the order SYSCALLS.md gives its errors, and reports the same error it always did.
@@ -232,22 +270,13 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
         return None;
     }
     let cell = current_space()?;
-    let _as = cell.lock();
-    let space = cell.held_mut();
-    let k = kmem::mem();
-    // (a pager's page that is missing leaves its need in the slot: the call, run again under the lock, finds it itself)
-    let saved = k.vmos.swap_need(None);
-    let data = copy_from_user(space, k.mm, k.vmos, k.jobs, a[1], len);
-    let raw = if hlen == 0 {
-        Ok(Vec::new())
+    let data = copy_in_chunked(cell, a[1], len)?;
+    let handles = if hlen == 0 {
+        Vec::new()
     } else {
-        copy_from_user(space, k.mm, k.vmos, k.jobs, a[3], hlen.saturating_mul(8))
+        copy_in_chunked(cell, a[3], hlen.saturating_mul(8))?
     };
-    let _ = k.vmos.swap_need(saved);
-    Some(ksys::Staged {
-        data: data.ok()?,
-        handles: raw.ok()?,
-    })
+    Some(ksys::Staged { data, handles })
 }
 
 /// The copy-in of a big `channel_call` request (T215), before the object lock is taken: the record is read, and if the request carries `OUTSIDE_COPY_MIN` bytes or
@@ -259,45 +288,30 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the record is CHANNEL_CALL_ARGS_BYTES (56) long and the offsets read are below it; nhandles <= MAX_MSG_HANDLES was checked, so nhandles * 8 is small
 pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
     let cell = current_space()?;
-    let _as = cell.lock();
-    let space = cell.held_mut();
-    let k = kmem::mem();
-    let saved = k.vmos.swap_need(None);
-    let staged = (|| {
-        let rec = copy_from_user(
-            space,
-            k.mm,
-            k.vmos,
-            k.jobs,
-            a[1],
-            abi::CHANNEL_CALL_ARGS_BYTES,
-        )
-        .ok()?;
-        let le64 = |at: usize| u64::from_le_bytes(rec[at..at + 8].try_into().unwrap_or([0; 8]));
-        let le32 = |at: usize| u32::from_le_bytes(rec[at..at + 4].try_into().unwrap_or([0; 4]));
-        let (req_bytes, req_handles) = (le64(0), le64(8));
-        let (nbytes, nhandles) = (le32(16) as usize, le32(20) as usize);
-        if !(ksys::OUTSIDE_COPY_MIN..=MAX_MSG_BYTES).contains(&nbytes) || nhandles > MAX_MSG_HANDLES
-        {
-            return None;
-        }
-        let data = copy_from_user(space, k.mm, k.vmos, k.jobs, req_bytes, nbytes).ok()?;
-        let handles = if nhandles == 0 {
-            Vec::new()
-        } else {
-            copy_from_user(space, k.mm, k.vmos, k.jobs, req_handles, nhandles * 8).ok()?
-        };
-        Some(ksys::Staged { data, handles })
-    })();
-    let _ = k.vmos.swap_need(saved);
-    staged
+    let rec = copy_in_chunked(cell, a[1], abi::CHANNEL_CALL_ARGS_BYTES)?;
+    let le64 = |at: usize| u64::from_le_bytes(rec[at..at + 8].try_into().unwrap_or([0; 8]));
+    let le32 = |at: usize| u32::from_le_bytes(rec[at..at + 4].try_into().unwrap_or([0; 4]));
+    let (req_bytes, req_handles) = (le64(0), le64(8));
+    let (nbytes, nhandles) = (le32(16) as usize, le32(20) as usize);
+    if !(ksys::OUTSIDE_COPY_MIN..=MAX_MSG_BYTES).contains(&nbytes) || nhandles > MAX_MSG_HANDLES {
+        return None;
+    }
+    let data = copy_in_chunked(cell, req_bytes, nbytes)?;
+    let handles = if nhandles == 0 {
+        Vec::new()
+    } else {
+        copy_in_chunked(cell, req_handles, nhandles * 8)?
+    };
+    Some(ksys::Staged { data, handles })
 }
 
 /// The copy-out of a big `channel_read` or `socket_read`, after the object lock was let go (T215): the destinations were checked against the message
 /// under it, before the message was taken. A sibling thread that unmaps or decommits the buffer in between makes this copy fail, and the message,
 /// already taken, is lost with the error: the program that does that has no use for the message (SYSCALLS.md).
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: at < d.data.len() in the loop, n <= len - at, so at + n <= len
 pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
     let Some(d) = deferred else {
         return result;
@@ -305,25 +319,48 @@ pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Rep
     let Some(cell) = current_space() else {
         return Err((Status::BadState, None, None));
     };
-    let _as = cell.lock();
-    let space = cell.held_mut();
-    let k = kmem::mem();
-    let saved = k.vmos.swap_need(None);
-    let mut done = kcore::usercopy::copy_to_user(space, k.mm, k.vmos, k.jobs, d.bytes_at, &d.data);
-    for (i, h) in d.handles.iter().enumerate() {
-        if done.is_err() {
-            break;
+    let mut done: Result<(), Status> = Ok(());
+    let mut at = 0usize;
+    while at < d.data.len() && done.is_ok() {
+        let n = COPY_CHUNK.min(d.data.len() - at);
+        {
+            let _as = cell.lock();
+            let k = kmem::mem();
+            let saved = k.vmos.swap_need(None);
+            done = kcore::usercopy::copy_to_user(
+                cell.held_mut(),
+                k.mm,
+                k.vmos,
+                k.jobs,
+                d.bytes_at.saturating_add(at as u64),
+                &d.data[at..at + n],
+            );
+            let _ = k.vmos.swap_need(saved);
         }
-        done = kcore::usercopy::copy_to_user(
-            space,
-            k.mm,
-            k.vmos,
-            k.jobs,
-            d.handles_at.saturating_add((i as u64).saturating_mul(8)),
-            &h.0.to_le_bytes(),
-        );
+        at += n;
+        if at < d.data.len() {
+            crate::irq::window();
+        }
     }
-    let _ = k.vmos.swap_need(saved);
+    if done.is_ok() && !d.handles.is_empty() {
+        let _as = cell.lock();
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None);
+        for (i, h) in d.handles.iter().enumerate() {
+            if done.is_err() {
+                break;
+            }
+            done = kcore::usercopy::copy_to_user(
+                cell.held_mut(),
+                k.mm,
+                k.vmos,
+                k.jobs,
+                d.handles_at.saturating_add((i as u64).saturating_mul(8)),
+                &h.0.to_le_bytes(),
+            );
+        }
+        let _ = k.vmos.swap_need(saved);
+    }
     match done {
         Ok(()) => result,
         Err(e) => Err((e, None, None)),
@@ -397,13 +434,68 @@ fn hart_call(n: usize, a: [u64; 6]) -> Reply {
     }
 }
 
+/// `debug_stat` 120 to 124: the backstops (PL8): objects, queued IPC bytes, processes, user threads, DMA pages; `None` for any other index.
+#[inline(never)]
+fn backstop_stat(s: &UserState, which: u64) -> Option<u64> {
+    let b = &s.backstops;
+    match which {
+        120 => Some(b.objects as u64),
+        121 => Some(b.ipc_bytes as u64),
+        122 => Some(b.processes as u64),
+        123 => Some(b.user_threads as u64),
+        124 => Some(b.dma_total_pages),
+        _ => None,
+    }
+}
+
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame just over 1 KiB (the state closure and the test-build arms); T172 shrinks them
 fn debug_stat_call(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
             .map_err(|e| (e, None, None))?;
+        #[cfg(feature = "fault-alloc")]
+        match a[1] {
+            // KT9 (guest half): 200 arms the calling thread (`a2` = N), 201 disarms and says whether the failure was injected, 202 counts
+            200 => {
+                crate::heap::faultalloc::arm(a[2]);
+                return Ok((Some(0), None));
+            }
+            // 208: arm persistently: every class-R allocation from the Nth on fails
+            208 => {
+                crate::heap::faultalloc::arm_persist(a[2]);
+                return Ok((Some(0), None));
+            }
+            // 207: suspend (`a2` = 1) or resume (0) counting and failing, so that a scenario arms only the call under test
+            207 => {
+                crate::heap::faultalloc::pause(a[2] != 0);
+                return Ok((Some(0), None));
+            }
+            201 => return Ok((Some(u64::from(crate::heap::faultalloc::disarm())), None)),
+            202 => return Ok((Some(crate::heap::faultalloc::count()), None)),
+            // 205: run a whole reachability sweep now (a destruction that found no memory leaks its objects until one runs: KT9)
+            205 => {
+                s.sweep_start();
+                while s.objs.sweep_active()
+                    && !matches!(
+                        s.sweep_slice(SWEEP_SLICE_BUDGET),
+                        kcore::object::SweepStep::Done(_)
+                    )
+                {}
+                return Ok((Some(0), None));
+            }
+            // 206: the registry's live objects
+            206 => return Ok((Some(s.objs.live() as u64), None)),
+            // 204: the VMOs that exist, so a sweep can check a scenario leaves none behind
+            204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
+            _ => {}
+        }
+        // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
+        if let Some(v) = backstop_stat(s, a[1]) {
+            return Ok((Some(v), None));
+        }
         Ok((Some(thread::wake_stat(a[1])), None))
     })
 }
@@ -720,14 +812,15 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             let va = fault.address;
             let mut pager_need = None;
             let mut resolved = {
-                let pid = with_state(|s| s.thread_pid.get(&thread::current()).copied());
+                let pid = with_state(|s| s.pid_of(thread::current()));
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
-                        let p = state_locked().procs.get_mut(&pid).expect("process exists");
-                        let _as = klock::aslock::AsCell::hold(&p.aspace);
+                        // (the address space is cloned out of the section: a reference count, no allocation)
+                        let aspace = with_state(|s| s.procs.get(&pid).map(|p| p.aspace.clone()))
+                            .expect("process exists");
+                        let _as = klock::aslock::AsCell::hold(&aspace);
                         let k = kmem::get();
-                        let r = p
-                            .aspace
+                        let r = aspace
                             .held_mut()
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
@@ -842,7 +935,7 @@ fn fault_or_exit(fault: &crate::arch::Fault) {
 fn raise_fault(f: ksys::exception::Fault) {
     let delivered = any_state(|s| {
         let tid = thread::current();
-        let Some(&pid) = s.thread_pid.get(&tid) else {
+        let Some(pid) = s.pid_of(tid) else {
             return false;
         };
         if !ksys::exception::deliver(s, kmem::jobs().jobs, pid, tid, &f, None) {
@@ -953,7 +1046,21 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PAGER_FAIL
         | nr::PAGER_QUERY_DIRTY
         | nr::PAGER_WRITEBACK_DONE => {
-            let r = process_call(n, a);
+            // (the calls that end or deliver something for a process that exists cannot be refused for want of memory: class N, T248; the creating and
+            // mapping calls are reportable and stay outside)
+            let r = if matches!(
+                n,
+                nr::EXCEPTION_RESUME
+                    | nr::THREAD_RESUME
+                    | nr::PAGER_SUPPLY
+                    | nr::PAGER_FAIL
+                    | nr::PAGER_QUERY_DIRTY
+                    | nr::PAGER_WRITEBACK_DONE
+            ) {
+                crate::heap::nofail(|| process_call(n, a))
+            } else {
+                process_call(n, a)
+            };
             notify();
             reply(frame, r);
         }
@@ -998,6 +1105,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::PORT_REARM
             ) {
                 if n == nr::HANDLE_CLOSE {
+                    // (T206) what the close left owed (a chain it freed) is paid before the call returns, a slice per critical section
+                    while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {
+                        crate::irq::window();
+                    }
                     // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
                     locked_state(ksys::exception::reap_closed_job_channels);
                 }
@@ -1025,7 +1136,7 @@ fn lend_to_reader() {
     locked_state(|s| {
         let read = s.objs.take_dequeued_calls();
         for (caller, call) in read {
-            if s.calls.get(&(caller as Tid)) == Some(&call) {
+            if s.thread(caller as Tid).and_then(|t| t.call) == Some(call) {
                 thread::pi_donate(caller as Tid, me);
             }
         }
@@ -1084,18 +1195,21 @@ fn sweep_before_create(n: usize) {
     // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
     while locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active())
     {
-        with_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
+        locked_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
+        crate::irq::window(); // (T206: interrupts are taken between the slices)
     }
     if locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
-        let began = with_state(|s| s.sweep_start());
+        let began = locked_state(|s| s.sweep_start());
         if began {
-            while with_state(|s| {
+            while locked_state(|s| {
                 s.objs.sweep_active()
                     && !matches!(
                         s.sweep_slice(SWEEP_SLICE_BUDGET),
                         kcore::object::SweepStep::Done(_)
                     )
-            }) {}
+            }) {
+                crate::irq::window();
+            }
         }
     }
 }
@@ -1114,9 +1228,25 @@ pub(super) fn dispatch(
     staged: Option<ksys::Staged>,
     deferred: &mut Option<ksys::Deferred>,
 ) -> Reply {
+    with_state(|s| dispatch_in(s, n, a, staged, deferred))
+}
+
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `dispatch`
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+// INVARIANT: as `dispatch`
+fn dispatch_in(
+    s: &mut UserState,
+    n: usize,
+    a: [u64; 6],
+    staged: Option<ksys::Staged>,
+    deferred: &mut Option<ksys::Deferred>,
+) -> Reply {
     let tid = thread::current();
-    let s = state_locked();
-    let Some(&pid) = s.thread_pid.get(&tid) else {
+    let Some(pid) = s.pid_of(tid) else {
         return fail(Status::BadState);
     };
     let UserState {
@@ -1125,7 +1255,7 @@ pub(super) fn dispatch(
         irq_objs,
         ..
     } = s;
-    let p = procs.get_mut(&pid).expect("process exists");
+    let p: &mut ksys::Process = procs.get_mut(&pid).expect("process exists");
     let h = |i: usize| Handle(a[i]);
     // The syscall layer that needs no machine is in the `ksys` crate (TS3): the width check of the 32-bit arguments first, then the calls
     // on handles, events, channels, sockets and ports, over this machine's memory.

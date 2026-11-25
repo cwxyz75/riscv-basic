@@ -95,7 +95,7 @@ fn state() -> &'static mut FpState {
         crate::bkl::held(),
         "FP state touched without the big kernel lock"
     );
-    // SAFETY: the object lock is held (debug-checked), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
+    // SAFETY: the object lock is held (every caller does; it is checked in debug builds only), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
     // that holds one passes it down (`drop_claim` takes `s`) instead of calling `state()` again, so no two live `&mut` alias on this hart (T239).
     unsafe {
         let cell = &mut *STATE.0.get();
@@ -151,7 +151,7 @@ impl StateUnit for HartUnit {
 
     fn load(&mut self, r: &FpRegs) {
         let (f, fcsr) = (r.f.as_ptr(), u64::from(r.fcsr));
-        // SAFETY: as `save`: `f` points at the 32 u64s of the live `&FpRegs`, `c` at its fcsr, they are only read, and interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc`. The FP registers are deliberately *not*
+        // SAFETY: as `save`: `f` points at the 32 u64s of the live `&FpRegs`, `c` holds its fcsr value, they are only read, and interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc`. The FP registers are deliberately *not*
         // declared clobbered: the kernel executes no FP instruction of its own (it runs with the unit
         // off, INVARIANTS FP3), so the compiler holds nothing in them; declaring them would make it
         // save and restore the callee-saved ones with FP instructions in this function's prologue,
@@ -296,33 +296,75 @@ fn hart() -> usize {
 /// This hart's register file now holds `tid`'s latest FP (`fp`) or vector state: record the claim, and drop the one the thread's previous holder
 /// hart had (that copy is stale now). Under the big lock.
 fn claim<R>(t: &mut kcore::fp::UnitThread<R>, harts: &mut [FpHart], tid: u64, h: usize, fp: bool) {
-    use core::sync::atomic::Ordering::Release;
-    let cells = |hart: usize| {
-        let p = crate::percpu::hart(hart);
-        if fp {
-            (&p.fs_claim, &p.fs_buf)
-        } else {
-            (&p.vs_claim, &p.vs_buf)
-        }
-    };
-    if let Some(old) = t.holder() {
-        if old != h {
-            let (c, b) = cells(old);
-            // (only if the old hart still holds this thread: another thread's load there has replaced the claim already)
-            if c.load(core::sync::atomic::Ordering::Acquire) == tid {
-                c.store(0, Release);
-                b.store(0, Release);
-                // (a save that takes no lock keeps the token, so the old hart's token must stop matching)
-                if let Some(f) = harts.get_mut(old) {
-                    f.forget();
-                }
-            }
-        }
+    if fp {
+        kcore::fp::claim(&FpCells, t, harts, tid, h);
+    } else {
+        kcore::fp::claim(&VecCells, t, harts, tid, h);
     }
-    t.set_holder(Some(h));
-    let (c, b) = cells(h);
-    b.store(t.regs_ptr().map_or(0, |p| p as usize), Release);
-    c.store(tid, Release);
+}
+
+/// The per-hart claim cells of the FP unit, in the hart's record (`kcore::fp::ClaimCells`; the protocol is modelled in `kcore/tests/fp_claim_model.rs`).
+struct FpCells;
+/// The same for the vector unit.
+struct VecCells;
+
+impl kcore::fp::ClaimCells for FpCells {
+    fn claim(&self, hart: usize) -> u64 {
+        crate::percpu::hart(hart)
+            .fs_claim
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn buf(&self, hart: usize) -> usize {
+        crate::percpu::hart(hart)
+            .fs_buf
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn set(&self, hart: usize, tid: u64, buf: usize) {
+        let p = crate::percpu::hart(hart);
+        p.fs_buf.store(buf, core::sync::atomic::Ordering::Release);
+        p.fs_claim.store(tid, core::sync::atomic::Ordering::Release);
+    }
+    fn clear(&self, hart: usize) {
+        let p = crate::percpu::hart(hart);
+        p.fs_claim.store(0, core::sync::atomic::Ordering::Release);
+        p.fs_buf.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+impl kcore::fp::ClaimCells for VecCells {
+    fn claim(&self, hart: usize) -> u64 {
+        crate::percpu::hart(hart)
+            .vs_claim
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn buf(&self, hart: usize) -> usize {
+        crate::percpu::hart(hart)
+            .vs_buf
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn set(&self, hart: usize, tid: u64, buf: usize) {
+        let p = crate::percpu::hart(hart);
+        p.vs_buf.store(buf, core::sync::atomic::Ordering::Release);
+        p.vs_claim.store(tid, core::sync::atomic::Ordering::Release);
+    }
+    fn clear(&self, hart: usize) {
+        let p = crate::percpu::hart(hart);
+        p.vs_claim.store(0, core::sync::atomic::Ordering::Release);
+        p.vs_buf.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// What a frame's `sstatus` field says about a unit.
+fn lazy_of(bits: u64, clean: u64, dirty: u64) -> kcore::fp::Lazy {
+    if bits == 0 {
+        kcore::fp::Lazy::Off
+    } else if bits == dirty {
+        kcore::fp::Lazy::Dirty
+    } else if bits == clean {
+        kcore::fp::Lazy::Clean
+    } else {
+        kcore::fp::Lazy::Initial
+    }
 }
 
 /// Save what the user left dirty in the FP and vector units without the big lock, when this hart's claim names the running thread (so its
@@ -344,10 +386,9 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
     let tid = crate::thread::current();
     let me = crate::percpu::this();
     if vsb == VS_DIRTY {
-        let buf = me.vs_buf.load(Acquire);
-        if me.vs_claim.load(Acquire) != tid || buf == 0 {
+        let Some(buf) = kcore::fp::light_target(&VecCells, me.index.load(Acquire), tid) else {
             return false;
-        }
+        };
         // SAFETY: the claim names the thread running here (set only under the object lock together with the holder and `vs_buf`; another hart clears it only when it
         // loads or saves the same thread, which cannot run in two places, and thread ids are never reused), so its registers are in this hart's unit and nothing else
         // touches its saved copy. `buf` is the address of that copy's box, which is freed or replaced only by `thread_gone` and `write_vec`'s replacement, each of which drops
@@ -356,10 +397,9 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
         frame.sstatus = (frame.sstatus & !VS_MASK) | VS_CLEAN;
     }
     if fsb == FS_DIRTY {
-        let buf = me.fs_buf.load(Acquire);
-        if me.fs_claim.load(Acquire) != tid || buf == 0 {
+        let Some(buf) = kcore::fp::light_target(&FpCells, me.index.load(Acquire), tid) else {
             return false;
-        }
+        };
         // SAFETY: as above, for the FP unit's copy (`fs_claim`, `fs_buf`; `write_fp`'s replacement drops the claim first, for a parked target) (T242).
         unsafe { HartUnit.save_into(&mut *(buf as *mut FpRegs)) };
         frame.sstatus = (frame.sstatus & !FS_MASK) | FS_CLEAN;
@@ -462,10 +502,9 @@ fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     // names the thread. The claim is set where the state is saved or loaded and is cleared when another hart saves or loads the thread's state.
     let tid = crate::thread::current();
     let me = crate::percpu::this();
-    let fs_ok = fsb == 0
-        || (fsb >= FS_CLEAN && me.fs_claim.load(core::sync::atomic::Ordering::Acquire) == tid);
-    let vs_ok = vsb == 0
-        || (vsb >= VS_CLEAN && me.vs_claim.load(core::sync::atomic::Ordering::Acquire) == tid);
+    let h = me.index.load(core::sync::atomic::Ordering::Relaxed);
+    let fs_ok = kcore::fp::quiet_return(&FpCells, h, tid, lazy_of(fsb, FS_CLEAN, FS_DIRTY));
+    let vs_ok = kcore::fp::quiet_return(&VecCells, h, tid, lazy_of(vsb, VS_CLEAN, VS_DIRTY));
     if fs_ok && vs_ok {
         return;
     }
@@ -478,11 +517,13 @@ fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     } else {
         Some(match s.threads.get_mut(&tid) {
             Some(t) => {
+                // (asked before the load: afterwards the hart holds the thread's state whatever it held)
+                let was_held = s.harts[hart()].holds(t);
                 let fs = s.harts[hart()].return_to_user(t, &mut HartUnit);
                 claim(t, &mut s.harts, tid, hart(), true);
                 // dirty state still in the unit (a trap that skipped `trap_entry`) is the thread's own
                 debug_assert!(
-                    fsb != FS_DIRTY || s.harts[hart()].holds(t),
+                    fsb != FS_DIRTY || was_held,
                     "returning to a thread with unsaved dirty FP state that is not in this hart's unit"
                 );
                 fs
@@ -495,10 +536,11 @@ fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     } else {
         Some(match s.vthreads.get_mut(&tid) {
             Some(t) => {
+                let was_held = s.vharts[hart()].holds(t);
                 let vs = s.vharts[hart()].return_to_user(t, &mut VecHartUnit);
                 claim(t, &mut s.vharts, tid, hart(), false);
                 debug_assert!(
-                    vsb != VS_DIRTY || s.vharts[hart()].holds(t),
+                    vsb != VS_DIRTY || was_held,
                     "returning to a thread with unsaved dirty vector state that is not in this hart's unit"
                 );
                 vs
@@ -547,12 +589,14 @@ fn fp_first_use(frame: &mut TrapFrame) -> bool {
     if frame.sstatus & FS_MASK != 0 {
         return false;
     }
-    let s = state();
     let tid = crate::thread::current();
+    let job = crate::user::job_of_thread(tid);
+    let s = state();
     // (the state is the job's kernel memory: a job at its limit cannot give a thread more; the instruction then faults like any illegal one)
     if !charge_state(
         &mut s.fp_charge,
         tid,
+        job,
         (core::mem::size_of::<FpThread>() + core::mem::size_of::<FpRegs>()) as u64,
     ) {
         return false;
@@ -573,11 +617,12 @@ fn vec_first_use(frame: &mut TrapFrame) -> Option<bool> {
     if frame.sstatus & VS_MASK != 0 {
         return Some(false);
     }
-    let s = state();
     let tid = crate::thread::current();
+    let job = crate::user::job_of_thread(tid);
+    let s = state();
     let bytes =
         (core::mem::size_of::<VecThread>() + core::mem::size_of::<VecRegs>() + vlenb() * 32) as u64;
-    if !charge_state(&mut s.vec_charge, tid, bytes) {
+    if !charge_state(&mut s.vec_charge, tid, job, bytes) {
         return None;
     }
     let FpState {
@@ -595,11 +640,19 @@ fn vec_first_use(frame: &mut TrapFrame) -> Option<bool> {
 
 /// Charge `bytes` of register state to the job of user thread `tid`, once (a second call for a thread already charged is free); `false`
 /// when the job is at its kernel-memory limit. Kernel threads are not charged.
-fn charge_state(book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>, tid: u64, bytes: u64) -> bool {
+///
+/// `job` is the thread's job (`None` for a kernel thread), named by the caller: a caller inside a user-state closure has it from its own `s`, and this
+/// function does not open the state again (KT14: that aliased the caller's `&mut UserState`).
+fn charge_state(
+    book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>,
+    tid: u64,
+    job: Option<kcore::job::JobId>,
+    bytes: u64,
+) -> bool {
     if book.contains_key(&tid) {
         return true;
     }
-    let Some(job) = crate::user::job_of_thread(tid) else {
+    let Some(job) = job else {
         return true;
     };
     let j = crate::kmem::jobs();
@@ -627,22 +680,11 @@ fn credit_state(book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>, tid: u64) {
 pub fn thread_gone(tid: u64) {
     let s = state();
     // (a claim must not outlive the state it names)
-    for (t, fp) in [
-        (s.threads.get(&tid).and_then(|t| t.holder()), true),
-        (s.vthreads.get(&tid).and_then(|t| t.holder()), false),
-    ] {
-        if let Some(h) = t {
-            let p = crate::percpu::hart(h);
-            let (cell, buf) = if fp {
-                (&p.fs_claim, &p.fs_buf)
-            } else {
-                (&p.vs_claim, &p.vs_buf)
-            };
-            if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
-                cell.store(0, core::sync::atomic::Ordering::Release);
-                buf.store(0, core::sync::atomic::Ordering::Release);
-            }
-        }
+    if let Some(t) = s.threads.get(&tid) {
+        kcore::fp::drop_claim(&FpCells, t, &mut [], tid, false);
+    }
+    if let Some(t) = s.vthreads.get(&tid) {
+        kcore::fp::drop_claim(&VecCells, t, &mut [], tid, false);
     }
     s.threads.remove(&tid);
     s.vthreads.remove(&tid);
@@ -680,28 +722,12 @@ pub fn read_fp(tid: u64) -> [u64; 33] {
 
 /// Make the registers of the hart that holds `tid`'s state stale (its claim is dropped, so the return to user mode loads from the saved copy).
 fn drop_claim(s: &mut FpState, tid: u64, fp: bool) {
-    let holder = if fp {
-        s.threads.get(&tid).and_then(|t| t.holder())
-    } else {
-        s.vthreads.get(&tid).and_then(|t| t.holder())
-    };
-    if let Some(h) = holder {
-        let p = crate::percpu::hart(h);
-        let (cell, buf) = if fp {
-            (&p.fs_claim, &p.fs_buf)
-        } else {
-            (&p.vs_claim, &p.vs_buf)
-        };
-        // (only if the hart still holds this thread: another thread's load there has replaced the claim already)
-        if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
-            cell.store(0, core::sync::atomic::Ordering::Release);
-            buf.store(0, core::sync::atomic::Ordering::Release);
-            if fp {
-                s.harts[h].forget();
-            } else {
-                s.vharts[h].forget();
-            }
+    if fp {
+        if let Some(t) = s.threads.get(&tid) {
+            kcore::fp::drop_claim(&FpCells, t, &mut s.harts, tid, true);
         }
+    } else if let Some(t) = s.vthreads.get(&tid) {
+        kcore::fp::drop_claim(&VecCells, t, &mut s.vharts, tid, true);
     }
 }
 
@@ -709,11 +735,12 @@ fn drop_claim(s: &mut FpState, tid: u64, fp: bool) {
 /// charged to its job. `frame` is the thread's saved user frame if it has run (its `sstatus.FS` is set so the return to user mode loads the
 /// state); a thread that has not run gets it at its first entry (`mark_present`). False when the job cannot be charged.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the register image is built on the stack and moved into its box); T172 shrinks them
-pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
+pub fn write_fp(tid: u64, job: Option<kcore::job::JobId>, w: &[u64; 33]) -> bool {
     let s = state();
     if !charge_state(
         &mut s.fp_charge,
         tid,
+        job,
         (core::mem::size_of::<FpThread>() + core::mem::size_of::<FpRegs>()) as u64,
     ) {
         return false;
@@ -752,12 +779,13 @@ pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// Write the thread's vector state (`bytes` in the layout of `read_vec`, of exactly `32 + 32 * vlenb` bytes). As `write_fp`.
-pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
+pub fn write_vec(tid: u64, job: Option<kcore::job::JobId>, bytes: &[u8]) -> bool {
     let n = vlenb();
     let s = state();
     if !charge_state(
         &mut s.vec_charge,
         tid,
+        job,
         (core::mem::size_of::<VecThread>() + core::mem::size_of::<VecRegs>() + n * 32) as u64,
     ) {
         return false;

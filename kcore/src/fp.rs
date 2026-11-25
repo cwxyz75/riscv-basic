@@ -276,3 +276,96 @@ impl FpHart {
         Fs::Clean
     }
 }
+
+/// What a thread's frame says about a unit (`sstatus.FS` or `.VS`), as the lock-free return path reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lazy {
+    Off,
+    Initial,
+    Clean,
+    Dirty,
+}
+
+/// The per-hart claim cells of one unit (T188): the thread (0: none) whose latest state this hart's register file holds, and the address of that
+/// thread's saved copy. The kernel backs them with atomics in the hart's record; the model with plain cells. Every write is under the big lock; the
+/// lock-free paths read their own hart's cells with interrupts off.
+pub trait ClaimCells {
+    /// The thread this hart claims (0: none).
+    fn claim(&self, hart: usize) -> u64;
+    /// The address of the claimed thread's saved copy (0: none).
+    fn buf(&self, hart: usize) -> usize;
+    /// Claim: store `buf` first, then `claim` (a reader that sees the claim sees the address).
+    fn set(&self, hart: usize, tid: u64, buf: usize);
+    /// Drop the claim: store `claim` 0 first, then `buf` 0.
+    fn clear(&self, hart: usize);
+}
+
+/// This hart's register file now holds `tid`'s latest state (`claim` follows the save or the load that made it so): record the claim, and drop the one
+/// the thread's previous holder hart had (that copy is stale now). Under the big lock.
+pub fn claim<R, C: ClaimCells>(
+    cells: &C,
+    t: &mut UnitThread<R>,
+    harts: &mut [FpHart],
+    tid: u64,
+    h: usize,
+) {
+    if let Some(old) = t.holder() {
+        // (only if the old hart still holds this thread: another thread's load there has replaced the claim already)
+        if old != h && cells.claim(old) == tid {
+            cells.clear(old);
+            // (a save that takes no lock keeps the token, so the old hart's token must stop matching)
+            if let Some(f) = harts.get_mut(old) {
+                f.forget();
+            }
+        }
+    }
+    debug_assert!(
+        harts.get(h).is_some_and(|f| f.holds(t)),
+        "a claim for thread {tid} on hart {h} that does not hold its state"
+    );
+    t.set_holder(Some(h));
+    cells.set(h, tid, t.regs_ptr().map_or(0, |p| p as usize));
+}
+
+/// The thread's state is going away or being replaced (it ended, or a debugger wrote its registers): a claim must not outlive the state it names. Only for
+/// a thread that is on no hart. `forget_hart`: also make that hart's token stop matching (a replacement keeps the thread; the new state has a new token
+/// anyway, so this is for the debugger's write, as the kernel did). Under the big lock.
+pub fn drop_claim<R, C: ClaimCells>(
+    cells: &C,
+    t: &UnitThread<R>,
+    harts: &mut [FpHart],
+    tid: u64,
+    forget_hart: bool,
+) {
+    if let Some(h) = t.holder() {
+        // (only if the hart still holds this thread: another thread's load there has replaced the claim already)
+        if cells.claim(h) == tid {
+            cells.clear(h);
+            if forget_hart {
+                if let Some(f) = harts.get_mut(h) {
+                    f.forget();
+                }
+            }
+        }
+    }
+}
+
+/// Where a trap that takes no lock may save the dirty unit: the address of `tid`'s saved copy, when this hart claims `tid` (the buffer is read first,
+/// then the claim, as the cells were written).
+pub fn light_target<C: ClaimCells>(cells: &C, h: usize, tid: u64) -> Option<usize> {
+    let buf = cells.buf(h);
+    if cells.claim(h) != tid || buf == 0 {
+        return None;
+    }
+    Some(buf)
+}
+
+/// May the return to user mode skip the lock for this unit? Off: nothing is owed. Clean or Dirty: when this hart's claim names the thread (its registers
+/// are the thread's). Initial never: the zero state is still to be loaded.
+pub fn quiet_return<C: ClaimCells>(cells: &C, h: usize, tid: u64, frame: Lazy) -> bool {
+    match frame {
+        Lazy::Off => true,
+        Lazy::Initial => false,
+        Lazy::Clean | Lazy::Dirty => cells.claim(h) == tid,
+    }
+}

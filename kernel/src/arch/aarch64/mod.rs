@@ -105,13 +105,13 @@ pub mod fp {
     pub fn read_fp(tid: u64) -> [u64; 33] {
         unimplemented!()
     }
-    pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
+    pub fn write_fp(tid: u64, job: Option<kcore::job::JobId>, w: &[u64; 33]) -> bool {
         unimplemented!()
     }
     pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
         unimplemented!()
     }
-    pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
+    pub fn write_vec(tid: u64, job: Option<kcore::job::JobId>, bytes: &[u8]) -> bool {
         unimplemented!()
     }
     pub fn apply_written(tid: u64, frame: &mut TrapFrame, fp: bool, vec: bool) {
@@ -126,6 +126,7 @@ pub mod fp {
 }
 
 pub mod irq {
+    pub static WINDOWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     pub fn save_and_disable() -> bool {
         unimplemented!()
     }
@@ -145,6 +146,9 @@ pub mod irq {
         unimplemented!()
     }
     pub fn off<R>(f: impl FnOnce() -> R) -> R {
+        unimplemented!()
+    }
+    pub fn window() {
         unimplemented!()
     }
 }
@@ -177,6 +181,7 @@ pub mod timer {
 }
 
 pub mod trap {
+    pub static WINDOW_TRAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     use crate::arch::UserTrap;
     use kcore::aspace::{Access, FaultError};
 

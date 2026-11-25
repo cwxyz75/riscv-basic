@@ -1,5 +1,5 @@
 //! The VMO calls on the host (TS3b): the error rows of SYSCALLS.md, over the kernel's real VMO table and address-space code.
-use abi::limits::{MAX_COMMIT_PAGES, MAX_MSG_BYTES, MAX_VMO_PAGES};
+use abi::limits::{MAX_COMMIT_PAGES, MAX_MSG_BYTES};
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::syscall as nr;
@@ -18,7 +18,7 @@ fn vmo_create_rows() {
         Status::InvalidArgs
     );
     assert_eq!(
-        w.err(nr::VMO_CREATE, [(MAX_VMO_PAGES + 1) * 4096, 0, 0, 0, 0, 0]),
+        w.err(nr::VMO_CREATE, [abi::user::TOP + 4096, 0, 0, 0, 0, 0]),
         Status::InvalidArgs
     );
     let v = w.ok(nr::VMO_CREATE, [4 * 4096, 0, 0, 0, 0, 0]).0.unwrap();
@@ -165,7 +165,7 @@ fn vmo_commit_rows() {
         Status::BadHandle
     );
     // out of frames: NO_MEMORY, and what was committed stays accounted
-    let pages = MAX_COMMIT_PAGES.min(MAX_VMO_PAGES);
+    let pages = MAX_COMMIT_PAGES;
     let mut st = None;
     for _ in 0..200 {
         let more = w
@@ -223,7 +223,7 @@ fn vmo_create_takes_bytes_and_rounds_up_to_pages() {
     );
     let v = w.ok(nr::VMO_CREATE, [4097, 0, 0, 0, 0, 0]).0.unwrap();
     assert_eq!(w.ok(nr::VMO_GET_SIZE, [v, 0, 0, 0, 0, 0]).0, Some(8192));
-    let top = MAX_VMO_PAGES * 4096;
+    let top = abi::user::TOP;
     assert!(w.ok(nr::VMO_CREATE, [top, 0, 0, 0, 0, 0]).0.is_some());
     assert_eq!(
         w.err(nr::VMO_CREATE, [top + 1, 0, 0, 0, 0, 0]),

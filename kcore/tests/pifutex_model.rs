@@ -107,7 +107,7 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
         let words: Vec<W> = (0..KEYS).map(|_| W(Cell::new(0))).collect();
         for t in 1..=THREADS {
             let b = rng.below(40) as u8;
-            d.add_thread(t, b);
+            d.add_thread(t, b).unwrap();
             r.base.insert(t, b);
         }
         for step in 0..STEPS {
@@ -119,7 +119,15 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
             match rng.below(9) {
                 // a runnable thread locks
                 0 | 1 if !blocked => {
-                    let res = pi.lock(&mut d, &words[k as usize], key, t, |_| true, true);
+                    let res = pi.lock(
+                        &mut d,
+                        &words[k as usize],
+                        key,
+                        t,
+                        |_| true,
+                        true,
+                        &mut |_| {},
+                    );
                     let was_dead = r.dead.get(&k).copied().unwrap_or(false);
                     // a stale record is dissolved when a call reaches the queueing step: its waiters are ended
                     let mut ended: Vec<u64> = Vec::new();
@@ -148,7 +156,7 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                                 );
                             }
                             Some(_) => {
-                                assert!(matches!(res, Ok(Lock::Blocked { .. })), "{ctx}: {res:?}");
+                                assert!(matches!(res, Ok(Lock::Blocked)), "{ctx}: {res:?}");
                                 // arrival order: the hand-over picks the best effective priority at that time
                                 r.queue.entry(k).or_default().push(t);
                             }
@@ -157,7 +165,8 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                     for w in &ended {
                         assert_eq!(pi.take_outcome(*w), Some(Outcome::Died), "{ctx}");
                     }
-                    let mut got = pi.drain_wake();
+                    let mut got = Vec::new();
+                    pi.drain_wake_into(|w| got.extend_from_slice(w));
                     got.sort();
                     let mut want = ended.clone();
                     want.sort();
@@ -190,13 +199,21 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                     && !r.dead.get(&k).copied().unwrap_or(false) =>
                 {
                     let before = pi.len();
-                    let res = pi.lock(&mut d, &words[k as usize], key, t, |_| true, false);
+                    let res = pi.lock(
+                        &mut d,
+                        &words[k as usize],
+                        key,
+                        t,
+                        |_| true,
+                        false,
+                        &mut |_| {},
+                    );
                     assert_eq!(res, Ok(Lock::WouldBlock), "{ctx}");
                     assert_eq!(pi.len(), before, "{ctx}: a poll queues nothing");
                 }
                 // the owner unlocks
                 2 | 3 if r.word_owner(k) == Some(t) && !blocked => {
-                    let res = pi.unlock(&mut d, &words[k as usize], key, t);
+                    let res = pi.unlock(&mut d, &words[k as usize], key, t, &mut |_| {});
                     let mut ended: Vec<u64> = Vec::new();
                     if r.stale.remove(&k).is_some() {
                         // the record was stale: its waiters end with `Died` and the unlock frees the word
@@ -205,7 +222,8 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                         for w in &ended {
                             assert_eq!(pi.take_outcome(*w), Some(Outcome::Died), "{ctx}");
                         }
-                        let mut got = pi.drain_wake();
+                        let mut got = Vec::new();
+                        pi.drain_wake_into(|w| got.extend_from_slice(w));
                         got.sort();
                         let mut want = ended.clone();
                         want.sort();
@@ -248,14 +266,14 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                 }
                 // a non-owner unlocks: refused
                 2 if r.word_owner(k) != Some(t) && !blocked => {
-                    let res = pi.unlock(&mut d, &words[k as usize], key, t);
+                    let res = pi.unlock(&mut d, &words[k as usize], key, t, &mut |_| {});
                     assert_eq!(res, Err(PiError::NotOwner), "{ctx}");
                 }
                 // a waiter gives up
                 4 if blocked => {
                     let kk = r.blocked_on(t).unwrap();
                     let key = (1, 0x1000 + 4 * kk);
-                    let _ = pi.cancel(&mut d, t);
+                    pi.cancel(&mut d, t, &mut |_| {});
                     let q = r.queue.get_mut(&kk).unwrap();
                     q.retain(|&w| w != t);
                     if q.is_empty() {
@@ -303,7 +321,8 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                         got, want,
                         "{ctx}: exactly the waiters of its futexes are woken"
                     );
-                    let mut sw = pi.drain_wake();
+                    let mut sw = Vec::new();
+                    pi.drain_wake_into(|w| sw.extend_from_slice(w));
                     sw.sort();
                     stale_woken.sort();
                     assert_eq!(
@@ -318,7 +337,7 @@ fn random_pi_futex_steps_agree_with_the_recompute_everything_reference() {
                     }
                     // the dead thread leaves the graph and comes back as a new, idle one (ids are not reused in the kernel; here the model does)
                     let _ = d.remove_thread(t);
-                    d.add_thread(t, r.base[&t]);
+                    d.add_thread(t, r.base[&t]).unwrap();
                     // a poisoned futex becomes usable again when the test says so
                     for kk in 0..KEYS {
                         if r.dead.get(&kk).copied().unwrap_or(false) && rng.below(2) == 0 {
@@ -343,13 +362,16 @@ fn a_thread_id_that_does_not_fit_cannot_use_a_pi_futex() {
     let mut pi = PiFutexes::new();
     let w = W(Cell::new(0));
     let big = u64::from(OWNER_MASK) + 1;
-    d.add_thread(big, 5);
+    d.add_thread(big, 5).unwrap();
     assert!(!fits(big) && !fits(0) && fits(1));
     assert_eq!(
-        pi.lock(&mut d, &w, (1, 0), big, |_| true, true),
+        pi.lock(&mut d, &w, (1, 0), big, |_| true, true, &mut |_| {}),
         Err(PiError::NoId)
     );
-    assert_eq!(pi.unlock(&mut d, &w, (1, 0), big), Err(PiError::NoId));
+    assert_eq!(
+        pi.unlock(&mut d, &w, (1, 0), big, &mut |_| {}),
+        Err(PiError::NoId)
+    );
 }
 
 #[test]
@@ -358,17 +380,17 @@ fn the_classic_inversion_is_bounded() {
     let mut d = Donations::new();
     let mut pi = PiFutexes::new();
     let w = W(Cell::new(0));
-    d.add_thread(1, 5); // low
-    d.add_thread(2, 20); // mid
-    d.add_thread(3, 40); // high
+    d.add_thread(1, 5).unwrap(); // low
+    d.add_thread(2, 20).unwrap(); // mid
+    d.add_thread(3, 40).unwrap(); // high
     let key = (1, 0x1000);
     assert_eq!(
-        pi.lock(&mut d, &w, key, 1, |_| true, true),
+        pi.lock(&mut d, &w, key, 1, |_| true, true, &mut |_| {}),
         Ok(Lock::Acquired)
     );
     assert!(matches!(
-        pi.lock(&mut d, &w, key, 3, |_| true, true),
-        Ok(Lock::Blocked { .. })
+        pi.lock(&mut d, &w, key, 3, |_| true, true, &mut |_| {}),
+        Ok(Lock::Blocked)
     ));
     assert_eq!(
         d.eff(1),
@@ -380,7 +402,7 @@ fn the_classic_inversion_is_bounded() {
         "so the mid-priority thread cannot hold it off"
     );
     assert!(matches!(
-        pi.unlock(&mut d, &w, key, 1),
+        pi.unlock(&mut d, &w, key, 1, &mut |_| {}),
         Ok(Unlock::Handed { to: 3, .. })
     ));
     assert_eq!(d.eff(1), Some(5), "the boost is gone with the hand-over");
@@ -391,24 +413,24 @@ fn a_deadlock_is_refused_and_leaves_nothing_queued() {
     let mut d = Donations::new();
     let mut pi = PiFutexes::new();
     let (wa, wb) = (W(Cell::new(0)), W(Cell::new(0)));
-    d.add_thread(1, 5);
-    d.add_thread(2, 6);
+    d.add_thread(1, 5).unwrap();
+    d.add_thread(2, 6).unwrap();
     let (ka, kb) = ((1, 0x1000), (1, 0x2000));
     assert_eq!(
-        pi.lock(&mut d, &wa, ka, 1, |_| true, true),
+        pi.lock(&mut d, &wa, ka, 1, |_| true, true, &mut |_| {}),
         Ok(Lock::Acquired)
     );
     assert_eq!(
-        pi.lock(&mut d, &wb, kb, 2, |_| true, true),
+        pi.lock(&mut d, &wb, kb, 2, |_| true, true, &mut |_| {}),
         Ok(Lock::Acquired)
     );
     assert!(matches!(
-        pi.lock(&mut d, &wb, kb, 1, |_| true, true),
-        Ok(Lock::Blocked { .. })
+        pi.lock(&mut d, &wb, kb, 1, |_| true, true, &mut |_| {}),
+        Ok(Lock::Blocked)
     ));
     // 2 asking for 1's lock would close the cycle: BAD_STATE, no sleep
     assert_eq!(
-        pi.lock(&mut d, &wa, ka, 2, |_| true, true),
+        pi.lock(&mut d, &wa, ka, 2, |_| true, true, &mut |_| {}),
         Err(PiError::BadState)
     );
     assert!(!pi.still_waiting(2));
@@ -421,16 +443,16 @@ fn a_dead_owner_that_no_one_handed_the_lock_on_poisons_it() {
     let mut d = Donations::new();
     let mut pi = PiFutexes::new();
     let w = W(Cell::new(0));
-    d.add_thread(1, 5);
-    d.add_thread(2, 6);
+    d.add_thread(1, 5).unwrap();
+    d.add_thread(2, 6).unwrap();
     w.0.set(1); // thread 1 locked it in user mode and exited without a kernel record
     assert_eq!(
-        pi.lock(&mut d, &w, (1, 0), 2, |t| t != 1, true),
+        pi.lock(&mut d, &w, (1, 0), 2, |t| t != 1, true, &mut |_| {}),
         Err(PiError::BadState)
     );
     assert!(w.0.get() & OWNER_DIED != 0, "the word says the owner died");
     assert_eq!(
-        pi.lock(&mut d, &w, (1, 0), 2, |_| true, true),
+        pi.lock(&mut d, &w, (1, 0), 2, |_| true, true, &mut |_| {}),
         Err(PiError::BadState),
         "and stays poisoned"
     );

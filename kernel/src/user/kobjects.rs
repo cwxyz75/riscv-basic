@@ -136,6 +136,11 @@ impl KernelEnd {
     pub fn wait_readable(&self, deadline: u64) -> bool {
         let h = self.handle;
         let me = thread::current();
+        let admitted = locked_state(|s| crate::heap::nofail(|| s.waits.admit(me)).is_ok());
+        assert!(
+            admitted,
+            "a kernel thread's wait could not be admitted (class N)"
+        );
         commit_wake();
         let r = thread::wait_deadline_registered(
             || {
@@ -158,7 +163,10 @@ impl KernelEnd {
             },
             deadline,
         );
-        locked_state(|s| s.waits.forget(me));
+        locked_state(|s| {
+            s.waits.forget(me);
+            s.waits.retire(me);
+        });
         r
     }
 

@@ -101,6 +101,7 @@ OS_NODECOMMIT_ELF := target/os-fault-decommit/$(KERNEL_TARGET)/debug/kernel
 OS_NOPROTSHOOT_ELF := target/os-fault-protshoot/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
 OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
+OS_NOCBZE_ELF := target/os-fault-cbze/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
@@ -146,10 +147,10 @@ os-models:
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test latch_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test ticket_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --target-dir target/loom
-	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test park_concurrency --target-dir target/loom
+	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test park_concurrency --test fp_claim_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test latch_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test ticket_concurrency --target-dir target/shuttle
-	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --test fp_claim_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test rq_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test fcache_concurrency --target-dir target/shuttle
@@ -202,6 +203,13 @@ os-ktest-small: kernel-main
 # four harts, every Kernel test
 os-ktest-4: kernel-main
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+
+# The kernel-only boot at 4 GiB of RAM (T207 PR 4, B1): the Kernel tests at four harts on a kernel built with `latency-trace`; the first test commits a
+# 2 GiB VMO whole, unmaps, decommits and kills its last holder, and fails when the longest big-lock hold (debug_stat 14) is over B1's smoke bound (20 ms). The test covers the holds of the calls; the teardown chunks and the drain run under the memory locks without it.
+OS_KBIG_ELF := target/os-kbig/$(KERNEL_TARGET)/debug/kernel
+os-ktest-big: os-user
+	cd kernel && cargo build --features latency-trace --target-dir ../target/os-kbig
+	OS_RAM=4G OS_KFAST=1 OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=300 python3 scripts/os_boot_test.py $(OS_KBIG_ELF)
 
 OS_KREL_ELF := target/os-krelease/$(KERNEL_TARGET)/release/kernel
 os-ktest-release:
@@ -315,6 +323,8 @@ os-boot-test-smp-neg: kernel os-interactive
 	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) user_threads_run_in_parallel,kill_a_spinner_on_another_hart
 	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave
 	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFPSAVE_ELF) fp_state_is_private_to_each_thread_and_process
+	cd kernel && cargo build --features fault-skip-cbze --target-dir ../target/os-fault-cbze
+	OS_SMP=1 python3 scripts/os_boot_test.py --neg $(OS_NOCBZE_ELF) vector_state_is_private_to_each_thread_and_process
 	cd kernel && cargo build --features fault-skip-forced-touch --target-dir ../target/os-fault-forced
 	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFORCED_ELF) replacing_a_handle_ends_a_siblings_wait
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
@@ -342,7 +352,7 @@ os-bench: kernel-main
 	rm -f target/bench.tsv
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
-	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO)
+	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling.tsv
 
 # KT5: the guest's retired-instruction counts of the main syscall paths (`##BENCH count_<name> <n> instr` lines of the suite's
 # `instruction_counts_report`), booted at one hart under `-icount shift=0`, where they are deterministic. bench/counts.tsv holds the recorded
@@ -379,7 +389,7 @@ os-latency: kernel-main
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
 	rm -f target/latency.tsv
 	OS_BENCH=target/latency.tsv OS_BENCH_FULL=1 OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
-	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO)
+	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling.tsv
 
 os-boot-test-aia: kernel
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
@@ -499,7 +509,7 @@ feature: $(FEATURE_TARGETS)
 # Tier 1, the epic gate (OD144, TESTING.md): what an epic branch must pass before it merges into main. The feature gate, then the
 # boots: the suite on the default machine at four harts, the kernel-only boots, the instruction counts, the home computer's boot,
 # the release smoke.
-SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-ktest-release-content os-ktest-entry-neg os-ktest-shuffle os-count os-release-smoke
+SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-big os-ktest-release os-ktest-release-content os-ktest-entry-neg os-ktest-shuffle os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
@@ -566,8 +576,11 @@ os-fuzz-host:
 
 # KT9: the allocation-failure sweep of the syscall layer in both modes (one allocation fails; every allocation from the N-th on fails). `cargo test`
 # runs the first mode only. A failing case replays with `KALLOC_CHILD=<scenario>:<n>[:persist] cargo test -p ksys --test allocfail child_entry -- --exact --nocapture`.
-os-allocfail:
+os-allocfail: os-user
 	KALLOC_PERSIST=1 cargo test --profile release-checked -p ksys --test allocfail every -- --nocapture
+	# the guest half: a kernel whose heap fails the N-th allocation of an armed thread, and the suite's `kernel_allocation_failure_sweep` over six scenarios
+	cd kernel && cargo build --features fault-alloc --target-dir ../target/os-fault-alloc
+	OS_REQUIRE_LINE="alloc sweep: map and touch" OS_BOOT_ARGS="kaslr=off aslr=off" OS_SHARD=k OS_SMP=1 OS_BOOT_TIMEOUT=300 python3 scripts/os_boot_test.py target/os-fault-alloc/$(KERNEL_TARGET)/debug/kernel
 
 # `check` is the epic gate, tiers 0 and 1.
 check: smoke

@@ -1573,9 +1573,9 @@ fn vmo_basics() -> Outcome {
         "a VMO of no pages"
     );
     ensure_eq!(
-        st(sys::vmo_create(16385)),
+        st(sys::vmo_create(abi_top_pages() + 1)),
         Some(S::InvalidArgs),
-        "over 64 MiB"
+        "above the user half"
     );
     ensure_eq!(
         st(sys::vmo_write(v, 0, 0x10 as *const u8, 4)),
@@ -3048,6 +3048,349 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
     unsafe { core::ptr::write_volatile(0x500_1000 as *mut u32, 1) };
     ensure_eq!(st(sys::process_unmap(me, 0x500_0000)), Some(S::Ok), "unmap");
     Ok(())
+}
+
+/// T207 PR 4 (B1): at 4 GiB of RAM, a 2 GiB VMO is committed whole (in slices), mapped and touched, unmapped, decommitted,
+/// committed again, and last held by a process that is killed. Each operation is chunked, so no big-lock hold grows past 20 ms (B1's smoke
+/// bound, applied to the hold), which a kernel built with `latency-trace` reports (`debug_stat` 14, in 100 ns, and starts its window
+/// again; interrupts stay off through a call that nothing else wants the hart for, so the hold is what chunking bounds). Without 3 GiB of RAM it does nothing (the machine cannot hold the VMO).
+fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
+    const BASE: u64 = 0x10_0000_0000;
+    const GIB2: u64 = 2 << 30;
+    // (slices of 64 pages, not `MAX_COMMIT_PAGES`: a commit zeroes its pages with the big lock held, and 1024 of them is the milliseconds B1 names as its
+    // known worst case; this test is about what T207 chunked)
+    const SLICE: u64 = 64 * 4096;
+    if sys::debug_stat(102) * 4096 < 3 << 30 {
+        return Ok(());
+    }
+    let bound_ns = 20_000_000u64;
+    let at_start = sys::debug_stat(14); // (the boot's own figures are not this test's: the window starts again here)
+    let check = |what: &str| -> Outcome {
+        let at = sys::debug_stat(14); // (the window ends here: the log says where its longest span began)
+        ensure!(
+            at == 0 || at * 100 <= bound_ns,
+            "the longest big-lock hold after {what} is {} us (the boot's span was {} us)",
+            at / 10,
+            at_start / 10
+        );
+        Ok(())
+    };
+    let me = me()?;
+    let root = root_job()?;
+    let base = job_use(root, 2)?.0;
+    let v = ok(sys::vmo_create_flags(GIB2 / 4096, 0, 0), "a 2 GiB VMO")?.a1 as u64;
+    let commit_all = |v: u64| -> Outcome {
+        let mut off = 0;
+        while off < GIB2 {
+            ensure_eq!(
+                st(sys::vmo_commit(v, off, SLICE)),
+                Some(S::Ok),
+                "commit slice at {off}"
+            );
+            off += SLICE;
+        }
+        Ok(())
+    };
+    commit_all(v)?;
+    check("the commit")?;
+    ensure_eq!(
+        job_use(root, 2)?.0 - base,
+        GIB2 / 4096,
+        "all of it is charged"
+    );
+    ensure_eq!(
+        st(sys::process_map(me, v, BASE, 0, GIB2, PF_R | PF_W)),
+        Some(S::Ok),
+        "map all of it"
+    );
+    for i in 0..GIB2 / (1 << 20) {
+        // SAFETY: BASE..BASE + 2 GiB is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((BASE + i * (1 << 20)) as *mut u64, i + 1) };
+    }
+    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap all");
+    check("the unmap")?;
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, GIB2)),
+        Some(S::Ok),
+        "decommit all"
+    );
+    check("the decommit")?;
+    ensure_eq!(job_use(root, 2)?.0, base, "the pages are all back");
+    // the last holder dies: a process that never started maps it, and is killed
+    commit_all(v)?;
+    let child = proc_create()?;
+    ensure_eq!(
+        st(sys::process_map(child, v, BASE, 0, GIB2, PF_R | PF_W)),
+        Some(S::Ok),
+        "map it into a child"
+    );
+    sys::handle_close(v);
+    ensure_eq!(
+        st(sys::process_kill(child, 1)),
+        Some(S::Ok),
+        "kill the holder"
+    );
+    sys::handle_close(child);
+    job_use_settles(root, 2, base, 20_000)?;
+    check("the kill")
+}
+
+/// T206: closing the head of a chain of channels (each queues both ends of the next) is paid in slices with an interrupts window between them, and a
+/// timer tick taken in a window is recorded and handled at the window's own switch point (`irq::window`, `debug_stat(214)`): a few rounds of the close
+/// see at least one nested interrupt, every object is freed, and the stack budget check at the end of the boot (KT13) covers the depth.
+fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
+    const LINKS: usize = 1200;
+    static STOP: AtomicU32 = AtomicU32::new(0);
+    /// A hart's worth of work to compete with the closing thread, so that a scheduler tick is armed on every hart (a thread alone on a hart has none).
+    extern "C" fn spinner(_arg: usize) -> ! {
+        while STOP.load(Ordering::SeqCst) == 0 {
+            core::hint::spin_loop();
+        }
+        sys::thread_exit(0)
+    }
+    STOP.store(0, Ordering::SeqCst);
+    let harts = job_use(root_job()?, 7)?.0 as usize;
+    let mut spinners = Vec::new();
+    for _ in 0..=harts {
+        spinners.push(new_thread(spinner, 0)?);
+    }
+    let before_traps = sys::debug_stat(214);
+    let mut rounds = 0;
+    while sys::debug_stat(214) == before_traps && rounds < 40 {
+        let mut prev: Option<(u64, u64)> = None;
+        let mut head = (0, 0);
+        for _ in 0..LINKS {
+            let (a, b) = channel()?;
+            if let Some((pa, pb)) = prev {
+                let hs = [pa, pb];
+                ok(
+                    sys::channel_write(a, core::ptr::null(), 0, hs.as_ptr(), 2),
+                    "queue the previous pair",
+                )?;
+            }
+            prev = Some((a, b));
+            head = (a, b);
+        }
+        sys::handle_close(head.0);
+        sys::handle_close(head.1);
+        rounds += 1;
+    }
+    STOP.store(1, Ordering::SeqCst);
+    for t in spinners {
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(t);
+    }
+    ensure!(
+        sys::debug_stat(214) > before_traps,
+        "no interrupt was taken inside a window in {rounds} rounds of closing a chain ({} windows were made)",
+        sys::debug_stat(215)
+    );
+    // (everything is gone: a channel can be made again, and nothing of the chain is left to count against the budget)
+    let (a, b) = channel()?;
+    sys::handle_close(a);
+    sys::handle_close(b);
+    Ok(())
+}
+
+/// T207: while a chunked decommit is under way, a second decommit, a `vmo_set_size` and a `vmo_create_child` on the VMO are refused with SHOULD_WAIT
+/// (seen from a thread on another hart; with one hart nothing runs beside the call and the test passes without looking).
+fn a_decommit_under_way_refuses_the_calls_that_would_race_it() -> Outcome {
+    // T207 (3a, 3d): a chunked decommit holds its VMO to the end, and the calls that would race its cursor are refused with SHOULD_WAIT.
+    static RANGE_V: AtomicU64 = AtomicU64::new(0);
+    static RANGE_MODE: AtomicU32 = AtomicU32::new(0);
+    static RANGE_SEEN: AtomicU32 = AtomicU32::new(0);
+    static RANGE_READY: AtomicU32 = AtomicU32::new(0);
+    static RANGE_DONE: AtomicU32 = AtomicU32::new(0);
+
+    /// The other hart's side: until the decommit is over, try the call of the round and record that it was refused.
+    extern "C" fn range_prober(_arg: usize) -> ! {
+        let v = RANGE_V.load(Ordering::SeqCst);
+        let mode = RANGE_MODE.load(Ordering::SeqCst);
+        RANGE_READY.store(1, Ordering::SeqCst);
+        while RANGE_DONE.load(Ordering::SeqCst) == 0 {
+            let r = match mode {
+                // (the size it already has: nothing changes when the VMO is free)
+                0 => sys::vmo_decommit(v, 0, 4096),
+                1 => sys::vmo_set_size(v, 16384 * 4096),
+                _ => sys::vmo_create_child(v, 0, 4096, 0, rt::abi::child_flags::PRIVATE),
+            };
+            match st(r) {
+                Some(S::ShouldWait) => {
+                    RANGE_SEEN.store(1, Ordering::SeqCst);
+                }
+                Some(S::Ok) if mode == 2 => {
+                    sys::handle_close(r.a1 as u64);
+                }
+                _ => {}
+            }
+        }
+        sys::thread_exit(0)
+    }
+
+    let harts = job_use(root_job()?, 7)?.0;
+    if harts < 2 {
+        return Ok(()); // (nothing runs beside the call on one hart: the refusal cannot be seen)
+    }
+    let v = ok(
+        sys::vmo_create_flags(16384, 0, rt::abi::vmo_flags::RESIZABLE),
+        "a 64 MiB resizable VMO",
+    )?
+    .a1 as u64;
+    RANGE_V.store(v, Ordering::SeqCst);
+    // mode 0: a second `vmo_decommit`; 1: `vmo_set_size`; 2: `vmo_create_child`
+    for mode in 0..3u32 {
+        RANGE_MODE.store(mode, Ordering::SeqCst);
+        RANGE_SEEN.store(0, Ordering::SeqCst);
+        RANGE_READY.store(0, Ordering::SeqCst);
+        RANGE_DONE.store(0, Ordering::SeqCst);
+        let t = new_thread(range_prober, 0)?;
+        while RANGE_READY.load(Ordering::SeqCst) == 0 {
+            sys::thread_yield();
+        }
+        // (the call takes a while: 256 batches of 64 pages; a few tries make the overlap certain)
+        for _ in 0..8 {
+            if RANGE_SEEN.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            // (the prober's own calls make the VMO busy for a moment, so the main side is refused now and then too: it asks again)
+            let again = |f: &dyn Fn() -> Option<S>| {
+                for _ in 0..100_000 {
+                    match f() {
+                        Some(S::ShouldWait) => sys::thread_yield(),
+                        other => return other,
+                    };
+                }
+                Some(S::ShouldWait)
+            };
+            for k in 0..16u64 {
+                ensure_eq!(
+                    again(&|| st(sys::vmo_commit(v, k * 1024 * 4096, 1024 * 4096))),
+                    Some(S::Ok),
+                    "commit the VMO"
+                );
+            }
+            ensure_eq!(
+                again(&|| st(sys::vmo_decommit(v, 0, 16384 * 4096))),
+                Some(S::Ok),
+                "decommit all of it"
+            );
+        }
+        RANGE_DONE.store(1, Ordering::SeqCst);
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(t);
+        ensure_eq!(
+            RANGE_SEEN.load(Ordering::SeqCst),
+            1,
+            "round {mode}: a call made during the decommit was refused with SHOULD_WAIT"
+        );
+    }
+    ensure_eq!(
+        sys::vmo_get_size(v).a1 as u64,
+        16384 * 4096,
+        "the size is untouched"
+    );
+    sys::handle_close(v);
+    Ok(())
+}
+
+/// T207: a decommit inside the window a child inherits makes holes, and a hole's leaf is charged to the child's job: a job that cannot pay stops the
+/// call with NO_MEMORY, nothing changed.
+fn a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory() -> Outcome {
+    let root = root_job()?;
+    let parent = ok(sys::vmo_create(64), "a parent of 64 pages")?.a1 as u64;
+    ok(
+        sys::vmo_write(parent, 0, b"p".as_ptr(), 1),
+        "write the parent",
+    )?;
+    // (a job whose one page allows 512 kernel bytes cannot hold a leaf of 528)
+    let tiny = job(root, 1, 1, 1)?;
+    let child = ok(
+        sys::vmo_create_child(parent, 0, 64 * 4096, tiny, rt::abi::child_flags::PRIVATE),
+        "a PRIVATE child in the tiny job",
+    )?
+    .a1 as u64;
+    let before = job_use(tiny, 8)?.0;
+    ensure_eq!(
+        st(sys::vmo_decommit(child, 0, 4096)),
+        Some(S::NoMemory),
+        "no room for the hole's leaf"
+    );
+    ensure_eq!(job_use(tiny, 8)?.0, before, "nothing was charged");
+    let mut b = [0u8; 1];
+    ok(sys::vmo_read(child, 0, b.as_mut_ptr(), 1), "read the child")?;
+    ensure_eq!(b[0], b'p', "the child still shows the parent's page");
+    for h in [child, parent, tiny] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// T207 PR 4 (MM6): there is no size cap below the user half. A 2 GiB VMO is created, mapped whole and touched one page per 2 MiB (1024 pages
+/// committed, and a page table each), read back, then decommitted whole in one call; the job's page usage is back where it started, and a page
+/// read afterwards is a fresh zero.
+fn a_two_gib_sparse_vmo_is_mapped_touched_and_given_back() -> Outcome {
+    const BASE: u64 = 0x10_0000_0000;
+    const GIB2: u64 = 2 << 30;
+    const STEP: u64 = 2 << 20;
+    let me = me()?;
+    let root = root_job()?;
+    let before = job_use(root, 2)?.0;
+    let v = ok(
+        sys::vmo_create_flags(GIB2 / 4096, 0, rt::abi::vmo_flags::RESIZABLE),
+        "a 2 GiB VMO",
+    )?
+    .a1 as u64;
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, GIB2, "its size");
+    ensure_eq!(
+        st(sys::process_map(me, v, BASE, 0, GIB2, PF_R | PF_W)),
+        Some(S::Ok),
+        "map all of it"
+    );
+    let n = GIB2 / STEP;
+    for i in 0..n {
+        // SAFETY: BASE..BASE + 2 GiB is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((BASE + i * STEP) as *mut u64, i + 1) };
+    }
+    // (the pages, and a page table each: they are charged to this process's job, and the frames to the VMO's)
+    let touched = job_use(root, 2)?.0 - before;
+    ensure!(touched >= n, "a page per touch is charged");
+    for i in 0..n {
+        // SAFETY: as above.
+        let got = unsafe { core::ptr::read_volatile((BASE + i * STEP) as *const u64) };
+        ensure_eq!(got, i + 1, "page {i} reads back");
+    }
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, GIB2)),
+        Some(S::Ok),
+        "decommit all of it"
+    );
+    ensure_eq!(
+        touched - (job_use(root, 2)?.0 - before),
+        n,
+        "the frames are credited back (the tables stay while the mapping does)"
+    );
+    // SAFETY: as above (a decommitted page faults in again, as zeros).
+    let got = unsafe { core::ptr::read_volatile((BASE + 5 * STEP) as *const u64) };
+    ensure_eq!(got, 0, "a decommitted page reads zero");
+    ensure_eq!(
+        st(sys::vmo_set_size(v, STEP)),
+        Some(S::Ok),
+        "shrink to 2 MiB (the tail goes in batches)"
+    );
+    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap");
+    job_use_settles(root, 2, before + 1, 20_000)
+        .or_else(|_| job_use_settles(root, 2, before, 20_000))?;
+    ensure_eq!(
+        st(sys::vmo_create_flags(abi_top_pages() + 1, 0, 0)),
+        Some(S::InvalidArgs),
+        "above the user half"
+    );
+    sys::handle_close(v);
+    Ok(())
+}
+
+fn abi_top_pages() -> u64 {
+    rt::abi::user::TOP / 4096
 }
 
 /// MM6: `vmo_decommit` and `vmo_set_size` from user mode. A resizable VMO is mapped and written; a decommitted range reads zero through
@@ -5614,6 +5957,288 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
     Ok(())
 }
 
+/// What the last run of the sweep's map scenario saw (statuses packed by the scenario: printing inside it would add allocations to the count).
+static TRACE: AtomicU64 = AtomicU64::new(0);
+/// Set by a sweep scenario that lost something the failing allocation must not lose (a wakeup).
+static SWEEP_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// `debug_stat` for the allocation-failure sweep and its scenarios (which are plain functions and cannot capture a closure).
+fn sweep_stat(which: u64, arg: u64) -> u64 {
+    use rt::abi::syscall as nr;
+    let r = rt::syscall(
+        nr::DEBUG_STAT,
+        [
+            rt::debug::handle() as usize,
+            which as usize,
+            arg as usize,
+            0,
+            0,
+            0,
+        ],
+    );
+    // (a refused call must not read as a zero: that would end a scenario early or skip the test)
+    assert_eq!(r.status, 0, "debug_stat {which} refused");
+    r.a1 as u64
+}
+
+/// KT9, the guest half: with the kernel built with `fault-alloc` (`make os-allocfail`), fail the Nth kernel heap allocation of each scenario, for N = 1, 2, ...
+/// until the scenario completes with no failure injected. Every call must return (an error or success); an infallible allocation on the path is a kernel panic,
+/// and the line printed before each run names the scenario and N. Without the feature the test passes at once.
+fn kernel_allocation_failure_sweep() -> Outcome {
+    let stat = sweep_stat;
+    if stat(203, 0) == 0 {
+        return Ok(());
+    }
+    let scenarios: [(&str, fn()); 11] = [
+        ("channel", || {
+            let r = sys::channel_create();
+            if r.status != 0 {
+                return;
+            }
+            let (a, b) = (r.a1 as u64, r.a2 as u64);
+            let msg = [7u8; 64];
+            let _ = sys::channel_write(a, msg.as_ptr(), msg.len(), core::ptr::null(), 0);
+            let mut buf = [0u8; 64];
+            let _ = sys::channel_read(b, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+            sys::handle_close(a);
+            sys::handle_close(b);
+        }),
+        ("channel with a handle", || {
+            let c = sys::channel_create();
+            let e = sys::event_create();
+            if c.status == 0 && e.status == 0 {
+                let (a, b, ev) = (c.a1 as u64, c.a2 as u64, e.a1 as u64);
+                let hs = [ev];
+                let w = sys::channel_write(a, [1u8].as_ptr(), 1, hs.as_ptr(), 1);
+                let mut buf = [0u8; 8];
+                let mut got = [0u64; 2];
+                let r = sys::channel_read(b, buf.as_mut_ptr(), 8, got.as_mut_ptr(), 2);
+                if w.status == 0 && r.status == 0 {
+                    sys::handle_close(got[0]);
+                } else {
+                    sys::handle_close(ev);
+                }
+                sys::handle_close(a);
+                sys::handle_close(b);
+            } else {
+                for r in [c, e] {
+                    if r.status == 0 {
+                        sys::handle_close(r.a1 as u64);
+                        if r.a2 != 0 {
+                            sys::handle_close(r.a2 as u64);
+                        }
+                    }
+                }
+            }
+        }),
+        ("vmo write", || {
+            let v = sys::vmo_create(4);
+            if v.status == 0 {
+                let data = [3u8; 100];
+                let _ = sys::vmo_write(v.a1 as u64, 0, data.as_ptr(), data.len());
+                sys::handle_close(v.a1 as u64);
+            }
+        }),
+        ("port bind", || {
+            let p = sys::port_create();
+            let e = sys::event_create();
+            if p.status == 0 && e.status == 0 {
+                let _ = sys::port_bind(p.a1 as u64, e.a1 as u64, 1, 9);
+            }
+            for r in [p, e] {
+                if r.status == 0 {
+                    sys::handle_close(r.a1 as u64);
+                }
+            }
+        }),
+        ("job and socket", || {
+            let root = sys::job_root();
+            if root.status == 0 {
+                let j = sys::job_create(root.a1 as u64, &[u64::MAX; 6]);
+                if j.status == 0 {
+                    sys::handle_close(j.a1 as u64);
+                }
+                sys::handle_close(root.a1 as u64);
+            }
+            let s = sys::socket_create();
+            if s.status == 0 {
+                sys::handle_close(s.a1 as u64);
+                if s.a2 != 0 {
+                    sys::handle_close(s.a2 as u64);
+                }
+            }
+        }),
+        ("process create", || {
+            let p = sys::process_create();
+            if p.status == 0 {
+                sys::handle_close(p.a1 as u64);
+            }
+        }),
+        ("thread spawn and join", || {
+            // (a failed spawn is NO_MEMORY with nothing left behind; one that works ends and is joined)
+            // (a stack the kernel provisions: the program's own would be a VMO and a handle of its own to lose)
+            let me = sys::process_self();
+            if me.status == 0 {
+                let rec = rt::SpawnArgs {
+                    entry: worker_set as *const () as usize as u64,
+                    arg: 3,
+                    ..rt::SpawnArgs::default()
+                };
+                let t = sys::thread_spawn(me.a1 as u64, &rec);
+                if t.status == 0 {
+                    sys::object_wait(t.a1 as u64, sig::TERMINATED, sys::clock_get() + 20_000);
+                    sys::handle_close(t.a1 as u64);
+                }
+                sys::handle_close(me.a1 as u64);
+            }
+        }),
+        ("futex wait and wake", || {
+            // (the word is 0 and so is `expected`: the wait queues and times out, or says NO_MEMORY with nothing queued; the wake finds nobody or reports it)
+            static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            sys::futex_wait(WORD.as_ptr(), 0, sys::clock_get() + 2);
+            sys::futex_wake(WORD.as_ptr(), 1);
+        }),
+        ("snapshot child decommit", || {
+            // (a child's decommit inside the window it inherits makes explicit holes, which are allocations of their own)
+            sweep_stat(207, 1);
+            let v = sys::vmo_create(4);
+            if v.status == 0 {
+                let src = v.a1 as u64;
+                sys::vmo_commit(src, 0, 4 * 4096);
+                sweep_stat(207, 0);
+                let c = sys::vmo_create_child(src, 0, 4 * 4096, 0, rt::abi::child_flags::SNAPSHOT);
+                sweep_stat(207, 1);
+                let c = if c.status == 0 {
+                    c
+                } else {
+                    sys::vmo_create_child(src, 0, 4 * 4096, 0, rt::abi::child_flags::SNAPSHOT)
+                };
+                if c.status == 0 {
+                    sweep_stat(207, 0);
+                    let d = sys::vmo_decommit(c.a1 as u64, 4096, 2 * 4096);
+                    sweep_stat(207, 1);
+                    if d.status != 0 {
+                        sys::vmo_decommit(c.a1 as u64, 4096, 2 * 4096);
+                    }
+                    sys::handle_close(c.a1 as u64);
+                }
+                sys::handle_close(src);
+            }
+        }),
+        ("job set sched", || {
+            let root = sys::job_root();
+            if root.status == 0 {
+                let j = sys::job_create(root.a1 as u64, &[u64::MAX; 6]);
+                if j.status == 0 {
+                    let _ = sys::job_set_sched(j.a1 as u64, 10, 0, 0);
+                    sys::handle_close(j.a1 as u64);
+                }
+                sys::handle_close(root.a1 as u64);
+            }
+        }),
+        ("map and touch", || {
+            let me = sys::process_self();
+            let v = sys::vmo_create(4);
+            if me.status == 0 && v.status == 0 {
+                let m =
+                    sys::process_map_anywhere(me.a1 as u64, v.a1 as u64, 0, 4 * 4096, PF_R | PF_W);
+                TRACE.store(m.status as u64 & 0xff, Ordering::Relaxed);
+                if m.status == 0 {
+                    // SAFETY: the mapping was just made (4 pages, read-write) and `a1` is its base
+                    unsafe { core::ptr::write_volatile((m.a1 as usize + 4096) as *mut u8, 1) };
+                    // (an unmap that failed for want of memory left the mapping, and with it the VMO: the failure is injected once, so it is retried)
+                    let u = sys::process_unmap(me.a1 as u64, m.a1 as u64).status;
+                    TRACE.fetch_or((u as u64 & 0xff) << 8, Ordering::Relaxed);
+                    if u != 0 {
+                        let _ = sys::process_unmap(me.a1 as u64, m.a1 as u64);
+                    }
+                }
+            }
+            for r in [me, v] {
+                if r.status == 0 {
+                    sys::handle_close(r.a1 as u64);
+                }
+            }
+        }),
+    ];
+    for (name, run) in scenarios {
+        let vmos_before = stat(204, 0);
+        let objs_before = stat(206, 0);
+        let mut n = 1u64;
+        loop {
+            let mut line = Detail::new();
+            let _ =
+                core::fmt::Write::write_fmt(&mut line, format_args!("alloc sweep: {name} n={n}\n"));
+            let _ = sys::debug_write(line.as_bytes());
+            stat(200, n);
+            run();
+            let fired = stat(201, 0) != 0;
+            ensure_eq!(
+                SWEEP_LOST.load(Ordering::Relaxed),
+                0,
+                "scenario {name} with the allocation {n} failing lost a wakeup"
+            );
+            // (a destruction that found no memory leaks its objects until a sweep reclaims them)
+            stat(205, 0);
+            ensure_eq!(
+                stat(204, 0),
+                vmos_before,
+                "scenario {name} with the allocation {n} failing left a VMO behind (trace {:#x})",
+                TRACE.load(Ordering::Relaxed)
+            );
+            ensure_eq!(
+                stat(206, 0),
+                objs_before,
+                "scenario {name} with the allocation {n} failing left a kernel object behind"
+            );
+            if !fired {
+                break;
+            }
+            n += 1;
+            ensure!(
+                n < 2000,
+                "the scenario {name} never completed: allocations without end"
+            );
+        }
+        ensure!(
+            n > 1,
+            "the scenario {name} made no kernel allocation to fail"
+        );
+        // the persistent pass: every class-R allocation from the first on fails, as it does with the heap at its reserve; nothing may panic or leak. (A
+        // scenario that touches a lazily committed page is left out: the fault that finds no memory ends the process, which is what it must do, and
+        // this process is the one running the scenario)
+        if name == "map and touch" {
+            continue;
+        }
+        let mut line = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut line,
+            format_args!("alloc sweep: {name} persistent\n"),
+        );
+        let _ = sys::debug_write(line.as_bytes());
+        stat(208, 1);
+        run();
+        stat(201, 0);
+        ensure_eq!(
+            SWEEP_LOST.load(Ordering::Relaxed),
+            0,
+            "scenario {name} with every allocation failing lost a wakeup"
+        );
+        stat(205, 0);
+        ensure_eq!(
+            stat(204, 0),
+            vmos_before,
+            "scenario {name} with every allocation failing left a VMO behind"
+        );
+        ensure_eq!(
+            stat(206, 0),
+            objs_before,
+            "scenario {name} with every allocation failing left a kernel object behind"
+        );
+    }
+    Ok(())
+}
+
 /// PL8: a job's region quota bounds the regions of one address space of its processes (the quota replaces the constant): mapping one more VMO than it allows is
 /// NO_MEMORY, an unmap makes room, a lowered quota leaves what is mapped and refuses more, and `job_info` 11 reports the effective value.
 fn a_jobs_region_quota_bounds_its_processes() -> Outcome {
@@ -7318,7 +7943,11 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
     let scale = (sys::debug_stat(121) as usize / (2 << 20)).max(1);
     let mut chans = vec![0u64; 40 * scale];
     let mut nch = 0;
-    'outer: for _ in 0..20 * scale {
+    'outer: for pair in 0..20 * scale {
+        if scale > 1 && pair % 8 == 0 {
+            // (with a big RAM the budget is big and this takes minutes: the boot test judges progress by output)
+            println!("queued handles: pair {pair} of {}", 20 * scale);
+        }
         let (a, b) = channel()?;
         chans[nch] = a;
         chans[nch + 1] = b;
@@ -7485,6 +8114,82 @@ fn fetch_the_conformance_image() -> Outcome {
     Ok(())
 }
 
+static KFUZZ_IMAGE: AtomicU64 = AtomicU64::new(0);
+
+fn fetch_the_fuzzer_image() -> Outcome {
+    let (m, n) = request(25, b'F', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u64; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the image");
+    KFUZZ_IMAGE.store(got[0], Ordering::Relaxed);
+    Ok(())
+}
+
+/// KT8, the guest half: the program `kfuzz` runs the generator of the host fuzzer against this kernel, seed by seed, each in a child of its own inside a small job
+/// (a handle to the job goes to it over the bootstrap channel). Whatever the sequence did (the program may even fault: it can close a handle of its own runtime
+/// by chance), killing the job must bring the job's counters and the kernel heap back to where they began, and the kernel must still be running (a panic is
+/// the boot test's `##PANIC`).
+fn the_guest_fuzzer_leaves_nothing_behind() -> Outcome {
+    const SEEDS: u64 = 4;
+    let root = root_job()?;
+    for seed in 1..=SEEDS {
+        let j = job(root, 4, 12, 2000)?;
+        let heap_before = sys::debug_stat(109);
+        let (p, mine) =
+            launch_image_in(KFUZZ_IMAGE.load(Ordering::Relaxed), seed as usize as u64, j)?;
+        // the job handle the program's job calls act on: a duplicate with every right
+        let dup = ok(
+            sys::handle_duplicate(j, Rights::JOB.0),
+            "duplicate the job handle",
+        )?
+        .a1 as u64;
+        let hs = [dup];
+        ensure_eq!(
+            st(sys::channel_write(
+                mine,
+                [0u8; 1].as_ptr(),
+                1,
+                hs.as_ptr(),
+                1
+            )),
+            Some(S::Ok),
+            "send the job handle"
+        );
+        // it ends by itself (the sequence is finite); if it does not within the budget, that is a hang worth knowing about
+        let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 6000);
+        ensure!(
+            r.status == 0 && r.a1 as u32 & sig::TERMINATED != 0,
+            "seed {seed}: the fuzzer ended within its budget"
+        );
+        sys::job_kill(j, 1);
+        sys::handle_close(p);
+        sys::handle_close(mine);
+        for which in [0, 1, 2, 3, 4, 5, 8] {
+            job_use_settles(j, which, 0, 2000)?;
+        }
+        sys::handle_close(j);
+        let held = heap_before.wrapping_sub(sys::debug_stat(109)) as i64;
+        ensure!(
+            held <= 64 * 1024,
+            "seed {seed}: {held} kernel heap bytes stayed behind"
+        );
+    }
+    sys::handle_close(root);
+    Ok(())
+}
+
 /// AB9: the conformance program (built against `libsys` alone) runs to the end with no check failed; each failure it found comes back as a message.
 fn abi_conformance_passes() -> Outcome {
     let (p, mine) = launch_image(ABI_CONFORMANCE_IMAGE.load(Ordering::Relaxed), 0)?;
@@ -7591,6 +8296,59 @@ fn runtime_startup_heap_and_stdio() -> Outcome {
         sys::process_info(p).a1 as i64,
         2,
         "exit code: the number of arguments"
+    );
+    Ok(())
+}
+
+/// T207 PR 5 (MM6): a program that allocates and frees 64 MiB ends with its job's page usage near where it started (the heap gives an arena
+/// back when nothing in it is live), and the memory is there to be made again. Run in this process, whose heap is the same `rt` heap.
+fn the_heap_gives_memory_back_when_it_is_freed() -> Outcome {
+    let root = root_job()?;
+    // (one warm-up round, so that the first arenas and the spare exist before the baseline is read)
+    {
+        let _warm: Vec<u8> = vec![1u8; 1 << 20];
+    }
+    let before = job_use(root, 2)?.0;
+    let mut peak = 0;
+    for round in 0..2 {
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..64 {
+            let mut b: Vec<u8> = Vec::new();
+            ensure!(
+                b.try_reserve_exact(1 << 20).is_ok(),
+                "block {i} of round {round}"
+            );
+            b.resize(1 << 20, i as u8);
+            blocks.push(b);
+        }
+        peak = job_use(root, 2)?.0 - before;
+        ensure!(peak >= 64 * 256, "64 MiB held is charged ({peak} pages)");
+        for (i, b) in blocks.iter().enumerate() {
+            ensure!(
+                b[0] == i as u8 && b[(1 << 20) - 1] == i as u8,
+                "block {i} intact"
+            );
+        }
+    }
+    let after = job_use(root, 2)?.0;
+    // (what stays is a spare arena of at most 1 MiB and the tables of what it holds)
+    ensure!(
+        after <= before + 300,
+        "the job holds {} pages more than at the start, after 64 MiB were freed (peak {peak})",
+        after as i64 - before as i64
+    );
+    Ok(())
+}
+
+/// T207 PR 5: in a child, memory made and freed three times over (the heap trims between), the cap is still a null allocation and not a fault.
+fn runtime_heap_stops_at_its_cap_after_giving_memory_back() -> Outcome {
+    let (p, in_w, out_r) = start_hello(&[b"hello", b"trim"])?;
+    let _ = (out_r, in_w);
+    wait_ended(p, 60_000)?;
+    let blocks = sys::process_info(p).a1 as i64;
+    ensure!(
+        (64..=128).contains(&blocks),
+        "the heap gave {blocks} MiB before refusing after three trims (cap 128 MiB; an exit code of 94 is an allocation that failed too soon)"
     );
     Ok(())
 }
@@ -13119,6 +13877,8 @@ fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
 static RT_STOP: AtomicU32 = AtomicU32::new(0);
 static RT_PROBE_PRIO: AtomicU32 = AtomicU32::new(0);
 static RT_WORST_LATE_US: AtomicU64 = AtomicU64::new(0);
+/// The second-worst of the probe's samples (T219: one pause of the host delays one wake, which must not fail the bound).
+static RT_SECOND_LATE_US: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn rt_hog(_: usize) -> ! {
     while RT_STOP.load(Ordering::Relaxed) == 0 {
@@ -13130,21 +13890,28 @@ extern "C" fn rt_hog(_: usize) -> ! {
 extern "C" fn rt_probe(_: usize) -> ! {
     sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
     let gate = sys::event_create().a1 as u64;
-    let mut worst = 0u64;
+    let (mut worst, mut second) = (0u64, 0u64);
     for _ in 0..30 {
         let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
         sys::object_wait(gate, 1 << 24, target);
         // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
         let late = sys::clock_ns().saturating_sub(target * 1_000_000);
-        worst = worst.max(late / 1000); // microseconds
+        let late = late / 1000; // microseconds
+        if late > worst {
+            second = worst;
+            worst = late;
+        } else {
+            second = second.max(late);
+        }
     }
+    RT_SECOND_LATE_US.store(second, Ordering::SeqCst);
     RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
     sys::handle_close(gate);
     sys::thread_exit(0)
 }
 
-/// The probe's worst lateness (microseconds) at `prio` with a hog on every hart.
-fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
+/// The probe's worst and second-worst lateness (microseconds) at `prio` with a hog on every hart.
+fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     let harts = job_use(root_job()?, 7)?.0;
     RT_STOP.store(0, Ordering::SeqCst);
     RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
@@ -13163,19 +13930,23 @@ fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
     }
     sys::handle_close(probe);
     ensure_eq!(w.status, 0, "the probe finished");
-    Ok(RT_WORST_LATE_US.load(Ordering::SeqCst))
+    Ok((
+        RT_WORST_LATE_US.load(Ordering::SeqCst),
+        RT_SECOND_LATE_US.load(Ordering::SeqCst),
+    ))
 }
 
 fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not() -> Outcome {
-    let rt = worst_lateness_us(40)?;
+    let (rt, second) = worst_lateness_us(40)?;
     println!("##BENCH rt_user_latency_max_us {rt} us");
-    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late: the kernel's own probe uses the same 4 ms)
+    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late, and a pause of the host delays one wake: the bound is on the second-worst of
+    // the 30 samples, which a scheduler that delays every wake still fails, and the worst only has to stay within a hundredth of a second: T219)
     ensure!(
-        rt <= 4_000,
-        "a real-time thread woke {rt} us late with a hog on every hart (bound 4 ms)"
+        second <= 4_000 && rt <= 30_000,
+        "a real-time thread woke {rt} us late (second worst {second} us) with a hog on every hart (bound 4 ms, worst 30 ms)"
     );
     // the negative control: at the hogs' priority the wake waits for a slice to end
-    let normal = worst_lateness_us(10)?;
+    let (normal, _) = worst_lateness_us(10)?;
     ensure!(
         normal > 6_000,
         "an equal-priority probe was only {normal} us late: the hogs are not loading the harts"
@@ -13820,9 +14591,10 @@ fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
         (95_000_000..=105_000_000).contains(&spun),
         "a thread that spun for 100 ms was charged {spun} ns"
     );
-    // (the thread's start-up, its event and its two calls cost about a millisecond on a loaded CI machine: the point is that 50 ms of sleep cost nothing)
+    // (the thread's start-up, its event and its two calls cost a few milliseconds on a loaded CI machine under emulation, 5.5 to 7.9 ms seen (T250): the point
+    // is that 50 ms of sleep were not charged, which 25 ms still tells)
     ensure!(
-        slept < 5_000_000,
+        slept < 25_000_000,
         "a thread that slept 50 ms was charged {slept} ns"
     );
     // an ended thread's handle keeps the total
@@ -14430,6 +15202,47 @@ fn jobs_do_not_leak() -> Outcome {
     }
     job_use_settles(root, 0, procs0, 500)?;
     sys::handle_close(root);
+    Ok(())
+}
+
+/// T249: the page index of a VMO is charged to its job as kernel bytes, one 528-byte leaf per 64 pages touched, and given back with the VMO. A job
+/// too small for a leaf has the write refused (NO_MEMORY) with its usage unchanged.
+fn the_page_index_is_charged_to_the_job() -> Outcome {
+    const LEAF: u64 = 528;
+    let root = root_job()?;
+    let j = job(root, 4, 4, 64)?;
+    let (before, _) = job_use(j, 8)?;
+    let v = ok(sys::vmo_create_in(64 * 40, j), "a VMO of 40 leaves")?.a1 as u64;
+    // (the VMO's own object body and handle are kernel bytes too: the leaves are what moves from here)
+    let (base, _) = job_use(j, 8)?;
+    for k in 0..8u64 {
+        ok(
+            sys::vmo_write(v, k * 64 * 4096, b"x".as_ptr(), 1),
+            "touch one page of a new leaf",
+        )?;
+    }
+    // (another page of a leaf that exists costs nothing more)
+    ok(sys::vmo_write(v, 4096, b"y".as_ptr(), 1), "same leaf")?;
+    ensure_eq!(job_use(j, 8)?.0, base + 8 * LEAF, "eight leaves charged");
+    // half the VMO gone: its leaves with it
+    ok(
+        sys::vmo_decommit(v, 0, 4 * 64 * 4096),
+        "decommit four leaves",
+    )?;
+    ensure_eq!(job_use(j, 8)?.0, base + 4 * LEAF, "four leaves credited");
+    sys::handle_close(v);
+    job_use_settles(j, 8, before, 500)?;
+    // a job whose one page allows 512 kernel bytes cannot hold a leaf
+    let tiny = job(root, 1, 1, 1)?;
+    let t = ok(sys::vmo_create_in(64, tiny), "a VMO in a tiny job")?.a1 as u64;
+    let tb = job_use(tiny, 8)?.0;
+    let r = sys::vmo_write(t, 0, b"x".as_ptr(), 1);
+    ensure_eq!(st(r), Some(S::NoMemory), "no room for the leaf");
+    ensure_eq!(job_use(tiny, 8)?.0, tb, "nothing was charged");
+    ensure_eq!(job_use(tiny, 2)?.0, 0, "no page either");
+    for h in [t, tiny, j, root] {
+        sys::handle_close(h);
+    }
     Ok(())
 }
 
@@ -15370,7 +16183,7 @@ fn bench_channel_call(name: &str, n: u32, bystanders: u32) -> Result<u64, Detail
 // of 5.2 is the cost at N = 1 over the cost at N: how many times more round trips a second N pairs get through (`bench_compare.py`
 // prints it). On a boot with fewer harts than N it shows how little the pairs share, which is the point of running it at both counts.
 
-const PS_MAX: usize = 4;
+const PS_MAX: usize = 32;
 static PS_GO: AtomicU32 = AtomicU32::new(0);
 static PS_ROUNDS: AtomicU32 = AtomicU32::new(0);
 static PS_WORD: [AtomicU32; PS_MAX] = [const { AtomicU32::new(0) }; PS_MAX];
@@ -15453,6 +16266,8 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
         }
     }
     nap_ticks(3); // everyone is at the gate
+                  // (T213 M2: what the harts did while the pairs ran: IPIs received, retentive suspends, `wfi` idles, idle time)
+    let stat0 = [209, 210, 211, 212].map(sys::debug_stat);
     let t0 = cycles();
     PS_GO.store(1, Ordering::SeqCst);
     sys::futex_wake(PS_GO.as_ptr(), u32::MAX);
@@ -15461,8 +16276,26 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
         ensure_eq!(w.status, 0, "a pair thread ended");
     }
     let c = cycles() - t0;
+    let stat1 = [209, 210, 211, 212].map(sys::debug_stat);
     let name = alloc::format!("pair_scaling_{kind}_n{pairs}");
-    let ns = bench_line(&name, c, u64::from(rounds) * pairs as u64);
+    let trips = u64::from(rounds) * pairs as u64;
+    let ns = bench_line(&name, c, trips);
+    // (per thousand round trips, so that a rate below one is not rounded away)
+    for (i, (what, unit)) in [
+        ("ipis", "per_1000_rt"),
+        ("suspends", "per_1000_rt"),
+        ("wfis", "per_1000_rt"),
+        ("idle_ns", "per_1000_rt"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let d = stat1[i].saturating_sub(stat0[i]);
+        println!(
+            "##BENCH ps_{kind}_n{pairs}_{what} {} {unit}",
+            d * 1000 / trips.max(1)
+        );
+    }
     for t in threads {
         sys::handle_close(t);
     }
@@ -15474,7 +16307,12 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
 
 fn bench_pair_scaling(k: u32) -> Result<u64, Detail> {
     let mut last = 0;
-    for pairs in [1, 2, 4] {
+    // (SC2: the full run also measures one pair per hart at 8, 16 and 32 harts, where the machine has them; a boot with fewer harts measures 1, 2 and 4 as before)
+    let harts = job_use(root_job()?, 7)?.0 as usize;
+    for pairs in [1, 2, 4, 8, 16, 32] {
+        if pairs > 4 && (k < 10 || pairs > harts) {
+            continue;
+        }
         last = bench_pairs("futex", pairs, 500 * k)?;
         last += bench_pairs("channel_call", pairs, 250 * k)?;
     }
@@ -15644,6 +16482,10 @@ fn instruction_counts_report() -> Outcome {
 pub fn app_main() -> i32 {
     let mut failed = 0;
     let tests: &[Test] = &[
+        (
+            "a_two_gib_vmo_committed_whole_stays_within_the_latency_bound",
+            a_two_gib_vmo_committed_whole_stays_within_the_latency_bound,
+        ),
         ("user_mode_runs_and_prints", user_mode_runs_and_prints),
         ("clock_advances_in_user_mode", clock_advances_in_user_mode),
         ("unknown_syscalls_are_refused", unknown_syscalls_are_refused),
@@ -16028,6 +16870,8 @@ pub fn app_main() -> i32 {
             fetch_the_conformance_image,
         ),
         ("abi_conformance_passes", abi_conformance_passes),
+        ("fetch_the_fuzzer_image", fetch_the_fuzzer_image),
+        ("the_guest_fuzzer_leaves_nothing_behind", the_guest_fuzzer_leaves_nothing_behind),
         (
             "runtime_startup_heap_and_stdio",
             runtime_startup_heap_and_stdio,
@@ -16035,6 +16879,10 @@ pub fn app_main() -> i32 {
         (
             "runtime_heap_stops_at_its_cap",
             runtime_heap_stops_at_its_cap,
+        ),
+        (
+            "runtime_heap_stops_at_its_cap_after_giving_memory_back",
+            runtime_heap_stops_at_its_cap_after_giving_memory_back,
         ),
         (
             "runtime_refuses_a_bad_startup_message",
@@ -16177,6 +17025,26 @@ pub fn app_main() -> i32 {
             a_write_to_a_protected_page_ends_the_process,
         ),
         (
+            "the_heap_gives_memory_back_when_it_is_freed",
+            the_heap_gives_memory_back_when_it_is_freed,
+        ),
+        (
+            "a_close_that_frees_a_chain_takes_interrupts_between_its_slices",
+            a_close_that_frees_a_chain_takes_interrupts_between_its_slices,
+        ),
+        (
+            "a_decommit_under_way_refuses_the_calls_that_would_race_it",
+            a_decommit_under_way_refuses_the_calls_that_would_race_it,
+        ),
+        (
+            "a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory",
+            a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory,
+        ),
+        (
+            "a_two_gib_sparse_vmo_is_mapped_touched_and_given_back",
+            a_two_gib_sparse_vmo_is_mapped_touched_and_given_back,
+        ),
+        (
             "vmo_decommit_and_resize_from_user_mode",
             vmo_decommit_and_resize_from_user_mode,
         ),
@@ -16269,6 +17137,7 @@ pub fn app_main() -> i32 {
             job_kill_ends_every_process_below_and_forbids_more,
         ),
         ("jobs_do_not_leak", jobs_do_not_leak),
+        ("the_page_index_is_charged_to_the_job", the_page_index_is_charged_to_the_job),
         (
             "dma_runs_are_allocated_and_freed_repeatedly",
             dma_runs_are_allocated_and_freed_repeatedly,
@@ -16357,6 +17226,10 @@ pub fn app_main() -> i32 {
         (
             "a_jobs_region_quota_bounds_its_processes",
             a_jobs_region_quota_bounds_its_processes,
+        ),
+        (
+            "kernel_allocation_failure_sweep",
+            kernel_allocation_failure_sweep,
         ),
         (
             "a_bad_stream_handle_is_refused",

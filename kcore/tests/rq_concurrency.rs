@@ -45,6 +45,9 @@ struct World {
     bkl: Mutex<()>,
     /// The thread each hart is executing (0: none yet).
     exec: Vec<AtomicU64>,
+    /// The thread each hart last switched away from and has not yet looked at for reaping (the kernel's `percpu.prev`, T165): `reap_prev` takes the
+    /// big lock again, after a variable delay, and frees it only if it exited and is not in transit.
+    prev: Vec<AtomicU64>,
     /// Threads that exist (spawned and not yet reaped), and those that have exited and wait to be reaped.
     tids: Mutex<Vec<Tid>>,
     dead: Mutex<Vec<Tid>>,
@@ -63,7 +66,10 @@ impl World {
     /// it left is available to the other harts.
     fn finish(&self, h: usize) {
         let c = self.s.current_on(h);
-        self.exec[h].store(c, Ordering::SeqCst);
+        let old = self.exec[h].swap(c, Ordering::SeqCst);
+        if old != 0 && old != c && old != self.s.idle(h) {
+            self.prev[h].store(old, Ordering::SeqCst);
+        }
         if c != self.s.idle(h) {
             for x in 0..HARTS {
                 if x != h {
@@ -135,7 +141,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
         }
         let exec = w.exec[h].load(Ordering::SeqCst);
         let running_user = exec != 0 && exec != w.s.idle(h);
-        match rng.gen_range(0..11u32) {
+        match rng.gen_range(0..12u32) {
             // the tick and the reschedule IPI: no big lock unless the hart must switch
             0 | 1 => {
                 now += MS;
@@ -201,6 +207,32 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     assert!(w.s.reap(t).is_ok(), "reap of {t} failed");
                 }
             }
+            11 => {
+                // `reap_prev` (T165; dropping the `is_in_transit` test below is an equivalent mutant here: the model sets `prev` only once the hart's switch is
+                // complete, so the thread is never in transit when it is consumed; the assertion on `exec` is what catches a premature free): the lock taken again after the switch, and the thread this hart left freed by the kernel's rule (exited, not in
+                // transit): no hart may be executing it, whatever the other harts did between the switch and now
+                let _g = w.bkl.lock().unwrap();
+                let p = w.prev[h].swap(0, Ordering::SeqCst);
+                if p != 0 {
+                    let mut dead = w.dead.lock().unwrap();
+                    if let Some(i) = dead.iter().position(|&t| t == p) {
+                        if w.s.state(p) == Some(kcore::sched::State::Exited)
+                            && !w.s.is_in_transit(p)
+                        {
+                            for x in 0..HARTS {
+                                assert_ne!(
+                                    w.exec[x].load(Ordering::SeqCst),
+                                    p,
+                                    "reap_prev: thread {p} is freed while hart {x} still executes it"
+                                );
+                            }
+                            dead.remove(i);
+                            w.tids.lock().unwrap().retain(|&x| x != p);
+                            assert!(w.s.reap(p).is_ok(), "reap_prev of {p} failed");
+                        }
+                    }
+                }
+            }
             9 => {
                 let _g = w.bkl.lock().unwrap();
                 let list = w.tids.lock().unwrap().clone();
@@ -250,6 +282,7 @@ fn model(steps: usize, deferred: bool, g4: bool) {
         s: Sched2::over(rqs),
         bkl: Mutex::new(()),
         exec: (0..HARTS).map(|_| AtomicU64::new(0)).collect(),
+        prev: (0..HARTS).map(|_| AtomicU64::new(0)).collect(),
         tids: Mutex::new(Vec::new()),
         dead: Mutex::new(Vec::new()),
         ipi: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),

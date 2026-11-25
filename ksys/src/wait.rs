@@ -135,8 +135,10 @@ pub fn port_poll_many<M: PhysMem>(
         Status::ShouldWait => Status::ShouldWait,
         _ => Status::InvalidArgs,
     })?;
+    // (the buffer is reserved before the poll takes anything: NO_MEMORY consumes no packet, T248)
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| Status::NoMemory)?;
     let got = ipc::port_poll_many_in(objs, &p.handles, h, jobs, cap)?;
-    let mut bytes = Vec::with_capacity(got.len() * abi::limits::PORT_PACKET_BYTES);
     for &(key, observed) in &got {
         bytes.extend_from_slice(&key.to_le_bytes());
         bytes.extend_from_slice(&observed.to_le_bytes());
@@ -245,11 +247,11 @@ pub fn futex_wait_enqueue<M: PhysMem, B: Buckets>(
             },
         );
     }
-    let queued = table.wait_if((me, w.addr), who, || read_word(mem, w.pa) == w.expected);
-    if queued {
-        FutexCheck::Sleep
-    } else {
-        FutexCheck::Done(Status::ShouldWait) // the word changed: do not sleep
+    match table.wait_if((me, w.addr), who, || read_word(mem, w.pa) == w.expected) {
+        Ok(true) => FutexCheck::Sleep,
+        Ok(false) => FutexCheck::Done(Status::ShouldWait), // the word changed: do not sleep
+        // (KT9: the queue entry could not be made, so the thread is not asleep: a call that decides to sleep is where running out is reported)
+        Err(_) => FutexCheck::Done(Status::NoMemory),
     }
 }
 
@@ -329,7 +331,9 @@ pub fn futex_wake<B: Buckets>(
     wake: impl FnOnce(&[u64]),
 ) -> Result<usize, Status> {
     let (addr, count) = futex_wake_args(a)?;
-    Ok(table.wake_with((me, addr), count, wake))
+    table
+        .wake_with((me, addr), count, wake)
+        .map_err(|_| Status::NoMemory)
 }
 
 // ---- channel_call ----
@@ -370,7 +374,7 @@ pub fn channel_call_send<M: PhysMem>(
     me: u64,
     caller: u64,
     a: [u64; 6],
-    take_interrupt: impl FnOnce() -> bool,
+    take_interrupt: impl FnOnce(&mut crate::state::Threads, &mut usize) -> bool,
 ) -> Result<Call, Status> {
     channel_call_send_staged(us, mm, vmos, jobs, me, caller, a, None, take_interrupt)
 }
@@ -387,14 +391,15 @@ pub fn channel_call_send_staged<M: PhysMem>(
     caller: u64,
     a: [u64; 6],
     mut staged: Option<crate::Staged>,
-    take_interrupt: impl FnOnce() -> bool,
+    take_interrupt: impl FnOnce(&mut crate::state::Threads, &mut usize) -> bool,
 ) -> Result<Call, Status> {
     let ch = Handle(a[0]);
     let UserState {
         objs,
         procs,
-        calls,
+        threads,
         next_call,
+        n_interrupts,
         ..
     } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
@@ -421,7 +426,7 @@ pub fn channel_call_send_staged<M: PhysMem>(
         return Err(Status::InvalidArgs);
     }
     // An interrupt already pending ends the call before anything is sent (a retry then sends one request, not two).
-    if deadline != 0 && take_interrupt() {
+    if deadline != 0 && take_interrupt(threads, n_interrupts) {
         return Err(Status::Interrupted);
     }
     // Send the request.
@@ -466,7 +471,9 @@ pub fn channel_call_send_staged<M: PhysMem>(
         Some((caller, call)),
     )?;
     // (from here until the call ends, a server that reads the request lends it the caller's priority: L22)
-    calls.insert(caller, call);
+    if let Some(t) = threads.get_mut(&caller) {
+        t.call = Some(call);
+    }
     Ok(Call {
         ch,
         txid: le32(&data, 0),
@@ -511,7 +518,7 @@ pub fn channel_call_reply<M: PhysMem>(
     jobs: &mut Jobs,
     me: u64,
     c: &Call,
-    take_interrupt: impl FnOnce() -> bool,
+    take_interrupt: impl FnOnce(&mut crate::state::Threads, &mut usize) -> bool,
 ) -> Reply {
     channel_call_reply_deferred(us, mm, vmos, jobs, me, c, &mut None, false, take_interrupt)
 }
@@ -528,9 +535,15 @@ pub fn channel_call_reply_deferred<M: PhysMem>(
     c: &Call,
     deferred: &mut Option<crate::Deferred>,
     defer_out: bool,
-    take_interrupt: impl FnOnce() -> bool,
+    take_interrupt: impl FnOnce(&mut crate::state::Threads, &mut usize) -> bool,
 ) -> Reply {
-    let UserState { objs, procs, .. } = us;
+    let UserState {
+        objs,
+        procs,
+        threads,
+        n_interrupts,
+        ..
+    } = us;
     objs.clear_dequeued_calls(); // (the reply is read here, not by a server: a note an earlier read left must not be attributed to a later one, L22)
     let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
     let out: Reply = match ipc::channel_peek(
@@ -589,7 +602,7 @@ pub fn channel_call_reply_deferred<M: PhysMem>(
         Err(ReadError::Status(st)) => Err((st, None, None)),
     };
     match out {
-        Err((Status::TimedOut, ..)) if c.deadline != 0 && take_interrupt() => {
+        Err((Status::TimedOut, ..)) if c.deadline != 0 && take_interrupt(threads, n_interrupts) => {
             fail(Status::Interrupted)
         }
         other => other,

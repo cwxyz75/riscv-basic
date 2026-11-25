@@ -17,8 +17,10 @@ use abi::rights::Rights;
 use abi::Handle;
 use kcore::ipc::{self, KObj, Quota};
 use kcore::job::JobId;
+use kcore::object::ObjId;
 use kfuzz_gen::{Gen, Kind, Model, Window};
 use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 mod common;
@@ -64,7 +66,17 @@ fn kind_of(w: &World, h: u64) -> Kind {
 /// One sequence. Returns a hash of every call and its reply (two runs of a seed must agree), or the first problem.
 fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result<u64, String> {
     at.set(("setup", 0));
-    let mut w = world_with(256);
+    // (one seed in four runs short of frames, so a commit that cannot get one rolls back: T176)
+    let mut w = if seed % 4 == 3 {
+        world_with_frames(256, 24 + (seed as usize / 4) % 20)
+    } else {
+        world_with(256)
+    };
+    let mut waits = kcore::wait::WaitTable::new();
+    let mut masks: BTreeMap<u64, (ObjId, u32)> = BTreeMap::new(); // what each registered thread waits for
+    for t in 1..=WAITERS {
+        waits.admit(t).map_err(|_| "admit".to_string())?;
+    }
     // a handle to the root job, to give the job calls something to act on (the generator never closes it or sets limits on it)
     let jh = {
         let mut q = Quota {
@@ -122,6 +134,13 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             }
         }
         at.set(("call", i));
+        // (T176 6: what the call may have changed is in the dirty log, which the kernel's wake-up pass reads: a signal word that moved, or an object that went, with no entry would never wake its waiters)
+        let before: Vec<(ObjId, u32)> = w
+            .objs
+            .live_ids()
+            .into_iter()
+            .filter_map(|o| ipc::signals_of_object(&w.objs, o).map(|s| (o, s)))
+            .collect();
         let r = match ksys::wide_argument_error(call.nr, &call.args) {
             Some(st) => Some(Err((st, None, None))), // refused before it runs, as in the kernel
             None => w.call(call.nr, call.args),
@@ -133,6 +152,32 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
         };
         if std::env::var("KFUZZ_TRACE").is_ok() {
             eprintln!("{i}: {call:?} -> {r:?}");
+        }
+        at.set(("dirty", i));
+        {
+            let mut logged: std::collections::HashSet<ObjId> =
+                w.objs.peek_dirty().iter().map(|&(o, _)| o).collect();
+            // (a port's READABLE follows what it binds: the wait table releases a port's waiters when something it binds is touched, L21a)
+            for (o, _) in &before {
+                if ipc::port_bound_objects(&w.objs, *o)
+                    .iter()
+                    .any(|b| logged.contains(b))
+                {
+                    logged.insert(*o);
+                }
+            }
+            for (o, was) in &before {
+                let now = ipc::signals_of_object(&w.objs, *o);
+                // (a signal that is only cleared wakes nobody: a waiter wants a bit that is set)
+                if now.is_none_or(|n| n & !*was != 0)
+                    && !logged.contains(o)
+                    && !w.objs.dirty_overflowed()
+                {
+                    return Err(format!(
+                        "seed {seed}, call {i} ({call:?}): {o:?} gained signals ({was:#x} to {now:?}) or died and the dirty log does not name it"
+                    ));
+                }
+            }
         }
         at.set(("observe", i));
         model.observe(&call, ok, a1, a2);
@@ -170,16 +215,171 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                 }
             }
         }
+        // (T176 2: `port_wait` lives in the kernel, so the harness polls the ports the process holds the way the wait does, one binding or a batch: the cursor,
+        // the one-shot disarm and the pruning of bindings whose object went all run, and what comes back must be a delivered signal)
+        if i % 5 == 2 {
+            at.set(("poll", i));
+            let ports: Vec<u64> = model
+                .live()
+                .iter()
+                .filter(|&&(_, k)| k == Kind::Port)
+                .map(|&(h, _)| h)
+                .collect();
+            if let Some(&p) = ports.get(i / 5 % ports.len().max(1)) {
+                if i % 10 == 2 {
+                    if let Ok(Some((key, seen))) =
+                        ipc::port_poll_in(&mut w.objs, &w.handles, Handle(p), &mut w.jobs)
+                    {
+                        if seen == 0 {
+                            return Err(format!("seed {seed}, call {i}: a poll of port {p} delivered key {key} with no signal"));
+                        }
+                    }
+                } else if let Ok(got) = ipc::port_poll_many_in(
+                    &mut w.objs,
+                    &w.handles,
+                    Handle(p),
+                    &mut w.jobs,
+                    1 + i % 4,
+                ) {
+                    if got.len() > 1 + i % 4 || got.iter().any(|&(_, seen)| seen == 0) {
+                        return Err(format!(
+                            "seed {seed}, call {i}: a batch poll of port {p} gave {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
         at.set(("cleanup", i));
-        cleanup(&mut w);
+        let dirty = cleanup_keep(&mut w);
+        at.set(("waits", i));
+        // (T176 7: the threads of the wait table, which the kernel keeps outside `ksys`, wait on what the fuzzer makes and breaks)
+        check_waits(&mut w, &mut waits, &mut masks, dirty, seed, i)?;
         at.set(("audit", i));
         audit(&mut w).map_err(|e| format!("seed {seed}, call {i} ({call:?}): {e}"))?;
     }
     at.set(("baseline", calls));
+    // (what is left waiting is released by the destruction of everything: one last commit, then every thread leaves)
+    let dirty = cleanup_keep(&mut w);
+    check_waits(&mut w, &mut waits, &mut masks, dirty, seed, calls)?;
+    for t in 1..=WAITERS {
+        waits.forget(t);
+        waits.retire(t);
+    }
+    waits
+        .audit(|o| w.objs.is_alive(o))
+        .map_err(|e| format!("seed {seed}, after the waiters left: {e}"))?;
     w.job = JobId::ROOT;
     baseline(&mut w).map_err(|e| format!("seed {seed}, at the end: {e}"))?;
     (w.objs.live(), w.handles.len()).hash(&mut hasher);
     Ok(hasher.finish())
+}
+
+/// How many threads wait on what the fuzzer makes.
+const WAITERS: u64 = 6;
+
+/// The kernel's commit to the waiters after a call, and what must hold of it (W3, W4, as `kcore/tests/wait_model.rs` checks them over the IPC layer
+/// alone): every woken thread had a cause, none that is left has a true predicate, a dead object or a removed handle, and the table's own audit. Then
+/// some idle threads start waiting, only when their predicate is false, on an object that is not a port (a port's baton is that model's).
+fn check_waits(
+    w: &mut World,
+    waits: &mut kcore::wait::WaitTable,
+    masks: &mut BTreeMap<u64, (ObjId, u32)>,
+    dirty: kcore::object::Dirty,
+    seed: u64,
+    i: usize,
+) -> Result<(), String> {
+    let forced: BTreeSet<ObjId> = dirty
+        .items
+        .iter()
+        .filter(|(_, f)| *f)
+        .map(|(o, _)| *o)
+        .collect();
+    let overflow = dirty.overflow;
+    let woken = {
+        let objs = &w.objs;
+        waits.commit(
+            |id| ipc::signals_of_object(objs, id),
+            |id, f| objs.for_each_binder(id, f),
+            |_, _| false,
+            dirty,
+        )
+    };
+    for t in &woken {
+        let Some((obj, mask)) = masks.remove(t) else {
+            return Err(format!(
+                "seed {seed}, call {i}: thread {t} was woken but was not waiting"
+            ));
+        };
+        let sig = ipc::signals_of_object(&w.objs, obj);
+        if !(overflow || sig.is_none_or(|s| s & mask != 0) || forced.contains(&obj)) {
+            return Err(format!(
+                "seed {seed}, call {i}: thread {t} was woken without cause (signals {sig:?}, mask {mask:#x})"
+            ));
+        }
+        if waits.is_registered(*t) {
+            return Err(format!(
+                "seed {seed}, call {i}: woken thread {t} is still registered"
+            ));
+        }
+    }
+    waits.recycle(woken);
+    for (t, (obj, mask)) in masks.iter() {
+        if !waits.is_registered(*t) {
+            return Err(format!(
+                "seed {seed}, call {i}: thread {t} lost its registration without a wake"
+            ));
+        }
+        if forced.contains(obj) {
+            return Err(format!(
+                "seed {seed}, call {i}: thread {t} still waits on {obj:?} though a handle to it was removed"
+            ));
+        }
+        match ipc::signals_of_object(&w.objs, *obj) {
+            None => {
+                return Err(format!("seed {seed}, call {i}: thread {t} still waits on a dead object"))
+            }
+            Some(s) if s & mask != 0 => {
+                return Err(format!(
+                    "seed {seed}, call {i}: thread {t} was not woken though its signals {s:#x} match {mask:#x}"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    waits
+        .audit(|o| w.objs.is_alive(o))
+        .map_err(|e| format!("seed {seed}, call {i}: the wait table: {e}"))?;
+    // some idle threads start waiting
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (i as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        | 1;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for t in 1..=WAITERS {
+        if masks.contains_key(&t) || next() % 100 >= 30 {
+            continue;
+        }
+        let ids: Vec<ObjId> = w
+            .objs
+            .live_ids()
+            .into_iter()
+            .filter(|&id| !matches!(w.objs.get(id), Some(KObj::Port(_))))
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let obj = ids[(next() % ids.len() as u64) as usize];
+        let mask = 1u32 << (next() % 4);
+        if ipc::signals_of_object(&w.objs, obj).is_some_and(|s| s & mask == 0) {
+            waits.register(t, obj, mask);
+            masks.insert(t, (obj, mask));
+        }
+    }
+    Ok(())
 }
 
 #[test]

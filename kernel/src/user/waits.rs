@@ -5,11 +5,8 @@ use super::*;
 /// The signal word of `h` in the calling process (0 if it names nothing). Interrupts off.
 pub(super) fn signals_now(h: Handle) -> Result<u32, Status> {
     with_state(|s| {
-        let pid = s
-            .thread_pid
-            .get(&thread::current())
-            .ok_or(Status::BadState)?;
-        let p = s.procs.get(pid).ok_or(Status::BadState)?;
+        let pid = s.pid_of(thread::current()).ok_or(Status::BadState)?;
+        let p = s.procs.get(&pid).ok_or(Status::BadState)?;
         ipc::signals_of(&s.objs, &p.handles, h)
     })
 }
@@ -40,9 +37,20 @@ pub(super) fn touch_port_of(h: Handle) {
     });
 }
 
+/// An R point of the blocking calls (T177): make the calling thread known to the wait table, with room for everything it can register or be woken by.
+/// Idempotent; no memory is `NoMemory` and nothing has changed.
+pub(super) fn admit_caller() -> Result<(), ReplyErr> {
+    locked_state(|s| {
+        s.waits
+            .admit(thread::current())
+            .map_err(|_| Status::NoMemory)
+    })
+    .map_err(|e| (e, None, None))
+}
+
 fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
     with_state(|s| {
-        let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        let Some(pid) = s.pid_of(thread) else {
             return;
         };
         let Some(p) = s.procs.get(&pid) else {
@@ -51,11 +59,10 @@ fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
         if let Ok(entry) = p.handles.get(h) {
             if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
                 // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
-                let bound = ipc::port_bound_objects(&s.objs, entry.obj);
                 if poller {
-                    s.waits.register_poller(thread, entry.obj, mask, bound);
+                    s.waits.register_poller(thread, entry.obj, mask);
                 } else {
-                    s.waits.register_port(thread, entry.obj, mask, bound);
+                    s.waits.register_port(thread, entry.obj, mask);
                 }
             } else {
                 s.waits.register(thread, entry.obj, mask);
@@ -67,7 +74,7 @@ fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
 /// Register `thread` to wait for the reply with `txid` on the channel end the calling process's handle `h` names (a `channel_call`, L21d).
 pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
     with_state(|s| {
-        let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        let Some(pid) = s.pid_of(thread) else {
             return;
         };
         let Some(p) = s.procs.get(&pid) else {
@@ -85,7 +92,7 @@ fn in_process<R>(
 ) -> Result<R, ReplyErr> {
     locked_state(|s| {
         let me = caller_pid(s)?;
-        let _as = AsLocks::of(s, &[me]); // (the caller's address space, before the memory locks)
+        let _as = AsLocks::one(s, me); // (the caller's address space, before the memory locks)
         f(s, &mut kmem::get(), me)
     })
     .map_err(|e| (e, None, None))
@@ -96,6 +103,7 @@ pub(super) fn object_wait(a: [u64; 6]) -> Reply {
     let w = in_process(|s, _, me| ksys::object_wait_check(s, me, a))?;
     let (h, mask, deadline) = (w.handle, w.mask, w.deadline);
     if deadline != 0 {
+        admit_caller()?;
         // A handle that stops naming anything ends the wait (the report below then says so).
         let me = thread::current();
         // (anything a kernel thread touched without committing goes first: a thread must not sleep
@@ -149,7 +157,7 @@ pub(super) fn futex_wait(a: [u64; 6]) -> Reply {
     let deadline = a[2];
     let (me, addr) = match locked_state(|s| -> Result<(u64, u64, ksys::FutexCheck), Status> {
         let me = caller_pid(s)?;
-        let _as = AsLocks::of(s, &[me]);
+        let _as = AsLocks::one(s, me);
         let w = {
             let k = kmem::get();
             ksys::futex_wait_resolve(s, k.mm, k.vmos, k.jobs, me, a)?
@@ -180,6 +188,7 @@ fn pi_status(e: kcore::pifutex::PiError) -> Status {
         kcore::pifutex::PiError::BadState => Status::BadState,
         kcore::pifutex::PiError::NotOwner => Status::AccessDenied,
         kcore::pifutex::PiError::NoId => Status::NotSupported,
+        kcore::pifutex::PiError::NoMemory => Status::NoMemory,
     }
 }
 
@@ -191,28 +200,25 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
     // find it held. A poll is decided here and nothing is queued, so a hand-over cannot land between a queue and a cancel.
     let step = locked_state(|s| -> Result<(u64, Option<bool>), Status> {
         let me = caller_pid(s)?;
-        let _as = AsLocks::of(s, &[me]);
+        let _as = AsLocks::one(s, me);
         let w = {
             let k = kmem::get();
             ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, me, addr)?
         };
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
-        let live = |t: Tid| s.thread_pid.get(&t) == Some(&me);
+        let live = |t: Tid| s.pid_of(t) == Some(me);
         let r = futex_table().with_key(key, |f| {
-            let r = thread::pi_op(
-                |d| match f.pi.lock(d, &word, key, who, live, deadline != 0) {
-                    Ok(kcore::pifutex::Lock::Acquired) => (Ok(Some(true)), Vec::new()),
-                    Ok(kcore::pifutex::Lock::WouldBlock) => (Ok(None), Vec::new()),
-                    Ok(kcore::pifutex::Lock::Blocked { changes }) => (Ok(Some(false)), changes),
-                    Err(e) => (Err(e), Vec::new()),
-                },
-            );
+            let r = thread::pi_op(|d, sink| {
+                match f.pi.lock(d, &word, key, who, live, deadline != 0, sink) {
+                    Ok(kcore::pifutex::Lock::Acquired) => Ok(Some(true)),
+                    Ok(kcore::pifutex::Lock::WouldBlock) => Ok(None),
+                    Ok(kcore::pifutex::Lock::Blocked) => Ok(Some(false)),
+                    Err(e) => Err(e),
+                }
+            });
             // (waiters the call ended because the word and the record had come apart: woken with the bucket lock held)
-            let ended = f.pi.drain_wake();
-            if !ended.is_empty() {
-                thread::wake_many_quiet(&ended);
-            }
+            f.pi.drain_wake_into(thread::wake_many_quiet);
             r
         });
         match r {
@@ -245,7 +251,7 @@ pub(super) fn futex_lock_pi(a: [u64; 6]) -> Reply {
     let ended = irq::without(|| {
         futex_table().with_key(key, |f| {
             if f.pi.still_waiting(who) {
-                thread::pi_op(|d| ((), f.pi.cancel(d, who)));
+                thread::pi_op(|d, sink| f.pi.cancel(d, who, sink));
                 None
             } else {
                 f.pi.take_outcome(who)
@@ -266,7 +272,7 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
     let addr = a[0];
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let _as = AsLocks::of(s, &[me]);
+        let _as = AsLocks::one(s, me);
         let w = {
             let k = kmem::get();
             ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, me, addr)
@@ -275,19 +281,16 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
         let word = kmem::PhysWord(w.pa);
         let key = (me, w.addr);
         let r = futex_table().with_key(key, |f| {
-            let r = thread::pi_op(|d| match f.pi.unlock(d, &word, key, who) {
-                Ok(kcore::pifutex::Unlock::Handed { to, changes }) => {
+            let r = thread::pi_op(|d, sink| match f.pi.unlock(d, &word, key, who, sink) {
+                Ok(kcore::pifutex::Unlock::Handed { to }) => {
                     // (the wake is issued with the bucket lock held, as `futex_wake` does)
                     thread::wake_many_quiet(&[to]);
-                    (Ok(()), changes)
+                    Ok(())
                 }
-                Ok(kcore::pifutex::Unlock::Free) => (Ok(()), Vec::new()),
-                Err(e) => (Err(e), Vec::new()),
+                Ok(kcore::pifutex::Unlock::Free) => Ok(()),
+                Err(e) => Err(e),
             });
-            let ended = f.pi.drain_wake();
-            if !ended.is_empty() {
-                thread::wake_many_quiet(&ended);
-            }
+            f.pi.drain_wake_into(thread::wake_many_quiet);
             r
         });
         r.map(|()| (None, None))
@@ -300,50 +303,46 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
     if PI_USED.load(Ordering::Relaxed) {
-        // the PI futexes with waiters that it owns, and what their words say now (read outside the bucket locks: the memory locks are after them)
-        let mut keys: Vec<kcore::pifutex::Key> = Vec::new();
-        futex_table().for_each_bucket(|f| keys.extend(f.pi.owned_keys(tid)));
-        let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = {
-            let _as = AsLocks::of(s, &[pid]);
-            let k = kmem::get();
-            let mut out = alloc::collections::BTreeMap::new();
-            for key in &keys {
+        // the PI futexes with waiters that it owns, one at a time (nothing is collected): what the word says now is read outside the bucket
+        // locks (the memory locks are after them), the record ends under its bucket's lock, and the word is poisoned outside it again
+        loop {
+            let mut next = None;
+            futex_table().for_each_bucket(|f| {
+                if next.is_none() {
+                    next = f.pi.first_owned_key(tid);
+                }
+            });
+            let Some(key) = next else {
+                break;
+            };
+            let (pa, value) = {
+                let _as = AsLocks::one(s, pid);
+                let k = kmem::get();
                 match ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, pid, key.1) {
-                    Ok(w) => {
-                        out.insert(*key, kcore::pifutex::Word::load(&kmem::PhysWord(w.pa)));
-                    }
+                    Ok(w) => (
+                        Some(w.pa),
+                        Some(kcore::pifutex::Word::load(&kmem::PhysWord(w.pa))),
+                    ),
                     Err(_) => {
                         // (a page of a pager's VMO that is not there sets the slot a syscall's copy reads: this thread is leaving and reads nothing)
                         let _ = k.vmos.take_need();
+                        (None, None)
                     }
                 }
-            }
-            out
-        };
-        let mut dead: Vec<(kcore::pifutex::Key, Vec<u64>)> = Vec::new();
-        let mut ended: Vec<u64> = Vec::new();
-        futex_table().for_each_bucket(|f| {
-            let found = thread::pi_op(|d| f.pi.owner_died(d, tid, |key| words.get(&key).copied()));
-            dead.extend(found);
-            ended.extend(f.pi.drain_wake());
-        });
-        for (key, woken) in dead {
-            // poison the word (if its page is still there), then wake the waiters
-            if words.contains_key(&key) {
-                {
-                    let _as = AsLocks::of(s, &[pid]);
-                    let w = {
-                        let k = kmem::get();
-                        ksys::futex_pi_resolve(s, k.mm, k.vmos, k.jobs, pid, key.1).ok()
-                    };
-                    if let Some(w) = w {
-                        kcore::pifutex::PiFutexes::poison(&kmem::PhysWord(w.pa));
-                    }
+            };
+            let mut poison = false;
+            futex_table().for_each_bucket(|f| {
+                if f.pi.first_owned_key(tid) == Some(key) {
+                    poison = thread::pi_op(|d, sink| f.pi.owner_died_one(d, tid, key, value, sink));
+                    f.pi.drain_wake_into(thread::wake_many_quiet);
+                }
+            });
+            if poison {
+                if let Some(pa) = pa {
+                    kcore::pifutex::PiFutexes::poison(&kmem::PhysWord(pa));
                 }
             }
-            thread::wake_many(&woken);
         }
-        thread::wake_many(&ended);
     }
     thread::pi_gone(tid);
 }
@@ -360,20 +359,31 @@ pub fn futex_wake(pid: u64, a: [u64; 6]) -> Reply {
     }
 }
 
+/// Wake the threads a pager step ended the wait of, in batches: each batch is taken under the state lock and woken after it (the wake takes the
+/// scheduler's locks, which come after it). A wake cannot be refused: class N.
+pub(super) fn wake_pager_waiters() {
+    loop {
+        let mut batch = [0; 16];
+        let n = any_state(|s| s.pagers.take_woken(&mut batch));
+        let Some(w) = batch.get(..n).filter(|w| !w.is_empty()) else {
+            return;
+        };
+        crate::heap::nofail(|| thread::wake_many(w));
+    }
+}
+
 /// Wait for a page of a pager's VMO (MM9, KERNEL-V1-SPEC 4.5, PG1): register as a waiter (the request goes to the pager once per page), let go of every
 /// lock, and sleep until the pager supplies the page, fails it, dies, or this thread is killed or interrupted. `Ok` when the page was supplied
 /// (the caller tries again) or the wait was cut short by a kill or an interrupt (the return to user mode ends the process, or the access is
 /// tried again); `Err` with the pager's status when the page cannot be had.
 pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Result<(), Status> {
     let me = thread::current();
+    // (the room for this thread's wait was made when it was: T248; a pager found dead while registering ends the others' waits too)
     let begun = any_state(|s| {
         let k = kmem::get();
         ksys::pager::pager_wait_begin(s, k.vmos, k.jobs, me, need)
     });
-    // (a pager found dead while registering wakes the others through `pending_wake`)
-    let mut woken = any_state(|s| core::mem::take(&mut s.pending_wake));
-    woken.extend(begun.as_ref().map(|w| w.as_slice()).unwrap_or(&[]));
-    thread::wake_many(&woken);
+    wake_pager_waiters();
     begun?;
     // (the page came in since the call found it missing: nothing was registered)
     if !any_state(|s| s.pagers.waiting(me)) {
@@ -405,11 +415,11 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
         if ended {
             break;
         }
-        let woken = with_state(|s| {
+        with_state(|s| {
             let k = kmem::get();
-            ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager)
+            ksys::pager::pager_flush(s, k.vmos, k.jobs, need.pager);
         });
-        thread::wake_many(&woken);
+        wake_pager_waiters();
         commit_wake();
     }
     // a fault ignores `thread_interrupt` (the flag stays for the next blocking call); a call that was interrupted or killed while it waited
@@ -444,6 +454,7 @@ pub(super) fn pager_after_call(frame: &mut crate::trap::TrapFrame) {
 
 /// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),
 /// then report one in turn.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn port_wait(a: [u64; 6]) -> Reply {
     let (h, deadline) = ksys::port_wait_check(a).map_err(|e| (e, None, None))?;
     let poll = || in_process(|s, k, me| ksys::port_poll(s, k.jobs, me, h));
@@ -457,6 +468,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
         && irq::without(killed_now).is_none()
         && !irq::without(interrupted_now)
     {
+        admit_caller()?;
         // (the poll above may have touched the port; tell the wait table before sleeping, so that no
         // thread goes to sleep, and the lock is released, with signal changes still in the log)
         commit_wake();
@@ -494,6 +506,7 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
         && irq::without(killed_now).is_none()
         && !irq::without(interrupted_now)
     {
+        admit_caller()?;
         commit_wake();
         let me = thread::current();
         thread::wait_deadline_registered(
@@ -524,7 +537,9 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
     locked_state(|s| {
         // (one section with the server's donation, `lend_to_reader`: after it, no donation for this call can be made)
-        s.calls.remove(&me);
+        if let Some(t) = s.thread_mut(me) {
+            t.call = None;
+        }
         thread::pi_revoke(me);
     });
     super::trap::finish_out(r, deferred)
@@ -537,7 +552,8 @@ fn channel_call_inner(
     staged: Option<ksys::Staged>,
     deferred: &mut Option<ksys::Deferred>,
 ) -> Reply {
-    // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
+    admit_caller()?; // (before anything is sent: the wait below registers without allocating)
+                     // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
     let call = in_process(|s, k, me| {
         ksys::channel_call_send_staged(
             s,
@@ -548,7 +564,7 @@ fn channel_call_inner(
             thread::current() as u64,
             a,
             staged,
-            take_interrupt_held,
+            take_interrupt_in,
         )
     })?;
     notify_sync(); // (the request is queued and this thread blocks next: the server it wakes runs on this hart, L24)
@@ -556,10 +572,10 @@ fn channel_call_inner(
     let me = thread::current();
     let ready = || {
         with_state(|s| {
-            let Some(&pid) = s.thread_pid.get(&thread::current()) else {
+            let Some(pid) = s.pid_of(thread::current()) else {
                 return true;
             };
-            let interrupted = s.interrupts.contains(&thread::current());
+            let interrupted = s.interrupt_pending(thread::current());
             ksys::channel_call_ready(s, pid, &call, interrupted)
         })
     };
@@ -585,7 +601,7 @@ fn channel_call_inner(
                     &call,
                     deferred,
                     true,
-                    take_interrupt_held,
+                    take_interrupt_in,
                 ),
                 Err(e) => Err((e, None, None)),
             }

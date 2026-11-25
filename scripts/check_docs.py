@@ -32,7 +32,7 @@ GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of ci.yml may take at most this
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
 # Targets besides the smoke ones that ci.yml may run: parts of a smoke target that CI runs as their own jobs.
 # (the smoke boot is two parallel jobs, one per shard of the suite, and the release smoke is a third: OD121)
-GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-a", "os-boot-test-smoke-b", "os-ktest-small", "os-ktest-4", "lint-target",
+GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-a", "os-boot-test-smoke-b", "os-ktest-small", "os-ktest-4", "os-ktest-big", "lint-target",
               "os-boot-test-fail-demo"}  # the harness check, when the harness itself changed
 # What in a recipe means "this starts the emulator" (or a script that does).
 BOOTS_RE = re.compile(r"qemu-system|\$\(QEMU\)|os_boot_test\.py|os_repeat\.py|chaos\.py|_test\.py")
@@ -174,14 +174,16 @@ ATOMICS = {
     "kcore/src/sync.rs": (15, "the re-export of the atomics (core's, loom's or shuttle's): the layer itself"),
     "kcore/src/ticket.rs": (13, "the ticket lock protocol, modelled under loom and shuttle"),
     "kcore/src/handle.rs": (6, "two process-wide counters of the handle tables: slot growth events and clamped tables (MM5), read by the kernel so a syscall that grew nothing skips the charging pass; and the next table identity, the counter a port binding names the table it was made through by (L21c)"),
-    "kcore/src/aspace.rs": (4, "`PAGER_NEED_PENDING` (MM9: set when a pager page was missing, read after every call so the common case takes no lock), `COPY_PENDING`: set when the VMO store logged a page that makes translations stale (MM8), read by the kernel after every call and fault so the common case costs one load; the log itself is under the VMO lock"),
+    "kcore/src/aspace.rs": (8, "`DRAIN_PENDING` (T207 PR 3c: set when a VMO is dying, read after every call and fault so the common case costs one load; the list itself is under the VMO lock), `NEXT_OWNER` (T207: the counter of address-space owner ids, one fetch_add per space made, never reused), `PAGER_NEED_PENDING` (MM9: set when a pager page was missing, read after every call so the common case takes no lock), `COPY_PENDING`: set when the VMO store logged a page that makes translations stale (MM8), read by the kernel after every call and fault so the common case costs one load; the log itself is under the VMO lock"),
     "kcore/src/jobsched.rs": (9, "per-job CPU and real-time accounting (SCHED-SMP-SPEC 4.10, L8): each hart charges the running thread's job with no lock, one atomic for the CPU total and one that packs the real-time window with its used time so a boundary is one compare-and-swap; tested under real threads in `kcore/tests/jobsched.rs`"),
     "kcore/src/asid.rs": (3, "the allocator's current generation, published for a return to user mode that holds no big lock (L19): written under the big lock when the generation turns, read with acquire"),
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
-    "kernel/src/percpu.rs": (91, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1, and the library text range of the running process, AB8)"),
+    "kernel/src/arch/aarch64/mod.rs": (4, "the AArch64 stub (AR1): the two statistics the riscv64 layer has (T206), never run"),
+    "kernel/src/arch/riscv64/irq.rs": (2, "the count of windows made inside syscalls (T206, a statistic read by `debug_stat`)"),
+    "kernel/src/percpu.rs": (95, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1, and the library text range of the running process, AB8, and the depth inside heap::nofail of KT9, and the syscall-window flag of T206: set and read by its own hart only)"),
     "klock/src/aslock.rs": (3, "the installed machine hooks of the address-space lock: one pointer, stored once at boot and read with acquire (L17)"),
     "kernel/src/bkl.rs": (13, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
@@ -189,20 +191,21 @@ ATOMICS = {
     "kernel/src/user/lifecycle.rs": (4, "the number of threads with suspend state (EX1): a copy of the table's size, read with no lock by `thread::block` so that a kernel thread that blocks holding a lock the big lock must not be taken under pays one load; the table itself is under the big lock"),
     "kernel/src/smp.rs": (12, "hart bring-up and IPI flags, and the two counters of instruction-cache synchronisations (PL7)"),
     "kernel/src/arch/riscv64/aia.rs": (14, "interrupt controller statistics and masks, and the per-source aimed-hart table sized at boot (PL5c)"),
-    "kernel/src/thread.rs": (34, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread); and the count of donations the graph refused (L22)"),
+    "kernel/src/thread.rs": (36, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread); and the count of donations the graph refused (L22)"),
     "kernel/src/arch/riscv64/timer.rs": (6, "the clock's zero (the counter value at the first tick), and the counter's frequency and fixed-point multiplier (PL4b), set once at boot and read by `now_ns`"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
     "kernel/src/user/mod.rs": (7, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot); `STATE_OPEN` (debug builds: the open-closure flag of T239); `USER_READY`: the user state exists, read by the commit-on-drop of `irq::without` before it touches the state (L20)"),
     "kernel/src/user/trap.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch); the pointer to the allocator's published generation (L19), set once at boot; the count of `clock_get` calls the kernel answers (AB7: a test reads it to see that the library's clock does not enter the kernel)"),
-    "kernel/src/arch/riscv64/trap.rs": (12, "the expected-fault test hook and its log words, and the per-hart stale-page retry word (T241)"),
-    "kernel/src/heap.rs": (14, "heap statistics, the growth guard, and the frame pool's readiness, size mirror, starvation flag and the refused-free counter"),
+    "kernel/src/arch/riscv64/trap.rs": (14, "the expected-fault test hook and its log words, and the per-hart stale-page retry word (T241), and the count of interrupts taken inside a syscall window (T206, a statistic)"),
+    "kernel/src/kstack.rs": (2, "the count of kernel stacks in use, which sizes the allocator's reserve for the allocations that cannot fail (KT9)"),
+    "kernel/src/heap.rs": (30, "heap statistics, the growth guard, the frame pool's readiness, size mirror, starvation flag and refused-free counter, and the fault-alloc test hook (armed thread, fail-at, count, fired, exempt thread, persistent mode: test builds only), and the reserve's switch (RESERVE_ON, KT9)"),
     "kernel/src/kmem.rs": (6, "the active-table bookkeeping counters, and the PI futex's lock word read and compare-and-swapped through the direct map (L23); the kernel page table's root, set once at boot (T224)"),
     "kernel/src/user/waits.rs": (2, "the flag that says a PI futex has had a waiter, so a thread's exit looks for owned PI futexes only then (L23)"),
     "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
     "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),
     "kernel/src/entropy.rs": (8, "whether the pool was keyed from a real seed, its first output for the boot tests (HD1), and the test-build flag `aslr=off` (HD2)"),
     "kernel/src/arch/riscv64/sbi.rs": (4, "whether the firmware has the debug console extension, probed once; the count of calls to the IPI extension (stays 0, PL6)"),
-    "kernel/src/console.rs": (10, "the console's panic flag and line state, and the UART's address, the firmware-console switch and its two counters (PL5b)"),
+    "kernel/src/console.rs": (12, "the console's panic flag and line state, the lock-broken flag that stops other harts' output after a panic (KT14), and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
     "kernel/src/sched_tests.rs": (49, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile)"),
@@ -231,6 +234,41 @@ def check_atomics():
                     out.append(f"C5: {rel} uses {n} atomic type(s) and is not in the audited allow-list (scripts/check_docs.py ATOMICS)")
                 elif n > allowed[0]:
                     out.append(f"C5: {rel} uses {n} atomic types, the audited count is {allowed[0]} ({allowed[1]}): add them to the audited layer or raise the count with a reason")
+    return out
+
+
+# KT9 (T177, T246): class N, the allocations that cannot be refused because nobody could be told, run in `heap::nofail(..)`. The class cannot grow
+# silently: a new use is a new row here, with the reason.
+NOFAIL = {
+    "kernel/src/thread.rs": (2, "the scheduler's spawn tail and the kernel thread registration"),
+    "kernel/src/user/lifecycle.rs": (1, "a thread's exit from its PI futexes"),
+    "kernel/src/user/trap.rs": (1, "the calls that end or deliver something for a process that exists (kill, exception resume, thread resume, the pager calls): their own tables are prepaid, what they reach is the scheduler's and teardown's (class N)"),
+    "kernel/src/user/calls.rs": (2, "the kill of a process and of each process of a job (the caller's own exit, which does not return, is outside)"),
+    "kernel/src/user/kobjects.rs": (1, "a kernel thread's admission to the wait table"),
+    "kernel/src/user/waits.rs": (1, "the wake of the threads a pager step ended (a wake cannot be refused); the pager tables themselves are prepaid per thread (T248)"),
+    "kernel/src/user/wake.rs": (5, "the epilogue's wakes, kills and teardown arms: a wake or a teardown cannot be refused"),
+}
+
+
+def check_nofail():
+    """T177: the number of `heap::nofail(` sites per file is the audited one."""
+    out = []
+    seen = {}
+    for d, _, files in os.walk(os.path.join(ROOT, "kernel", "src")):
+        for f in files:
+            if not f.endswith(".rs"):
+                continue
+            rel = os.path.relpath(os.path.join(d, f), ROOT)
+            n = sum(l.split("//")[0].count("heap::nofail(") for l in open(os.path.join(d, f)) if not l.lstrip().startswith("//"))
+            if n:
+                seen[rel] = n
+    for rel, n in sorted(seen.items()):
+        want = NOFAIL.get(rel)
+        if want is None or want[0] != n:
+            out.append(f"T177: {rel} has {n} heap::nofail site(s), the audited count is {want[0] if want else 0} (scripts/check_docs.py NOFAIL): a new class-N allocation needs a row and a reason")
+    for rel in NOFAIL:
+        if rel not in seen:
+            out.append(f"T177: {rel} is in NOFAIL but has no heap::nofail site")
     return out
 
 
@@ -363,6 +401,10 @@ def check_links():
             elif "/" in ref:
                 here = os.path.normpath(os.path.join(os.path.dirname(f), ref))
                 if not (os.path.exists(os.path.join(ROOT, ref)) or os.path.exists(os.path.join(ROOT, here))):
+                    # a closed work item's file is gone by design (`work.py done`); an old spec amendment may still name it, and a spec is not edited
+                    m = re.match(r"^work/([A-Za-z0-9-]+)\.md$", ref)
+                    if m and re.search(rf"(?m)^\|[^|]*\|\s*{re.escape(m.group(1))}\s*\|", read("docs/records/done.md")):
+                        continue
                     out.append(f"{f}:{line}: {ref} does not exist")
             elif base not in names and not re.match(r"^[a-z]", base):
                 out.append(f"{f}:{line}: {ref} does not exist anywhere in the tree")
@@ -434,7 +476,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

@@ -146,6 +146,31 @@ mod on {
         hart()
     }
 
+    /// The window of a test: say the longest big-lock hold and the longest interrupts-off span so far (with where the span ended: a trap
+    /// runs with interrupts off from entry to return unless a switch splits it, so it is the whole call when nothing else wants the hart; the
+    /// hold is what the chunking of T207 bounds, X4), return the hold, and start again.
+    pub fn take_window() -> u64 {
+        use core::fmt::Write;
+        let (m, site) = irq_off_max();
+        let hold = (0..SYSCALLS)
+            .map(|n| HOLD_MAX[n].swap(0, Relaxed))
+            .max()
+            .unwrap_or(0);
+        let _ = writeln!(
+            crate::console::Console,
+            "latency: window: big-lock hold max {} ns; interrupts-off max {} ns ending at {}",
+            hold * 100,
+            m * 100,
+            site.map_or(alloc::string::String::from("?"), |s| alloc::format!(
+                "{}:{}",
+                s.file(),
+                s.line()
+            ))
+        );
+        reset();
+        hold
+    }
+
     pub fn reset() {
         for h in 0..MAX_HARTS {
             OFF_MAX[h].store(0, Relaxed);
@@ -235,6 +260,9 @@ mod off {
     pub fn bkl_released() {}
     pub fn irq_off_max() -> (u64, Option<&'static Location<'static>>) {
         (0, None)
+    }
+    pub fn take_window() -> u64 {
+        0
     }
     pub fn reset() {}
     pub fn report() {}

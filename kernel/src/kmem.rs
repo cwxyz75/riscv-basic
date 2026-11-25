@@ -236,7 +236,7 @@ pub fn get() -> Kmem {
     // SAFETY: every reference points into the storage of the lock whose guard is stored in the same struct, and the guards are fields declared after the
     // references, so they drop after them. The spin locks are not recursive (a second take on this hart panics) and are held with interrupts off, so no
     // other `&mut` to the same value exists while this one does. The type does not stop safe code from moving a reference out and past the guard's drop (the
-    // fields are public); no caller does (T242: every use is `kmem::get().field`); the object lock keeps the kernel address space to this hart.
+    // fields are public); no caller does (T242: every use names the field of the temporary, `kmem::get().field`, or binds it for the statement).
     unsafe {
         Kmem {
             mm: inside(&mut frame),
@@ -699,7 +699,7 @@ fn kernel_half_now() -> [u64; 256] {
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn snapshot_kernel_half() {
     // SAFETY: the one call (`kmain`, after the memory tests) is before any reader: `kernel_half_unchanged` is called only on the paths that load or end a process, and
-    // the first process is loaded after it. Interrupts are on and the other harts are running by then, but none of them reads `KERNEL_HALF` yet (T242).
+    // the first process is loaded after it. Interrupts are on and the other harts are running by then, but none of them reads `KERNEL_HALF` yet (T242), and the first reader runs after the spawn of the process's first thread, whose thread-table lock orders this store before the read (KT14).
     unsafe { *addr_of_mut!(KERNEL_HALF) = kernel_half_now() };
 }
 

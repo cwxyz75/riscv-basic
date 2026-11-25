@@ -93,6 +93,8 @@ pub struct PerHart {
     pub cur_as: core::sync::atomic::AtomicPtr<klock::aslock::AsCell>,
     /// Times this hart took the big kernel lock from free (outermost takes): the measure of how often a hart needs it.
     pub bkl_takes: AtomicU64,
+    /// How deep this hart is inside `heap::nofail` (class N: the allocator's reserve may be used, KT9). Touched with interrupts off.
+    pub nofail_depth: AtomicU32,
     /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
     pub running: AtomicU64,
     /// The thread this hart is switching away from (set just before the switch, taken by the `finish_switch` that completes it; 0:
@@ -101,6 +103,8 @@ pub struct PerHart {
     /// A wake or priority change on this hart designated another thread to run here: the switch happens at the next defined point
     /// (`thread::preempt_point`), never inside the wake (SCHED-SMP-SPEC X7). Written and read by this hart only, interrupts off.
     pub need_resched: AtomicBool,
+    /// T206: this hart is inside `irq::window()` (a syscall's interrupts-on gap); a trap taken then only sets `need_resched` (never switches or grows the heap on the syscall's stack).
+    pub syscall_window: AtomicBool,
     /// The attention epoch (`user::ATTENTION`) this hart last saw at a return to user mode: a trap from user mode that finds it
     /// unchanged has no kill or stop to look for and needs no big lock (L12b).
     pub attention_seen: AtomicU64,
@@ -277,9 +281,11 @@ impl PerHart {
             cur_lib_end: AtomicU64::new(0),
             cur_as: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             bkl_takes: AtomicU64::new(0),
+            nofail_depth: AtomicU32::new(0),
             running: AtomicU64::new(0),
             prev: AtomicU64::new(0),
             need_resched: AtomicBool::new(false),
+            syscall_window: AtomicBool::new(false),
             attention_seen: AtomicU64::new(0),
             idle_wfi: AtomicU64::new(0),
             idle_suspend: AtomicU64::new(0),

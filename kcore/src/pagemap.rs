@@ -1,14 +1,18 @@
-//! The committed pages of a VMO: page number to frame, in two levels (chunks of 64 pages), with **fallible** growth (KT9). A `BTreeMap` would do the
-//! same job, but its node allocations cannot report failure: a failed allocation while committing a page would abort the kernel, where this
-//! returns `Err` and the commit gives its frame and charge back.
+//! The committed pages of a VMO: page number to frame, **sparse** (T207 PR 1). The map is an `FMap` from a chunk number (`page / 64`) to a leaf
+//! of 64 slots, so the cost is one 528-byte leaf per *touched* chunk and nothing per untouched page: a page at 2 GiB costs one leaf, not an
+//! outer vector of 196 KiB. Growth is **fallible** (KT9: class R): an insert that needs a new leaf reserves its room first and returns
+//! `NoMemory` with nothing changed; removal never allocates (a leaf whose last entry goes is freed).
 
+use crate::fbox::FBox;
+use crate::fmap::FMap;
 use crate::frame::Pfn;
-use alloc::vec::Vec;
 
 const CHUNK: u64 = 64;
 const NONE: u64 = u64::MAX;
 /// A page that is explicitly empty: it reads as zeros whatever an ancestor holds, and has no frame (MM8: a decommit in a VMO that inherits).
 const HOLE: u64 = u64::MAX - 1;
+/// What one leaf costs the kernel heap: the 64 slots (the key and the count live in the map's own entry).
+pub const LEAF_BYTES: u64 = CHUNK * 8 + 16;
 
 /// What the map says about a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,44 +24,53 @@ pub enum Entry {
     Frame(Pfn),
 }
 
+impl Entry {
+    /// The frame, if the entry is one.
+    pub fn frame(self) -> Option<Pfn> {
+        match self {
+            Entry::Frame(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// One chunk: 64 slots and how many of them are not `NONE` (a frame or a hole). A leaf with `used == 0` does not exist.
+#[derive(Debug)]
+struct Leaf {
+    slots: FBox<[u64; CHUNK as usize]>,
+    used: u8,
+}
+
 #[derive(Debug, Default)]
 pub struct PageMap {
-    chunks: Vec<Option<Vec<u64>>>,
+    leaves: FMap<u64, Leaf>,
+    /// Frames (not holes).
     len: usize,
 }
 
 impl PageMap {
     pub const fn new() -> PageMap {
         PageMap {
-            chunks: Vec::new(),
+            leaves: FMap::new(),
             len: 0,
         }
     }
 
     /// The pages `0 .. pages` mapped to the frames `first ..` (the device and DMA VMOs, which are made once, with privilege).
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pages is below MAX_VMO_PAGES and first + pages is a frame range the caller checked
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: first + pages is a frame range the caller checked
     pub fn from_run(pages: u64, first: Pfn) -> PageMap {
         let mut m = PageMap::new();
         for i in 0..pages {
-            // (an infallible allocation, on a privileged path: T177)
-            m.insert_growing(i, first + i);
+            // (a privileged path that has always been infallible: a failure here aborts, as `Box::new` would; T177)
+            assert!(
+                m.put(i, first + i).is_ok(),
+                "out of memory making a device or DMA VMO"
+            );
         }
         m
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the chunk index is below chunks.len() after the resize, and the slot index is below CHUNK
-    fn insert_growing(&mut self, page: u64, pfn: Pfn) {
-        let c = (page / CHUNK) as usize;
-        if self.chunks.len() <= c {
-            self.chunks.resize_with(c + 1, || None);
-        }
-        let chunk = self.chunks[c].get_or_insert_with(|| alloc::vec![NONE; CHUNK as usize]);
-        if chunk[(page % CHUNK) as usize] == NONE {
-            self.len += 1;
-        }
-        chunk[(page % CHUNK) as usize] = pfn;
-    }
-
+    /// Frames in the map.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -66,24 +79,27 @@ impl PageMap {
         self.len == 0
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK, the chunk's length
+    /// Leaves held: the kernel bytes the index costs are `leaf_count() * LEAF_BYTES`.
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK
+    fn raw(&self, page: u64) -> u64 {
+        match self.leaves.get(&(page / CHUNK)) {
+            Some(l) => l.slots[(page % CHUNK) as usize],
+            None => NONE,
+        }
+    }
+
     pub fn get(&self, page: u64) -> Option<Pfn> {
-        let chunk = self.chunks.get((page / CHUNK) as usize)?.as_ref()?;
-        let v = chunk[(page % CHUNK) as usize];
+        let v = self.raw(page);
         (v != NONE && v != HOLE).then_some(v)
     }
 
     /// What the map says about `page`.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK, the chunk's length
     pub fn entry(&self, page: u64) -> Entry {
-        match self
-            .chunks
-            .get((page / CHUNK) as usize)
-            .and_then(|c| c.as_ref())
-        {
-            Some(chunk) => Self::decode(chunk[(page % CHUNK) as usize]),
-            None => Entry::None,
-        }
+        Self::decode(self.raw(page))
     }
 
     fn decode(v: u64) -> Entry {
@@ -111,8 +127,12 @@ impl PageMap {
     /// Turn a page that has a slot already (a frame or a hole) into a hole. Cannot fail; returns the frame it had.
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a frame is replaced
     pub fn make_hole(&mut self, page: u64) -> Option<Pfn> {
-        let chunk = self.chunks.get_mut((page / CHUNK) as usize)?.as_mut()?;
-        let old = core::mem::replace(&mut chunk[(page % CHUNK) as usize], HOLE);
+        let leaf = self.leaves.get_mut(&(page / CHUNK))?;
+        let slot = &mut leaf.slots[(page % CHUNK) as usize];
+        if *slot == NONE {
+            return None;
+        }
+        let old = core::mem::replace(slot, HOLE);
         match Self::decode(old) {
             Entry::Frame(pfn) => {
                 self.len -= 1;
@@ -122,27 +142,26 @@ impl PageMap {
         }
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the chunk index is below chunks.len() after the reservation, and the slot index is below CHUNK; len counts frames
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len counts frames; used counts non-NONE slots (at most 64)
     fn put(&mut self, page: u64, raw: u64) -> Result<(), abi::status::Status> {
-        let c = (page / CHUNK) as usize;
-        if self.chunks.len() <= c {
-            self.chunks
-                .try_reserve(c + 1 - self.chunks.len())
+        let key = page / CHUNK;
+        if !self.leaves.contains_key(&key) {
+            self.leaves
+                .reserve(1)
                 .map_err(|_| abi::status::Status::NoMemory)?;
-            self.chunks.resize_with(c + 1, || None);
+            let slots =
+                FBox::try_new([NONE; CHUNK as usize]).map_err(|_| abi::status::Status::NoMemory)?;
+            self.leaves.insert_reserved(key, Leaf { slots, used: 0 });
         }
-        if self.chunks[c].is_none() {
-            let mut v: Vec<u64> = Vec::new();
-            v.try_reserve_exact(CHUNK as usize)
-                .map_err(|_| abi::status::Status::NoMemory)?;
-            v.resize(CHUNK as usize, NONE);
-            self.chunks[c] = Some(v);
-        }
-        if let Some(chunk) = self.chunks[c].as_mut() {
-            let slot = &mut chunk[(page % CHUNK) as usize];
+        if let Some(leaf) = self.leaves.get_mut(&key) {
+            let slot = &mut leaf.slots[(page % CHUNK) as usize];
             let was_frame = matches!(Self::decode(*slot), Entry::Frame(_));
+            let was_none = *slot == NONE;
             let is_frame = matches!(Self::decode(raw), Entry::Frame(_));
             *slot = raw;
+            if was_none {
+                leaf.used += 1;
+            }
             if is_frame && !was_frame {
                 self.len += 1;
             } else if was_frame && !is_frame {
@@ -153,45 +172,130 @@ impl PageMap {
     }
 
     /// The first page at or after `from` with an entry (a frame or a hole), and what it is (an allocation-free walk over the map).
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the chunk index is below chunks.len() and the slot index below CHUNK
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; the key times CHUNK is a page number below 2^64 / 64 * 64
     pub fn next_entry_at_or_after(&self, from: u64) -> Option<(u64, Entry)> {
-        let mut c = (from / CHUNK) as usize;
-        let mut slot = (from % CHUNK) as usize;
-        while c < self.chunks.len() {
-            if let Some(chunk) = self.chunks[c].as_ref() {
-                while slot < CHUNK as usize {
-                    if chunk[slot] != NONE {
-                        return Some((c as u64 * CHUNK + slot as u64, Self::decode(chunk[slot])));
-                    }
-                    slot += 1;
+        let first_key = from / CHUNK;
+        for (&key, leaf) in self.leaves.range(first_key..) {
+            let start = if key == first_key {
+                (from % CHUNK) as usize
+            } else {
+                0
+            };
+            for slot in start..CHUNK as usize {
+                let v = leaf.slots[slot];
+                if v != NONE {
+                    return Some((key * CHUNK + slot as u64, Self::decode(v)));
                 }
             }
-            c += 1;
-            slot = 0;
         }
         None
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a slot is occupied
+    /// Frames (not holes) in the pages `first .. end`, without allocating: the cost is the leaves the range touches, not its length.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; lo and hi are inside the range, so hi - lo is at most 64
+    pub fn count_frames_in(&self, first: u64, end: u64) -> u64 {
+        if first >= end {
+            return 0;
+        }
+        let mut n = 0;
+        for (&key, leaf) in self.leaves.range(first / CHUNK..=(end - 1) / CHUNK) {
+            let lo = first.max(key * CHUNK) - key * CHUNK;
+            let hi = end.min(key * CHUNK + CHUNK) - key * CHUNK;
+            n += leaf.slots[lo as usize..hi as usize]
+                .iter()
+                .filter(|&&v| v != NONE && v != HOLE)
+                .count() as u64;
+        }
+        n
+    }
+
+    /// Remove the frames of `first .. end`, up to `out.len()` of them, into `out` (in page order); returns how many, and the page to continue from
+    /// (`end` when the range is done). Holes in the range stay. Never allocates: the batch is the caller's (a chunked decommit takes 64 at a time).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: n < out.len() when a frame is stored; the page numbers are below end
+    pub fn take_frames_in(&mut self, first: u64, end: u64, out: &mut [Pfn]) -> (usize, u64) {
+        let mut n = 0;
+        let mut at = first;
+        while at < end {
+            let Some((pg, e)) = self.next_entry_at_or_after(at) else {
+                return (n, end);
+            };
+            if pg >= end {
+                return (n, end);
+            }
+            if let Entry::Frame(_) = e {
+                if n == out.len() {
+                    return (n, pg);
+                }
+                if let Some(pfn) = self.remove(pg) {
+                    out[n] = pfn;
+                    n += 1;
+                }
+            }
+            at = pg + 1;
+        }
+        (n, end)
+    }
+
+    /// Does the leaf that holds `page` exist (an insert there needs no new leaf)?
+    pub fn has_leaf(&self, page: u64) -> bool {
+        self.leaves.contains_key(&(page / CHUNK))
+    }
+
+    /// Remove whatever the map says about `page`, a frame or a hole, and return it. A leaf left empty is freed (`leaf_count` falls). Never
+    /// allocates.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a frame is removed; used is at least 1 in a leaf
+    pub fn clear(&mut self, page: u64) -> Entry {
+        let key = page / CHUNK;
+        let Some(leaf) = self.leaves.get_mut(&key) else {
+            return Entry::None;
+        };
+        let slot = &mut leaf.slots[(page % CHUNK) as usize];
+        let v = *slot;
+        if v == NONE {
+            return Entry::None;
+        }
+        *slot = NONE;
+        leaf.used -= 1;
+        let gone = leaf.used == 0;
+        if v != HOLE {
+            self.len -= 1;
+        }
+        if gone {
+            self.leaves.remove(&key);
+        }
+        Self::decode(v)
+    }
+
+    /// Remove the frame at `page` (a hole stays). Never allocates.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a frame is removed; used is at least 1 in a leaf
     pub fn remove(&mut self, page: u64) -> Option<Pfn> {
-        let chunk = self.chunks.get_mut((page / CHUNK) as usize)?.as_mut()?;
-        let v = core::mem::replace(&mut chunk[(page % CHUNK) as usize], NONE);
+        let key = page / CHUNK;
+        let leaf = self.leaves.get_mut(&key)?;
+        let slot = &mut leaf.slots[(page % CHUNK) as usize];
+        let v = *slot;
         if v == NONE || v == HOLE {
             return None;
         }
+        *slot = NONE;
+        leaf.used -= 1;
+        let gone = leaf.used == 0;
         self.len -= 1;
+        if gone {
+            self.leaves.remove(&key);
+        }
         Some(v)
     }
 
     /// Call `f` with every frame, and empty the map.
     pub fn drain_pfns(&mut self, mut f: impl FnMut(Pfn)) {
-        for chunk in self.chunks.drain(..).flatten() {
-            for v in chunk {
+        for leaf in self.leaves.values() {
+            for &v in leaf.slots.iter() {
                 if v != NONE && v != HOLE {
                     f(v);
                 }
             }
         }
+        self.leaves.clear();
         self.len = 0;
     }
 }
@@ -200,6 +304,7 @@ impl PageMap {
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
 
     #[test]
     fn it_behaves_like_a_map_of_page_to_frame() {

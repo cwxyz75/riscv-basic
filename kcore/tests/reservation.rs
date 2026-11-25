@@ -72,6 +72,7 @@ fn usage_is_committed_plus_prepaid_at_every_step_and_the_ledger_is_asked_in_batc
         "only the VMO's pages are left charged"
     );
     vmos.release(&mut mm, &mut jobs, id).unwrap();
+    vmos.drain_all(&mut mm, &mut jobs);
     assert_eq!(pages_of(&jobs, j), 0);
 }
 

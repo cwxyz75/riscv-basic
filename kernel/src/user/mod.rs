@@ -19,8 +19,6 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::user::{MAX_DEBUG_WRITE, STACK_PAGES, STACK_TOP};
 use abi::Handle;
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -50,6 +48,8 @@ pub static BOOT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootimg
 /// The conformance program of the system library (AB9): started by the boot-time suite, not part of the boot image.
 pub static ABI_CONFORMANCE_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/abi_conformance.elf"));
+/// The guest syscall fuzzer (KT8): started by the boot-time suite in a limited job, not part of the boot image.
+pub static KFUZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kfuzz.elf"));
 pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the
@@ -148,14 +148,12 @@ pub(crate) fn any_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
 /// `with_state` for the code that does not hold the object lock yet (a kernel thread, a boot-time check): it takes the lock for the closure.
 #[track_caller]
 pub(crate) fn locked_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
-    irq::without(|| f(state()))
-}
-
-/// The user state for the few places that run inside a section the caller made (an `irq::without` that returns early with `?` or `return`, which a closure
-/// would change): the object lock is asserted held. Everything else goes through `with_state`.
-#[track_caller]
-fn state_locked() -> &'static mut UserState {
-    state()
+    irq::without(|| {
+        // (KT14: the debug guard of `with_state` covers this entry too, so a closure of either kind that opens the other is caught)
+        #[cfg(debug_assertions)]
+        let _one = StateOpen::enter();
+        f(state())
+    })
 }
 
 #[track_caller]
@@ -166,7 +164,7 @@ fn state() -> &'static mut UserState {
         "user state touched without the big kernel lock"
     );
     // SAFETY: the object lock is held (debug-checked), so no other hart has the state; every caller drops the reference before any context switch, and
-    // `with_state` never nests (a debug guard panics on a second open while one is live: T239), so no two live `&mut` alias.
+    // `with_state` and `locked_state` never nest (a debug guard panics on a second open of either while one is live: T239, KT14), so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
         slot.get_or_insert_with(|| {
@@ -177,6 +175,8 @@ fn state() -> &'static mut UserState {
                 crate::kstack::MAX_SLOTS as usize,
             );
             s.backstops = b;
+            // (KT9, T177: the address-space cells `process_create` arms, one per process the backstop allows)
+            s.fill_as_pool(b.processes);
             s.objs.set_caps(b.objects, b.ipc_bytes);
             // (the kernel's own table holds one end per process and job: bounded by the object backstop, like the rest)
             s.ktable = kcore::handle::HandleTable::new(b.objects);
@@ -217,10 +217,13 @@ pub fn reported() -> (u32, u32) {
 /// How many processes exist right now (a leak counter for tests).
 /// (jobs alive including the root, and the root job's live processes, threads, objects, queued
 /// IPC bytes and kernel bytes): `(1, 0, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
-/// J2). Applies the credits of destroyed objects first.
+/// J2). Applies the credits of destroyed objects first. The kernel bytes exclude the page-index leaves of the VMOs that are alive (T249: each VMO's
+/// index is charged to its job while it lives; the tests count the surviving VMOs themselves), so a leaf charge that outlives its VMO shows.
 pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
     locked_state(|s| {
         ipc::settle(&mut s.objs, kmem::jobs().jobs);
+        // (the memory locks before the job ledger's: the lock order)
+        let index = kmem::get().vmos.index_bytes_of_job(JobId::ROOT);
         let jobs = &kmem::jobs().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
         (
@@ -229,7 +232,7 @@ pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
             u.threads,
             u.objects,
             u.ipc_bytes,
-            u.kernel_bytes,
+            u.kernel_bytes.saturating_sub(index),
         )
     })
 }
@@ -301,10 +304,18 @@ pub(crate) fn dump_state() {
             out,
             "##SCHED user: job exception channels {:?}, suspends {:?}, parked {:?}",
             s.job_exc.keys().collect::<alloc::vec::Vec<_>>(),
-            s.suspends.keys().collect::<alloc::vec::Vec<_>>(),
-            s.parked_tids
+            s.threads
+                .iter()
+                .filter(|(_, t)| t.suspend.is_some())
+                .map(|(tid, _)| *tid)
+                .collect::<alloc::vec::Vec<_>>(),
+            s.threads
+                .iter()
+                .filter(|(_, t)| t.parked)
+                .map(|(tid, _)| *tid)
+                .collect::<alloc::vec::Vec<_>>()
         );
-        for (pid, p) in &s.procs {
+        for (pid, p) in s.procs.iter() {
             if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
                 continue;
             }

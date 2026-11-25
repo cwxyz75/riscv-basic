@@ -597,14 +597,19 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 return true;
             }
         }
-        // A hart that is about to sleep looks at the others' queues first (the spec's `overloaded` mask, read the slow way): with no
-        // periodic tick nothing else would make it pull work whose mark was spent while it was busy or already asleep (a thread queued
-        // behind others on a busy hart, with every mark for it consumed). Only a thread this hart may take counts, so an idle hart does
-        // not spin on work that is pinned elsewhere or in transit.
-        for g in 0..self.harts() {
-            if g == h || !self.is_online(g) {
+        // A hart that is about to sleep looks at the others' queues first (the spec's `overloaded` mask, SC2): with no periodic tick nothing else would
+        // make it pull work whose mark was spent while it was busy or already asleep (a thread queued behind others on a busy hart, with every mark for it
+        // consumed). Only the harts the mask names are looked at, and only a thread this hart may take counts, so an idle hart does not spin on work that
+        // is pinned elsewhere or in transit. The mask is published under the hart's lock, before it is let go (`Hq::drop`), so a bit that is clear here
+        // is one that hart's last change cleared: the same answer the lock would have given, and a queue filled after this read sends its own mark.
+        let mut cand = self.masks.overloaded.load(Ordering::SeqCst) & !(1u64 << h);
+        while cand != 0 {
+            let g = cand.trailing_zeros() as usize;
+            cand &= cand.wrapping_sub(1);
+            if !self.is_online(g) {
                 continue;
             }
+            self.pull_looks.fetch_add(1, Ordering::Relaxed);
             let src = self.lq(g);
             if src
                 .queued_top_where(&|t| {

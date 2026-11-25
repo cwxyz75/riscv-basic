@@ -163,12 +163,48 @@ fn note_free(h: &Heaps) {
         POOL_STARVED.store(false, Ordering::Relaxed);
     }
     LOW.store(
-        h.boot.free().saturating_add(h.grown.free()) < LOW_WATER
+        h.boot.free().saturating_add(h.grown.free()) < low_water()
             || (h.pool_count < POOL_LOW
                 && POOL_READY.load(Ordering::Relaxed)
                 && !POOL_STARVED.load(Ordering::Relaxed)),
         Ordering::Relaxed,
     );
+}
+
+/// KT9, T177 class N: the free bytes class R (an allocation a call can be refused) may not take: a base plus a share for every thread that exists, since
+/// what the allocations that cannot fail (the scheduler's queues, teardown) need grows with the population, and the population cannot grow once class R
+/// is refused. An estimate, not a proof: a fragmented free list can still fail a large class-N request (a tidy item of T177).
+const RESERVE_BASE: usize = 1024 * 1024;
+const RESERVE_PER_THREAD: usize = 256;
+
+/// Set when the machine is up (the harts have their records and the frame database exists): before it nothing is refused.
+static RESERVE_ON: AtomicBool = AtomicBool::new(false);
+
+/// Start refusing class R below the reserve (called once, after boot).
+pub fn enable_reserve() {
+    RESERVE_ON.store(true, Ordering::Release);
+}
+
+/// The reserve now.
+pub fn reserve() -> usize {
+    RESERVE_BASE.saturating_add(
+        RESERVE_PER_THREAD.saturating_mul(crate::kstack::LIVE.load(Ordering::Relaxed)),
+    )
+}
+
+/// The heap grows when fewer than this are free: `LOW_WATER` above the reserve, so growth still leads.
+fn low_water() -> usize {
+    LOW_WATER.saturating_add(reserve())
+}
+
+/// Is the allocation on this hart one that cannot be refused (class N)? Inside `nofail`, or while a scheduler lock is held (the order checker's stack
+/// sees every holder; the scheduler needs no call-site marker). Interrupts are off.
+fn is_class_n() -> bool {
+    let me = crate::percpu::this();
+    me.nofail_depth.load(Ordering::Relaxed) != 0
+        || me
+            .held
+            .with(|h| h.holds(klock::Class::Tt) || h.holds(klock::Class::Rq))
 }
 
 /// Bytes of the window mapped so far (the grown heap's size).
@@ -300,12 +336,31 @@ fn small_free(addr: usize) {
 // objects come from the slab allocator behind this hart's magazines (interrupts off), and go back there.
 unsafe impl GlobalAlloc for IrqSafeHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "fault-alloc")]
+        if faultalloc::should_fail() {
+            return core::ptr::null_mut();
+        }
         if let Some(class) = slab::class_for(layout.size(), layout.align()) {
             if let Some(p) = small_alloc(class) {
                 return p;
             }
         }
+        let gated = RESERVE_ON.load(Ordering::Acquire) && {
+            let was = irq::save_and_disable();
+            let n = is_class_n();
+            irq::restore(was);
+            !n
+        };
         with_heaps(|h| {
+            if gated
+                && h.boot
+                    .free()
+                    .saturating_add(h.grown.free())
+                    .saturating_sub(layout.size())
+                    < reserve()
+            {
+                return core::ptr::null_mut(); // (class R below the reserve: refused, the caller reports NoMemory)
+            }
             let p = match h.boot.allocate_first_fit(layout) {
                 Ok(p) => p.as_ptr(),
                 Err(()) => h
@@ -341,6 +396,105 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
             note_free(h);
         });
     }
+}
+
+/// KT9, the guest half: fail the Nth allocation that one armed thread makes (once), so a program can sweep N over a scenario. An infallible allocation
+/// on the path ends in the allocation-error handler, a panic the harness reports with the scenario that was running.
+#[cfg(feature = "fault-alloc")]
+pub mod faultalloc {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static ARMED: AtomicU64 = AtomicU64::new(0); // the armed thread's id plus one
+    static FAIL_AT: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    /// Counting and failing are suspended (a scenario sets up and tears down with memory, and arms only the call under test: `debug_stat` 207).
+    static PAUSED: AtomicBool = AtomicBool::new(false);
+    /// Every class-R allocation from the Nth on fails, not just the Nth (what exhaustion with the reserve in force looks like, KT9).
+    static PERSIST: AtomicBool = AtomicBool::new(false);
+
+    /// `arm`, persistent.
+    pub fn arm_persist(n: u64) {
+        arm(n);
+        PERSIST.store(true, Relaxed);
+    }
+
+    /// Arm for the calling thread: its `n`th allocation from now fails.
+    pub fn arm(n: u64) {
+        COUNT.store(0, Relaxed);
+        FIRED.store(false, Relaxed);
+        FAIL_AT.store(n, Relaxed);
+        ARMED.store(crate::thread::current().saturating_add(1), Relaxed);
+    }
+
+    /// Suspend (`true`) or resume (`false`) the armed thread's counting and failing.
+    pub fn pause(on: bool) {
+        PAUSED.store(on, Relaxed);
+    }
+
+    /// Disarm; whether the failure was injected.
+    pub fn disarm() -> bool {
+        ARMED.store(0, Relaxed);
+        PAUSED.store(false, Relaxed);
+        PERSIST.store(false, Relaxed);
+        FIRED.load(Relaxed)
+    }
+
+    /// Allocations the armed thread has made since `arm`.
+    pub fn count() -> u64 {
+        COUNT.load(Relaxed)
+    }
+
+    pub(super) fn should_fail() -> bool {
+        let armed = ARMED.load(Relaxed);
+        if armed == 0 || PAUSED.load(Relaxed) || crate::thread::current().saturating_add(1) != armed
+        {
+            return false;
+        }
+        // (class N is not refused by the reserve, so it is not failed here either: inside `nofail`, or with a scheduler lock held; not counted either, so
+        // that N does not move with what the scheduler does)
+        {
+            let was = crate::irq::save_and_disable();
+            let n = super::is_class_n();
+            crate::irq::restore(was);
+            if n {
+                return false;
+            }
+        }
+        let c = COUNT.fetch_add(1, Relaxed).saturating_add(1);
+        if PERSIST.load(Relaxed) && c >= FAIL_AT.load(Relaxed) {
+            FIRED.store(true, Relaxed);
+            return true;
+        }
+        if c == FAIL_AT.load(Relaxed) {
+            FIRED.store(true, Relaxed);
+            // (where the failure was injected: `scripts/resolve_trace.py` turns the words into the call chain, so a panic that follows can be placed)
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    crate::console::PanicConsole::new(),
+                    "alloc fail: n={c}{}",
+                    crate::Trace
+                );
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Run `f`, whose allocations cannot be refused because nobody could be told (KT9, T177 class N: the scheduler core, which allocates on every spawn,
+/// sleep and wake, and teardown): they may use the allocator's reserve, which class R cannot (`reserve`), and the `fault-alloc` sweep does not fail them.
+/// Each use is counted by the docs check
+/// (`scripts/check_docs.py`), so the class cannot grow silently.
+pub fn nofail<R>(f: impl FnOnce() -> R) -> R {
+    // (the hart is the one the section starts on, and the count is put back on the same record: every use of `nofail` but the boot's is with interrupts
+    // already off, under the object lock or a scheduler lock, so the thread does not move; where it could, the count only stays a little off on the hart
+    // it started on, which is the lenient side)
+    let me = crate::percpu::this();
+    me.nofail_depth.fetch_add(1, Ordering::Relaxed);
+    let r = f();
+    me.nofail_depth.fetch_sub(1, Ordering::Relaxed);
+    r
 }
 
 #[global_allocator]
@@ -443,7 +597,7 @@ pub fn needs_service() -> bool {
 /// The safe point: with the big kernel lock held, make sure the heap has headroom (see the module comment).
 pub fn service() {
     // (until the heap is back above the low-water mark, or nothing more can be added)
-    while LOW.load(Ordering::Relaxed) && free_bytes() < LOW_WATER {
+    while LOW.load(Ordering::Relaxed) && free_bytes() < low_water() {
         if grow(GROW_STEP) == 0 {
             break;
         }

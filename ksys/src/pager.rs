@@ -20,6 +20,7 @@ fn map_vmo_error(e: VmoError) -> Status {
         VmoError::Gone => Status::BadHandle,
         VmoError::NoMemory => Status::NoMemory,
         VmoError::NotSuppliable => Status::BadState,
+        VmoError::Busy => Status::ShouldWait,
         _ => Status::InvalidArgs,
     }
 }
@@ -38,6 +39,8 @@ pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64
         .handles
         .reserve(2)
         .map_err(|_| Status::NoMemory)?;
+    us.pager_ends.reserve(1).map_err(|_| Status::NoMemory)?;
+    us.pagers.reserve_pager().map_err(|_| Status::NoMemory)?;
     let id = us.next_pager;
     let UserState {
         objs,
@@ -67,7 +70,7 @@ pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64
         Ok((ph, _)) => {
             us.next_pager = id.saturating_add(1);
             pagers.create(id);
-            pager_ends.insert(id, kernel_end);
+            pager_ends.insert_reserved(id, kernel_end);
             Ok((ph.0, ch.0))
         }
         Err(e) => {
@@ -116,7 +119,7 @@ pub fn pager_supply<M: PhysMem>(
     machine: &mut impl Machine,
     me: u64,
     a: [u64; 6],
-) -> Result<Vec<Tid>, Status> {
+) -> Result<(), Status> {
     let (pager, vmo, first, count) = range(us, vmos, me, &a)?;
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let src = ipc::vmo_of(&us.objs, &caller.handles, Handle(a[4]), Rights::WRITE)?;
@@ -131,11 +134,9 @@ pub fn pager_supply<M: PhysMem>(
     // V1: a process of another job than the source's holds its mapping on the promise that touching it never fails; taking pages from under
     // it would break that (as `vmo_decommit` refuses)
     let src_job = vmos.job_of(src).ok_or(Status::BadHandle)?;
-    if us
-        .procs
-        .values()
-        .any(|p| p.job != src_job && p.aspace.held_ref().maps_vmo_range(src, sfirst, count))
-    {
+    if vmos.maps_other_job(src, sfirst, count, src_job, &|o| {
+        us.procs.get(&o).map(|p| p.job)
+    }) {
         return Err(Status::BadState);
     }
     // (refused for what is wrong with the VMOs before any mapping is touched)
@@ -155,26 +156,17 @@ pub fn pager_supply<M: PhysMem>(
         Ok(n) => (n, None),
         Err((n, e)) => (n, Some(e)),
     };
-    let woken = us.pagers.supply(pager, vmo, first, moved);
+    // (the pages that did move are supplied, and their waiters end, whatever the call answers; the kernel wakes them with `drain_woken`)
+    us.pagers.supply(pager, vmo, first, moved);
     match err {
-        // (the pages that did move are supplied, and their waiters wake; the error path of a call has nowhere to return them, so the kernel
-        // takes them from `pending_wake`)
-        Some(e) => {
-            us.pending_wake.extend(woken);
-            Err(map_vmo_error(e))
-        }
-        None => Ok(woken),
+        Some(e) => Err(map_vmo_error(e)),
+        None => Ok(()),
     }
 }
 
 /// `pager_fail(pager, vmo, offset, length, status)`: the pager cannot supply these pages; the threads waiting for them fail with `status`
 /// (a faulting thread takes a PAGER exception, a kernel copy returns it). Returns the threads to wake.
-pub fn pager_fail(
-    us: &mut UserState,
-    vmos: &Vmos,
-    me: u64,
-    a: [u64; 6],
-) -> Result<Vec<Tid>, Status> {
+pub fn pager_fail(us: &mut UserState, vmos: &Vmos, me: u64, a: [u64; 6]) -> Result<(), Status> {
     let (pager, vmo, first, count) = range(us, vmos, me, &a)?;
     // (a failure the reader can act on: not OK, and not one of the codes that mean "try again" or "stopped by the caller")
     let status = i32::try_from(a[4] as i64)
@@ -182,28 +174,28 @@ pub fn pager_fail(
         .and_then(Status::from_code)
         .filter(|s| !matches!(s, Status::Ok | Status::ShouldWait | Status::Interrupted))
         .ok_or(Status::InvalidArgs)?;
-    Ok(us.pagers.fail(pager, vmo, first, count, status))
+    us.pagers.fail(pager, vmo, first, count, status);
+    Ok(())
 }
 
 /// The last handle to a pager was closed: the waits for its pages fail, and the kernel's end of its channel goes.
-pub fn pager_destroyed(us: &mut UserState, id: u64) -> Vec<Tid> {
-    let woken = us.pagers.destroy(id);
+pub fn pager_destroyed(us: &mut UserState, id: u64) {
+    us.pagers.destroy(id);
     if let Some(h) = us.pager_ends.remove(&id) {
         let UserState { objs, ktable, .. } = us;
         let _ = ktable.close(objs, h);
     }
-    woken
 }
 
 /// Write the requests of `pager` that have not been written yet (its channel was full), oldest first, until one does not fit. Returns the
 /// threads to wake if the pager's channel turned out to have no reader any more (every wait for its pages fails).
-pub fn pager_flush(us: &mut UserState, vmos: &Vmos, jobs: &mut Jobs, pager: u64) -> Vec<Tid> {
+pub fn pager_flush(us: &mut UserState, vmos: &Vmos, jobs: &mut Jobs, pager: u64) {
     let Some(&end) = us.pager_ends.get(&pager) else {
-        return Vec::new();
+        return;
     };
     loop {
         let Some(r) = us.pagers.unsent(pager) else {
-            return Vec::new();
+            return;
         };
         let UserState {
             objs,
@@ -216,7 +208,8 @@ pub fn pager_flush(us: &mut UserState, vmos: &Vmos, jobs: &mut Jobs, pager: u64)
             continue;
         };
         if ipc::channel_peer_closed(objs, ktable, end) {
-            return pagers.destroy(pager);
+            pagers.destroy(pager);
+            return;
         }
         let mut msg = Vec::new();
         for w in [key, r.page.saturating_mul(4096), 4096, abi::pager::READ, 0] {
@@ -225,7 +218,7 @@ pub fn pager_flush(us: &mut UserState, vmos: &Vmos, jobs: &mut Jobs, pager: u64)
         match ipc::channel_write_in(objs, ktable, end, &msg, &[], jobs) {
             Ok(()) => pagers.sent(pager),
             // (full, or the pager's job has no room for the message: the request stays pending and the waiter's wait goes on)
-            Err(_) => return Vec::new(),
+            Err(_) => return,
         }
     }
 }
@@ -238,28 +231,28 @@ pub fn pager_wait_begin(
     jobs: &mut Jobs,
     tid: Tid,
     need: PagerNeed,
-) -> Result<Vec<Tid>, Status> {
+) -> Result<(), Status> {
     // (a page supplied since the call found it missing, or a VMO that is gone, is nothing to wait for)
     if !vmos.still_needed(need) {
-        return Ok(Vec::new());
+        return Ok(());
     }
     // a pager whose channel has no reader is dead, whether or not it has anything to write
     if let Some(&end) = us.pager_ends.get(&need.pager) {
         if ipc::channel_peer_closed(&us.objs, &us.ktable, end) {
-            let woken = us.pagers.destroy(need.pager);
-            us.pending_wake.extend(woken);
+            us.pagers.destroy(need.pager);
             return Err(Status::PeerClosed);
         }
     }
     us.pagers.wait(tid, need.pager, need.vmo, need.page)?;
-    Ok(pager_flush(us, vmos, jobs, need.pager))
+    pager_flush(us, vmos, jobs, need.pager);
+    Ok(())
 }
 
 /// The request channel of a pager lost its reader (its user end's last handle went): the pager is dead and every wait for its pages fails.
 /// The kernel calls this after objects were destroyed; an empty table costs one test.
-pub fn reap_closed_channels(us: &mut UserState) -> Vec<Tid> {
+pub fn reap_closed_channels(us: &mut UserState) {
     if us.pager_ends.is_empty() {
-        return Vec::new();
+        return;
     }
     let UserState {
         objs,
@@ -268,16 +261,13 @@ pub fn reap_closed_channels(us: &mut UserState) -> Vec<Tid> {
         pagers,
         ..
     } = us;
-    let dead: Vec<u64> = pager_ends
+    while let Some(p) = pager_ends
         .iter()
-        .filter(|(p, h)| pagers.exists(**p) && ipc::channel_peer_closed(objs, ktable, **h))
+        .find(|(p, h)| pagers.exists(**p) && ipc::channel_peer_closed(objs, ktable, **h))
         .map(|(p, _)| *p)
-        .collect();
-    let mut woken = Vec::new();
-    for p in dead {
-        woken.extend(pagers.destroy(p));
+    {
+        pagers.destroy(p);
     }
-    woken
 }
 
 /// The thread's wait is over (or abandoned): forget it. `None`: it ended without a result (killed or interrupted).

@@ -109,12 +109,21 @@ the checked release build (`FUZZ_SEEDS`, `FUZZ_CALLS`). A failure prints its rep
 (`KFUZZ_SEEDS=<seed> KFUZZ_CALLS=<n> cargo test --profile release-checked -p ksys --test fuzz sequences`);
 `KFUZZ_TRACE=1` prints every call.
 
+The guest half is the program `init/src/bin/kfuzz.rs`: the same generator, its calls made through the system library against the real kernel, one seed per child process in a small job (the suite test `the_guest_fuzzer_leaves_nothing_behind` runs seeds 1 to 4 on every kernel boot; widen `SEEDS` there, or run the shard with a larger range, for a long hunt). A kernel panic is the boot test's `##PANIC`; after each child the job is killed and its counters (processes, threads, pages, jobs, objects, IPC bytes, kernel bytes) must settle at zero and the kernel heap must come back. A seed replays to the same calls (the window moves with ASLR, but the calls are relative to it).
+
 **The allocation-failure sweep.** `ksys/tests/allocfail.rs` runs each scenario with its N-th allocation failing, for
 every N until the scenario finishes without reaching it. Each case runs in a child process, because an infallible
 allocation aborts on failure: a child that dies is reported with the scenario, the N and the frames of the failing
 allocation. A child that survives must have returned NO_MEMORY from the call that met the failure, the same call must
 succeed when repeated with memory, and the state must pass the fuzzer's audits. `cargo test` runs the one-failure mode;
 `make os-allocfail` (overnight) adds the persistent mode, where every allocation from the N-th on fails.
+The guest half (`make os-fault-alloc` family, `init/src/bin/suite.rs` "alloc sweep") does the same in the real kernel: the suite thread arms the
+N-th allocation (`debug_stat` 200), runs a scenario, disarms (201) and checks that no VMO or object was left behind (204, 206, after a reachability
+sweep, 205). The epilogue of every call (wake commit, cleanup, copy-on-write sync) is **counted**, not exempt: what it allocates is either
+allocation-free (the wait table, the address-space scratch), refused with `NO_MEMORY` at an R point, or in `heap::nofail` (class N, counted per file by
+`scripts/check_docs.py`). After the one-failure sweep of a scenario a **persistent pass** (`debug_stat` 208) fails every class-R allocation from the
+first on, with class N exempt as the reserve makes it: nothing may panic or leak. (A scenario that touches a lazily committed page is left out of
+that pass: its fault ends the process, which is the right answer, and the process is the one running the suite.)
 `KALLOC_SCENARIO=<name>` and `KALLOC_MAX=<n>` run one scenario; `KALLOC_CHILD=<scenario>:<n>[:persist]` replays one case.
 
 **Mutation testing.** `make os-mutants` (overnight; cargo-mutants) mutates `kcore` and `klock` with their host tests as
@@ -136,7 +145,7 @@ benchmarks at a tenth of the iterations with sanity assertions only, so they can
 them in full at one and four harts and compares with `bench/baseline.tsv` through `scripts/bench_compare.py`: a
 threefold slowdown fails. The numbers are costs of the emulated machine and move with the host: read the ratios.
 `pair_scaling_<kind>_n<N>` (futex and `channel_call` pairs, one, two and four) is the cost per round trip over all pairs;
-`bench_compare.py` prints the scaling, the cost at one pair over the cost at N. `rt_latency_p99` and `rt_latency_max` are the
+`bench_compare.py` prints the scaling, the cost at one pair over the cost at N, and `--scaling-floor bench/scaling.tsv` (on in `make os-bench` and `make os-latency`) fails if a ratio falls below its recorded floor. The floors are tripwires for a collapse (about 60% of the lowest of three full runs), not the design's goals of 3.0 and 2.5, which are not gates (SCHED-SMP-SPEC amendment of 2026-11-24, T252); the measured figures at four harts are futex 0.5 to 1.3 (it swings with the pair's placement) and `channel_call` 0.8. `rt_latency_p99` and `rt_latency_max` are the
 real-time probe's lateness, printed by the kernel's scheduler test.
 
 **The latency trace.** `make os-latency` (soak) builds the kernel with the `latency-trace` feature, runs the suite at

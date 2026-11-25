@@ -14,7 +14,6 @@ use kcore::pagetable::PageTable;
 use kcore::usercopy::{copy_from_user, copy_to_user};
 use kcore::Mm;
 use ksys::{proc_call, Machine, PCtx, ProcState, Process, Reply};
-use std::collections::BTreeMap;
 
 mod common;
 use common::FakeMem;
@@ -57,20 +56,19 @@ impl Machine for Tlb {
 
 struct W {
     objs: Kobjs,
-    procs: BTreeMap<u64, Box<Process>>,
+    procs: ksys::ProcTable,
     mm: Mm<FakeMem>,
     vmos: Vmos,
     jobs: kcore::job::Jobs,
     tlb: Tlb,
 }
 
-fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
+fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId, pid: u64) -> Process {
+    let mut space = AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap());
+    space.set_owner_fresh(pid); // (the lists of mappings name processes)
     Process {
         live_tids: Default::default(),
-        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
-            1,
-            AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
-        )),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(pid, space)),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
@@ -86,11 +84,10 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: BTreeMap::new(),
         job,
-        table_charge: BTreeMap::new(),
-        charge_end: BTreeMap::new(),
-        stacks: BTreeMap::new(),
+        table_charge: kcore::fmap::FMap::new(),
+        charge_end: kcore::fmap::FMap::new(),
+        stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
         libsys: Default::default(),
@@ -104,9 +101,9 @@ fn world() -> (W, u64) {
         mem: FakeMem::default(),
     };
     let kernel = PageTable::new(&mut mm).unwrap();
-    let mut procs = BTreeMap::new();
-    procs.insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
-    procs.insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
+    let mut procs = kcore::fmap::FMap::new();
+    ksys::put_process(&mut procs, 1, process(&mut mm, &kernel, JobId::ROOT, 1));
+    ksys::put_process(&mut procs, 2, process(&mut mm, &kernel, JobId::ROOT, 2));
     let mut w = W {
         objs: Kobjs::new(),
         procs,
@@ -522,8 +519,8 @@ fn thread_and_process_info_report_cpu_time() {
         )
         .unwrap();
         let t = w.procs.get_mut(&target).unwrap();
-        t.live_tids.insert(tid);
-        t.thread_objs.insert(tid, o);
+        t.live_tids.try_insert(tid).unwrap();
+        ipc::thread_set_tid(&mut w.objs, o, tid);
         (h.0, o)
     };
     let (h7, o7) = make(&mut w, 7);
@@ -543,7 +540,6 @@ fn thread_and_process_info_report_cpu_time() {
     {
         let p = w.procs.get_mut(&target).unwrap();
         p.live_tids.remove(&7);
-        p.thread_objs.remove(&7);
     }
     ipc::thread_cpu_final(&mut w.objs, Some(o7), Some(pobj), 5000);
     ipc::thread_mark_terminated(&mut w.objs, o7, 0);
@@ -734,6 +730,17 @@ fn kill_and_stop_name_their_target_and_refuse_the_ended() {
     );
 }
 
+/// `job_kill` as the kernel runs it: the begin step, then the victims one at a time by process id.
+fn job_kill_victims(w: &mut W, me: u64, jh: abi::Handle) -> Result<(Vec<u64>, bool), Status> {
+    let (job, inside) = ksys::job_kill_begin(&w.objs, &w.procs, &mut w.jobs, me, jh)?;
+    let (mut v, mut after) = (Vec::new(), 0);
+    while let Some(p) = ksys::job_kill_next(&w.objs, &w.procs, &w.jobs, me, jh, job, after) {
+        v.push(p);
+        after = p;
+    }
+    Ok((v, inside))
+}
+
 #[test]
 fn job_kill_closes_the_job_and_names_the_victims() {
     let (mut w, _) = world();
@@ -742,8 +749,7 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     w.procs.get_mut(&2).unwrap().job = deeper;
     let jh = job_handle(&mut w, sub);
     // the caller (1) is outside the job: it is not a victim and not inside
-    let (v, inside) =
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(jh)).unwrap();
+    let (v, inside) = job_kill_victims(&mut w, 1, abi::Handle(jh)).unwrap();
     assert_eq!(
         (v, inside),
         (vec![2], false),
@@ -757,16 +763,12 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     );
     // the caller inside: ends last, not named
     w.procs.get_mut(&1).unwrap().job = sub;
-    let (v, inside) =
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(jh)).unwrap();
+    let (v, inside) = job_kill_victims(&mut w, 1, abi::Handle(jh)).unwrap();
     assert_eq!((v, inside), (vec![2], true));
     let weak = narrow(&mut w, jh, Rights::MANAGE);
+    assert_eq!(job_kill_victims(&mut w, 1, weak), Err(Status::AccessDenied));
     assert_eq!(
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, weak),
-        Err(Status::AccessDenied)
-    );
-    assert_eq!(
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(0x999)),
+        job_kill_victims(&mut w, 1, abi::Handle(0x999)),
         Err(Status::BadHandle)
     );
 }
@@ -800,7 +802,13 @@ fn thread_target_and_set_sched_rows() {
         Err(Status::BadState),
         "never started"
     );
-    w.procs.get_mut(&2).unwrap().thread_objs.insert(other, tobj);
+    w.procs
+        .get_mut(&2)
+        .unwrap()
+        .live_tids
+        .try_insert(other)
+        .unwrap();
+    ipc::thread_set_tid(&mut w.objs, tobj, other);
     assert_eq!(
         ksys::thread_target(&w.objs, &w.procs, 1, me_tid, th.0, Rights::MANAGE),
         Ok((other, 2))
@@ -919,15 +927,16 @@ fn decommit_takes_the_pages_from_every_mapping_and_asks_for_the_shootdown_only_w
         (0, 0),
         "no translation existed: no shootdown"
     );
-    // mapped and touched in two processes of the VMO's own job: both lose the pages, one shootdown
+    // mapped and touched in two processes of the VMO's own job: both lose the pages, a shootdown for each
     w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
     w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, W | R]);
     touch(&mut w, 1, VA + 2 * 4096);
     touch(&mut w, 2, VA + 3 * 4096);
     let jobs_before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
     w.ok(nr::VMO_DECOMMIT, [v, 2 * 4096, 2 * 4096, 0, 0, 0]);
-    assert_eq!(w.tlb.shootdowns, 1);
-    assert_eq!(w.tlb.flushes, 1);
+    // (one shootdown for each address space cleared, inside its section: the locks drop between two)
+    assert_eq!(w.tlb.shootdowns, 2);
+    assert_eq!(w.tlb.flushes, 2);
     for pid in [1, 2] {
         let a = w.procs[&pid].aspace.held_ref();
         assert!(a.table().translate(&w.mm, VA + 2 * 4096).is_none());

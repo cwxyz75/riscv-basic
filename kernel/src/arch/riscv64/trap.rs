@@ -505,6 +505,14 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     //
     let cause = frame.scause;
     let ready = crate::thread::scheduler_ready();
+    if !from_user
+        && ready
+        && (cause == (1 << 63) | 5 || cause == (1 << 63) | 9)
+        && crate::percpu::this().syscall_window.load(Ordering::SeqCst)
+    {
+        window_trap(frame, cause);
+        return;
+    }
     // An inter-hart interrupt (an external one carrying only message 1, `external_trap`) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
     let light = cause == (1 << 63) | 5 && !ready;
@@ -612,6 +620,50 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::fp::return_to_user(frame);
         crate::user::user_mode_entered();
     }
+}
+
+/// T206: an interrupt taken inside `irq::window()` of a syscall, on the user thread's kernel stack above its ecall frame. It never switches, never takes the
+/// heap's service and never touches the FP unit (a kernel frame); it records what the interrupt asked for in `need_resched` and returns with interrupts off
+/// (SPIE cleared), so the window sees exactly this trap and then makes the switch itself at its own depth.
+/// Interrupts taken inside a syscall's window since boot (T206: a guest test reads it with `debug_stat(214)`).
+pub static WINDOW_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+#[inline(never)]
+fn window_trap(frame: &mut TrapFrame, cause: u64) {
+    WINDOW_TRAPS.fetch_add(1, Ordering::Relaxed);
+    if cause == (1 << 63) | 5 {
+        crate::percpu::this()
+            .timer_ticks
+            .fetch_add(1, Ordering::SeqCst);
+        if crate::thread::timer_interrupt() {
+            crate::percpu::this()
+                .need_resched
+                .store(true, Ordering::SeqCst);
+        }
+    } else {
+        let ids = crate::aia::claim();
+        let devices = ids & !crate::aia::IPI_BIT;
+        let reasons = if ids & crate::aia::IPI_BIT != 0 {
+            crate::smp::ipi_interrupt()
+        } else {
+            0
+        };
+        let mut ask = reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::reschedule_fast();
+        if devices != 0 {
+            crate::bkl::lock();
+            if crate::aia::deliver(devices, crate::user::irq_fired) {
+                crate::user::wake_signal_waiters();
+            }
+            ask = true;
+            crate::bkl::unlock();
+        }
+        if ask {
+            crate::percpu::this()
+                .need_resched
+                .store(true, Ordering::SeqCst);
+        }
+    }
+    frame.sstatus &= !(1 << 5); // SPIE: return with interrupts off
 }
 
 /// An inter-hart interrupt on its own (no device message came with it): the quiet paths of L12b, the lock only when the hart has scheduling to do.

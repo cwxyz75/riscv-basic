@@ -29,7 +29,22 @@ pub fn app_main() -> i32 {
         return 90;
     }
     drop(big);
-    if env.startup.args.get(1).map(|a| a.as_slice()) == Some(b"hog") {
+    let arg1 = env.startup.args.get(1).map(|a| a.as_slice());
+    if arg1 == Some(b"hog") || arg1 == Some(b"trim") {
+        if arg1 == Some(b"trim") {
+            // (T207 PR 5) the heap gives memory back: three rounds of 32 MiB made and freed, and then the cap is still a clean failure
+            for _ in 0..3 {
+                let mut blocks: Vec<Vec<u8>> = Vec::new();
+                for _ in 0..32 {
+                    let mut b: Vec<u8> = Vec::new();
+                    if b.try_reserve_exact(1 << 20).is_err() {
+                        return 94;
+                    }
+                    b.resize(1 << 20, 7);
+                    blocks.push(b);
+                }
+            }
+        }
         // allocate 1 MiB blocks until the heap says no: it must fail gracefully at its cap
         let mut blocks: Vec<Vec<u8>> = Vec::new();
         loop {

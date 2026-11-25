@@ -11,7 +11,6 @@ use kcore::job::{JobId, Limits, Resource, SchedLimits};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::Mm;
 use ksys::{ProcState, Process, UserState};
-use std::collections::BTreeMap;
 
 mod common;
 use common::FakeMem;
@@ -42,11 +41,10 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         killed: None,
         stopped: false,
         threads_alive: 0,
-        thread_objs: BTreeMap::new(),
         job,
-        table_charge: BTreeMap::new(),
-        charge_end: BTreeMap::new(),
-        stacks: BTreeMap::new(),
+        table_charge: kcore::fmap::FMap::new(),
+        charge_end: kcore::fmap::FMap::new(),
+        stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
         libsys: Default::default(),
@@ -70,10 +68,8 @@ fn world() -> W {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut us = UserState::new();
-    us.procs
-        .insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
-    us.procs
-        .insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
+    ksys::put_process(&mut us.procs, 1, process(&mut mm, &kernel, JobId::ROOT));
+    ksys::put_process(&mut us.procs, 2, process(&mut mm, &kernel, JobId::ROOT));
     let mut vmos = Vmos::new();
     let mut jobs = kcore::job::Jobs::new();
     let code = vmos.create(&mut jobs, 1);
@@ -445,7 +441,7 @@ fn a_suspended_thread_is_made_with_its_object_stopped_and_a_register_image() {
     assert_eq!(w.spawn(r), Err(Status::InvalidArgs));
     let mut r = w.plain();
     r[5] = u64::from(sp::SUSPENDED) << 32;
-    let s = w.spawn(r).unwrap();
+    let mut s = w.spawn(r).unwrap();
     assert!(s.suspended);
     // the object says SUSPENDED from the start, and the image is the entry, the stack and the argument (a1 is filled with the tid later)
     let obj = s.obj.unwrap();
@@ -458,14 +454,15 @@ fn a_suspended_thread_is_made_with_its_object_stopped_and_a_register_image() {
     assert_eq!(image[9], 7, "a0 is the argument");
     assert_eq!(image[3], 0x1234, "tp");
     // the spawner records the stopped state once it has the tid; suspend, resume and state then work on it
-    ksys::thread_spawned_suspended(&mut w.us, 77, &s);
+    ksys::thread_registered_by_spawner(&mut w.us, 77, &mut s);
     assert!(w
         .us
-        .suspends
-        .get(&77)
+        .suspend_of(77)
         .is_some_and(|x| x.stopped() && x.parked()));
     assert_eq!(
-        w.us.initial_regs.get(&77).map(|g| g[10]),
+        w.us.thread(77)
+            .and_then(|t| t.initial_regs.as_deref())
+            .map(|g| g[10]),
         Some(77),
         "a1 is the tid"
     );
@@ -488,33 +485,32 @@ fn a_resume_before_a_suspended_thread_first_runs_is_not_lost() {
     let mut w = world();
     let mut r = w.plain();
     r[5] = u64::from(sp::SUSPENDED) << 32;
-    let s = w.spawn(r).unwrap();
+    let mut s = w.spawn(r).unwrap();
     // the spawner's half, and a resume at once (the fork-child sequence with no pause)
-    ksys::thread_registered_by_spawner(&mut w.us, 77, &s);
-    ksys::thread_spawned_suspended(&mut w.us, 77, &s);
+    ksys::thread_registered_by_spawner(&mut w.us, 77, &mut s);
     let (tid, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
     assert_eq!((tid, wake), (77, true));
     // the thread's own registration, when it first runs: the image the spawner made says that the stopped state was registered, and a resume
     // has used it up, so the thread does not make it again (the kernel's `user_thread_main` tests this)
-    assert!(w.us.initial_regs.contains_key(&77));
-    assert!(!w.us.suspends.contains_key(&77), "not suspended again");
+    assert!(w.us.thread(77).is_some_and(|t| t.initial_regs.is_some()));
+    assert!(w.us.suspend_of(77).is_none(), "not suspended again");
 }
 
 #[test]
 fn a_thread_asleep_in_the_park_at_the_return_counts_as_parked_not_blocked_in_a_call() {
     let mut w = world();
-    let s = w.spawn(w.plain()).unwrap();
-    ksys::thread_registered_by_spawner(&mut w.us, 88, &s);
+    let mut s = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 88, &mut s);
     // the thread is asleep in the park of a stopped process (the scheduler says "blocked"): a suspend finds it there
-    w.us.parked_tids.insert(88);
+    w.us.thread_mut(88).unwrap().parked = true;
     ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| true).unwrap();
     assert!(
         ksys::thread_state_target(&w.us, 1, 5, s.handle, true).is_ok(),
         "its registers can be written: it is parked at the return to user mode"
     );
     // a thread that is blocked in a call and not parked there: a read, no write
-    let s2 = w.spawn(w.plain()).unwrap();
-    ksys::thread_registered_by_spawner(&mut w.us, 89, &s2);
+    let mut s2 = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 89, &mut s2);
     ksys::thread_suspend(&mut w.us, 1, 5, s2.handle, |_| true).unwrap();
     assert!(ksys::thread_state_target(&w.us, 1, 5, s2.handle, false).is_ok());
     assert_eq!(
@@ -527,14 +523,14 @@ fn a_thread_asleep_in_the_park_at_the_return_counts_as_parked_not_blocked_in_a_c
 fn a_suspend_that_finds_a_thread_still_asleep_in_the_park_raises_suspended() {
     // (resume, then suspend again before the woken thread has run to leave the park: the signal the resume dropped must rise again)
     let mut w = world();
-    let s = w.spawn(w.plain()).unwrap();
-    ksys::thread_registered_by_spawner(&mut w.us, 90, &s);
-    w.us.parked_tids.insert(90);
+    let mut s = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 90, &mut s);
+    w.us.thread_mut(90).unwrap().parked = true;
     let (_, raised) = ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| false).unwrap();
     assert!(raised, "parked at the return: stopped, SUSPENDED up");
     let (_, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
     assert!(wake);
-    // the thread has not run: it is still in `parked_tids`
+    // the thread has not run: it is still parked
     let (_, raised) = ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| false).unwrap();
     assert!(
         raised,

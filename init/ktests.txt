@@ -1,5 +1,6 @@
 # The Kernel tests of the suite (KT1): they start no server and need no disk, network or console service. `shard=k` runs
 # exactly these, except that `kfast` boots (one and two harts) skip those marked `slow` (about 40 s of the 77 s a one-hart boot takes on the development machine) (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test.
+a_two_gib_vmo_committed_whole_stays_within_the_latency_bound
 user_mode_runs_and_prints
 clock_advances_in_user_mode
 unknown_syscalls_are_refused
@@ -43,6 +44,8 @@ fetch_the_program_image
 fetch_the_hello_image
 fetch_the_conformance_image
 abi_conformance_passes
+fetch_the_fuzzer_image
+the_guest_fuzzer_leaves_nothing_behind
 child_exit_code_and_terminated_signal
 programs_are_placed_at_random
 the_system_library_is_in_every_process
@@ -144,6 +147,11 @@ a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not slo
 job_limits_stop_a_process_bomb_and_usage_comes_back
 job_limits_stop_a_thread_bomb
 job_memory_limits_stop_a_hog_and_are_credited_back
+a_decommit_under_way_refuses_the_calls_that_would_race_it
+a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory
+a_two_gib_sparse_vmo_is_mapped_touched_and_given_back
+a_close_that_frees_a_chain_takes_interrupts_between_its_slices
+the_heap_gives_memory_back_when_it_is_freed
 vmo_decommit_and_resize_from_user_mode
 process_protect_and_range_unmap_from_user_mode
 a_write_to_a_protected_page_ends_the_process
@@ -192,6 +200,7 @@ bystander_cost_of_sleeping_bindings
 a_dead_client_frees_everything
 a_kill_storm_on_a_stream_loses_no_range
 a_jobs_region_quota_bounds_its_processes
+kernel_allocation_failure_sweep
 a_bad_stream_handle_is_refused
 a_process_ending_with_spawned_threads_leaks_nothing
 thread_spawn_starts_with_the_documented_state
@@ -204,3 +213,4 @@ a_job_limits_how_many_jobs_may_exist_below_it
 job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back
 job_create_sees_the_credit_of_a_job_closed_just_before
 threads_left_behind_when_init_exits
+the_page_index_is_charged_to_the_job

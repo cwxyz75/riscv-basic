@@ -1,5 +1,6 @@
 //! CNT1 (no kernel counter wraps): each counter is a u64 that refuses or retires at its end, never wraps. The ends are reached by
 //! starting the counter near them (the `ff=` boot arguments do the same in the kernel).
+mod common;
 use kcore::object::{Object, Registry};
 use kcore::sched2::{Error, FixedPrio, SchedAttr};
 use kcore::sched_smp::Sched2;
@@ -81,4 +82,42 @@ fn a_slot_whose_generation_is_exhausted_is_retired_not_wrapped() {
     let d = r.create(Plain);
     assert!(r.get(b).is_none() && r.get(a).is_none());
     assert!(r.get(d).is_some());
+}
+
+#[test]
+fn a_vmo_slot_whose_generation_is_exhausted_is_retired_not_wrapped() {
+    use kcore::aspace::Vmos;
+    use kcore::frame::FrameDb;
+    use kcore::job::Jobs;
+    use kcore::Mm;
+    {
+        let mut mm = Mm {
+            db: FrameDb::new(100, 10),
+            mem: common::FakeMem::default(),
+        };
+        let mut jobs = Jobs::new();
+        let mut v = Vmos::new();
+        v.set_first_generation(u32::MAX - 2);
+        // one slot cycles through its last generations: MAX - 2, MAX - 1, MAX
+        let mut dead = Vec::new();
+        let mut last = 0;
+        for _ in 0..3 {
+            v.reserve_one().unwrap();
+            let id = v.create(&mut jobs, 1);
+            assert!(v.pages(id).is_some());
+            assert_eq!(id & 0xffff_ffff, 1, "the same slot is reused");
+            last = id;
+            v.release(&mut mm, &mut jobs, id).unwrap();
+            dead.push(id);
+        }
+        assert_eq!(last >> 32, u64::from(u32::MAX), "the last one is at MAX");
+        // the slot at generation MAX is retired: the next VMO gets a new slot, and no old id is alive
+        v.reserve_one().unwrap();
+        let fresh = v.create(&mut jobs, 1);
+        assert_ne!(fresh & 0xffff_ffff, 1, "an exhausted slot is not reused");
+        for id in dead {
+            assert!(v.pages(id).is_none(), "id {id:#x} came back to life");
+        }
+        assert!(v.pages(fresh).is_some());
+    }
 }

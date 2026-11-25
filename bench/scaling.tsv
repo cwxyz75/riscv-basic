@@ -1,0 +1,7 @@
+# Scaling floors (T252; SCHED-SMP-SPEC amendment of 2026-11-24): label, series, N, the lowest acceptable `pair_scaling` ratio (cost at one pair over cost at N).
+# These are tripwires for a collapse, not the design goals (3.0 futex, 2.5 channel_call: not gates). Set at about 60% of the lowest of three full runs at four harts
+# (debug kernel, QEMU TCG, a loaded laptop, 2026-11-24): futex n4 0.97, 1.27, 0.51 (it swings with where the pair is placed, T231, T232); channel_call n4 0.85, 0.82, 0.82.
+# Change a floor on purpose, with the runs that justify it.
+smp4	pair_scaling_futex	4	0.3
+smp4	pair_scaling_channel_call	2	0.6
+smp4	pair_scaling_channel_call	4	0.5

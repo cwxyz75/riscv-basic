@@ -33,20 +33,22 @@ pub use create::process_create;
 pub mod exception;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
-    job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,
-    thread_target,
+    job_kill_begin, job_kill_next, job_set_sched, kill_target, stop_target,
+    thread_set_sched_target, thread_target,
 };
 pub use proc::{
-    cow_sync, place_anywhere, proc_call, LibRange, Machine, NoMap, PCtx, ProcState, Process,
-    SpawnStack, StartMap,
+    cow_sync, place_anywhere, proc_call, process_protect_begin, process_protect_end,
+    process_protect_step, process_unmap_begin, process_unmap_end, process_unmap_step, put_process,
+    vmo_range_begin, vmo_range_finish, vmo_range_next_owner, vmo_range_take, vmo_range_unmap_owner,
+    LibRange, Machine, NoMap, PCtx, ProcState, ProcTable, Process, ProtectCall, RangeBatch,
+    RangeCall, SpawnStack, StartMap, UnmapCall,
 };
-pub use state::{PendingRegs, ThreadStart, UserState};
+pub use state::{set_interrupt_in, PendingRegs, ThreadStart, Threads, UThread, UserState};
 pub use thread::{
     charge_thread, clamp_prio, credit_thread, initial_general, new_start, process_start,
     thread_at_return, thread_blocks, thread_is_suspended, thread_registered_by_spawner,
-    thread_resume, thread_spawn, thread_spawned_suspended, thread_start_suspended,
-    thread_state_target, thread_stop_pending, thread_suspend, thread_suspend_forget,
-    thread_unparked, total_threads, Spawn, KSTACK_PAGES,
+    thread_resume, thread_spawn, thread_state_target, thread_stop_pending, thread_suspend,
+    thread_suspend_forget, thread_unparked, total_threads, Spawn, KSTACK_PAGES,
 };
 pub use vmo::{vmo_call, vmo_commit_resolved, vmo_rw_resolved};
 pub use wait::{
@@ -207,7 +209,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
     let h = |i: usize| Handle(a[i]);
     let r: Reply = (|| match n {
         nr::HANDLE_CLOSE => handles
-            .close(objs, h(0))
+            .close_bounded(objs, h(0))
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
         nr::HANDLE_DUPLICATE => {
