@@ -767,3 +767,52 @@ rows; they are the load tasks 11 and 12 of `SCHED-SMP-SPEC.md` are planned to us
 4. **Both QEMU variants:** smoke runs only the default AIA machine at four harts and the rest is soak (12.2 Q18), matching `TESTING.md`; is that enough to tick the roadmap box, or do you want one plain-`virt`
    run in smoke as well?
 5. **Resolved (2026-11-14):** step 0's slirp checks were wanted and are done (3.2); what remains unchecked is listed there. Owner answers recorded: 1 names yes, 2 limits yes, 3 DMA charged to `devmgr` accepted as a shortcut (TIDY-UP T84), 4 one smoke boot yes.
+
+## Amendment 2026-11-25 (IOMMU): the net claim and the pools under the IOMMU
+
+Decided by OD148 and the owner's answers of 2026-11-25 (Q-IOMMU-ABI, Q-IOMMU-IRQ, Q-IOMMU-MODEL, Q-IOMMU-MSI). The contract is `IOMMU-SPEC.md`.
+It supersedes the passages of 3.1, 4.1, 4.2, 4.3, 5.1, 5.2, invariant N2's check and check Q16 named below; the section numbers are this
+file's.
+
+1. **Section 4.3, the `devmgr` net claim.** "The reply is `txid u32 | status i32 | flags u32 | pool sizes` with handles in this order: MMIO VMO
+   (RW), RX DMA VMO, TX DMA VMO, queue DMA VMO (each with the `DMA` right), and, if `flags` bit 0 is set, the interrupt." and "The DMA VMOs are
+   created by `devmgr` (only the root resource can), so **they are charged to `devmgr`'s job** (a shortcut recorded in TIDY-UP: the claimant's
+   job should pay); the three together are 130 pages of the 1024-page system DMA budget." Superseded: the device is a virtio-pci function, claimed
+   by the steps of IOMMU-SPEC 9. The reply carries the VMO of the device's register BAR in place of the MMIO slot, the three DMA VMOs, a handle
+   to the device's **domain**, and one **interrupt handle per vector** in place of the optional interrupt; `index` counts virtio-net functions in
+   ascending device id. The DMA VMOs are still created by `devmgr`, with `vmo_create_dma_in` naming **the claimant's job**, which pays for them and
+   for the domain (IOMMU-SPEC 5.3); the system backstop is RAM / 16 pages. `netsup` keeps the control rights on the domain and gives `netdrv` a
+   duplicate with the map and unmap rights only. `Busy` and `NoDevice` stand; a released device has bus mastering cleared and is reset by
+   `devmgr`, and its domain destroyed, before it can be claimed again.
+2. **Section 5.1, Memory.** "Created by `devmgr` (DMA) and `netsup` (rings)" and the three "DMA VMO" rows. The sizes and contents stand. A DMA VMO
+   is not physically contiguous. Each is mapped **into the device's domain** by `netdrv`: the receive pool and the queue memory read-write for the
+   device, the transmit pool read-only for the device. The addresses the driver writes into the virtqueues are the I/O addresses `iodomain_map`
+   returned; no process learns a physical address (`vmo_phys_addr` is a stub that returns NOT_SUPPORTED: IOMMU-SPEC 4.8).
+3. **Section 3.1, the test machine.** "`-device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56`" and "plus the existing `-global
+   virtio-mmio.force-legacy=false` (the transport is modern virtio-mmio, version 2, exactly as `blkd`)". Superseded: the machine has the
+   platform IOMMU (`-M virt,aia=aplic-imsic,iommu-sys=on`) and the device is `virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56,iommu_platform=on,
+   disable-legacy=on` at a fixed slot; the `virtio-mmio` global goes. `iommu_platform=on` is a requirement of the test machine, not an option
+   (IOMMU-SPEC 15.1, L1). The `-netdev` and `filter-dump` lines stand. The facts of 3.2 about the virtio-mmio slots, and the first row of 3.3,
+   describe the earlier transport.
+4. **Sections 4.1 and 4.2.** In the table of 4.1, `netdrv`'s "MMIO slot (RW), interrupt (or none), the three DMA VMOs **with `DMA` right** (not
+   mapped, except the queue page)" becomes: the VMO of the device's register BAR, one interrupt handle per vector, the three DMA VMOs with the
+   `DMA` right (the transmit pool without WRITE), and a handle to the device's domain with the map and unmap rights only. In 4.2, "The MMIO slot
+   and interrupt (from `devmgr`)" and "It resets the device (virtio status 0) before any new driver starts": `netsup` still holds the three DMA
+   VMOs, the rings and the rest across child lifetimes, but the device's domain, its mappings and its vectors do **not** outlive a driver: when
+   `netdrv` dies the function is reset with bus mastering cleared, its domain is destroyed and a new one is made at the re-claim
+   (IOMMU-SPEC 10.2, 10.4), and the new driver maps the same pools afresh.
+5. **Section 5.2.** "Transport: virtio-mmio version 2 (modern). The driver reads magic `0x74726976`, version 2, device id 1." Superseded: the
+   transport is modern virtio-pci, through the VMO of the device's register BAR; the driver never sees configuration space (IOMMU-SPEC 9).
+   "**only `VIRTIO_F_VERSION_1` (bit 32) and `VIRTIO_NET_F_MAC` (bit 5)**": a third feature is required and accepted,
+   `VIRTIO_F_ACCESS_PLATFORM` (bit 33), without which the device would bypass the IOMMU; the list of refused features stands. "**Wake source:**
+   an interrupt object if `interrupt_create` succeeds ..., otherwise a poll on the timer tick": the wake source is always the device's vectors,
+   handed over at the claim; there is no mode without an interrupt. The safety poll of 5.5 stands. Every address written into a virtqueue is an
+   I/O address.
+6. **Invariant N2.** "The stack never learns a physical address and never maps a pool writable that it should not. *Check:* `netd`'s handles
+   lack `DMA`". The invariant stands and is wider: **no** process learns a physical address, the driver included (IOMMU-SPEC IO6). `netd`'s
+   handles still lack `DMA`, which now means it cannot map a pool for the device. Added to the check: the device cannot write the transmit pool
+   (`net_device_cannot_write_the_transmit_pool`, IOMMU-SPEC 13).
+7. **Section 12.2, check Q16 `net_pools_cannot_be_abused`.** "`vmo_phys_addr` on `netd`'s pool handle is refused; the driver's address space
+   has no pool mapping." Superseded: `vmo_phys_addr` returns NOT_SUPPORTED for every caller, `netd` and `netdrv` alike; `iodomain_map` with
+   `netd`'s pool handles is ACCESS_DENIED (no `DMA` right); the driver's address space still has no pool mapping (it maps the pools for the
+   device, not for itself). The store to the RX pool from `netd`'s side still faults.

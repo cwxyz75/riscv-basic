@@ -157,7 +157,7 @@ def check_tiers():
     return out
 
 
-LIVING = ["CLAUDE.md", "README.md", "WORK-PLAN.md", "docs/README.md", "docs/specs", "docs/reference", "work", "home"]
+LIVING = ["CLAUDE.md", "README.md", "docs/README.md", "docs/specs", "docs/reference", "work", "home"]
 RETIRED = {"ROADMAP.md": "work/ (open items) or docs/records/roadmap-2026-11-18.md (history)",
            "TIDY-UP.md": "work/ (tidy items) or docs/records/done.md (closed ones)"}
 # Words that say how far the build has got. A spec describes the end state (owner, 2026-11-18): progress belongs in work/.
@@ -378,7 +378,7 @@ def md_files(paths):
 
 def check_layout():
     """Only the work lists and the two entry points live at the root (owner, 2026-11-18)."""
-    allowed = {"README.md", "CLAUDE.md", "WORK-PLAN.md"}
+    allowed = {"README.md", "CLAUDE.md"}
     return [f"{f}: documents live under docs/ (specs, reference, records); only {sorted(allowed)} stay at the root"
             for f in os.listdir(ROOT) if f.endswith(".md") and f not in allowed]
 
@@ -470,7 +470,7 @@ def main():
     # Every document the README and CLAUDE.md point at exists.
     for name in ["docs/README.md", "docs/specs/OS-ARCHITECTURE.md", "docs/reference/SYSCALLS.md",
                  "docs/reference/INVARIANTS.md", "docs/records/decisions.md", "docs/records/done.md",
-                 "WORK-PLAN.md", "work/README.md"]:
+                 "work/README.md"]:
         if not os.path.exists(os.path.join(ROOT, name)):
             problems.append(f"{name} is missing")
 

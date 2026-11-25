@@ -738,3 +738,32 @@ stands.
 ## Amendment 2026-11-20: inter-hart interrupts (PL6)
 
 Section "IPIs and TLB shootdowns" (SBI IPI and RFENCE): the inter-hart interrupt is a message to the target hart's IMSIC supervisor file (message id 1), not the SBI IPI extension; the AIA is required. Remote fences stay SBI RFENCE.
+
+## Amendment 2026-11-25 (IOMMU): DMA and device interrupts are isolated by an IOMMU
+
+Decided by OD148 and the owner's answers of 2026-11-25 (Q-IOMMU-ABI, Q-IOMMU-IRQ, Q-IOMMU-MODEL, Q-IOMMU-MSI). The contract is `IOMMU-SPEC.md`.
+Line numbers are those of this file as it stood on 2026-11-25.
+
+1. **Lines 212 and 213.** "Devices: **virtio-mmio** first (no PCI enumeration). PCI/virtio-pci later if realism is wanted." Superseded: the OS
+   track's devices are **virtio-pci** functions behind the platform RISC-V IOMMU, which the profile requires. virtio-mmio slots are not behind
+   that IOMMU and are not reachable from user mode. PCI enumeration lives in the device manager; the kernel has no PCI code (IOMMU-SPEC 2 and 9).
+2. **Section 11, the interrupt-objects bullet (lines 485 to 489).** "each interrupt line is an object. When it fires, the kernel masks it at the
+   APLIC and raises a signal; a userspace driver thread wakes, services the device, then acknowledges (which unmasks)." This stands for a wired
+   source. There is a second kind of interrupt object, the **vector** of a device domain: a device's MSI-X vector, translated by the IOMMU in MRIF
+   mode, masked by the enable bit of the vector's own interrupt file and unmasked by the acknowledgement. A vector is granted on a domain by its
+   supervisor; the driver's handle can wait and acknowledge and names nothing else (IOMMU-SPEC 8). PCI INTx is never an interrupt object.
+3. **Section 11, lines 493 to 497.** "**DMA is the honest weak spot.** QEMU's virtio devices access guest physical memory directly and there is no
+   IOMMU by default. Userspace drivers contain crashes (a stray pointer cannot corrupt the kernel) but not malice. DMA buffers are **pinned VMOs**
+   that expose physical addresses only to holders of a specific handle. A virtual IOMMU is a possible later tightening." Superseded: a device
+   reaches exactly the frames mapped into its **device domain**, with the access granted, and causes exactly the interrupts of the vectors granted
+   on it. DMA buffers are pinned VMOs mapped into the domain at I/O addresses the kernel chooses; no physical address is learnable from user mode;
+   a frame is freed only after the device's translation to it was invalidated and fenced. A driver holds, for DMA, its buffers and the map and
+   unmap rights on its own device's domain. Userspace drivers contain malice as far as IOMMU-SPEC 1 and 15 state, and no further.
+4. **Section 19, lines 708 and 709.** "Userspace drivers under DMA without an IOMMU do not contain malicious drivers (documented, accepted)."
+   Withdrawn. The risk that replaces it is IOMMU-SPEC 15.1: the isolation is proven on one emulated IOMMU, QEMU's virtio devices opt in to it, and
+   interrupt isolation rests on one optional capability (MRIF).
+5. **Section 11, the device-memory bullet (lines 490 to 492).** "the root resource can mint a VMO backed by a specific physical range (a device's
+   MMIO registers). A driver's whole authority is its MMIO VMO, its interrupt object and its DMA buffers." The first sentence stands, for the
+   ranges IOMMU-SPEC 2.6 admits. The second is superseded: a driver's whole authority over its device is the VMO of its register BAR, one
+   interrupt handle per granted vector, its DMA VMOs, and a handle to its device's domain with the map and unmap rights only (IOMMU-SPEC 9). It
+   holds no control right on the domain and nothing that names a physical address, an interrupt identity or configuration space.

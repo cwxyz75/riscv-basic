@@ -6,7 +6,7 @@ Usage:
   work.py next PREFIX           the next unused number for a prefix (T, L, ...), counting closed items too
   work.py blocked              items waiting on another item, with what they wait on
   work.py decisions             decisions waiting on the owner (kind: decision)
-  work.py list [--kind K] [--area A] [--horizon H] [--fixed-by ID] [--complexity L|M|H] [--change-risk L|M|H]
+  work.py list [--kind K] [--area A] [--horizon H] [--fixed-by ID] [--complexity L|M|H] [--change-risk L|M|H] [--epic NAME]
   work.py show ID [ID...]       print items in full
   work.py areas                 item counts per area
   work.py graph                 the blocked-by / fixed-by graph as Mermaid
@@ -43,10 +43,10 @@ AREAS = {
     "testing": "test harness, CI, flaky tests, oracles",
     "platform": "boot, build, hardware assumptions",
 }
-FIELDS = ["id", "kind", "title", "area", "horizon", "risk", "complexity", "change_risk", "blocked_by", "fixed_by", "refs"]
+FIELDS = ["id", "kind", "title", "area", "horizon", "risk", "complexity", "change_risk", "epic", "blocked_by", "fixed_by", "refs"]
 REQUIRED = ["id", "kind", "title", "area", "horizon"]
 LIST_FIELDS = {"blocked_by", "fixed_by", "refs"}
-NEAR_CAP = 15  # the near horizon is what WORK-PLAN.md orders; keep it short enough to read every session
+NEAR_CAP = 15  # the near horizon is what is worked on next; keep it short enough to read every session
 ID_RE = re.compile(r"^[A-Z][A-Za-z0-9-]*$")
 
 
@@ -125,6 +125,8 @@ def check(items):
             out.append(f"{name}: area {it.area!r} is not one of {sorted(AREAS)}")
         if it.risk and it.risk not in RISKS:
             out.append(f"{name}: risk {it.risk!r} is not one of {RISKS}")
+        if it.epic and not re.match(r"^[a-z0-9][a-z0-9-]*$", it.epic):
+            out.append(f"{name}: epic {it.epic!r} must be a branch name part like iommu-kernel (the branch is epic/<name>)")
         for f in ("complexity", "change_risk"):
             if getattr(it, f) and getattr(it, f) not in RISKS:
                 out.append(f"{name}: {f} {getattr(it, f)!r} is not one of {RISKS}")

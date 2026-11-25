@@ -9,3 +9,7 @@ horizon: someday
 A helper that runs a program with a deliberately narrowed capability set, and limits on resource exhaustion and covert channels beyond quotas.
 
 (Not specified, not scheduled, not committed: a direction from the design conversations of 2026-11-14 and 2026-11-15. Needs a spec, an acceptance check and an OD entry before it becomes a slice.)
+
+## Note (2026-11-25): the precondition "an IOMMU" is planned (T42)
+
+Running an untrusted **driver** needs DMA and interrupt isolation, which the system does not have yet: without an IOMMU a driver can point its device at any RAM. That is now specified (`docs/specs/IOMMU-SPEC.md`: a device reaches only the frames mapped into its domain and causes only the interrupts granted on it) and decided (OD148, OD162 to OD166), and planned as the IOMMU epic (state and order: `work/T42.md`). An untrusted driver becomes possible only when **IOMMU12** has merged (virtio-mmio off the allowlist, no physical address learnable from user mode, the hostile-driver matrix green), within the limits the spec states (its section 15.1). The per-job limits on I/O-mapped pages and interrupt vectors (hierarchical, set finite by the supervisor) are the resource-exhaustion part for drivers. Nothing else in this topic is changed by the epic.
