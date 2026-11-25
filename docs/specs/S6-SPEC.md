@@ -180,3 +180,32 @@ TIDY-UP work), one request in flight, message-copied bulk data.
 The device windows a physical VMO may name are no longer the fixed table this document describes (the eight virtio-mmio slots and the
 RTC page): the kernel builds them at boot from the device tree under a rule that fails closed (`KERNEL-V1-SPEC.md`, amendment 2026-11-20). On
 QEMU `virt` the result is the same two ranges.
+
+## Amendment 2026-11-25 (IOMMU)
+
+Decided by OD148 and the owner's answers of 2026-11-25 (Q-IOMMU-ABI, Q-IOMMU-IRQ, Q-IOMMU-MODEL, Q-IOMMU-MSI). The contract is `IOMMU-SPEC.md`.
+Line numbers are those of this file as it stood on 2026-11-25.
+
+1. **Section 1, the non-goals (lines 15 and 16).** "no IOMMU (DMA is trusted-driver, OD14), no hot-plug, no virtio-pci". The first and the third
+   are withdrawn: the block driver's device is a virtio-pci function behind the required IOMMU, and DMA is no longer trusted-driver (IOMMU-SPEC 1).
+   "no hot-plug" stands.
+2. **Section 3, "DMA VMOs" (lines 55 to 61).** "`vmo_create_dma(resource, pages) -> vmo`: `pages` physically contiguous frames (at most
+   `MAX_DMA_PAGES` = 64 per object, 4 MiB total across the system), committed and zeroed at creation, charged to the *caller's job* pages like any
+   VMO, freed with the VMO. The extra right `DMA` on the handle gates `vmo_phys_addr(vmo) -> pa`; a plain duplicate without `DMA` cannot learn
+   physical addresses. Mappable READ/WRITE. A DMA VMO that is unmapped and closed while the device may still write to it is the driver's bug
+   (trusted-driver DMA, OD14); the kernel frees the frames when the last handle and mapping go." Superseded by IOMMU-SPEC 4.7, 4.8 and 5:
+   a DMA VMO is made by `vmo_create_dma_in(resource, pages, job)`, which names the job that pays; the frames are pinned, committed, zeroed and
+   fixed but **not promised contiguous**, and the 64-page limit is gone; the right `DMA` means "may be mapped into a device domain"; the
+   two-argument `vmo_create_dma` and `vmo_phys_addr` stay in the system library as stubs that return NOT_SUPPORTED, and no physical address is
+   learnable from user mode; a device mapping holds the VMO, so closing it while the device may still write is safe: the
+   frames are freed only after the last handle, region and device mapping go, and for a device mapping only after its invalidation was fenced.
+3. **Section 3, "Interrupt objects" (line 63 and the paragraph it begins).** "`interrupt_create(resource, irq) -> handle` ... One object per source
+   at a time". This stands for a wired source, with the identity the source is delivered on chosen by the kernel. There is a second kind of
+   interrupt object, the **vector** of a device domain, made by `iodomain_grant_vector` and not by `interrupt_create`; waiting and acknowledging
+   are the same calls (IOMMU-SPEC 8.3, 8.5). The block driver's interrupts are vectors.
+4. **Section 4, "Kill safety (T42)" (lines 104 to 108).** "Decided at S6b: ownership, not a kernel mechanism. The supervisor (S6c: the device
+   manager) holds its own handles to the DMA VMO and the MMIO slot for as long as the device is in use, hands the driver duplicates, and after a
+   driver dies resets the virtio device (`STATUS = 0`) before the buffer goes to the next driver". Superseded: kill safety is a **kernel
+   mechanism** (IOMMU-SPEC 5, 6 and 10). A killed driver, a killed supervisor, or both, cannot leave a device writing into freed RAM. The
+   supervisor still clears bus-master enable and resets the function when a driver dies, before the domain is torn down, for function and not for
+   safety (IOMMU-SPEC 10.2).

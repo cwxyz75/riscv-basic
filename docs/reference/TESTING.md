@@ -14,7 +14,7 @@ now and then when a phase's boots fail; "When an epic's smoke is red" keeps that
 | Branch | What it is | What merges into it | Gate |
 |---|---|---|---|
 | `main` | Always builds and boots. | An epic branch, when its phase is done; a documentation-only change, directly. | The epic gate (tier 1). |
-| `epic/<name>` | One phase of `WORK-PLAN.md` (a long phase may be cut into two or three epics). Cut from `main`. | Feature branches. | The feature gate (tier 0). |
+| `epic/<name>` | One epic: the children of an umbrella work item (a large one may be cut into two or three epics). Cut from `main`. | Feature branches. | The feature gate (tier 0). |
 | a feature branch | One work item, or one named part of one, cut from the epic. | Commits. | The commit hook. |
 
 - A feature branch is **squash-merged** into its epic, so an epic is one commit per piece of work.
@@ -54,10 +54,9 @@ now and then when a phase's boots fail; "When an epic's smoke is red" keeps that
    builder, never required and never routine: at most a few per epic.
 6. **Soak and overnight run only when the owner asks** (OD142). Nobody else starts them: not `make soak` or one of its
    targets locally, not `soak.yml` or `overnight.yml`, not a schedule, not a label. Running `os-repeat` over a soak
-   target is a soak run. Changes do not each record a run as owed: `WORK-PLAN.md` carries one standing line, and one
+   target is a soak run. Changes do not each record a run as owed: nothing is recorded per change, and one
    run of a tier covers everything merged before it. A red soak or overnight run means "fix next", not "revert".
-7. **A work item closes when its epic's gate is green.** An item's acceptance check is written first, as before. Its
-   box in `WORK-PLAN.md` is ticked when its feature merges; `scripts/work.py done` runs in the epic's closing commit,
+7. **A work item closes when its epic's gate is green.** An item's acceptance check is written first, as before. `scripts/work.py done` runs in the epic's closing commit,
    so the record reaches `main` only with a green boot behind it. The kernel-only boots of tier 1 are the verification
    at one, two and four harts.
 8. **Where a new test goes.** Pure logic (a decision, a data structure, a codec, an accounting rule): a host test in a
@@ -69,9 +68,15 @@ now and then when a phase's boots fail; "When an epic's smoke is red" keeps that
    hand; the standing negative controls are tier 2.
 10. **Independent oracles** (the upstream Lua suite, the C transcript against the host build, the BASIC golden corpus,
     real clients) stay in the suite, in smoke, while smoke fits its budget.
-11. **An intermittent failure of a kernel test is a defect until its cause is known** (OD140). It gets a work item at
-    once and is investigated; it is not re-run and noted. (A job that fails for infrastructure reasons, such as a
-    package mirror timing out, is simply re-run.)
+11. **An intermittent failure of a kernel test is a defect until its cause is known** (OD140, OD160). A failure that
+    appears is investigated, not re-run and noted: first ask whether the change under test could cause it (if so, it
+    is that change's defect, to fix in the same PR), then try to reproduce it. A failure counts as **intermittent**
+    only after **five** attempts to reproduce it have failed (the same test, target and hart count, the failing seed
+    or a record-and-replay capture where there is one: `os-repeat` loops over a smoke target are ordinary debugging, OD160). Then, and not
+    before, it gets a work item (area `testing`) with where and when it was seen, the log, what was tried and how to
+    trace it, and the PR it appeared on goes on. The item closes only on a named cause or a demonstrated test race,
+    never on a count of green runs (OD160). (A job that fails for infrastructure reasons, such as a package mirror
+    timing out, is simply re-run.)
 12. **Reviews are separate from tests** and unchanged: a kernel or security slice gets its fresh-context review on its
     own feature pull request, before it merges into the epic.
 

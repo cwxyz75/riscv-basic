@@ -1569,3 +1569,18 @@ Section "futex_lock_pi / futex_unlock_pi" (the error list). `futex_lock_pi` can 
 **This amendment was made with the project owner's explicit permission (given in conversation on 2026-11-24: "I'm comfortable saying we'll accept the scaling as is ... You have my explicit permission to relax the spec"); an agent may not amend a spec without it.**
 
 Sections 6 (the budget table, the `pair_scaling` row) and 7 (the task table, tasks 14 and 20). The figures "at least 3.0 for futex ping-pong after task 14" and "at least 2.5 for `channel_call` after task 20" are no longer acceptance gates: tasks 14 and 20 are accepted with the scaling as measured (release build, QEMU TCG, four harts, 2026-11-24: futex 1.38, `channel_call` 0.93), and the benchmark keeps printing and recording the ratio. The figures remain the design's goals; the investigation of the gap is `work/T267.md`. T70's trigger in section 3.13 is unchanged (below 2.5 at four harts **and** more than 30% of syscall time in `OBJ`); it is evaluated by that investigation, not by task 20. The other acceptance parts of task 20 (the loom model, `wait-audit`, the whole budget of 3.12 asserted in soak) are unchanged; the soak is the owner's (FZ1).
+
+## Amendment 2026-11-25 (IOMMU): the lock class `IOMMU`
+
+Section 3.3 (the lock hierarchy), as amended on 2026-11-23 ("the order is now `OBJ` (1), `AS` (2), `PROCS` (3), `FUTEX` (4), `VMO` (5), `JOBS` (6), `PI` (7), `TT` (8), `RQ` (9), `KSTACK` (10), `FRAME` (11), `HEAP` (12), `ENTROPY` (13), `UART` (14)"). The table gains one class, between `KSTACK` and `FRAME`, and the classes after it move up by one: `OBJ` (1), `AS` (2), `PROCS` (3), `FUTEX` (4), `VMO` (5), `JOBS` (6), `PI` (7), `TT` (8), `RQ` (9), `KSTACK` (10), **`IOMMU` (11)**, `FRAME` (12), `HEAP` (13), `ENTROPY` (14), `UART` (15).
+
+| Class | Instances | Protects | IRQ | Nested same-class |
+|---|---|---|---|---|
+| `IOMMU` | one | The device-domain store (each domain's I/O page table, I/O address allocator, mapping records, fault ring and state), the device directory, the MSI page tables, the IOMMU's command queue and fault queue | external (the IOMMU's fault interrupt) | no |
+
+Why it sits there (the nestings that occur; every path is listed in `IOMMU-SPEC.md` 11.2):
+
+* After `OBJ`: the IOMMU's fault interrupt arrives on the external-interrupt path, which holds `OBJ`; a handle close reaches a domain's destruction under `OBJ`; a vector grant, revoke or move holds `OBJ` for the interrupt identity and the object while it writes the MSI entry.
+* After `VMO` and `JOBS`: a map takes its hold on the VMO and charges the job before it writes a leaf, and nothing ever needs the opposite order: the hold is dropped, and the job credited, only after `IOMMU` is released.
+* Before `FRAME` and `HEAP`: a map and a domain's creation take page-table frames while they hold it.
+* It is taken with interrupts off and is **never held across a wait**: a command fence is waited for with the lock released. Under it nothing takes `OBJ`, an `AS` lock, `VMO` or `JOBS`, and nothing makes a thread or scheduler call; no path holds `TT`, `RQ` or `KSTACK` when it takes it. A vector's interrupt file in memory is touched only with atomic operations and belongs to no class.

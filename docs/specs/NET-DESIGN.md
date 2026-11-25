@@ -618,3 +618,22 @@ What changed, and what did not:
   S8 (13). The proposed ODs are renumbered to OD98 to OD101 because OD97 is the service directory.
 * **Unchanged:** the driver and stack split, the rings, the sans-IO core, the supervision contracts, the datagram drop rule,
   the open question about client-created sockets, and the testing plan.
+
+## Amendment 2026-11-25 (IOMMU): the DMA right and I/O addresses
+
+Decided by OD148 and the owner's answers of 2026-11-25 (Q-IOMMU-ABI, Q-IOMMU-IRQ, Q-IOMMU-MODEL, Q-IOMMU-MSI). The contract is `IOMMU-SPEC.md`.
+Line numbers are those of this file as it stood on 2026-11-25.
+
+1. **Section 1, "DMA VMOs" (lines 28 to 31).** "physically contiguous, at most 64 pages each, **4 MiB for the whole system**, committed at
+   creation; the `DMA` right gates `vmo_phys_addr`, so a duplicate without it can map and touch the memory but cannot learn physical addresses. A
+   driver gets only an MMIO slot, a DMA VMO and an interrupt (OD65); the supervisor keeps the handles across driver lifetimes and resets the
+   device (T42)." Superseded: a DMA VMO is pinned, committed and fixed, not promised contiguous, with no per-object page limit (IOMMU-SPEC 4.7);
+   the `DMA` right means "may be mapped into a device domain" and nobody learns a physical address; a driver gets its register VMO, its DMA VMOs,
+   the map and unmap rights on its device's domain and one interrupt handle per vector; kill safety is the kernel's (IOMMU-SPEC 5, 6, 10).
+2. **Section 4.1 (lines 216 and 217).** "Under OD14 DMA is *trusted-driver*: a process holding a DMA-capable device can make it write anywhere in
+   physical memory, because there is no IOMMU." Superseded: the device reaches only what is mapped into its domain. The split into driver and
+   stack stands, for its other reason: the code that programs the device reads no packets, and the code that reads packets holds no device.
+3. **Section 5.1, the rights table (lines 250 and 251).** "RX pool | DMA right (knows physical addresses); does not map it" and "TX pool | DMA
+   right; does not map it". Superseded for `netdrv`: it holds the `DMA` right on both pools and maps them **into the device's domain**, the
+   receive pool read-write for the device and the transmit pool **read-only for the device** (its handle to that pool has no WRITE, so it cannot
+   map it otherwise: IOMMU-SPEC 4.3, 9). It knows I/O addresses, never physical ones. `netd`'s column stands.

@@ -1,7 +1,7 @@
 # Documentation (OS track)
 
 Three kinds of document live here. Work lists do not: what is left to do is in `work/` (one file per item,
-`work/README.md`), and the near-term plan is `WORK-PLAN.md` at the root. The home computer's documents stay in `home/`.
+`work/README.md`), ordered by horizon (`work.py ready`). The home computer's documents stay in `home/`.
 
 ## specs/: what the system is meant to be
 
@@ -28,6 +28,7 @@ contract was settled differently while it was built; amendments from now on go a
 | `specs/NET-SPEC.md` | S8: the network stack's lower layers. |
 | `specs/S9-SPEC.md` | S9: TCP, sockets in the C library, HTTP and DNS. |
 | `specs/FS-SPEC.md` | doofs, the disk filesystem, and the wall clock. |
+| `specs/IOMMU-SPEC.md` | DMA isolation and interrupt isolation for devices: the required IOMMU, device domains, the invalidation protocol, MSI translation, teardown order. |
 | `specs/USER-VIEW-SPEC.md` | The command-line view: namespace layout, POSIX surface, terminal, sessions, login, `/proc`. |
 | `specs/SHELL-SPEC.md` | `ish`, the native shell. |
 

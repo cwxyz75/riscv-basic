@@ -553,8 +553,7 @@ process's job like a `process_map`'s; the process record keeps the base and the 
 page holds nine words (`libsys::page`): the ABI version, the clock's multiplier and shift, the page size, the two cache-block sizes, the harts online, flags and the
 counter's value at the clock's zero. `sys_clock_get` is code in the library that reads `time` and the page (the kernel sets `scounteren.TM`), so `clock_get`
 no longer enters the kernel (`debug_stat` 131 counts the calls the kernel still answers). `rt` reads the library's `.dynsym` once in `_start`; every call goes
-through the table that gives, so a program has no `ecall` of its own (`scripts/check_ecall.py`; `crash` and `suite` plant theirs on purpose). The kernel's own `clock_get`,
-`port_wait` and the other old shapes stay until AB8 takes the numbers private.
+through the table that gives, so a program has no `ecall` of its own (`scripts/check_ecall.py`; `crash` and `suite` plant theirs on purpose). 
 
 ## Amendment 2026-11-23 (AB8): entry enforcement and private numbers
 
@@ -564,10 +563,49 @@ calls handled with no big kernel lock. Programs no longer contain an `ecall` at 
 produced by `abi::syscall::number`, which is the identity unless `ABI_SHUFFLE_SEED` is set when the workspace is built, and then a seed-chosen bijection on
 `0..LIMIT`: `libsys`, the kernel's dispatch and `rt` all take their numbers from it, and a program that wrote a literal number fails the suite.
 
-## Amendment 2026-11-23 (MM4): the allocator keeps its frame pool
+## Amendment 2026-11-25 (IOMMU): the IOMMU is required; DMA and device interrupts follow IOMMU-SPEC
 
-Section 4.2 had the allocator take slab frames and large runs from the frame database inline, and the free-list heaps and their dependency go. That is not what the kernel does, and
-the end state of 4.2 is this instead: small objects (up to 2048 bytes) come from slabs behind per-hart magazines; the slabs' frames come from a pool that is stocked at
-safe points; a request the slabs cannot serve (larger than a slab object, or the pool empty, or before the frame database exists) is served by the free-list heaps (a boot
-region and a grown window). Reason: the memory operations hold `VMO`, `JOBS` and `FRAME` together while code that allocates runs under them, so an inline frame take by
-the allocator would be a self-deadlock on that hart. The decision log of `WORK-PLAN.md` has the alternative.
+Decided by OD148 and the owner's answers of 2026-11-25 (Q-IOMMU-ABI, Q-IOMMU-IRQ, Q-IOMMU-MODEL, Q-IOMMU-MSI). The contract is `IOMMU-SPEC.md`;
+this amendment says what it supersedes here. Section numbers and line numbers are those of this file as it stood on 2026-11-25.
+
+1. **Section 1, the non-goals (line 32).** "Non-goals of v1: heterogeneous harts, NUMA, physical hotplug, Sv48, large pages for user mappings, an
+   IOMMU, ..." The words "an IOMMU" are withdrawn: a kernel-managed IOMMU is part of v1 (OD148). The Targets table's Processor row ("Also required
+   beyond the profile: AIA (APLIC and IMSIC, message-signalled mode) and Sstc") gains a third requirement, **enforced** in the same way: a platform
+   RISC-V IOMMU with the capabilities of IOMMU-SPEC 2.3, among them `MSI_MRIF`. The kernel refuses to boot without it (IOMMU-SPEC 2.5).
+2. **Section 2 and 2.3 (discovery).** The table "what comes from the device tree" gains three rows: the IOMMU's registers and interrupt sources
+   (the `riscv,iommu` node); the device ids behind it (the PCI host's `iommu-map`); the number of interrupt identities in a hart's file (the
+   supervisor IMSIC's `riscv,num-ids`). The row "Interrupt controller: APLIC base, number of sources, each hart's IMSIC file" stands.
+3. **Section 2.4.** "AIA in message-signalled mode is the only interrupt model. Inter-hart interrupts are sent by writing the target hart's IMSIC
+   file directly (one reserved interrupt identity), not through SBI." This stands, and is completed: every interrupt identity is allocated by the
+   kernel, per hart, and has one route (IOMMU-SPEC 8.1); identity 1 on every hart is the inter-hart interrupt; no identity is derived from a source
+   number. Device interrupts are MSI-X through the IOMMU's MSI translation in MRIF mode (IOMMU-SPEC 8); PCI INTx is never admitted.
+4. **Section 2.5, the row "DMA pages, whole system | RAM / 16" (line 108).** The backstop stands as a backstop (Q-IOMMU-ABI 4). Behind the job
+   quotas there are now two more per-job limits, I/O-mapped pages and interrupt vectors (IOMMU-SPEC 5.3), and a DMA VMO has no per-object page
+   limit and no promise of physical contiguity (IOMMU-SPEC 4.7). The two per-job limits are hierarchical (the smallest set on a job and its
+   ancestors applies) and have no default.
+5. **Section 4.7 (lines 350 and 351).** "DMA frames follow the policy of S6-SPEC (the supervisor keeps the handle); the kernel does not enforce
+   device quiescence until an IOMMU exists (OD136)." Replaced by: DMA frames follow IOMMU-SPEC. A device mapping holds its VMO; a frame is freed
+   only after the device's translation to it was invalidated and fenced (IOMMU-SPEC 5 and 6); who pays is IOMMU-SPEC 5.3.
+6. **The amendment of 2026-11-20 (PL5a), lines 528, 529 and 534.** "its `compatible` is on a list of the devices the system drives (`virtio,mmio` and
+   `google,goldfish-rtc` today)" and "on QEMU `virt` it would have made fw-cfg (whose DMA interface writes guest RAM), the writable flash banks and
+   the PCI ECAM window mappable by the holder of the resource handle." The rule (an allowlist that fails closed) stands; the list changes and the
+   ECAM part is reversed: the PCI host's ECAM window and the memory windows of its `ranges` **are** device windows, because every PCI function is
+   behind the IOMMU and is denied by default; `virtio,mmio` leaves the list, because those slots are not behind it; fw-cfg and the flash banks stay
+   unmappable; the IOMMU's own register page is cut from every window. A DMA-capable device is reachable from user mode only if the tree puts it
+   behind the IOMMU (IOMMU-SPEC 2.6). The interrupt sources an interrupt object may name follow the same list, and never include a source of a
+   PCI host's `interrupt-map`.
+7. **Section 9 (the freeze).** "After that a kernel change needs a reason recorded as a decision, and may only add to the system
+   library." The system library takes these changes as one amendment, whenever the work lands, before or after the freeze (Q-IOMMU-ABI 2).
+   **Added:** `sys_iodomain_create`, `sys_iodomain_map`, `sys_iodomain_unmap`, `sys_iodomain_destroy`, `sys_iodomain_grant_vector`,
+   `sys_iodomain_fault_read`, `sys_interrupt_deliver_here`, `sys_job_set_io_limits`, `sys_vmo_create_dma_in` (a DMA VMO charged to a named
+   job); the object kind *device domain*; a second kind of interrupt object (a vector of a domain); the rights IO_MAP, IO_UNMAP, IO_GRANT and
+   IO_DESTROY; the signal DEVICE_FAULT; two `job_info` selectors. **Changed in meaning, not in signature:** the right DMA means "may be mapped
+   into a device domain"; `sys_interrupt_create` chooses the identity itself and can fail for want of one. **No longer provided by the
+   kernel**, and kept in the library as stubs that return NOT_SUPPORTED, as section 3.1 requires ("The library is additive: a function is never
+   removed or changed; a call the kernel no longer provides stays as a stub returning NOT_SUPPORTED"): `sys_vmo_phys_addr` and the two-argument
+   `sys_vmo_create_dma`. Nothing is removed from the library and no function changes its signature. Every signature, right and error is in
+   IOMMU-SPEC 4, 5.3, 7.4 and 8.
+8. **Section 6 (locking).** The order gains the class `IOMMU` (the amendment of the same date to `SCHED-SMP-SPEC.md`; IOMMU-SPEC 11).
+9. **Section 4.1 (Frames).** "Contiguous allocation (DMA) is an ordinary higher-order allocation." Superseded for DMA: a DMA VMO's frames are
+   not promised contiguous and are taken as ordinary single frames (IOMMU-SPEC 4.7); a device sees a contiguous range of I/O addresses whatever
+   the frames are. Higher-order allocation stands for what the kernel itself needs contiguous (among them a device domain's 16 KiB root table).

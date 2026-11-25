@@ -10,7 +10,7 @@ Project: an experimental RISC-V computer for QEMU (`virt`), in Rust, with two tr
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
   human as product owner. Spec: `docs/specs/OS-ARCHITECTURE.md` (the documents are indexed in
   `docs/README.md`). Read it before working on it, then
-  `WORK-PLAN.md` (what is next) and `work/README.md` (the work queue). What is left to do is
+  `work/README.md` (the work queue; `scripts/work.py ready` says what is next). What is left to do is
   in `work/`, one file per item, queried with `scripts/work.py`; never read the whole
   directory. How the system got here is in `docs/records/` and git history.
 
@@ -67,7 +67,7 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 
 ## Working agreement
 
-- **Epic branches** (OD144, `TESTING.md`). A phase of `WORK-PLAN.md` is an epic branch (`epic/<name>`, cut from `main`). One work item
+- **Epic branches** (OD144, `TESTING.md`). An epic is the set of work items tagged with its name (the `epic` field; `work.py list --epic <name>`), and is a branch (`epic/<name>`, cut from `main`). One work item
   (or a named part of one) is a feature branch cut from the epic, with a PR **into the epic**, squash-merged when the feature gate is
   green: build and host tests, no QEMU. A finished epic is merged into `main` with a merge commit when the epic gate (smoke) is green.
   Code-touching tidy items and fixes ride on the open epic; documentation-only changes go straight to `main`. `main` always builds
@@ -80,16 +80,14 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
   only), not before a push, not "the gate, locally". CI is the check. Targeted experiments are welcome at your judgement: the one test
   being written, one boot (`make kquick`) to watch an acceptance check fail and then pass, a mutation check of a new test, a
   reproduction while debugging, static analysis. The soak tier and the long-run tier **run only when the owner asks** (OD142): never
-  start one, locally or in CI, and never put one on a schedule or a label; do not record a run as owed per change (`WORK-PLAN.md` has
-  one standing line). Smoke may be started by hand on an epic (`gh workflow run ci.yml --ref epic/<name>`) as a checkpoint after a risky
+  start one, locally or in CI, and never put one on a schedule or a label; do not record a run as owed per change. Smoke may be started by hand on an epic (`gh workflow run ci.yml --ref epic/<name>`) as a checkpoint after a risky
   change: sparingly. When an epic's smoke is red, `make epic-bisect` finds the commit. Kernel/security slices that get a Fable review
   keep their own small feature PR. New tests go where `TESTING.md` says: logic on the host, syscall behaviour in the suite, only what
   the machine shows in QEMU.
 - If `home/BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
   language semantic; settle it in the spec, then code it.
 - Only close a work item (`scripts/work.py done`) when its acceptance criterion has actually
-  been verified. For anything that needs a boot, that is its epic's green smoke: tick the item's box in `WORK-PLAN.md` when its
-  feature merges, and run `work.py done` in the epic's closing commit.
+  been verified. For anything that needs a boot, that is its epic's green smoke: run `work.py done` in the epic's closing commit.
 - **Documents come in three kinds** (`docs/README.md`): specs (`docs/specs/`: the end state,
   versioned; a change is a dated amendment appended at the end, never a rewrite of the body),
   reference (`docs/reference/`: SYSCALLS, INVARIANTS, TESTING, changed in place with the code)
@@ -99,7 +97,7 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
   looks wrong or out of date, say so in the reply and record it in `work/`, and leave the spec alone. Work being hard, risky or expensive is never a reason to change a spec so that the problem gets easier: build what
   the spec says, or stop, record the blocker in `work/` and ask.
 - **Work lists and documentation are separate.** Plans, to-dos, progress and "not built yet"
-  go in `work/` and `WORK-PLAN.md`, never in a spec. A spec describes the end state; it has
+  go in `work/`, never in a spec. A spec describes the end state; it has
   no opinion about how far the build has got.
 - Binary size is not a goal. Prefer simple over small; `core::fmt` is fine.
 - Record real design choices in the decision log in `home/DESIGN.md`.
@@ -131,10 +129,13 @@ boots, `// SAFETY:` comments, the feature gate and the epic gate). In addition:
 - Architecture target: **RVA23, enforced** (OD47, OD127): the kernel refuses to boot below the profile, `-cpu rva23s64` is
   the only test CPU, AIA and Sstc are required, and there are no fallbacks. The home computer under `home/` keeps its
   rv64gc contract.
-- **Shortcuts become tidy items in `work/`.** Any stand-in, ambient authority, deferred review
-  finding or "good enough for now" gets an item (`kind: tidy`, `work.py next T` for its id) in
-  the same PR (what, why acceptable, risk, proper fix and when). A question only the owner
-  can answer is a `kind: decision` item. Fixed items are closed with `work.py done`.
+- **Finish the work; no stand-ins.** Work on a ticket does not leave a shortcut, an ambient authority, a deferred
+  review finding or a "good enough for now" behind: it is done in the same PR, and risk or difficulty is no reason
+  to defer (`docs/prompts/engineer.md`). A new work item is written only for (a) a fundamental problem in a spec
+  that building revealed (stop that part, record it, ask), (b) an intermittent failure under `TESTING.md` rule 11
+  (only after five failed attempts to reproduce it), or (c) a question only the owner can answer (`kind: decision`).
+  Planning and triage sessions the owner starts may file items (`kind: tidy`, `work.py next T` for the id: what, why,
+  risk, proper fix and when). Fixed items are closed with `work.py done`.
 - Everything must be diagnosable headlessly: structured serial output, QEMU's exit
   device for pass/fail. Debugging by eye is not an available tool.
 - Close an OS-track item only when verified in QEMU, which is its epic's smoke: the kernel-only boots run at one, two and four

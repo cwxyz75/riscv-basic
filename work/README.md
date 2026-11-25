@@ -4,7 +4,7 @@ Every piece of open work is one file here: a short header and free text. Work li
 (`docs/`): a spec says what the system is meant to be, a work item says what is left to do. Closed items are deleted; their
 line goes to `docs/records/done.md` and their text stays in git history.
 
-`WORK-PLAN.md` at the root is the near-term plan: the order of the next few items and why, in prose, by id.
+The next items are `work.py ready` (near first); an epic's items are the children its umbrella item lists.
 
 ## Using it
 
@@ -50,10 +50,11 @@ The file is named `<id>.md`. Fields:
 | `kind` | yes | `slice` (a planned piece of work with an acceptance check), `tidy` (a shortcut, stand-in or deferred finding: the old TIDY-UP register), `decision` (a question only the owner can answer), `topic` (a direction noted but not committed; needs a spec, an acceptance check and an OD before it becomes a slice). |
 | `title` | yes | One line. |
 | `area` | yes | One of the areas in `scripts/work.py` (`work.py areas` lists them). |
-| `horizon` | yes | `near` (ordered in `WORK-PLAN.md`; at most 15), `long` (planned, not next), `someday` (watch items, ideas, things to do only if they bite). |
+| `horizon` | yes | `near` (what is worked on next; at most 15), `long` (planned, not next), `someday` (watch items, ideas, things to do only if they bite). |
 | `risk` | no | For tidy items: `H` can hurt the system or its security once untrusted code runs; `M` weakens a design property or will cost real rework later; `L` convenience or polish. |
 | `complexity` | no | How tricky the fix is and how much work or planning it needs: `L` a small, local change or a test that calls a function; `M` a contained change across a few files, or real design; `H` concurrency or lock-order logic, an on-disk or wire format, or a change that needs planning first. Set on tidy items. |
 | `change_risk` | no | How likely the fix is to introduce subtle bugs (not how bad the shortcut is: that is `risk`): `L` mechanical or covered by existing tests; `M` touches live paths the suite covers well; `H` concurrency, memory ownership, translations or other things the suite cannot easily catch. Set on tidy items. |
+| `epic` | no | The epic the item belongs to, as the branch name without `epic/` (`iommu-kernel` for `epic/iommu-kernel`). The epic's manager takes its tickets with `work.py list --epic <name>`. Items that go straight to `main` (documentation only) have none. |
 | `blocked_by` | no | Open items that must be done (or decided) first. |
 | `fixed_by` | no | Open items expected to resolve this one as a side effect (a debt that a planned slice removes). When that item closes, re-check this one. |
 | `refs` | no | Specs, decisions or records it relates to. |
