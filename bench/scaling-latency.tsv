@@ -1,0 +1,3 @@
+# Scaling floors for `make os-latency` (the latency-trace kernel): channel_call only, same values as bench/scaling.tsv. The traced futex pair is not comparable (n4 ratio 0.02 on every local run, 2026-11-24).
+smp4	pair_scaling_channel_call	2	0.6
+smp4	pair_scaling_channel_call	4	0.5
