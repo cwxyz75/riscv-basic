@@ -97,15 +97,10 @@ impl Iova {
         })
     }
 
-    /// Word `w` of the occupied map (live or pending), with the bits past the window's end set.
-    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)] // INVARIANT: w < words; the tail shift is 1 to 63
+    /// Word `w` of the occupied map (live or pending). The bits past the window's end are clear: `scan` stops at `pages`.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: w < words
     fn occupied(&self, w: usize) -> u64 {
-        let mut word = self.live[w] | self.pending[w];
-        let end = (w as u64 + 1) * 64;
-        if end > self.pages {
-            word |= !0u64 << (self.pages % 64);
-        }
-        word
+        self.live[w] | self.pending[w]
     }
 
     /// The first index at or after `i` whose occupied bit is `want`, or `pages` if there is none.

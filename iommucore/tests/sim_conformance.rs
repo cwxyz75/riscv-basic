@@ -18,6 +18,7 @@ const FQ: u64 = 0x8040_0000;
 const DIR: u64 = 0x8000_0000;
 const G_ROOT: u64 = 0x8100_0000; // 16 KiB
 const S_ROOT: u64 = 0x8200_0000;
+const MSI_BASE: u64 = 1 << 40;
 
 const EN: u32 = regs::QCSR_EN;
 const IE: u32 = regs::QCSR_IE;
@@ -52,7 +53,25 @@ impl Machine {
                     .unwrap();
                 t.map(&mem, &mut frames, 0x3000, 0x2000_3000, Access::Read)
                     .unwrap();
+                // A page whose address lies in the MSI window (1 << 40), for the MSI check after translation.
+                t.map(
+                    &mem,
+                    &mut frames,
+                    0x7000,
+                    MSI_BASE + 0x3000,
+                    Access::ReadWrite,
+                )
+                .unwrap();
             }
+            // The top half of the first stage's space (an address sign-extended from bit 38).
+            s.map(
+                &mem,
+                &mut frames,
+                0xffff_ffc0_0000_1000,
+                0x2000_4000,
+                Access::Read,
+            )
+            .unwrap();
             for (did, t, id) in [(1, &g, 1), (2, &g, 2), (3, &s, 5), (4, &s, 6)] {
                 d.set(
                     &mem,
@@ -138,6 +157,12 @@ fn fake_memory_and_frames() {
     assert_eq!(f.alloc(), Some(a));
     assert_eq!(f.alloc(), None);
     assert_eq!((f.allocs, f.frees), (4, 2));
+    // A budget counts down with each frame given, with frames to spare.
+    let mut f = FakeFrames::new(&mem, 0x2_0000_0000, 8);
+    f.budget = Some(2);
+    assert!(f.alloc().is_some() && f.alloc().is_some());
+    assert_eq!(f.alloc(), None);
+    assert_eq!(f.budget, Some(0));
 }
 
 #[test]
@@ -184,6 +209,25 @@ fn queue_control_registers() {
     // The 64-bit view of two 32-bit registers.
     assert_eq!(sim.read64(regs::CQH), 1 | (1 << 32));
     assert_eq!(sim.read64(regs::FCTL), u64::from(sim.read32(regs::FCTL)));
+    // A second illegal command while the first's interrupt is still pending leaves it pending.
+    assert!(!run(
+        &mut sim,
+        &mem,
+        Command {
+            dword0: 0x7f,
+            dword1: 0
+        }
+    ));
+    assert_eq!(sim.read32(regs::IPSR), regs::IPSR_CIP);
+    sim.write32(regs::CQCSR, EN | IE | regs::CQCSR_CMD_ILL);
+    mem.write(CQ + 16, 0x7f);
+    sim.write32(regs::CQT, 2);
+    assert_eq!(sim.read32(regs::IPSR), regs::IPSR_CIP);
+    sim.write32(regs::IPSR, regs::IPSR_CIP);
+    mem.write(CQ + 16, Command::iofence_c(None).unwrap().dword0);
+    sim.write32(regs::CQCSR, EN | IE | regs::CQCSR_CMD_ILL);
+    sim.write32(regs::CQT, 2);
+    assert_eq!(sim.read32(regs::CQH), 2);
     // Without IE an illegal command raises no interrupt.
     sim.write32(regs::CQCSR, EN);
     assert!(!run(
@@ -195,8 +239,17 @@ fn queue_control_registers() {
         }
     ));
     assert_eq!(sim.read32(regs::IPSR), 0);
-    // Off: on clears; on again: head and tail start at 0.
-    sim.write32(regs::CQCSR, regs::CQCSR_CMD_ILL);
+    // Off, and on again: the error bits are cleared by the enable (QEMU `riscv_iommu_process_cq_control`).
+    sim.write32(regs::CQCSR, 0);
+    assert_eq!(sim.read32(regs::CQCSR), regs::CQCSR_CMD_ILL);
+    sim.write32(regs::CQCSR, EN);
+    assert_eq!(sim.read32(regs::CQCSR), EN | ON);
+    // Off: on clears; a write of 0 while off leaves it off; on again: head and tail start at 0.
+    sim.write32(regs::CQCSR, 0);
+    assert_eq!(sim.read32(regs::CQCSR), 0);
+    sim.write32(regs::CQCSR, regs::QCSR_IE);
+    assert_eq!(sim.read32(regs::CQCSR), regs::QCSR_IE);
+    sim.write32(regs::CQCSR, 0);
     assert_eq!(sim.read32(regs::CQCSR), 0);
     sim.write32(regs::CQCSR, EN);
     assert_eq!(sim.read32(regs::CQCSR), EN | ON);
@@ -218,6 +271,12 @@ fn queue_control_registers() {
     assert_eq!(sim.read32(regs::FQH), 3, "fqh is masked to the queue");
     sim.write32(regs::FQCSR, 0);
     assert_eq!(sim.read32(regs::FQCSR), 0);
+    sim.write32(regs::FQCSR, regs::QCSR_IE);
+    assert_eq!(
+        sim.read32(regs::FQCSR),
+        regs::QCSR_IE,
+        "a write without EN leaves it off"
+    );
 }
 
 #[test]
@@ -365,6 +424,38 @@ fn each_invalidation_drops_exactly_what_it_names() {
         }
     ));
     assert_eq!(tlb(&sim), 8);
+    // Each soft id reaches only its own translations: with the leaves gone, the device whose entries were dropped faults and
+    // the other is still served from its cached ones.
+    let gl = leaf_addr(&m.mem, G_ROOT, 11, 0x1000);
+    let sl = leaf_addr(&m.mem, S_ROOT, 9, 0x1000);
+    let (g_leaf, s_leaf) = (m.mem.read(gl), m.mem.read(sl));
+    m.mem.write(gl, 0);
+    m.mem.write(sl, 0);
+    assert!(run(&mut sim, &m.mem, Command::iotinval_gvma(1, None)));
+    assert!(run(&mut sim, &m.mem, Command::iotinval_vma(Some(5), None)));
+    assert!(sim.read(1, 0x1000).is_err() && sim.read(3, 0x1000).is_err());
+    assert_eq!(
+        (sim.read(2, 0x1000), sim.read(4, 0x1000)),
+        (Ok(0x2000_1000), Ok(0x2000_1000))
+    );
+    assert!(run(
+        &mut sim,
+        &m.mem,
+        Command::iotinval_gvma(2, Some(0x1000))
+    ));
+    assert!(run(
+        &mut sim,
+        &m.mem,
+        Command::iotinval_vma(Some(6), Some(0x1000))
+    ));
+    assert!(sim.read(2, 0x1000).is_err() && sim.read(4, 0x1000).is_err());
+    assert_eq!(
+        (sim.read(2, 0x2000), sim.read(4, 0x2000)),
+        (Ok(0x2000_2000), Ok(0x2000_2000))
+    );
+    m.mem.write(gl, g_leaf);
+    m.mem.write(sl, s_leaf);
+    fill(&mut sim);
     // IODIR: one context, or all; translations stay (QEMU keeps them until IOTINVAL).
     assert!(run(&mut sim, &m.mem, Command::iodir_inval_ddt(Some(3))));
     assert_eq!(sim.cached().1, 3);
@@ -383,6 +474,14 @@ fn each_invalidation_drops_exactly_what_it_names() {
     assert!(
         sim.write(1, 0x3010, 1).is_err(),
         "a read-only cached entry does not serve a write"
+    );
+    // A writable leaf the crate wrote (D set): an entry cached by a read serves a later write.
+    let rw = leaf_addr(&m.mem, G_ROOT, 11, 0x2000);
+    sim.read(1, 0x2000).unwrap();
+    m.mem.write(rw, 0);
+    assert_eq!(
+        sim.write(1, 0x2010, 1),
+        Ok(iommucore::sim::WriteOutcome::Memory(0x2000_2010))
     );
 }
 
@@ -459,6 +558,25 @@ fn faults_are_reported_as_qemu_does() {
     assert_eq!(sim.read32(regs::FQT), 3);
     assert_eq!(sim.read32(regs::FQCSR), EN | IE | ON | regs::FQCSR_OF);
     assert_eq!(sim.faults_reported(), 5);
+    // Disabled and enabled again, the overflow bit is cleared (QEMU `riscv_iommu_process_fq_control`) and the ring is empty.
+    sim.write32(regs::FQCSR, 0);
+    assert_eq!(sim.read32(regs::FQCSR), regs::FQCSR_OF);
+    sim.write32(regs::FQCSR, EN | IE);
+    assert_eq!(sim.read32(regs::FQCSR), EN | IE | ON);
+    assert_eq!((sim.read32(regs::FQH), sim.read32(regs::FQT)), (0, 0));
+    for slot in 0..3 {
+        assert_eq!(sim.read(7, 0x1000), Err(faultq::CAUSE_DDT_INVALID));
+        assert_eq!(record(slot).device_id, 7);
+    }
+    assert_eq!(sim.read(7, 0x1000), Err(faultq::CAUSE_DDT_INVALID));
+    assert_eq!(sim.read32(regs::FQCSR), EN | IE | ON | regs::FQCSR_OF);
+    // Drained but not acknowledged: still nothing is written while the overflow bit is set.
+    let fqh = sim.read32(regs::FQH);
+    let t = sim.read32(regs::FQT);
+    sim.write32(regs::FQH, t);
+    assert_eq!(sim.read(7, 0x1000), Err(faultq::CAUSE_DDT_INVALID));
+    assert_eq!(sim.read32(regs::FQT), t);
+    sim.write32(regs::FQH, fqh);
     // Drained and acknowledged, the queue takes records again.
     sim.write32(regs::FQH, 3);
     let ack = regs::Fqcsr(sim.read32(regs::FQCSR)).acknowledge();
@@ -480,7 +598,7 @@ fn faults_are_reported_as_qemu_does() {
     let before = m.mem.read(FQ + 32);
     let _ = sim.read(7, 0x6000);
     assert_eq!(m.mem.read(FQ + 32), before);
-    assert_eq!(sim.faults_reported(), 8);
+    assert_eq!(sim.faults_reported(), 13);
 }
 
 /// Device 1's read of page 0x1000 after `change` to the machine, on a fresh simulator with `cfg`.
@@ -587,14 +705,20 @@ fn first_stage_modes_follow_the_capabilities() {
             "mode {mode}"
         );
     }
-    // A first-stage address must be sign-extended from its top bit (bit 38 for Sv39).
+    // A first-stage address must be sign-extended from its top bit (bit 38 for Sv39): the mapped top-half page is reached
+    // only by its canonical address.
     let mut sim = m.sim(SimConfig::qemu());
+    assert_eq!(sim.read(3, 0xffff_ffc0_0000_1000), Ok(0x2000_4000));
     assert_eq!(
         sim.read(3, 0x40_0000_1000),
         Err(faultq::CAUSE_READ_PAGE_FAULT)
     );
     assert_eq!(
-        sim.read(3, 0xffff_ffc0_0000_1000),
+        sim.read(3, 0x7fff_ffc0_0000_1000),
+        Err(faultq::CAUSE_READ_PAGE_FAULT)
+    );
+    assert_eq!(
+        sim.read(3, 0x40_0000_1000),
         Err(faultq::CAUSE_READ_PAGE_FAULT)
     );
     // A second-stage address must be below 2^41 (Sv39x4).
@@ -625,6 +749,12 @@ fn the_directory_walk() {
     sim.write64(regs::DDTP, d.ddtp().bits());
     assert_eq!(sim.read(did, 0x1000), Ok(0x2000_1000));
     assert_eq!(sim.read(1 << 15, 0x1000), Err(faultq::CAUSE_TTYPE_BLOCKED));
+    // One level, extended: 6 bits.
+    let one = Ddt::new(&mem, 0x8700_0000, Levels::One, Format::Extended).unwrap();
+    let mut sim1 = Sim::new(&mem, SimConfig::qemu());
+    sim1.write64(regs::DDTP, one.ddtp().bits());
+    assert_eq!(sim1.read(63, 0x1000), Err(faultq::CAUSE_DDT_INVALID));
+    assert_eq!(sim1.read(64, 0x1000), Err(faultq::CAUSE_TTYPE_BLOCKED));
     let entry = DIR + u64::from(did >> 6) * 8;
     let good = mem.read(entry);
     for (bad, cause) in [
@@ -678,6 +808,88 @@ fn the_directory_walk() {
             "{levels:?}"
         );
     }
+}
+
+#[test]
+fn the_msi_check_follows_the_first_stage_only() {
+    // IOMMU-SPEC 3.3 and QEMU `riscv_iommu_spa_fetch`: with a first stage, the MSI window is checked against the address the
+    // first stage produced; with the second stage only, against the device's own address, never the translated one.
+    let m = Machine::new();
+    for did in [1, 3] {
+        m.mem.write(m.ctx_word(did, 4), 1 << 60 | 0x8600_0000 >> 12);
+        m.mem.write(m.ctx_word(did, 5), 0xff);
+        m.mem.write(m.ctx_word(did, 6), MSI_BASE >> 12);
+    }
+    let mut sim = m.sim(SimConfig::qemu());
+    // (The table is empty: an MSI is refused as invalid; a memory write lands.)
+    assert_eq!(sim.write(3, 0x7000, 5), Err(faultq::CAUSE_MSI_INVALID));
+    assert_eq!(
+        sim.write(1, 0x7000, 5),
+        Ok(iommucore::sim::WriteOutcome::Memory(MSI_BASE + 0x3000))
+    );
+    assert_eq!(
+        sim.write(1, MSI_BASE + 0x10, 5),
+        Err(faultq::CAUSE_MSI_INVALID)
+    );
+    // A read never takes the MSI path.
+    assert_eq!(sim.read(3, 0x7000), Ok(MSI_BASE + 0x3000));
+}
+
+#[test]
+fn basic_msi_entries_are_checked() {
+    // A basic-translate entry (M = 3; IOMMU-SPEC 3.3 keeps it to the fault-injection build): bits 63:54 and 9:3 are reserved.
+    let m = Machine::new();
+    m.mem.write(m.ctx_word(1, 4), 1 << 60 | 0x8600_0000 >> 12);
+    m.mem.write(m.ctx_word(1, 5), 0xff);
+    m.mem.write(m.ctx_word(1, 6), MSI_BASE >> 12);
+    let entry = |m: &Machine, w0: u64| {
+        m.mem.write(0x8600_0000 + 2 * 16, w0);
+        m.sim(SimConfig::qemu()).write(1, MSI_BASE + 0x2000, 9)
+    };
+    let good = (0x2800_0000u64 >> 12) << 10 | 3 << 1 | 1;
+    assert_eq!(
+        entry(&m, good),
+        Ok(iommucore::sim::WriteOutcome::Basic {
+            page: 0x2800_0000,
+            data: 9
+        })
+    );
+    for bad in [1u64 << 54, 1 << 62, 1 << 3, 1 << 9] {
+        assert_eq!(
+            entry(&m, good | bad),
+            Err(faultq::CAUSE_MSI_MISCONFIGURED),
+            "{bad:#x}"
+        );
+    }
+    assert_eq!(
+        entry(&m, good | 1 << 63),
+        Err(faultq::CAUSE_MSI_INVALID),
+        "custom"
+    );
+    assert_eq!(entry(&m, good & !1), Err(faultq::CAUSE_MSI_INVALID));
+    for mode in [0u64, 2] {
+        assert_eq!(
+            entry(&m, (good & !6) | mode << 1),
+            Err(faultq::CAUSE_MSI_MISCONFIGURED)
+        );
+    }
+}
+
+#[test]
+fn a_device_write_is_four_bytes_at_its_address() {
+    let m = Machine::new();
+    let mut sim = m.sim(SimConfig::qemu());
+    m.mem.write(0x2000_1000, 0x1111_1111_2222_2222);
+    assert_eq!(
+        sim.write(1, 0x1004, 0xabcd),
+        Ok(iommucore::sim::WriteOutcome::Memory(0x2000_1004))
+    );
+    assert_eq!(m.mem.read(0x2000_1000), 0x0000_abcd_2222_2222);
+    assert_eq!(
+        sim.write(1, 0x1000, 0x55),
+        Ok(iommucore::sim::WriteOutcome::Memory(0x2000_1000))
+    );
+    assert_eq!(m.mem.read(0x2000_1000), 0x0000_abcd_0000_0055);
 }
 
 #[test]
@@ -740,6 +952,17 @@ fn the_debug_interface_and_other_registers() {
         regs::decode_tr_response(sim.read64(regs::TR_RESPONSE)),
         Some(0x2000_1000)
     );
+    // A write request in the device's MSI window answers with the window's page (the address goes to the MSI path, untranslated).
+    m.mem.write(m.ctx_word(1, 4), 1 << 60 | 0x8600_0000 >> 12);
+    m.mem.write(m.ctx_word(1, 5), 0xff);
+    m.mem.write(m.ctx_word(1, 6), (1 << 40) >> 12);
+    let mut sim = m.sim(SimConfig::qemu());
+    sim.write64(regs::TR_REQ_IOVA, (1 << 40) + 0x5000);
+    sim.write64(regs::TR_REQ_CTL, regs::tr_req_ctl(1, true));
+    assert_eq!(
+        regs::decode_tr_response(sim.read64(regs::TR_RESPONSE)),
+        Some((1 << 40) + 0x5000)
+    );
     // The interface does not fill the translation cache, and reports no fault.
     assert_eq!(sim.cached().0, 0);
     assert_eq!(sim.faults_reported(), 0);
@@ -753,6 +976,22 @@ fn the_debug_interface_and_other_registers() {
     sim.write64(regs::ICVEC, u64::MAX);
     assert_eq!(sim.read64(regs::ICVEC), 0xffff);
     assert_eq!(sim.read64(regs::CAPABILITIES), QEMU_CAPS & !(1 << 31));
+    assert_eq!(
+        sim.read32(regs::CAPABILITIES),
+        (QEMU_CAPS & !(1 << 31)) as u32
+    );
+    // Registers the simulator does not model read as 0, at either width.
+    for off in [
+        regs::MSI_CFG_TBL,
+        regs::MSI_CFG_TBL + 8,
+        0x0c,
+        0x38,
+        0x40,
+        0x58,
+    ] {
+        assert_eq!(sim.read64(off), 0, "{off:#x}");
+        assert_eq!(sim.read32(off), 0, "{off:#x}");
+    }
     assert_eq!(
         sim.read32(regs::CAPABILITIES + 4),
         ((QEMU_CAPS & !(1 << 31)) >> 32) as u32

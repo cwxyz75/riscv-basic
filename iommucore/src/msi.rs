@@ -36,9 +36,6 @@ pub struct MsiWindow {
     pattern: u64,
 }
 
-/// The mask and pattern fields are 52 bits wide.
-const WINDOW_FIELD: u64 = (1 << 52) - 1;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsiError {
     /// An address is not aligned as the format needs (the window's base to its size, a table to its page, a file to 512 bytes).
@@ -58,7 +55,8 @@ impl MsiWindow {
         }
         let mask = (1u64 << files_log2).wrapping_sub(1);
         let base_page = base_pa >> PAGE_SHIFT;
-        if base_pa & (PAGE_SIZE - 1) != 0 || base_page & mask != 0 || base_page > WINDOW_FIELD {
+        // (The pattern field is 52 bits wide, and a page number always fits it.)
+        if base_pa & (PAGE_SIZE - 1) != 0 || base_page & mask != 0 {
             return Err(MsiError::Misaligned);
         }
         Ok(MsiWindow {

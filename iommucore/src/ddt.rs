@@ -165,8 +165,9 @@ impl DeviceContext {
     pub const fn is_valid(&self) -> bool {
         self.words[0] & TC_V != 0
     }
+    /// The context names an MSI table (`translate` writes `msiptp` only with one, and it is never 0 then: its mode is Flat).
     const fn has_msi(&self) -> bool {
-        self.words[4] != 0 || self.words[5] != 0 || self.words[6] != 0
+        self.words[4] != 0
     }
 }
 

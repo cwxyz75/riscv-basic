@@ -1,2 +1,85 @@
 # Survivors of `make os-mutants` that no test can or should kill (KT10): one per line, `path: replace X with Y in fn  # reason`.
 # The first full run is owed to the owner (WORK-PLAN.md); its survivors are either killed by a new test or listed here with a reason.
+# iommucore (IOMMU2, the full run of 2026-11-25): equivalent mutants (mostly | for ^ on disjoint bit fields, and 1 << 0) and mutants
+# detected only as a timeout (an endless loop). The simulator's survivors are the same kinds.
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::msi_path  # equivalent: the notice identity's low ten bits and bit 10 are disjoint, and the table offset never overlaps the root (checked just before)
+iommucore/src/sim.rs: replace * with + in Sim<'m, M>::context  # equivalent: a base-format context's words past 32 bytes only feed msiptp, mask and pattern, which the simulator ignores without MSI_FLAT (the only case with 32-byte contexts)
+iommucore/src/sim.rs: replace < with <= in Sim<'m, M>::context  # equivalent: the extra word read is msiptp of a 32-byte (base-format) context, ignored without MSI_FLAT; an extended context never asks for word 8
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::context  # equivalent: the PPN field and the valid bit are disjoint
+iommucore/src/sim.rs: replace | with ^ in FakeMem::write32  # equivalent: the field was cleared by the mask just before
+iommucore/src/sim.rs: replace | with ^  # equivalent: constants built from distinct single bits (the queue RW1C masks)
+iommucore/src/sim.rs: replace |= with ^= in Sim<'m, M>::report  # equivalent: report returns before this line while the overflow bit is set, so it is only ever set from clear
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::walk  # equivalent: A (64) and D (128) are distinct bits
+iommucore/src/sim.rs: replace | with ^ in <impl Regs for Sim<'_, M>>::write64  # equivalent: the PPN field and LOG2SZ-1 are disjoint
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::context_ok  # equivalent: masks built from distinct single bits
+iommucore/src/sim.rs: replace |= with ^= in Sim<'m, M>::handed_over  # equivalent: the enable bit is clear just before (a fresh simulator), so set and toggle agree
+iommucore/src/ddt.rs: replace << with >>  # equivalent: TC_V is 1 << 0 (every other constant's mutant is killed)
+iommucore/src/regs.rs: replace << with >>  # equivalent: QCSR_EN and FCTL_BE are 1 << 0 (every other constant's mutant is killed)
+iommucore/src/cmdq.rs: replace | with ^ in Command::iotinval_gvma  # equivalent: the command's fields are disjoint bits
+iommucore/src/cmdq.rs: replace | with ^ in Command::iofence_c  # equivalent: the command's fields are disjoint bits
+iommucore/src/cmdq.rs: replace | with ^ in Command::iodir_inval_ddt  # equivalent: the command's fields are disjoint bits
+iommucore/src/msi.rs: replace | with ^ in MsiPte::basic  # equivalent: the entry's fields are disjoint bits
+iommucore/src/iopt.rs: replace | with ^ in leaf  # equivalent: the PTE's fields are disjoint bits
+iommucore/src/iopt.rs: replace & with | in Iopt::walk_leaves  # detected as a timeout: the walk then descends through every invalid entry of every table (and the corner-case test in vectors.rs fails when it ends)
+iommucore/src/iopt.rs: replace & with ^ in Iopt::walk_leaves  # detected as a timeout: as above
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::enable_cq  # equivalent: the queue is off (ON clear) when it is enabled, and the masks are distinct bits
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::enable_fq  # equivalent: as for enable_cq
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::write_cqcsr  # equivalent: the kept error bits and the written enable bits are disjoint
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::write_fqcsr  # equivalent: the kept error bits and the written enable bits are disjoint
+iommucore/src/sim.rs: replace | with &  # equivalent: the RW1C masks: the simulator never sets MF, cmd_to or fence_w_ip
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::execute  # equivalent: the completion word's half was cleared by the mask just before
+iommucore/src/sim.rs: replace | with ^ in <impl Regs for Sim<'_, M>>::read64  # equivalent: the two 32-bit halves are disjoint
+iommucore/src/sim.rs: replace * with / in Sim<'m, M>::context  # equivalent: as for `* with +`: only a base-format context reads past its words, into fields ignored without MSI_FLAT
+iommucore/src/sim.rs: replace + with * in <impl TableFrames for FakeFrames<'_, M>>::free  # detected as a timeout: the poison lands at addresses up to 4 KiB times the frame's, and the fake memory grows until the run is stopped (fake_memory_and_frames fails when it ends)
+iommucore/src/sim.rs: replace + with * in Sim<'m, M>::process_commands  # detected as a timeout: the head never moves, so the command loop never ends
+iommucore/src/iova.rs: replace / with % in Iova::scan  # detected as a timeout: the scan index never advances past a word
+iommucore/src/iova.rs: replace * with / in Iova::scan  # detected as a timeout: the scan index never advances past a word
+iommucore/src/cmdq.rs: replace | with ^ in Command::iotinval_vma  # equivalent: the command's fields are disjoint bits
+iommucore/src/cmdq.rs: replace << with >> in Command::iofence_c  # equivalent: IOFENCE.C's function code is 0, and 0 >> 7 is 0 << 7
+iommucore/src/ddt.rs: replace | with ^ in DeviceContext::deny  # equivalent: tc's V and DTF are distinct bits
+iommucore/src/ddt.rs: replace | with ^ in TableRoot::stage_words  # equivalent: the mode, soft id and PPN fields are disjoint
+iommucore/src/msi.rs: replace | with ^ in MsiPte::mrif  # equivalent: the entry's fields are disjoint bits
+iommucore/src/msi.rs: replace | with ^ in MsiPte::notice  # equivalent: the identity's low ten bits and bit 10 are disjoint
+iommucore/src/faultq.rs: replace | with ^ in FaultRecord::encode  # equivalent: the header's fields are disjoint bits
+iommucore/src/regs.rs: replace | with ^ in tr_req_ctl  # equivalent: GO, NW and the device id are disjoint bits
+iommucore/src/iopt.rs: replace | with ^ in Iopt::walk_leaves  # equivalent: R, W and X are distinct bits
+iommucore/src/faultq.rs: replace + with - in FaultQueue::pop  # equivalent: the record's second doubleword is reserved and `decode` ignores it
+iommucore/src/msi.rs: replace |= with ^= in pext  # equivalent: each output bit is set once, from clear
+iommucore/src/msi.rs: replace != with == in pext  # detected as a timeout: the loop over the mask's bits never ends
+iommucore/src/msi.rs: replace << with >>  # equivalent: PTE_V is 1 << 0 (every other constant's mutant is killed)
+iommucore/src/msi.rs: replace & with | in Mrif::stray  # equivalent: the read only skips a fetch_and that would change nothing
+iommucore/src/regs.rs: replace | with ^ in Fqcsr::acknowledge  # equivalent: the enable bits and the error bits are disjoint
+iommucore/src/regs.rs: replace | with ^ in icvec  # equivalent: the four fields are disjoint
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::report  # equivalent: the overflow and memory-fault bits are distinct
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::process_commands  # equivalent: cmd_ill and the memory-fault bit are distinct
+iommucore/src/sim.rs: replace |= with ^= in Sim<'m, M>::process_commands  # equivalent: commands run only while cmd_ill is clear, so it is only ever set from clear
+iommucore/src/sim.rs: replace > with >= in Sim<'m, M>::walk  # equivalent: at level 0 the alignment mask is 0
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::write  # equivalent: the field was cleared by the mask just before
+iommucore/src/iopt.rs: replace | with ^ in Iopt::path  # equivalent: R, W and X are distinct bits
+iommucore/src/iopt.rs: replace | with ^ in Iopt::free_below  # equivalent: R, W and X are distinct bits
+iommucore/src/iopt.rs: replace | with ^ in Iopt::map  # equivalent: R, W and X are distinct bits
+iommucore/src/iopt.rs: replace | with ^ in Iopt::translate  # equivalent: R, W and X are distinct bits, and a superpage's low PPN bits are checked zero before the offset is added
+iommucore/src/ddt.rs: replace | with ^ in DeviceContext::translate  # equivalent: the mode and PPN fields are disjoint
+iommucore/src/ddt.rs: replace | with ^ in Ddt::set  # equivalent: the PPN field and the valid bit are disjoint
+iommucore/src/cmdq.rs: replace |= with ^= in Command::iotinval_vma  # equivalent: the bits are clear before
+iommucore/src/cmdq.rs: replace << with >> in Command::iotinval_vma  # equivalent: IOTINVAL.VMA's function code is 0
+iommucore/src/iova.rs: replace |= with ^= in set_bits  # equivalent: every caller sets bits it has checked clear (free pages made live, live made pending)
+iommucore/src/iova.rs: replace > with < in Iova::alloc  # detected as a timeout: the allocation loop never ends
+iommucore/src/iova.rs: replace + with * in Iova::scan  # detected as a timeout: the scan index never advances
+iommucore/src/iopt.rs: replace << with >>  # equivalent: PTE_V is 1 << 0 (every other constant's mutant is killed)
+iommucore/src/sim.rs: replace << with >>  # equivalent: TC_V is 1 << 0 (every other constant's mutant is killed)
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::translate  # equivalent: a cached page address and the in-page offset are disjoint
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::handed_over  # equivalent: the PPN field and the mode are disjoint
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::read_ddtp  # equivalent: the busy bit is never set in the stored value
+iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::write_ddtp  # equivalent: the PPN field and the mode are disjoint
+iommucore/src/faultq.rs: replace + with * in FaultQueue::pop  # equivalent: the record's second doubleword is reserved and `decode` ignores it
+iommucore/src/iova.rs: replace | with ^ in Iova::free_pages  # equivalent: a page is never both live and pending
+iommucore/src/msi.rs: replace & with ^ in Mrif::stray  # equivalent: the read only skips a fetch_and that would change nothing
+iommucore/src/regs.rs: replace | with ^ in Ddtp::directory  # equivalent: the PPN field and the mode are disjoint
+iommucore/src/regs.rs: replace | with ^ in queue_base  # equivalent: the PPN field and LOG2SZ-1 are disjoint
+iommucore/src/cmdq.rs: replace << with >> in Command::iodir_inval_ddt  # equivalent: IODIR.INVAL_DDT's function code is 0
+iommucore/src/iova.rs: replace * with + in Iova::scan  # detected as a timeout: the scan index never advances past a word
+iommucore/src/iova.rs: replace Iova::scan -> u64 with 0  # detected as a timeout: the allocation loop never ends
+iommucore/src/iova.rs: replace Iova::scan -> u64 with 1  # detected as a timeout: the allocation loop never ends
+iommucore/src/iova.rs: replace > with == in Iova::alloc  # detected as a timeout: the allocation loop never ends
+iommucore/src/iova.rs: replace + with * in Iova::alloc  # detected as a timeout: the allocation loop never ends

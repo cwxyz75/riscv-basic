@@ -663,10 +663,33 @@ fn removal_stops_at_a_superpage_it_did_not_write() {
         assert_eq!(t.unmap(&mem, &mut frames, 0x20_1000), None);
         assert_eq!(mem.read(big + 8), 0x1);
         assert_eq!(mem.read(l1 + 8), (big >> 12) << 10 | leaf_bits);
+        // (Page 2 of the superpage: the word it would land on, read as a table, is 0.)
         assert_eq!(
-            t.map(&mem, &mut frames, 0x20_1000, 0x8765_5000, Access::Read),
+            t.map(&mem, &mut frames, 0x20_2000, 0x8765_5000, Access::Read),
             Err(iopt::MapError::AlreadyMapped)
         );
+        assert_eq!(mem.read(big + 16), 0);
+    }
+}
+
+#[test]
+fn destroy_frees_only_tables_and_not_a_superpage_it_did_not_write() {
+    for leaf_bits in [0x53u64, 0x59] {
+        let mem = FakeMem::new();
+        let mut frames = FakeFrames::new(&mem, 0x9000_0000, 8);
+        let mut t = iopt::Iopt::new(&mem, 0x8100_0000, PtMode::Sv39x4).unwrap();
+        t.map(&mem, &mut frames, 0x1000, 0x8765_4000, Access::Read)
+            .unwrap();
+        let l1 = (mem.read(0x8100_0000) >> 10) << 12;
+        mem.write(l1 + 8, (0x4000_0000u64 >> 12) << 10 | leaf_bits);
+        mem.write(0x8100_0000 + 8, (0x8000_0000u64 >> 12) << 10 | leaf_bits); // a 1 GiB one in the root
+        assert_eq!(t.destroy(&mem, &mut frames), 0x8100_0000);
+        assert_eq!(
+            frames.live(),
+            0,
+            "both tables freed, and nothing else (FakeFrames panics on a frame it never gave)"
+        );
+        assert_eq!(mem.read(0x8100_0000 + 8), 0);
     }
 }
 
@@ -680,20 +703,38 @@ fn a_pointer_at_the_last_level_is_not_a_leaf_and_not_followed() {
     let l1 = (mem.read(0x8100_0000) >> 10) << 12;
     let l0 = (mem.read(l1) >> 10) << 12;
     mem.write(l0 + 2 * 8, (0x9000_0000u64 >> 12) << 10 | 1); // V only, at level 0
+    mem.write(l0 + 3 * 8, (0x9000_0000u64 >> 12) << 10 | 0xd6); // a leaf with V clear
+    mem.write(0x8100_0000 + 5 * 8, 0xd6); // and one in the root
+    mem.write(l1 + 8, (0x4000_0000u64 >> 12) << 10 | 0x59); // an execute-only 2 MiB leaf: reported, not followed
     let mut seen = Vec::new();
     t.for_each_leaf(&mem, |iova, pa, _| seen.push((iova, pa)));
-    assert_eq!(seen, [(0x1000, 0x8765_4000)]);
+    assert_eq!(seen, [(0x1000, 0x8765_4000), (0x20_0000, 0x4000_0000)]);
+    // Unmap of the pointer at the last level treats it as the entry it is (and clears it).
+    assert_eq!(t.unmap(&mem, &mut frames, 0x2000), Some(0x9000_0000));
+    assert_eq!(mem.read(l0 + 2 * 8), 0);
+    // A misaligned address is refused by unmap, not rounded to its page.
+    assert_eq!(t.unmap(&mem, &mut frames, 0x1008), None);
+    assert_eq!(t.translate(&mem, 0x1008, iopt::Op::Read), Ok(0x8765_4008));
+    // Destroy does not follow the pointer either (FakeFrames panics on a frame it never gave).
+    t.destroy(&mem, &mut frames);
+    assert_eq!(frames.live(), 0);
 }
 
 #[test]
 fn an_mrif_reset_clears_all_512_bytes() {
     let mem = FakeMem::new();
-    for i in 0..64 {
+    for i in 0..66 {
         mem.write(0x8300_0200 + i * 8, !0);
     }
-    Mrif::new(0x8300_0200).unwrap().reset(&mem);
+    let f = Mrif::new(0x8300_0200).unwrap();
+    assert_eq!(f.pa(), 0x8300_0200);
+    f.reset(&mem);
     for i in 0..64 {
         assert_eq!(mem.read(0x8300_0200 + i * 8), 0, "word {i}");
     }
-    assert_eq!(mem.read(0x8300_0200 + 512), 0);
+    assert_eq!(
+        mem.read(0x8300_0200 + 512),
+        !0,
+        "the next file is untouched"
+    );
 }

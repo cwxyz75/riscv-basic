@@ -195,6 +195,10 @@ fn ddtp_transitions_are_qemus() {
     );
     sim.write64(regs::DDTP, one);
     assert_eq!(sim.read64(regs::DDTP), two);
+    // The same directory mode with another root is accepted (iommu.c:1939: new_mode == old_mode).
+    let two_b = Ddtp::directory(Levels::Two, 0x9100_0000).bits();
+    sim.write64(regs::DDTP, two_b);
+    assert_eq!(sim.read64(regs::DDTP), two_b);
     sim.write64(regs::DDTP, 0);
     assert_eq!(sim.read64(regs::DDTP), 0);
     sim.write64(regs::DDTP, one);
@@ -215,8 +219,9 @@ fn ddtp_transitions_are_qemus() {
     );
     sim.write64(regs::DDTP, one);
     sim.write64(regs::DDTP, two);
-    assert!(decode_ddtp(sim.read64(regs::DDTP)).busy);
-    assert!(decode_ddtp(sim.read64(regs::DDTP)).busy);
+    // While busy the register shows the old value (Off) with the busy bit.
+    assert_eq!(sim.read64(regs::DDTP), 0x10);
+    assert_eq!(sim.read64(regs::DDTP), 0x10);
     assert_eq!(sim.read64(regs::DDTP), one);
     assert_eq!(sim.ddtp_writes(), [one, two]);
 }

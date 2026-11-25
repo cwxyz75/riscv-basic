@@ -151,6 +151,15 @@ fn a_pending_range_is_never_handed_out() {
 #[test]
 fn page_zero_is_never_in_a_window_and_the_real_window_is_fast() {
     assert_eq!(Iova::new(0, 16), Err(IovaError::BadWindow));
+    // An empty range is refused, not a no-op.
+    let mut z = Iova::new(16, 16).unwrap();
+    let p = z.alloc(1).unwrap();
+    assert_eq!(z.release(p, 0), Err(IovaError::OutOfRange));
+    assert_eq!(z.release(p, 1), Ok(()));
+    assert_eq!(z.complete(p, 0), Err(IovaError::OutOfRange));
+    assert_eq!(z.alloc(0), None);
+    assert_eq!(z.alloc(17), None);
+    assert_eq!(z.free_pages(), 15);
     assert_eq!(Iova::new(1, 0), Err(IovaError::BadWindow));
     assert_eq!(Iova::new(1 << 52, 1), Err(IovaError::BadWindow));
     assert_eq!(Iova::new((1 << 52) - 1, 1).map(|a| a.pages()), Ok(1));

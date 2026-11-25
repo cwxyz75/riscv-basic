@@ -10,7 +10,7 @@ use iommucore::ddt::{Ddt, Format, Levels};
 use iommucore::faultq::{FaultQueue, FaultRecord, TransactionType};
 use iommucore::iopt::{self, Iopt, PtMode};
 use iommucore::iova::Iova;
-use iommucore::msi::{Mrif, MsiPte};
+use iommucore::msi::{Mrif, MsiPte, MsiTable, MsiWindow};
 use iommucore::regs::{self, Caps, Cqcsr, Fqcsr, Igs};
 use iommucore::sim::FakeMem;
 use iommucore::PhysMem64;
@@ -160,6 +160,40 @@ fn interrupt_vector_and_debug_translation_fields() {
 }
 
 #[test]
+fn queue_and_interrupt_constants() {
+    // bits.h:140-178 (queue csr bits) and 240-246 (ipsr).
+    assert_eq!(
+        [
+            regs::QCSR_EN,
+            regs::QCSR_IE,
+            regs::QCSR_MF,
+            regs::CQCSR_CMD_TO,
+            regs::FQCSR_OF
+        ],
+        [1, 2, 1 << 8, 1 << 9, 1 << 9]
+    );
+    assert_eq!(
+        [
+            regs::CQCSR_CMD_ILL,
+            regs::CQCSR_FENCE_W_IP,
+            regs::QCSR_ON,
+            regs::QCSR_BUSY
+        ],
+        [1 << 10, 1 << 11, 1 << 16, 1 << 17]
+    );
+    assert_eq!(
+        [
+            regs::IPSR_CIP,
+            regs::IPSR_FIP,
+            regs::IPSR_PMIP,
+            regs::IPSR_PIP
+        ],
+        [1, 2, 4, 8]
+    );
+    assert_eq!([regs::FCTL_BE, regs::FCTL_WSI, regs::FCTL_GXL], [1, 2, 4]);
+}
+
+#[test]
 fn pte_bits() {
     // The privileged architecture's PTE: V R W X U G A D in bits 0 to 7.
     let bits = [
@@ -192,9 +226,24 @@ fn small_accessors() {
     let a = Iova::new(0x1_2345, 77).unwrap();
     assert_eq!((a.first_page(), a.pages()), (0x1_2345, 77));
     // An MSI entry is valid by bit 0 only.
+    assert!(MsiPte::mrif(1 << 56, 0x2800_0000, 77).is_err()); // past the entry's 47-bit file field
+    assert!(MsiPte::mrif((1 << 56) - 512, 0x2800_0000, 77).is_ok());
     let e = MsiPte::mrif(0x8300_0200, 0x2800_0000, 77).unwrap();
     assert!(e.is_valid());
     assert!(!MsiPte::invalid().is_valid());
+    // The notice target reads back, with identities below and above 1024 (the MSB is a separate bit, 60).
+    for id in [1u16, 77, 1023, 1024, 1500, 2047] {
+        let e = MsiPte::mrif(0x8300_0200, 0x2800_3000, id).unwrap();
+        assert_eq!(e.notice(), (0x2800_3000, id));
+    }
+    // A new MSI table invalidates every entry of its page, over whatever was there.
+    for i in 0..512 {
+        mem.write(0x8500_0000 + i * 8, !0);
+    }
+    let table = MsiTable::new(&mem, 0x8500_0000, MsiWindow::new(1 << 40, 8).unwrap()).unwrap();
+    for i in 0..256 {
+        assert!(!table.get(&mem, i).unwrap().is_valid(), "entry {i}");
+    }
     let f = Mrif::new(0x8300_0400).unwrap();
     f.reset(&mem);
     for id in [1u16, 63, 64, 2047] {
@@ -203,6 +252,7 @@ fn small_accessors() {
         assert!(f.is_enabled(&mem, id).unwrap());
         assert!(!f.is_enabled(&mem, id ^ 1).unwrap(), "{id}");
         f.disable(&mem, id).unwrap();
+        assert!(!f.is_pending(&mem, id).unwrap());
     }
 }
 
@@ -220,6 +270,14 @@ fn pci_addresses_and_fault_records_round_trip() {
         iotval2: 0,
     };
     assert_eq!(rec(0x08).pci_address(), (0, 1, 0));
+    // The console's direction word (IOMMU-SPEC 7.2) for every transaction type (bits.h: TTYPE 1 to 9).
+    let dir = |code| TransactionType::from_code(code).direction();
+    let want = [
+        "none", "exec", "read", "write", "none", "exec", "read", "write", "none", "write",
+    ];
+    for (code, w) in want.iter().enumerate() {
+        assert_eq!(dir(code as u8), *w, "ttype {code}");
+    }
     assert_eq!(rec(0xffff).pci_address(), (0xff, 0x1f, 7));
     assert_eq!(rec(0x1_a3c5).pci_address(), (0xa3, 0x18, 5));
     // Every field survives encode then decode, in random combinations (the decoder is checked against hex in `vectors`).
@@ -247,12 +305,31 @@ fn a_new_directory_is_cleared_over_old_contents() {
         for i in 0..512 {
             mem.write(0x8400_0000 + i * 8, 0x11);
         }
+        mem.write(0x8400_1000, 0x22); // the next page is not the directory's
+        mem.write(0x8400_0000 - 8, 0x33);
         let d = Ddt::new(&mem, 0x8400_0000, Levels::One, format).unwrap();
+        assert_eq!(
+            (mem.read(0x8400_1000), mem.read(0x8400_0000 - 8)),
+            (0x22, 0x33)
+        );
         for i in 0..512 {
             assert_eq!(mem.read(0x8400_0000 + i * 8), 0, "{format:?} word {i}");
         }
         assert!(d.get(&mem, 3).is_none_or(|w| w == [0; 8]));
     }
+    // `get` reads back every word of the context `set` wrote (four in the base format).
+    let mem = FakeMem::new();
+    let mut frames = iommucore::sim::FakeFrames::new(&mem, 0x1_0000_0000, 8);
+    let t = Iopt::new(&mem, 0x8000_0000, PtMode::Sv39x4).unwrap();
+    let table = MsiTable::new(&mem, 0x8500_0000, MsiWindow::new(1 << 40, 8).unwrap()).unwrap();
+    let ctx = iommucore::ddt::DeviceContext::translate(t.context_root(9).unwrap(), Some(&table));
+    let mut d = Ddt::new(&mem, 0x8400_0000, Levels::Two, Format::Extended).unwrap();
+    d.set(&mem, &mut frames, 0x1234, &ctx).unwrap();
+    assert_eq!(d.get(&mem, 0x1234), Some(ctx.words()));
+    let ctx = iommucore::ddt::DeviceContext::translate(t.context_root(9).unwrap(), None);
+    let mut d = Ddt::new(&mem, 0x8600_0000, Levels::Two, Format::Base).unwrap();
+    d.set(&mem, &mut frames, 0x1234, &ctx).unwrap();
+    assert_eq!(d.get(&mem, 0x1234), Some(ctx.words()));
 }
 
 #[test]
