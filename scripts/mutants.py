@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Mutation testing of `kcore` and `klock` (KT10, OD140): run cargo-mutants with the crate's host tests as the oracle and fail on any
+"""Mutation testing of `kcore`, `klock` and `iommucore` (KT10, OD140; IOMMU2): run cargo-mutants with the crate's host tests as the oracle and fail on any
 surviving mutant that is not in `mutants-accepted.txt`.
 
 Usage: mutants.py PACKAGE [--shard K/N] [--file PATH]... [--list]
-  PACKAGE   kcore or klock
+  PACKAGE   kcore, klock or iommucore
   --shard   run one slice of the mutants (cargo-mutants' own sharding), so a CI matrix fits the job budget
   --file    only the mutants of these files (the acceptance check and local use)
 Output: target/mutants-<package>[-<k>of<n>]/ (cargo-mutants' own), a summary on stdout and, in CI, in the job summary.
@@ -16,7 +16,7 @@ import argparse, os, re, subprocess, sys
 
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 ap = argparse.ArgumentParser()
-ap.add_argument("package", choices=["kcore", "klock"])
+ap.add_argument("package", choices=["kcore", "klock", "iommucore"])
 ap.add_argument("--shard")
 ap.add_argument("--file", action="append", default=[])
 a = ap.parse_args()

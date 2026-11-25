@@ -28,7 +28,7 @@ help:
 	@echo "make check      the epic gate (smoke): what CI runs on a pull request into main"
 
 test:
-	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -42,7 +42,7 @@ fmt-check:
 lint: lint-host lint-target
 
 lint-host:
-	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 
 lint-target:
 	cd home/kernel && cargo clippy -- -D warnings
@@ -128,7 +128,7 @@ kernel: kernel-main
 # Host tests of the OS crates: plain, then the same code under the loom and
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
 os-test:
-	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock
+	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore
 	$(MAKE) os-models
 
 # AR1 (OD143): the kernel compiles against the AArch64 stub in kernel/src/arch/aarch64 (no code is built or run for it).
@@ -171,6 +171,7 @@ os-miri:
 	# (the allocation-failure sweep starts child processes of itself, which Miri cannot do; the host run and `os-allocfail` cover it)
 	cargo +nightly miri test -p ksys --target-dir target/miri -- --skip every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean
 	cargo +nightly miri test -p klock --target-dir target/miri
+	cargo +nightly miri test -p iommucore --target-dir target/miri
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
 # kernel at four harts is also the fastest full run (35 s: waits overlap).
@@ -548,12 +549,13 @@ os-chaos:
 	cd kernel && cargo build --features chaos --target-dir ../target/os-chaos
 	python3 scripts/chaos.py $(OS_CHAOS_ELF) "$(CHAOS_SEEDS)"
 
-# KT10: mutation testing of kcore and klock with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
-# `make os-mutants` runs both crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
+# KT10: mutation testing of kcore, klock and iommucore with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
+# `make os-mutants` runs the three crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
 # Fails on a surviving mutant that is not in mutants-accepted.txt with a reason. Hours: the owner starts it (OD142).
 os-mutants:
 ifeq ($(PKG),)
 	python3 scripts/mutants.py klock
+	python3 scripts/mutants.py iommucore
 	python3 scripts/mutants.py kcore
 else
 	python3 scripts/mutants.py $(PKG) $(if $(SHARD),--shard $(SHARD),)
@@ -564,7 +566,7 @@ endif
 # artifact in CI). Not a gate. (0.6.16 cannot read the coverage data of rustc 1.100 and reports 0 percent everywhere: found by the first overnight
 # run, 2026-11-21; with 0.9.2 the host tests of the four crates cover 90.4 percent of regions and 91.3 percent of lines.)
 os-coverage:
-	cargo llvm-cov -p kcore -p klock -p abi -p ksys --summary-only
+	cargo llvm-cov -p kcore -p klock -p abi -p ksys -p iommucore --summary-only
 	cargo llvm-cov report --html --output-dir target/cov
 
 # KT8: the host fuzzer of the syscall layer (`ksys/tests/fuzz.rs`, sequences from `kfuzz-gen`, audits after every call) over many seeds. A failing
