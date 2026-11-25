@@ -643,3 +643,57 @@ fn removal_asks_for_no_frame() {
     let _ = frames.alloc(); // (the budget is respected)
     assert_eq!(frames.live(), 0);
 }
+
+// ---- tables the crate did not write -------------------------------------------------------------------------------------
+
+#[test]
+fn removal_stops_at_a_superpage_it_did_not_write() {
+    // A 2 MiB leaf (read-only, or execute-only) put in by hand at level 1: unmapping a page inside it finds no 4 KiB leaf and
+    // touches neither the superpage nor the memory it maps (which must not be read as a table).
+    for leaf_bits in [0x53u64, 0x59] {
+        let mem = FakeMem::new();
+        let mut frames = FakeFrames::new(&mem, 0x9000_0000, 8);
+        let mut t = iopt::Iopt::new(&mem, 0x8100_0000, PtMode::Sv39x4).unwrap();
+        t.map(&mem, &mut frames, 0x1000, 0x8765_4000, Access::Read)
+            .unwrap();
+        let l1 = (mem.read(0x8100_0000) >> 10) << 12;
+        let big = 0x4000_0000u64;
+        mem.write(l1 + 8, (big >> 12) << 10 | leaf_bits);
+        mem.write(big + 8, 0x1); // looks like a valid entry if `big` were a table
+        assert_eq!(t.unmap(&mem, &mut frames, 0x20_1000), None);
+        assert_eq!(mem.read(big + 8), 0x1);
+        assert_eq!(mem.read(l1 + 8), (big >> 12) << 10 | leaf_bits);
+        assert_eq!(
+            t.map(&mem, &mut frames, 0x20_1000, 0x8765_5000, Access::Read),
+            Err(iopt::MapError::AlreadyMapped)
+        );
+    }
+}
+
+#[test]
+fn a_pointer_at_the_last_level_is_not_a_leaf_and_not_followed() {
+    let mem = FakeMem::new();
+    let mut frames = FakeFrames::new(&mem, 0x9000_0000, 8);
+    let mut t = iopt::Iopt::new(&mem, 0x8100_0000, PtMode::Sv39x4).unwrap();
+    t.map(&mem, &mut frames, 0x1000, 0x8765_4000, Access::Read)
+        .unwrap();
+    let l1 = (mem.read(0x8100_0000) >> 10) << 12;
+    let l0 = (mem.read(l1) >> 10) << 12;
+    mem.write(l0 + 2 * 8, (0x9000_0000u64 >> 12) << 10 | 1); // V only, at level 0
+    let mut seen = Vec::new();
+    t.for_each_leaf(&mem, |iova, pa, _| seen.push((iova, pa)));
+    assert_eq!(seen, [(0x1000, 0x8765_4000)]);
+}
+
+#[test]
+fn an_mrif_reset_clears_all_512_bytes() {
+    let mem = FakeMem::new();
+    for i in 0..64 {
+        mem.write(0x8300_0200 + i * 8, !0);
+    }
+    Mrif::new(0x8300_0200).unwrap().reset(&mem);
+    for i in 0..64 {
+        assert_eq!(mem.read(0x8300_0200 + i * 8), 0, "word {i}");
+    }
+    assert_eq!(mem.read(0x8300_0200 + 512), 0);
+}

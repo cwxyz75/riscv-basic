@@ -907,7 +907,9 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
                 .fetch_or(pte_addr, 64 | if write { 128 } else { 0 });
         }
         let span = (1u64 << (12 + 9 * i)) - 1;
-        Ok(((ppn << 12) & !span | (iova & span), w && (dirty || ade)))
+        // A cached entry serves a write only once D is set (by the leaf, or by this write's update): a later write through an
+        // entry cached by a read walks again and sets D.
+        Ok(((ppn << 12) & !span | (iova & span), w && (dirty || write)))
     }
 
     /// Translate one access of `did` at `iova`: to memory, or to the MSI path. Reports a fault when `report` is set.
@@ -1088,6 +1090,8 @@ impl<M: PhysMem64> Regs for Sim<'_, M> {
             regs::FQCSR => self.fqcsr,
             regs::PQCSR | regs::PQH | regs::PQT => 0,
             regs::IPSR => self.ipsr,
+            // The 32 bits above `fctl` are reserved (and `read64(FCTL)` reads them here: no recursion).
+            0x0c => 0,
             o if o % 8 == 4 => (self.read64(o - 4) >> 32) as u32,
             o => self.read64(o) as u32,
         }
