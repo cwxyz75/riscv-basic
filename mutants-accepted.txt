@@ -14,7 +14,7 @@ iommucore/src/sim.rs: replace | with ^ in <impl Regs for Sim<'_, M>>::write64  #
 iommucore/src/sim.rs: replace | with ^ in Sim<'m, M>::context_ok  # equivalent: masks built from distinct single bits
 iommucore/src/sim.rs: replace |= with ^= in Sim<'m, M>::handed_over  # equivalent: the enable bit is clear just before (a fresh simulator), so set and toggle agree
 iommucore/src/ddt.rs: replace << with >>  # equivalent: TC_V is 1 << 0 (every other constant's mutant is killed)
-iommucore/src/regs.rs: replace << with >>  # equivalent: QCSR_EN and FCTL_BE are 1 << 0 (every other constant's mutant is killed)
+iommucore/src/regs.rs: replace << with >>  # equivalent: QCSR_EN, FCTL_BE, IPSR_CIP and TR_GO_BUSY are 1 << 0 (every other constant's mutant is killed)
 iommucore/src/cmdq.rs: replace | with ^ in Command::iotinval_gvma  # equivalent: the command's fields are disjoint bits
 iommucore/src/cmdq.rs: replace | with ^ in Command::iofence_c  # equivalent: the command's fields are disjoint bits
 iommucore/src/cmdq.rs: replace | with ^ in Command::iodir_inval_ddt  # equivalent: the command's fields are disjoint bits
