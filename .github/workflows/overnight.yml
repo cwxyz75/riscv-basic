@@ -115,6 +115,7 @@ jobs:
       matrix:
         include:
           - {pkg: klock, shard: "0/1"}
+          - {pkg: iommucore, shard: "0/1"}
           - {pkg: kcore, shard: "0/8"}
           - {pkg: kcore, shard: "1/8"}
           - {pkg: kcore, shard: "2/8"}

@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "init", "ish", "kcore", "klock", "libc", "libsys", "kernel", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "profile", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "rt", "shell-core", "supervise", "svc",
+    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "init", "ish", "iommucore", "kcore", "klock", "libc", "libsys", "kernel", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "profile", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "rt", "shell-core", "supervise", "svc",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
 ]
 # Plain `cargo test` / `cargo build` at the root only touches the host-testable
 # host-testable crates. The two kernels target bare-metal RISC-V and are built from
 # inside kernel/ and home/kernel/ (see Makefile), which pick up their .cargo/config.toml.
 default-members = [
-    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "ish", "kcore", "klock", "libsys", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "shell-core", "supervise", "svc",
+    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "ish", "iommucore", "kcore", "klock", "libsys", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "shell-core", "supervise", "svc",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
 ]
 
@@ -92,6 +92,8 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.rngcore]
 opt-level = 2
+[profile.dev.package.iommucore]
+opt-level = 2
 [profile.dev.package.nettcp]
 opt-level = 2
 [profile.dev.package.netring]
@@ -126,4 +128,6 @@ overflow-checks = true
 [profile.release.package.ksys]
 overflow-checks = true
 [profile.release.package.abi]
+overflow-checks = true
+[profile.release.package.iommucore]
 overflow-checks = true

@@ -1,0 +1,21 @@
+[package]
+name = "iommucore"
+version = "0.1.0"
+edition = "2021"
+description = "OS track IOMMU2: the RISC-V IOMMU's in-memory and register formats (directory, I/O page tables, MSI page tables and interrupt files, queues, the I/O address allocator) as pure code, with a simulated IOMMU for host tests"
+
+[dependencies]
+
+[features]
+# The simulated IOMMU (`iommucore::sim`) and its fake memory and frame allocator: host tests only (this crate's, and kcore's and
+# ksys's later). Never enabled in a kernel build.
+sim = []
+# Negative controls (IOMMU-SPEC section 13): constructors for the states the kernel never writes. Each exists only so that a
+# fixture kernel can show that its named test fails; no real build enables them.
+fault-iommu-bare = []
+fault-msi-basic = []
+
+# The integration tests need the simulator and the negative-control constructors (the simulator must be able to walk what a
+# broken kernel would write).
+[dev-dependencies]
+iommucore = { path = ".", features = ["sim", "fault-iommu-bare", "fault-msi-basic"] }

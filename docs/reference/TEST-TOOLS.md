@@ -126,11 +126,11 @@ first on, with class N exempt as the reserve makes it: nothing may panic or leak
 that pass: its fault ends the process, which is the right answer, and the process is the one running the suite.)
 `KALLOC_SCENARIO=<name>` and `KALLOC_MAX=<n>` run one scenario; `KALLOC_CHILD=<scenario>:<n>[:persist]` replays one case.
 
-**Mutation testing.** `make os-mutants` (overnight; cargo-mutants) mutates `kcore` and `klock` with their host tests as
+**Mutation testing.** `make os-mutants` (overnight; cargo-mutants) mutates `kcore`, `klock` and `iommucore` with their host tests as
 the oracle. A survivor that is not in `mutants-accepted.txt` with a reason fails the run. `PKG=` and `SHARD=` run a slice.
 
 **Coverage.** `make os-coverage` (overnight; cargo-llvm-cov) reports line and region coverage of the host tests of
-`kcore`, `klock`, `abi` and `ksys`. It is a report, never a gate: a number says where a test is missing, not that the
+`kcore`, `klock`, `iommucore`, `abi` and `ksys`. It is a report, never a gate: a number says where a test is missing, not that the
 code is right.
 
 ## Kernel checks under QEMU
