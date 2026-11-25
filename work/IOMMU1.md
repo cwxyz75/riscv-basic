@@ -6,7 +6,6 @@ area: drivers
 horizon: long
 complexity: H
 change_risk: L
-blocked_by: [IOMMU0]
 refs: [T42, OD148, OD136, OD14, OD162, OD163, OD164, OD165, OD166, OD167, IOMMU-SPEC, KERNEL-V1-SPEC, OS-ARCHITECTURE, S6-SPEC, SCHED-SMP-SPEC]
 ---
 

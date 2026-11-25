@@ -162,3 +162,4 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-24 | T161 | Thread ids are a u32 counter with no wrap rule | Stale: Tid is u64 and SYSCALLS.md says identifiers are 64-bit, never reused, no counter wraps |
 | 2026-11-24 | T71 | `ran_on` is sticky | Stale: no ran_on exists; the item described an unbuilt design; per-hart shootdown tracking is T205 |
 | 2026-11-24 | T39 | TLB shootdowns flush everything on every other hart | Duplicate of T205 (whole-TLB shootdowns); the big-lock wording is also out of date after L20 |
+| 2026-11-25 | IOMMU0 | IOMMU facts: what QEMU's RISC-V IOMMU and iommu-testdev really do (a record, before the spec) | QEMU 11.1.3 facts record: 16 items answered (read in source, observed on a probe guest, or not established); docs/records/notes/2026-11-25-iommu-qemu-facts.md |
