@@ -9,7 +9,7 @@ mod common;
 
 use common::{Rng, SEEDS};
 use iommucore::ddt::{Ddt, DeviceContext, Format, Levels};
-use iommucore::iopt::{self, Access, Iopt, Op, PtMode};
+use iommucore::iopt::{Access, Iopt, Op, PtMode};
 use iommucore::regs;
 use iommucore::sim::{FakeFrames, FakeMem, Sim, SimConfig};
 use iommucore::{PhysMem64, Regs};
@@ -49,24 +49,25 @@ fn entries(mem: &FakeMem, t: &Iopt) -> Vec<(u64, u32)> {
     out
 }
 
+/// (The bits are literals, not the crate's constants: a wrong constant must not move both walkers' inputs with it.)
 fn corrupt(rng: &mut Rng, mem: &FakeMem, at: u64, level: u32) {
     let pte = mem.read(at);
     let leaf = pte & 0xe != 0;
     let new = match rng.below(12) {
-        0 => pte | iopt::PTE_R, // a non-leaf becomes a (probably misaligned) superpage
+        0 => pte | 0x02, // a non-leaf becomes a (probably misaligned) superpage
         1 if level > 0 => {
             // A well-formed superpage leaf, aligned to its level.
             let ppn = (rng.below(1 << 20) << (9 * level)) & ((1 << 44) - 1);
             (ppn << 10) | 0xd7
         }
-        2 if leaf => (pte & !0x3ff) | iopt::PTE_V, // a pointer where a leaf was (at level 0: a fault)
-        3 => pte | (1 << (54 + rng.below(10))),    // a high bit
-        4 if leaf => pte & !iopt::PTE_R | iopt::PTE_W, // W without R
-        5 if leaf => (pte & !0xe) | iopt::PTE_X,   // execute only
-        6 if leaf => pte & !iopt::PTE_U,
-        7 if leaf => pte & !iopt::PTE_A,
-        8 if leaf => pte & !iopt::PTE_D,
-        9 => pte & !iopt::PTE_V,
+        2 if leaf => (pte & !0x3ff) | 0x01, // a pointer where a leaf was (at level 0: a fault)
+        3 => pte | (1 << (54 + rng.below(10))), // a high bit
+        4 if leaf => pte & !0x02 | 0x04,    // W without R
+        5 if leaf => (pte & !0xe) | 0x08,   // execute only
+        6 if leaf => pte & !0x10,
+        7 if leaf => pte & !0x40,
+        8 if leaf => pte & !0x80,
+        9 => pte & !0x01,
         10 => rng.next() & !(0x3ffu64 << 54) | 1, // garbage, valid, no high bit
         _ => rng.next(),
     };
