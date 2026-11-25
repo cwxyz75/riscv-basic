@@ -564,7 +564,7 @@ fn channel_call_inner(
             thread::current() as u64,
             a,
             staged,
-            take_interrupt_held,
+            take_interrupt_in,
         )
     })?;
     notify_sync(); // (the request is queued and this thread blocks next: the server it wakes runs on this hart, L24)
@@ -601,7 +601,7 @@ fn channel_call_inner(
                     &call,
                     deferred,
                     true,
-                    take_interrupt_held,
+                    take_interrupt_in,
                 ),
                 Err(e) => Err((e, None, None)),
             }

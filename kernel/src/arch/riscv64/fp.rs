@@ -95,7 +95,7 @@ fn state() -> &'static mut FpState {
         crate::bkl::held(),
         "FP state touched without the big kernel lock"
     );
-    // SAFETY: the object lock is held (debug-checked), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
+    // SAFETY: the object lock is held (every caller does; it is checked in debug builds only), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
     // that holds one passes it down (`drop_claim` takes `s`) instead of calling `state()` again, so no two live `&mut` alias on this hart (T239).
     unsafe {
         let cell = &mut *STATE.0.get();
@@ -151,7 +151,7 @@ impl StateUnit for HartUnit {
 
     fn load(&mut self, r: &FpRegs) {
         let (f, fcsr) = (r.f.as_ptr(), u64::from(r.fcsr));
-        // SAFETY: as `save`: `f` points at the 32 u64s of the live `&FpRegs`, `c` at its fcsr, they are only read, and interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc`. The FP registers are deliberately *not*
+        // SAFETY: as `save`: `f` points at the 32 u64s of the live `&FpRegs`, `c` holds its fcsr value, they are only read, and interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc`. The FP registers are deliberately *not*
         // declared clobbered: the kernel executes no FP instruction of its own (it runs with the unit
         // off, INVARIANTS FP3), so the compiler holds nothing in them; declaring them would make it
         // save and restore the callee-saved ones with FP instructions in this function's prologue,
@@ -589,12 +589,14 @@ fn fp_first_use(frame: &mut TrapFrame) -> bool {
     if frame.sstatus & FS_MASK != 0 {
         return false;
     }
-    let s = state();
     let tid = crate::thread::current();
+    let job = crate::user::job_of_thread(tid);
+    let s = state();
     // (the state is the job's kernel memory: a job at its limit cannot give a thread more; the instruction then faults like any illegal one)
     if !charge_state(
         &mut s.fp_charge,
         tid,
+        job,
         (core::mem::size_of::<FpThread>() + core::mem::size_of::<FpRegs>()) as u64,
     ) {
         return false;
@@ -615,11 +617,12 @@ fn vec_first_use(frame: &mut TrapFrame) -> Option<bool> {
     if frame.sstatus & VS_MASK != 0 {
         return Some(false);
     }
-    let s = state();
     let tid = crate::thread::current();
+    let job = crate::user::job_of_thread(tid);
+    let s = state();
     let bytes =
         (core::mem::size_of::<VecThread>() + core::mem::size_of::<VecRegs>() + vlenb() * 32) as u64;
-    if !charge_state(&mut s.vec_charge, tid, bytes) {
+    if !charge_state(&mut s.vec_charge, tid, job, bytes) {
         return None;
     }
     let FpState {
@@ -637,11 +640,19 @@ fn vec_first_use(frame: &mut TrapFrame) -> Option<bool> {
 
 /// Charge `bytes` of register state to the job of user thread `tid`, once (a second call for a thread already charged is free); `false`
 /// when the job is at its kernel-memory limit. Kernel threads are not charged.
-fn charge_state(book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>, tid: u64, bytes: u64) -> bool {
+///
+/// `job` is the thread's job (`None` for a kernel thread), named by the caller: a caller inside a user-state closure has it from its own `s`, and this
+/// function does not open the state again (KT14: that aliased the caller's `&mut UserState`).
+fn charge_state(
+    book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>,
+    tid: u64,
+    job: Option<kcore::job::JobId>,
+    bytes: u64,
+) -> bool {
     if book.contains_key(&tid) {
         return true;
     }
-    let Some(job) = crate::user::job_of_thread(tid) else {
+    let Some(job) = job else {
         return true;
     };
     let j = crate::kmem::jobs();
@@ -724,11 +735,12 @@ fn drop_claim(s: &mut FpState, tid: u64, fp: bool) {
 /// charged to its job. `frame` is the thread's saved user frame if it has run (its `sstatus.FS` is set so the return to user mode loads the
 /// state); a thread that has not run gets it at its first entry (`mark_present`). False when the job cannot be charged.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the register image is built on the stack and moved into its box); T172 shrinks them
-pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
+pub fn write_fp(tid: u64, job: Option<kcore::job::JobId>, w: &[u64; 33]) -> bool {
     let s = state();
     if !charge_state(
         &mut s.fp_charge,
         tid,
+        job,
         (core::mem::size_of::<FpThread>() + core::mem::size_of::<FpRegs>()) as u64,
     ) {
         return false;
@@ -767,12 +779,13 @@ pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// Write the thread's vector state (`bytes` in the layout of `read_vec`, of exactly `32 + 32 * vlenb` bytes). As `write_fp`.
-pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
+pub fn write_vec(tid: u64, job: Option<kcore::job::JobId>, bytes: &[u8]) -> bool {
     let n = vlenb();
     let s = state();
     if !charge_state(
         &mut s.vec_charge,
         tid,
+        job,
         (core::mem::size_of::<VecThread>() + core::mem::size_of::<VecRegs>() + n * 32) as u64,
     ) {
         return false;

@@ -589,6 +589,12 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
     Ok((None, None))
 }
 
+/// The job of user thread `tid`, from the state the caller holds (`fp::write_fp` charges the register state to it and must not open the state again).
+fn job_of(s: &UserState, tid: kcore::sched::Tid) -> Option<kcore::job::JobId> {
+    let pid = s.pid_of(tid)?;
+    Some(s.procs.get(&pid)?.job)
+}
+
 /// `pager_create() -> (pager, channel)` (MM9).
 pub(super) fn pager_create_call() -> Reply {
     locked_state(|s| -> Reply {
@@ -835,7 +841,7 @@ fn state_write(
                     return bad(e);
                 }
             }
-            if !crate::fp::write_fp(tid, &g) {
+            if !crate::fp::write_fp(tid, job_of(s, tid), &g) {
                 return bad(Status::NoMemory);
             }
             if ran {
@@ -850,7 +856,7 @@ fn state_write(
                     return bad(e);
                 }
             }
-            if !crate::fp::write_vec(tid, &data) {
+            if !crate::fp::write_vec(tid, job_of(s, tid), &data) {
                 return bad(Status::NoMemory);
             }
             if ran {

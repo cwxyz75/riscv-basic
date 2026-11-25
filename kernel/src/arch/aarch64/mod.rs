@@ -105,13 +105,13 @@ pub mod fp {
     pub fn read_fp(tid: u64) -> [u64; 33] {
         unimplemented!()
     }
-    pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
+    pub fn write_fp(tid: u64, job: Option<kcore::job::JobId>, w: &[u64; 33]) -> bool {
         unimplemented!()
     }
     pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
         unimplemented!()
     }
-    pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
+    pub fn write_vec(tid: u64, job: Option<kcore::job::JobId>, bytes: &[u8]) -> bool {
         unimplemented!()
     }
     pub fn apply_written(tid: u64, frame: &mut TrapFrame, fp: bool, vec: bool) {

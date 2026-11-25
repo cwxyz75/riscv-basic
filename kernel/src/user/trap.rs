@@ -434,7 +434,22 @@ fn hart_call(n: usize, a: [u64; 6]) -> Reply {
     }
 }
 
+/// `debug_stat` 120 to 124: the backstops (PL8): objects, queued IPC bytes, processes, user threads, DMA pages; `None` for any other index.
+#[inline(never)]
+fn backstop_stat(s: &UserState, which: u64) -> Option<u64> {
+    let b = &s.backstops;
+    match which {
+        120 => Some(b.objects as u64),
+        121 => Some(b.ipc_bytes as u64),
+        122 => Some(b.processes as u64),
+        123 => Some(b.user_threads as u64),
+        124 => Some(b.dma_total_pages),
+        _ => None,
+    }
+}
+
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame just over 1 KiB (the state closure and the test-build arms); T172 shrinks them
 fn debug_stat_call(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -476,6 +491,10 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             // 204: the VMOs that exist, so a sweep can check a scenario leaves none behind
             204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
             _ => {}
+        }
+        // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
+        if let Some(v) = backstop_stat(s, a[1]) {
+            return Ok((Some(v), None));
         }
         Ok((Some(thread::wake_stat(a[1])), None))
     })
