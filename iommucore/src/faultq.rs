@@ -144,7 +144,7 @@ pub const RECORD_BYTES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultQueueError {
-    /// The base is not page-aligned, or the size is not a power of two from 2 to the records of one page.
+    /// The base is not page-aligned or past the PPN field, or the size is not a power of two from 2 to the records of one page.
     BadShape,
 }
 
@@ -152,29 +152,29 @@ pub enum FaultQueueError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultQueue {
     base: u64,
+    /// The `fqb` value.
+    reg: u64,
     entries: u32,
     head: u32,
 }
 
 impl FaultQueue {
     pub fn new(base_pa: u64, entries: u32) -> Result<FaultQueue, FaultQueueError> {
-        if base_pa & (PAGE_SIZE - 1) != 0
-            || !entries.is_power_of_two()
-            || entries < 2
-            || u64::from(entries).saturating_mul(RECORD_BYTES) > PAGE_SIZE
-        {
-            return Err(FaultQueueError::BadShape);
-        }
+        let reg = match crate::regs::queue_base(base_pa, entries) {
+            Some(reg) if u64::from(entries).saturating_mul(RECORD_BYTES) <= PAGE_SIZE => reg,
+            _ => return Err(FaultQueueError::BadShape),
+        };
         Ok(FaultQueue {
             base: base_pa,
+            reg,
             entries,
             head: 0,
         })
     }
 
     /// The value for the `fqb` register.
-    pub fn fqb(&self) -> u64 {
-        crate::regs::queue_base(self.base, self.entries).unwrap_or(0)
+    pub const fn fqb(&self) -> u64 {
+        self.reg
     }
     pub const fn entries(&self) -> u32 {
         self.entries

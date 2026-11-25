@@ -31,7 +31,7 @@ fn bring_up<R: Regs>(
     };
     let found = wait_ddtp(r).ok_or("IOMMU: will not go off")?;
     if found.mode != DdtpMode::Off {
-        r.write64(regs::DDTP, Ddtp::off().bits());
+        regs::write_ddtp(r, Ddtp::off());
         match wait_ddtp(r) {
             Some(v) if v.mode == DdtpMode::Off => {}
             _ => return Err("IOMMU: will not go off".into()),
@@ -60,7 +60,7 @@ fn bring_up<R: Regs>(
             return Err(format!("IOMMU: refused {csr:#x}"));
         }
     }
-    r.write64(regs::DDTP, d.ddtp().bits());
+    regs::write_ddtp(r, d.ddtp());
     let v = wait_ddtp(r).ok_or("IOMMU: refused ddtp")?;
     if v.mode != DdtpMode::Directory(d.levels()) || v.root_pa != d.root() {
         return Err("IOMMU: refused ddtp".into());

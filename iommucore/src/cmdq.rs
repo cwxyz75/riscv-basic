@@ -95,18 +95,20 @@ impl Command {
     }
 
     /// `IOFENCE.C`, always with PR and PW (it also orders the device reads and writes the IOMMU has already let through: A5), and
-    /// with `completion` = (address, data), a 4-byte write of `data` to the 4-byte-aligned address when it completes.
-    pub const fn iofence_c(completion: Option<(u64, u32)>) -> Command {
+    /// with `completion` = (address, data), a 4-byte write of `data` to the address when it completes. None if the address is
+    /// not 4-byte aligned (the command cannot name it).
+    pub const fn iofence_c(completion: Option<(u64, u32)>) -> Option<Command> {
         let d0 = OP_IOFENCE | (FUNC_FENCE_C << FUNC_SHIFT) | IOFENCE_PR | IOFENCE_PW;
         match completion {
-            Some((addr, data)) => Command {
+            Some((addr, _)) if addr & 3 != 0 => None,
+            Some((addr, data)) => Some(Command {
                 dword0: d0 | AV | ((data as u64) << IOFENCE_DATA_SHIFT),
                 dword1: addr >> 2,
-            },
-            None => Command {
+            }),
+            None => Some(Command {
                 dword0: d0,
                 dword1: 0,
-            },
+            }),
         }
     }
 }
@@ -117,7 +119,7 @@ pub enum QueueError {
     Full,
     /// A head value outside the commands the kernel submitted (an IOMMU that misbehaves).
     BadHead,
-    /// The base is not page-aligned, or the size is not a power of two from 2 to the entries of one page.
+    /// The base is not page-aligned or past the PPN field, or the size is not a power of two from 2 to the entries of one page.
     BadShape,
 }
 
@@ -125,6 +127,8 @@ pub enum QueueError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdQueue {
     base: u64,
+    /// The `cqb` value.
+    reg: u64,
     entries: u32,
     /// The next slot to fill (the value written to `cqt`).
     tail: u32,
@@ -142,15 +146,13 @@ impl CmdQueue {
     /// A queue of `entries` commands in the page at `base_pa` (which the caller zeroed), empty, as the IOMMU resets it when the
     /// queue is enabled.
     pub fn new(base_pa: u64, entries: u32) -> Result<CmdQueue, QueueError> {
-        if base_pa & (PAGE_SIZE - 1) != 0
-            || !entries.is_power_of_two()
-            || entries < 2
-            || u64::from(entries).saturating_mul(COMMAND_BYTES) > PAGE_SIZE
-        {
-            return Err(QueueError::BadShape);
-        }
+        let reg = match crate::regs::queue_base(base_pa, entries) {
+            Some(reg) if u64::from(entries).saturating_mul(COMMAND_BYTES) <= PAGE_SIZE => reg,
+            _ => return Err(QueueError::BadShape),
+        };
         Ok(CmdQueue {
             base: base_pa,
+            reg,
             entries,
             tail: 0,
             head: 0,
@@ -160,8 +162,8 @@ impl CmdQueue {
     }
 
     /// The value for the `cqb` register.
-    pub fn cqb(&self) -> u64 {
-        crate::regs::queue_base(self.base, self.entries).unwrap_or(0)
+    pub const fn cqb(&self) -> u64 {
+        self.reg
     }
     pub const fn entries(&self) -> u32 {
         self.entries

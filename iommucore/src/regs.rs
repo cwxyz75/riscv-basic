@@ -312,6 +312,12 @@ pub fn queue_base(base_pa: u64, entries: u32) -> Option<u64> {
     Some(((base_pa >> 12) << PPN_SHIFT) | log2sz_minus_1)
 }
 
+/// Write `ddtp`. The only value a caller can write is a [`Ddtp`], so Bare is written only with the `fault-iommu-bare` feature
+/// (IO2 by construction).
+pub fn write_ddtp<R: crate::Regs>(r: &mut R, v: Ddtp) {
+    r.write64(DDTP, v.bits());
+}
+
 /// Decode a queue base register: (first page's address, number of entries).
 pub fn decode_queue_base(raw: u64) -> (u64, u64) {
     (ppn_addr(raw), 2u64 << (raw & 0x1f))

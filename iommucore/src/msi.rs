@@ -257,10 +257,13 @@ pub struct Mrif {
 }
 
 impl Mrif {
-    /// The file at `pa`, which must be 512-byte aligned.
+    /// The file at `pa`, which must be 512-byte aligned and a physical address an MSI entry can name (below 2^56).
     pub const fn new(pa: u64) -> Result<Mrif, MsiError> {
         if pa & (MRIF_BYTES - 1) != 0 {
             return Err(MsiError::Misaligned);
+        }
+        if pa >> 56 != 0 {
+            return Err(MsiError::OutOfRange);
         }
         Ok(Mrif { pa })
     }
@@ -269,7 +272,7 @@ impl Mrif {
     }
 
     /// The pending doubleword of `id` and its bit.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: id <= 2047, so the offset is at most 0x1f0
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: id <= 2047, so the offset is at most 0x1f0, and pa < 2^56 (new)
     const fn pending_word(&self, id: u16) -> Result<(u64, u64), MsiError> {
         if id > MAX_IDENTITY {
             return Err(MsiError::BadIdentity);
@@ -278,7 +281,7 @@ impl Mrif {
     }
 
     /// Clear every pending and enable bit (before the file is first named by an entry).
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 64, so the offset is below 512
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 64, so the offset is below 512, and pa < 2^56 (new)
     pub fn reset<M: PhysMem64>(&self, mem: &M) {
         for i in 0..MRIF_BYTES / 8 {
             mem.write(self.pa + i * 8, 0);
@@ -315,19 +318,26 @@ impl Mrif {
         Ok(mem.read(p) & bit != 0)
     }
 
-    /// Take every pending bit whose enable bit is clear (the stray messages of IOMMU-SPEC 8.4: a data word other than the one the
-    /// kernel enabled) and return them, one bit per identity: word `k` holds identities `64 k` to `64 k + 63`.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: k < 32, so the offset is below 512
-    pub fn stray<M: PhysMem64>(&self, mem: &M) -> [u64; 32] {
+    /// Take every pending bit of an identity other than `own` (the stray messages of IOMMU-SPEC 8.4: a data word other than the
+    /// one the kernel grants) and return them, one bit per identity: word `k` holds identities `64 k` to `64 k + 63`. `own`'s
+    /// pending bit is never touched, whatever its enable bit says: a fired vector (8.5) has its enable clear and may hold a
+    /// real pending message. Since the kernel enables no identity but `own`, no other bit can be a real message, so there
+    /// is no window between reading and clearing.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: k < 32, so the offset is below 512, and pa < 2^56 (new)
+    pub fn stray<M: PhysMem64>(&self, mem: &M, own: u16) -> Result<[u64; 32], MsiError> {
+        if own == 0 {
+            return Err(MsiError::BadIdentity); // identity 0 does not exist (IOMMU-SPEC 8.1)
+        }
+        let (own_at, own_bit) = self.pending_word(own)?;
         let mut out = [0u64; 32];
         for (k, word) in out.iter_mut().enumerate() {
             let at = self.pa + k as u64 * 16;
-            let enabled = mem.read(at + 8);
-            if mem.read(at) & !enabled == 0 {
+            let keep = if at == own_at { own_bit } else { 0 };
+            if mem.read(at) & !keep == 0 {
                 continue;
             }
-            *word = mem.fetch_and(at, enabled) & !enabled;
+            *word = mem.fetch_and(at, keep) & !keep;
         }
-        out
+        Ok(out)
     }
 }

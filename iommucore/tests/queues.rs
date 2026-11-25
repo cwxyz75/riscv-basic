@@ -109,7 +109,7 @@ fn a_head_beyond_the_tail_is_refused() {
     let mem = FakeMem::new();
     let mut q = CmdQueue::new(BASE, 8).unwrap();
     for _ in 0..3 {
-        q.push(&mem, Command::iofence_c(None)).unwrap();
+        q.push(&mem, Command::iofence_c(None).unwrap()).unwrap();
     }
     assert_eq!(q.completed(4), Err(QueueError::BadHead));
     assert_eq!(q.completed(7), Err(QueueError::BadHead));
@@ -140,7 +140,10 @@ fn fences_complete_through_the_simulated_iommu() {
     for round in 0..10u32 {
         q.push(&mem, Command::iotinval_gvma(3, None)).unwrap();
         let tail = q
-            .push(&mem, Command::iofence_c(Some((0x8030_0004, round))))
+            .push(
+                &mem,
+                Command::iofence_c(Some((0x8030_0004, round))).unwrap(),
+            )
             .unwrap();
         let ticket = q.ticket();
         sim.write32(regs::CQT, tail);
@@ -160,7 +163,7 @@ fn fences_complete_through_the_simulated_iommu() {
         },
     )
     .unwrap();
-    let tail = q.push(&mem, Command::iofence_c(None)).unwrap();
+    let tail = q.push(&mem, Command::iofence_c(None).unwrap()).unwrap();
     sim.write32(regs::CQT, tail);
     sim.process_commands();
     let csr = regs::Cqcsr(sim.read32(regs::CQCSR));

@@ -236,7 +236,7 @@ fn msi_writes_follow_the_reference() {
                         let addr = IO_BASE + index * 4096;
                         cq.push(&mem, Command::iotinval_gvma(GSCID, Some(addr)))
                             .unwrap();
-                        let tail = cq.push(&mem, Command::iofence_c(None)).unwrap();
+                        let tail = cq.push(&mem, Command::iofence_c(None).unwrap()).unwrap();
                         sim.write32(regs::CQT, tail);
                         cq.completed(sim.read32(regs::CQH)).unwrap();
                         assert!(cq.is_done(cq.ticket()), "{ctx}");
@@ -274,12 +274,23 @@ fn msi_writes_follow_the_reference() {
                         reference.pending[f][w] &= !bit;
                         assert_eq!(files[f].take_pending(&mem, id).unwrap(), was, "{ctx}");
                     } else {
+                        // Everything but the vector's own identity, whatever the enable bits say.
+                        let own = if rng.chance(75) {
+                            1
+                        } else {
+                            1 + rng.below(2047) as u16
+                        };
                         let mut want = [0u64; 32];
                         for w in 0..32 {
-                            want[w] = reference.pending[f][w] & !reference.enable[f][w];
-                            reference.pending[f][w] &= reference.enable[f][w];
+                            let keep = if w == (own / 64) as usize {
+                                1u64 << (own % 64)
+                            } else {
+                                0
+                            };
+                            want[w] = reference.pending[f][w] & !keep;
+                            reference.pending[f][w] &= keep;
                         }
-                        assert_eq!(files[f].stray(&mem), want, "{ctx}");
+                        assert_eq!(files[f].stray(&mem, own), Ok(want), "{ctx}");
                     }
                 }
                 _ => {

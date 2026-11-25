@@ -6,7 +6,6 @@
 //! `release` and `complete` cannot fail for want of memory). The allocator does not bound the number of mappings: a mapping's
 //! own record lives in `kcore` (IOMMU3).
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +16,8 @@ pub enum IovaError {
     OutOfRange,
     /// The range is not entirely live (for `release`) or not entirely pending (for `complete`).
     WrongState,
+    /// The bitmaps could not be allocated.
+    NoMemory,
 }
 
 /// The state of one page of the window.
@@ -48,11 +49,18 @@ impl Iova {
             return Err(IovaError::BadWindow);
         }
         let words = usize::try_from(pages.div_ceil(64)).map_err(|_| IovaError::BadWindow)?;
+        let bitmap = || -> Result<Vec<u64>, IovaError> {
+            let mut v = Vec::new();
+            v.try_reserve_exact(words)
+                .map_err(|_| IovaError::NoMemory)?;
+            v.resize(words, 0);
+            Ok(v)
+        };
         Ok(Iova {
             first: first_page,
             pages,
-            live: vec![0; words],
-            pending: vec![0; words],
+            live: bitmap()?,
+            pending: bitmap()?,
         })
     }
 

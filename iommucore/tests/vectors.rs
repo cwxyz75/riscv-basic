@@ -133,6 +133,9 @@ fn queue_registers() {
     // 256 commands of 16 bytes and 128 records of 32 bytes are one page each (IOMMU-SPEC 2.3); one more is refused.
     assert!(CmdQueue::new(0x8010_0000, 512).is_err());
     assert!(FaultQueue::new(0x8010_1000, 256).is_err());
+    // A base past the 44-bit PPN field is refused rather than written as base 0.
+    assert!(CmdQueue::new(1 << 56, 256).is_err());
+    assert!(FaultQueue::new(1 << 56, 128).is_err());
     // bits.h:66-71, 162-178.
     assert_eq!(regs::QCSR_EN, 1);
     assert_eq!(regs::QCSR_IE, 2);
@@ -172,19 +175,21 @@ fn command_encodings() {
     // IOFENCE.C layout; QEMU's reserved mask 31:14 at bits.h:351 starts just above them), DATA 63:32 (bits.h:352), and the
     // address >> 2 in the second doubleword (iommu.c:2008).
     assert_eq!(
-        Command::iofence_c(Some((0x8020_0000, 0xdead_beef))),
+        Command::iofence_c(Some((0x8020_0000, 0xdead_beef))).unwrap(),
         Command {
             dword0: 0xdead_beef_0000_3402,
             dword1: 0x2008_0000
         }
     );
     assert_eq!(
-        Command::iofence_c(None),
+        Command::iofence_c(None).unwrap(),
         Command {
             dword0: 0x3002,
             dword1: 0
         }
     );
+    // An address the command cannot name (not 4-byte aligned) is refused, not truncated.
+    assert_eq!(Command::iofence_c(Some((0x8020_0002, 1))), None);
     // IOTINVAL.GVMA: opcode 1 (bits.h:339), func 1 (bits.h:341), AV bit 10, GV bit 33, GSCID 59:44 (bits.h:342-346); the
     // address's bits 63:12 in 61:10 of the second doubleword (iommu.c:2033: iova = (dword1 << 2) & page mask).
     assert_eq!(
@@ -582,7 +587,21 @@ fn mrif_layout() {
     assert_eq!(mem.read(0x8300_0200 + 0x18), 0);
     assert!(f.enable(&mem, 2048).is_err());
     assert!(Mrif::new(0x8300_0100).is_err());
+    assert!(Mrif::new(1 << 56).is_err()); // an MSI entry cannot name it
     assert_eq!(msi::MRIF_BYTES, 512);
+    // IOMMU-SPEC 8.4 and 8.5: a fired vector (identity 1, enable clear) keeps its pending bit; the strays (5, enabled or
+    // not, and 1000) are taken.
+    f.reset(&mem);
+    f.enable(&mem, 5).unwrap();
+    mem.write(0x8300_0200, (1 << 1) | (1 << 5));
+    mem.write(0x8300_0200 + 15 * 16, 1 << 40);
+    let mut want = [0u64; 32];
+    want[0] = 1 << 5;
+    want[15] = 1 << 40;
+    assert_eq!(f.stray(&mem, 1), Ok(want));
+    assert_eq!(mem.read(0x8300_0200), 1 << 1);
+    assert_eq!(mem.read(0x8300_0200 + 15 * 16), 0);
+    assert!(f.stray(&mem, 0).is_err());
 }
 
 // ---- the frames a removal never asks for ------------------------------------------------------------------------------------

@@ -988,7 +988,9 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
         let offset = file * 16;
         let root = (c.msiptp & crate::PPN_MASK) << 12;
         if root & offset != 0 {
-            return Err(faultq::CAUSE_MSI_LOAD_FAULT); // the file number is outside the table
+            // QEMU ORs the offset into the table address (iommu.c `msi_write`); an offset that overlaps the root's bits is
+            // treated as a load fault here. Not reachable through `MsiWindow`, whose files fit one page.
+            return Err(faultq::CAUSE_MSI_LOAD_FAULT);
         }
         let key = (c.tag(), gpa >> 12);
         let pte = match self.msi_cache.get(&key) {
