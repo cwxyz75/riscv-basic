@@ -7,7 +7,7 @@ horizon: long
 complexity: H
 change_risk: H
 epic: iommu-kernel
-blocked_by: [IOMMU1, IOMMU2]
+blocked_by: [IOMMU2]
 refs: [T42, OD148, OD164, OD166, IOMMU-SPEC, INVARIANTS, T262, T177]
 ---
 
