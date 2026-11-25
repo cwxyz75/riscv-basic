@@ -1005,3 +1005,40 @@ sections named state the result; this list says which is which.
     kernel writes Off, waits as the IOMMU specification requires, reads it back and continues with the normal bring-up; the
     boot is refused only if the IOMMU will not go Off (A17). IO2 holds: Off is not a pass-through state.
 12. **Whole-mapping unmap only** (4.4). Accepted.
+
+---
+
+## Amendment 2026-11-25: what QEMU 11.1.3 showed (IOMMU0)
+
+Owner-approved. Source: `docs/records/notes/2026-11-25-iommu-qemu-facts.md` (each fact there is marked read in source, observed
+or not established). The body above is not rewritten; this amendment says what it changes, and the assumptions it settles.
+
+1. **Messages with a wrong data word (8.2, 8.4).** What happens depends on the entry kind. In a **basic** entry the device's data
+   word is forwarded unchanged to the page the entry names: a word above the file's identities delivers nothing and faults
+   nothing; a word below them sets a pending bit in that vector's own file, where the enable bit is clear (the row of 8.4 holds).
+   In an **MRIF** entry a data word above 2047 **faults** (cause 263, `iotval` 0), and a word whose enable bit is clear sets the
+   pending bit and sends no notice. A check that expects "dropped, not faulted" for MRIF entries is wrong.
+2. **Second-stage invalidation (6).** In QEMU an `IOTINVAL.VMA` without a guest address-space id does not flush a cached
+   second-stage translation; `IOTINVAL.GVMA` does (the body already names it in 6.2; it is the **only** form the kernel issues
+   for a domain's address space, and A5's negative control relies on that). A context rewrite needs `IODIR.INVAL_DDT` as well:
+   the device-context cache serves the old context until it is issued (cause 258 afterwards).
+3. **Directory modes (2.4).** `ddtp` moves directly between a directory mode and Off or Bare, and from Off or Bare to a directory
+   mode. A direct change between two directory modes is **ignored** by the IOMMU: the kernel never writes one (it writes Off
+   first). The platform device cannot be made to hand over not Off, so the boot check of 2.4 step 1 has no machine proof; the
+   host test against the simulated device is the proof (A17).
+4. **The test device (A10, section 13).** `iommu-testdev` writes a fixed word to an I/O address and verifies it at a physical
+   address; it cannot read and cannot send a message with a chosen data word. It is the independent oracle for translation,
+   permission and invalidation checks (its failure is read from the fault queue). The independent **forger** for interrupt
+   checks is a virtio-pci function whose MSI-X table the test programs (the fallback of A10 becomes the rule).
+5. **Function-level reset (10.1, 10.2).** The virtio-pci functions of `virt` advertise none (no PCI Express capability): the
+   reset is the virtio status-0 write alone, after bus-master enable is cleared. A device that advertises one gets it as before.
+6. **MSI-X capacity (8.6).** A virtio-pci function has **two** MSI-X vectors by default (table and pending bits in BAR 1); a
+   driver that needs more requests them through the device's `vectors` property at creation, and a class's vector grant (5.3) is
+   at most the function's table size.
+7. **INTx (A13).** With MSI-X **disabled** the function does raise INTx. Whether the command register's interrupt-disable bit
+   silences it is not established; the suite's check of A13 stays, and a driver enables MSI-X before the device is started.
+8. **Settled or narrowed.** A5 (a stale entry is served until invalidated) and A9 (no `FEATURES_OK` without
+   `VIRTIO_F_ACCESS_PLATFORM`; a device without `iommu_platform` bypasses the IOMMU) hold as observed. A8 holds. A14 (a
+   Quarantined device's faults are suppressed by a valid context with reporting off) is untested. A11: the debug translation
+   interface exists, but its use is not established; the self-test stays a counted skip until it works. A1, A2 (as to the
+   ratified text), A4, A6, A7, A12 and A16 remain as written: nothing in QEMU settles them against hardware.
