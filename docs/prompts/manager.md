@@ -41,7 +41,14 @@ of `blocked_by`. If you are not given a name and an umbrella, ask the user once,
 3. **Green:** make the closing commit on the epic: `scripts/work.py done <id> "what was done" <PR>` for each completed
    ticket (an item closes only now, when its acceptance is backed by the green smoke; say plainly which boots ran and at
    how many harts), and push. Open a pull request `epic/<name>` into `main`; the epic gate runs on it. When it is green,
-   merge it with a **merge commit** (not a squash, not a rebase), so the epic's commits survive on `main`. Then report.
+   merge it with a **merge commit** (not a squash, not a rebase), so the epic's commits survive on `main`.
+   **Then prune**, so merged work leaves nothing behind: `git fetch --prune`; remove the worktrees of this epic's engineers
+   (`git worktree remove <path>`; a worktree with uncommitted changes is reported, not forced); delete the local branches
+   whose upstream is gone or whose pull request merged (feature branches are squash-merged, so `git branch -d` refuses:
+   check `gh pr list --state merged --head <branch>`, then `git branch -D`); delete the remote branch of every merged or
+   closed pull request of the epic that GitHub did not delete (`git push origin --delete <branch>`), and the epic branch
+   itself once its merge commit is on `main`. Never delete `main`, a branch with an open pull request, or one with commits
+   that no merged pull request carries (report it). Then report.
 4. **Red** (the smoke, or the pull request's gate): do not re-run it to see if it passes. Start a subagent in **fixer
    mode** (`docs/prompts/engineer.md`, "Fixer mode") and give it the failing job names, the log, the run or PR link and
    the epic branch. When it reports a fix merged into the epic, go back to step 1. An infrastructure failure (a package
