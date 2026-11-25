@@ -52,6 +52,8 @@ The file is named `<id>.md`. Fields:
 | `area` | yes | One of the areas in `scripts/work.py` (`work.py areas` lists them). |
 | `horizon` | yes | `near` (ordered in `WORK-PLAN.md`; at most 15), `long` (planned, not next), `someday` (watch items, ideas, things to do only if they bite). |
 | `risk` | no | For tidy items: `H` can hurt the system or its security once untrusted code runs; `M` weakens a design property or will cost real rework later; `L` convenience or polish. |
+| `complexity` | no | How tricky the fix is and how much work or planning it needs: `L` a small, local change or a test that calls a function; `M` a contained change across a few files, or real design; `H` concurrency or lock-order logic, an on-disk or wire format, or a change that needs planning first. Set on tidy items. |
+| `change_risk` | no | How likely the fix is to introduce subtle bugs (not how bad the shortcut is: that is `risk`): `L` mechanical or covered by existing tests; `M` touches live paths the suite covers well; `H` concurrency, memory ownership, translations or other things the suite cannot easily catch. Set on tidy items. |
 | `blocked_by` | no | Open items that must be done (or decided) first. |
 | `fixed_by` | no | Open items expected to resolve this one as a side effect (a debt that a planned slice removes). When that item closes, re-check this one. |
 | `refs` | no | Specs, decisions or records it relates to. |
