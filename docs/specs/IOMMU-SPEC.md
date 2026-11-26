@@ -1128,3 +1128,14 @@ mapping of this domain). As 4.4 read before, a destroyed domain has no live mapp
 BAD_STATE could not be returned. With this order a driver can tell "my domain was destroyed" from "a wrong address", and
 `iodomain_unmap` agrees with `iodomain_map`, which already gives BAD_STATE for a destroyed domain. An unmap that finds its domain
 destroyed **between its steps** is part 3's case and still returns OK.
+
+### 5. The MSI data word is an ABI constant (OD172)
+
+Amendment authorized by the owner, 2026-11-26 (answers Q-MSIDATA).
+
+8.2 gives every vector its own interrupt file with exactly one identity enabled, identity 1, so the data word a device must write
+is 1 for every vector by construction. It is therefore not returned: the ABI names it as the constant `MSI_DATA` = 1
+(`abi::iodomain::MSI_DATA`), and 8.3's call becomes `iodomain_grant_vector(domain, index) -> (interrupt, msi_address)`. A driver
+writes `msi_address` and `MSI_DATA` into the vector's MSI-X table entry. The word could vary only if vectors shared an interrupt
+file or messages were translated without MRIF; both are excluded by 8.2, OD165 and IO11, and either would be a spec revision with
+its own ABI change.
