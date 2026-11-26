@@ -158,6 +158,7 @@ os-models:
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test vmofamily_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test pager_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test park_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test iodomain_concurrency --target-dir target/shuttle
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
 # nightly --profile minimal --component miri); CI runs it, `make check` does not.

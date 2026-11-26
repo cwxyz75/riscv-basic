@@ -6,6 +6,8 @@ description = "OS track: pure kernel logic (no hardware, no unsafe), tested on t
 
 [dependencies]
 abi = { path = "../abi" }
+# IOMMU3: the device-domain store (`kcore::iodomain`) is built on the IOMMU's formats (OD148 step b).
+iommucore = { path = "../iommucore" }
 
 [features]
 # Negative control (L11d): a hart never pulls work from another hart's queue. Off in every real build; the kernel's
@@ -26,6 +28,10 @@ loom = "0.7"
 
 [target.'cfg(shuttle)'.dependencies]
 shuttle = "0.8"
+
+# The model, concurrency and allocation tests of `kcore::iodomain` drive the simulated IOMMU as the hardware (IOMMU3).
+[dev-dependencies]
+iommucore = { path = "../iommucore", features = ["sim"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
