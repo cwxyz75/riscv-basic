@@ -712,8 +712,17 @@ fn claim_file() -> (bool, kcore::msiid::IdSet) {
 #[inline(never)] // (as `ipi_trap`)
 fn external_trap(frame: &mut TrapFrame, from_user: bool) {
     let (ipi, devices) = claim_file();
-    // (identities to open or retire in this hart's file are work under the lock, like a device message: IOMMU4)
-    if devices.is_empty() && !crate::aia::has_work() {
+    if devices.is_empty() {
+        // (identities to open or retire in this hart's file: work under the lock, which may deliver a message a retired identity still
+        // held (IOMMU4). It is not a reason to switch here: a thread it wakes is placed and poked like any wake, and the inter-hart
+        // part then takes its usual quiet path. A hart that is going offline does this too, and must not schedule from it.)
+        if crate::aia::has_work() {
+            crate::bkl::lock();
+            if crate::aia::deliver(&devices, crate::user::irq_fired) {
+                crate::user::wake_signal_waiters();
+            }
+            crate::bkl::unlock();
+        }
         if ipi {
             ipi_trap(frame);
         }
