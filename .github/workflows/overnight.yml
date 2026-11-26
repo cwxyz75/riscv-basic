@@ -7,8 +7,22 @@ on:
   workflow_dispatch:
 
 jobs:
+  # CI's QEMU (TEST-TOOLS.md, "CI's QEMU"): look the cache entry up, and build it if this branch's cache has none; the jobs that boot
+  # restore it.
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look up CI's QEMU, and build it into the cache if it is missing
+        uses: ./.github/actions/install-qemu
+        with:
+          mode: fill
+          packages: ''
+
   repeat-smp:
     name: overnight (repeat smp)
+    needs: qemu
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
@@ -20,7 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: overnight-repeat-smp
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - uses: actions/cache@v4
         with:
@@ -45,6 +59,7 @@ jobs:
 
   checked:
     name: overnight (checked release)
+    needs: qemu
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -56,7 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: overnight-checked
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - uses: actions/cache@v4
         with:
@@ -79,6 +94,7 @@ jobs:
 
   chaos:
     name: overnight (schedule perturbation)
+    needs: qemu
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
@@ -90,7 +106,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: overnight-chaos
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-chaos
       - name: Summary

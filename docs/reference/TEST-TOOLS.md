@@ -186,3 +186,54 @@ mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-bo
 `make soak` runs `SOAK_JOBS` boots at once (default 3). The tests follow the host's clock, so on a machine that is
 doing anything else the network tests and the benchmark comparison fail from load. Use `SOAK_JOBS=1` for a result to
 trust, and never run two network boots at once by hand: their host ports are fixed and collide.
+
+## CI's QEMU
+
+CI boots on **QEMU 11.1.3**, the version the project develops on and the one the IOMMU facts were taken from
+(`docs/records/notes/2026-11-25-iommu-qemu-facts.md`). It is not the distribution's package: Ubuntu 26.04 ships 10.2.1, whose `virt`
+machine writes an `iommu-map` that leaves PCI requester id 0xffff outside the IOMMU, so the kernel (IOMMU-SPEC 2.2) keeps the PCI
+windows closed and the IOMMU, MSI and device-capability tests fail. 11.1.0 is the first release with the single full entry.
+
+**What is built.** `.github/actions/install-qemu/build-qemu.sh` pins the version, the tarball's sha256 (the same as Homebrew's
+formula) and the fingerprint of the QEMU release key (`CEAC C9E1 5534 EBAB B82D 3FA0 3353 C9CE F108 B584`; the public key is
+`qemu-release-key.asc` beside the script). It downloads the tarball from download.qemu.org, checks both before extracting it, and
+builds `riscv64-softmmu` alone with `--without-default-features` plus TCG, slirp (`-netdev user`), pixman (`screendump`, ramfb) and the
+system libfdt; no GUI, VNC, docs, tools or guest agent. `-bios default` is the OpenSBI that ships with the release (1.8.1 in 11.1.3),
+as on a developer's machine; the distribution's `opensbi` package is no longer installed.
+
+**The cache.** The install prefix (`~/qemu`) is one Actions cache entry, keyed
+`qemu-<version>-<distribution><release>-<arch>-<config>`, where `<config>` is a hash of the build script and the release key (so a new
+version, checksum or configure flag is a new entry) and the distribution part follows the runner image whose libraries the binary
+links against. The install action (`.github/actions/install-qemu`) has two modes:
+
+- `mode: use` (default; every job that boots): restore the entry, install its run-time libraries from the apt cache, put it on the
+  `PATH` and run `check-qemu.sh`. A miss **fails the job**; a job that boots never builds QEMU and never falls back to apt.
+- `mode: fill` (the tool-build job only): look the entry up without downloading it; on a miss, build it (the build dependencies come
+  through the same apt cache) and save it.
+
+`check-qemu.sh` is the version assertion: the `qemu-system-riscv64` on the `PATH` must be `~/qemu/bin/qemu-system-riscv64` and must
+print `QEMU emulator version 11.1.3` (the version is read from the build script, so the two cannot drift); it also requires the
+`aia` and `iommu-sys` machine options, the `rva23s64` CPU and the `user` network backend. The action runs it after every restore, and
+the smoke jobs `kernel (smoke a)` and `kernel (smoke b)` run it again as a step of their own.
+
+**Who fills it.** GitHub scopes a cache to the ref that saved it: a run can restore entries of its own ref and of `main`, and a
+pull request also those of its base branch. Two places build into the cache:
+
+- **ci.yml's `qemu` job**, which every job that boots `needs` (the docs check refuses a booting job without it). On a warm cache it is
+  a lookup of a few seconds; on a cold one it builds before any boot starts. So every smoke is correct with no step by hand, wherever
+  it runs: a smoke dispatched on `epic/<name>` fills that epic's scope, the epic's pull request into `main` reads `main`'s entry (or
+  builds into its own scope the first time), and the push to `main` that merges an epic fills `main`, after which every branch and
+  pull request reads `main`'s entry. It is the tool-build exception to the gate's budget (`TESTING.md`, "Budgets").
+- **`qemu.yml`**, which runs the same lookup-or-build and then checks the entry from a fresh runner as a boot job would (restore, the
+  version assertion, the device tree's `iommu-map` must be the single full entry `<0 phandle 0 0x10000>`
+  (`check-iommu-map.py`), and the machine started with no kernel to OpenSBI's banner with every device the harness passes). It
+  runs by itself on a push, to any branch but `main`, that changes `.github/actions/install-qemu/` or `qemu.yml`: a branch that
+  changes the build, and the epic it is squash-merged into, start warm. By hand: `gh workflow run qemu.yml --ref <branch>`.
+
+**When to dispatch `qemu.yml` by hand.** Only to keep a cold build out of a smoke's wall time: before a smoke on an epic whose scope
+has no entry (an epic cut before `main` had one, or after the entry was evicted: GitHub drops an entry unused for 7 days), run
+`gh workflow run qemu.yml --ref epic/<name>` and start the smoke when it is green. Nothing else needs it; a smoke without it is
+still correct, only longer by the build (measured cold build in the record of 2026-11-26).
+
+**Changing the version.** Edit `QEMU_VERSION`, `QEMU_SHA256` (and the key file and `QEMU_KEY_FPR` if the release manager changed)
+in `build-qemu.sh`; the key changes, the next tool-build job builds it, and `check-qemu.sh` then expects the new version.

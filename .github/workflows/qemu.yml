@@ -1,0 +1,63 @@
+name: qemu
+
+# CI's QEMU (TEST-TOOLS.md, "CI's QEMU"): builds the release pinned in .github/actions/install-qemu/build-qemu.sh into the Actions
+# cache of the branch it runs on (if that cache does not have it already), then checks the entry from a fresh runner the way a boot job
+# does: restored, on the PATH, at the pinned version, with its run-time libraries, its device tree's `iommu-map`, and the machine
+# started (with no kernel) to OpenSBI's banner with the harness's devices. It boots no kernel and runs no test.
+# A run's cache is visible to later runs on the same branch, to pull requests whose base is that branch, and (from main) to everyone.
+# It runs by itself on a push that changes the build (so a branch that changes it, and the epic it is merged into, start warm), and by
+# hand on any branch (`gh workflow run qemu.yml --ref <branch>`). ci.yml's `qemu` job does the same before every smoke, so this
+# workflow only saves that job's cold build from landing in a smoke run's wall time.
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore: [main]
+    paths:
+      - .github/actions/install-qemu/**
+      - .github/workflows/qemu.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look up CI's QEMU, and build it into the cache if it is missing
+        uses: ./.github/actions/install-qemu
+        with:
+          mode: fill
+          packages: ''
+
+  check:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore CI's QEMU as a boot job does (fails on a miss or a wrong version)
+        uses: ./.github/actions/install-qemu
+        with:
+          packages: ''
+      - name: The QEMU on the PATH is CI's pinned build
+        run: .github/actions/install-qemu/check-qemu.sh
+      - name: The device tree maps every PCI requester id through the IOMMU (the reason for this build)
+        run: |
+          qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on,dumpdtb=virt.dtb -cpu rva23s64 -m 256M -display none
+          python3 .github/actions/install-qemu/check-iommu-map.py virt.dtb
+      - name: The machine starts to OpenSBI's banner with every device and backend the boot harness passes
+        run: |
+          dd if=/dev/zero of=disk.img bs=1M count=1
+          set +e
+          timeout 10 qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -smp 4 -bios default -m 256M \
+            -display none -serial stdio -monitor none -rtc base=2030-06-15T12:00:00,clock=vm \
+            -device virtio-rng-pci,iommu_platform=on,disable-legacy=on,addr=0x4 -global virtio-mmio.force-legacy=false \
+            -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:17777-:7777,hostfwd=tcp:127.0.0.1:17778-:7778 \
+            -device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56 -object filter-dump,id=f0,netdev=n0,file=x.pcap \
+            -object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-device,rng=rng0 \
+            -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 > out.txt 2>&1
+          status=$?
+          set -e
+          cat out.txt
+          # no kernel is given, so QEMU runs until the timeout (124); any other status is QEMU refusing an argument
+          [ "$status" = 124 ] || { echo "::error::QEMU exited with $status"; exit 1; }
+          grep "^OpenSBI v" out.txt

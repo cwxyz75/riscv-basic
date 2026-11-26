@@ -28,6 +28,9 @@ STALE = [
 
 
 GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of ci.yml may take at most this long (the jobs run side by side)
+# TESTING.md, "Budgets": the one exception, the tool-build job (CI's QEMU into the cache: seconds when warm, a build when cold). It runs no
+# make target, starts nothing, and only calls the install action in `mode: fill`; every job that uses CI's QEMU needs it.
+TOOL_BUILD_JOB, TOOL_BUILD_BUDGET_MINUTES = "qemu", 20
 # Soak targets that CI runs split into smaller jobs: the soak workflow may name the parts instead.
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
 # Targets besides the smoke ones that ci.yml may run: parts of a smoke target that CI runs as their own jobs.
@@ -112,9 +115,20 @@ def check_tiers():
         cond = re.search(r"^    if:\s*(.*)$", job, re.M)
         if starts and not (cond and SMOKE_IF in cond.group(1)):
             out.append(f"ci.yml: job {name} starts QEMU but is not limited to the epic gate (its `if:` needs `{SMOKE_IF}`)")
-    for n in re.findall(r"timeout-minutes:\s*(\d+)", ci):
-        if int(n) > GATE_BUDGET_MINUTES:
-            out.append(f"ci.yml: a gate job's timeout is {n} minutes; the budget is {GATE_BUDGET_MINUTES} (TESTING.md)")
+        tool = name == TOOL_BUILD_JOB
+        if tool and (targets or starts or "mode: fill" not in job or re.search(r"^\s*(?:- )?run:", job, re.M)):
+            out.append(f"ci.yml: job {name} is the tool-build job: it may only call the install action in `mode: fill` (no run step, no make, no boot)")
+        if tool and not (cond and SMOKE_IF in cond.group(1)):
+            out.append(f"ci.yml: the tool-build job {name} runs only for the epic gate (its `if:` needs `{SMOKE_IF}`)")
+        budget = TOOL_BUILD_BUDGET_MINUTES if tool else GATE_BUDGET_MINUTES
+        for n in re.findall(r"timeout-minutes:\s*(\d+)", job):
+            if int(n) > budget:
+                out.append(f"ci.yml: job {name}'s timeout is {n} minutes; its budget is {budget} (TESTING.md, \"Budgets\")")
+        # a job that uses CI's QEMU (the install action without `qemu: 'false'`) must wait for the job that puts it in the cache
+        if not tool and "uses: ./.github/actions/install-qemu" in job and "qemu: 'false'" not in job:
+            needs = re.search(r"^    needs:\s*(.*)$", job, re.M)
+            if not needs or not re.search(rf"(?<![\w-]){TOOL_BUILD_JOB}(?![\w-])", needs.group(1)):
+                out.append(f"ci.yml: job {name} uses CI's QEMU but does not need the job `{TOOL_BUILD_JOB}` that fills the cache")
     if "matrix:" in ci:
         out.append("ci.yml: the merge gate has a build matrix; that belongs in soak.yml")
     # the commit hook: format, docs check, clippy; never a test or a boot

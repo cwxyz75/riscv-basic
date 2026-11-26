@@ -1,22 +1,82 @@
-name: Install QEMU and OpenSBI
+name: Install QEMU
 description: >
-  apt-get install of the packages the boot tests need, from a cache of the downloaded .deb files when there is one (T153): the mirror's speed
-  decided whether a 7-minute gate job passed. A warm cache installs without the network; a cold or stale one falls back to update and install.
+  CI's QEMU (TEST-TOOLS.md, "CI's QEMU"): the release pinned in build-qemu.sh, built from its tarball and kept in the Actions cache,
+  plus the apt packages a job asks for. `mode: use` (every job that boots) restores it and fails on a cache miss: it never builds, and
+  it never falls back to the distribution's QEMU. `mode: fill` (the tool-build job only: `qemu` in ci.yml, soak.yml, overnight.yml
+  and qemu.yml) looks the entry up and builds and saves it when it is missing. `qemu: 'false'` installs the apt packages only.
+  The apt packages come from a cache of the downloaded .deb files when there is one (T153): the mirror's speed decided whether a
+  7-minute gate job passed. A warm cache installs without the network; a cold or stale one falls back to update and install.
 inputs:
   packages:
-    description: Packages to install
-    default: qemu-system-riscv opensbi clang llvm
+    description: Apt packages to install besides what QEMU needs
+    default: clang llvm
+  qemu:
+    description: Install CI's QEMU ('true' or 'false')
+    default: 'true'
+  mode:
+    description: use (restore, fail on a miss) or fill (look up; on a miss build and save)
+    default: use
 runs:
   using: composite
   steps:
-    - uses: actions/cache@v4
-      with:
-        path: ~/apt-archives
-        key: apt-${{ runner.os }}-${{ runner.arch }}-${{ inputs.packages }}-v1
-    - name: Install
+    - id: plan
       shell: bash
       env:
         PKGS: ${{ inputs.packages }}
+        QEMU: ${{ inputs.qemu }}
+        MODE: ${{ inputs.mode }}
+        HERE: ${{ github.action_path }}
+      run: |
+        case "$MODE" in use|fill) ;; *) echo "::error::install-qemu: mode must be use or fill, not '$MODE'"; exit 1 ;; esac
+        version=$(sed -n 's/^QEMU_VERSION=//p' "$HERE/build-qemu.sh")
+        # the configuration: the build script (version, checksum, configure flags) and the key it checks, and the runner's
+        # distribution, whose shared libraries the binary is linked against
+        config=$(cat "$HERE/build-qemu.sh" "$HERE/qemu-release-key.asc" | sha256sum | cut -c1-16)
+        distro=$(. /etc/os-release && echo "$ID$VERSION_ID")
+        echo "key=qemu-$version-$distro-$RUNNER_ARCH-$config" >> "$GITHUB_OUTPUT"
+        echo "prefix=$HOME/qemu" >> "$GITHUB_OUTPUT"
+        if [ "$QEMU" = true ]; then
+          # the shared libraries the binary needs at run time
+          PKGS="$PKGS libglib2.0-0t64 libpixman-1-0 libslirp0 libfdt1"
+        fi
+        echo "apt=$(echo $PKGS)" >> "$GITHUB_OUTPUT"
+        echo "build-apt=ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev gnupg" >> "$GITHUB_OUTPUT"
+    - id: restore
+      if: inputs.qemu == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.plan.outputs.prefix }}
+        key: ${{ steps.plan.outputs.key }}
+        lookup-only: ${{ inputs.mode == 'fill' }}
+        fail-on-cache-miss: ${{ inputs.mode == 'use' }}
+    - if: failure() && steps.restore.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::error::CI's QEMU (${{ steps.plan.outputs.key }}) is not in this branch's cache, and a job that boots never builds it. The tool-build job (ci.yml's qemu, or qemu.yml) fills it: TEST-TOOLS.md, \"CI's QEMU\"."
+        exit 1
+    - id: need
+      shell: bash
+      run: |
+        # fill, and the entry exists: nothing to do (no apt, no download)
+        if [ "${{ inputs.mode }}" = fill ] && [ "${{ steps.restore.outputs.cache-hit }}" = true ]; then
+          echo "qemu: ${{ steps.plan.outputs.key }} is in the cache"
+          echo "apt=" >> "$GITHUB_OUTPUT"; echo "build=false" >> "$GITHUB_OUTPUT"
+        elif [ "${{ inputs.mode }}" = fill ]; then
+          echo "qemu: ${{ steps.plan.outputs.key }} is not in the cache; building it"
+          echo "apt=${{ steps.plan.outputs.apt }} ${{ steps.plan.outputs.build-apt }}" >> "$GITHUB_OUTPUT"; echo "build=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "apt=${{ steps.plan.outputs.apt }}" >> "$GITHUB_OUTPUT"; echo "build=false" >> "$GITHUB_OUTPUT"
+        fi
+    - if: steps.need.outputs.apt != ''
+      uses: actions/cache@v4
+      with:
+        path: ~/apt-archives
+        key: apt-${{ runner.os }}-${{ runner.arch }}-${{ steps.need.outputs.apt }}-v1
+    - name: Install
+      if: steps.need.outputs.apt != ''
+      shell: bash
+      env:
+        PKGS: ${{ steps.need.outputs.apt }}
       run: |
         mkdir -p "$HOME/apt-archives/partial"
         OPTS="-o Dir::Cache::archives=$HOME/apt-archives -o Acquire::Retries=3 -o Acquire::http::Timeout=20"
@@ -31,3 +91,21 @@ runs:
           done
         fi
         sudo chown -R "$USER" "$HOME/apt-archives"
+    - name: Build QEMU
+      if: steps.need.outputs.build == 'true'
+      shell: bash
+      run: |
+        start=$(date +%s)
+        "${{ github.action_path }}/build-qemu.sh" "${{ steps.plan.outputs.prefix }}"
+        echo "qemu: built in $(( $(date +%s) - start )) s; installed size $(du -sh "${{ steps.plan.outputs.prefix }}" | cut -f1)"
+    - if: steps.need.outputs.build == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.plan.outputs.prefix }}
+        key: ${{ steps.plan.outputs.key }}
+    - name: Check CI's QEMU
+      if: inputs.qemu == 'true' && (inputs.mode == 'use' || steps.need.outputs.build == 'true')
+      shell: bash
+      run: |
+        echo "${{ steps.plan.outputs.prefix }}/bin" >> "$GITHUB_PATH"
+        PATH="${{ steps.plan.outputs.prefix }}/bin:$PATH" "${{ github.action_path }}/check-qemu.sh"
