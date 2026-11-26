@@ -129,6 +129,9 @@ pub struct Vectors {
     /// Live vectors not yet placed by a first wait or acknowledgement (the kernel looks at waits only while this is not zero).
     unplaced: u64,
     spent: u64,
+    /// A fence completed naming an identity its route had already moved away from (a hart went offline during a grant or a move):
+    /// the caller runs the settle of the moves (`take_resettle`).
+    resettle: bool,
 }
 
 /// The file protocol of a notice (8.5) on an armed vector: whether the object fires. Atomic operations only, no lock.
@@ -198,6 +201,7 @@ impl Vectors {
             leaked: 0,
             unplaced: 0,
             spent: 0,
+            resettle: false,
         })
     }
 
@@ -316,6 +320,38 @@ impl Vectors {
         Ok(VectorRef { n: nn, gen: r.gen })
     }
 
+    /// 8.3: the hart a grant chose did not open its identity within the bound. The route takes an identity on the calling hart instead,
+    /// opened at once; the one it leaves is retired by its hart when that hart answers. `NoMemory`: the calling hart has no free
+    /// identity (the route is unchanged); `BadState`: the route is not granting.
+    pub fn grant_here(
+        &mut self,
+        ids: &mut MsiIds,
+        h: &mut dyn Harts,
+        v: VectorRef,
+    ) -> Result<(), IoError> {
+        if self.at(v).map(|r| r.state) != Some(RState::Granting) {
+            return Err(IoError::BadState);
+        }
+        let route = Route::Vector(v.n);
+        let here = h.here().filter(|&f| h.usable(f)).ok_or(IoError::NoMemory)?;
+        let id = ids.alloc(here, route).ok_or(IoError::NoMemory)?;
+        let new = Place { hart: here, id };
+        loop {
+            let old = ids
+                .places_of(route)
+                .find(|&(p, s)| p != new && !matches!(s, Slot::Retiring { .. }))
+                .map(|(p, _)| p);
+            let Some(p) = old else { break };
+            if ids.end(p).is_err() {
+                break;
+            }
+            h.ask(p.hart);
+        }
+        h.open_here(id);
+        let _ = ids.opened(new);
+        Ok(())
+    }
+
     /// Is the grant's identity open? `Ok(Some)`: open (and where); `Ok(None)`: not yet; `BadState`: the route ended (the domain was
     /// destroyed meanwhile).
     pub fn grant_ready(&self, ids: &MsiIds, v: VectorRef) -> Result<Option<Place>, IoError> {
@@ -376,6 +412,9 @@ impl Vectors {
         r.named = r.target.take();
         r.state = RState::Live;
         let named = r.named;
+        if current(ids, v.n).is_some_and(|(p, ready)| !ready || Some(p) != named) {
+            self.resettle = true;
+        }
         // (the identities the route moved away from: no entry names them any more, cached or not: retired by their harts now)
         loop {
             let next = ids
@@ -391,22 +430,27 @@ impl Vectors {
 
     /// A grant's or a move's fence will not complete (6.4): the vector is leaked (IO8): its identities are never retired (an entry
     /// that names one may stay cached), and its charge stays.
-    pub fn abandon(&mut self, store: &mut IoDomains, v: VectorRef) {
+    pub fn abandon<M: PhysMem64>(&mut self, store: &mut IoDomains, mem: &M, v: VectorRef) {
         let Some(r) = self.at(v) else {
             return;
         };
         let (d, index) = (DomainId::from_raw(r.domain), r.index);
         if store.vector_abandon(d, index) {
-            self.leak(v);
+            self.leak(mem, v);
         }
     }
 
-    fn leak(&mut self, v: VectorRef) {
+    /// Leak route `v` (IO8). Its file is disabled first (its frame is kept, never freed: writing it is safe), so a device that goes
+    /// on sending to an entry still cached sets a pending bit and sends no notice: a leaked vector cannot flood a hart (8.4).
+    fn leak<M: PhysMem64>(&mut self, mem: &M, v: VectorRef) {
         let Some(r) = self.at_mut(v) else {
             return;
         };
         if matches!(r.state, RState::Leaked | RState::Spent | RState::Dead) {
             return;
+        }
+        if let Ok(f) = Mrif::new(r.file) {
+            let _ = f.disable(mem, VECTOR_DATA);
         }
         r.state = RState::Leaked;
         r.busy = false;
@@ -657,6 +701,11 @@ impl Vectors {
         }
     }
 
+    /// Did a fence complete naming an identity its route had moved away from since the last look (the moves are to be settled)?
+    pub fn take_resettle(&mut self) -> bool {
+        core::mem::replace(&mut self.resettle, false)
+    }
+
     /// Give up a move before its entry write (the caller could not wait for an identity to open).
     pub fn unbusy(&mut self, v: VectorRef) {
         if let Some(r) = self.at_mut(v) {
@@ -753,9 +802,9 @@ impl Vectors {
     }
 
     /// A revoke's fence will not complete: the vector is leaked (IO8).
-    pub fn revoke_abandon(&mut self, store: &mut IoDomains, v: VectorRef) {
+    pub fn revoke_abandon<M: PhysMem64>(&mut self, store: &mut IoDomains, mem: &M, v: VectorRef) {
         if self.at(v).is_some_and(|r| r.state == RState::Revoking) {
-            self.abandon(store, v);
+            self.abandon(store, mem, v);
         }
     }
 
@@ -848,7 +897,7 @@ impl Vectors {
     }
 
     /// Domain `d`'s destruction fence will not complete (6.4): every route of the domain that has not ended is leaked (IO8).
-    pub fn domain_leaked(&mut self, d: DomainId) {
+    pub fn domain_leaked<M: PhysMem64>(&mut self, mem: &M, d: DomainId) {
         for k in 0..self.routes.len() {
             let Some(r) = self.routes.get(k) else {
                 continue;
@@ -860,7 +909,7 @@ impl Vectors {
             }
             let Ok(n) = u32::try_from(k) else { continue };
             let v = VectorRef { n, gen: r.gen };
-            self.leak(v);
+            self.leak(mem, v);
         }
     }
 }

@@ -15501,6 +15501,29 @@ fn msi_forgery_faults() -> Outcome {
             CAUSE_MSI_MISCONFIGURED,
             "data 4096: the entry is misconfigured for it"
         );
+        // a misaligned address on the granted page (8.4: cause 263; QEMU, observed: no fault and nothing delivered, records note
+        // 2026-11-25 section 13): nothing reaches a hart either way, and a fault, if one is recorded, is the misconfiguration
+        let before = iommu_faults();
+        msi_send(f, d, address + 2, 1)?;
+        msi_settle();
+        if iommu_faults() != before {
+            let (did, _, cause, _) = iommu_last_fault();
+            ensure_eq!(
+                (did, cause),
+                (IOMMU_TEST_DID, CAUSE_MSI_MISCONFIGURED),
+                "a misaligned message's fault"
+            );
+        }
+        ensure_eq!(
+            sys::debug_stat(162),
+            notices,
+            "a misaligned message sends no notice"
+        );
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20)),
+            Some(S::TimedOut),
+            "a misaligned message does not fire the vector"
+        );
         // a real interrupt file, from the device
         let before = iommu_faults();
         msi_send(f, d, IMSIC_S, 1)?;
@@ -15592,6 +15615,65 @@ fn msi_revoke_stops_the_vector() -> Outcome {
         sys::handle_close(irq);
         ensure_eq!(st(fired), Some(S::Ok), "the vector granted again fires");
         Ok(())
+    });
+    r.and(vectors_at_baseline(live, ids))
+}
+
+/// IOMMU-SPEC 6.3 and 10.6: destroying a domain with live vectors (one fired, one armed) revokes them all, and before the call returns
+/// (no waiting afterwards) their identities are free again and no vector is live. The handles stay and name dead objects:
+/// `interrupt_ack` and `interrupt_deliver_here` are BAD_STATE and the objects never fire again.
+fn msi_destroy_revokes_every_vector() -> Outcome {
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let r = with_domain(|_, f, d, _| {
+        let a = ok(sys::iodomain_grant_vector(d.sup, 0), "grant vector 0")?;
+        let b = ok(sys::iodomain_grant_vector(d.sup, 1), "grant vector 1")?;
+        let (x, y) = (a.a1 as u64, b.a1 as u64);
+        let r = (|| {
+            msi_send(f, d, a.a2 as u64, 1)?;
+            ensure_eq!(
+                st(sys::object_wait(x, sig::INTERRUPT, sys::clock_get() + 2000)),
+                Some(S::Ok),
+                "vector 0 fires before the destruction"
+            );
+            ensure_eq!(sys::debug_stat(146), live + 2, "two live vectors");
+            ok(sys::iodomain_destroy(d.sup), "iodomain_destroy")?;
+            ensure_eq!(
+                sys::debug_stat(146),
+                live,
+                "no live vector when the destroy returns"
+            );
+            ensure_eq!(
+                sys::debug_stat(141),
+                ids,
+                "every identity free when the destroy returns"
+            );
+            for (h, what) in [(x, "the fired vector"), (y, "the armed vector")] {
+                ensure_eq!(
+                    st(sys::interrupt_ack(h)),
+                    Some(S::BadState),
+                    "ack on {what} after the destruction"
+                );
+                ensure_eq!(
+                    st(sys::interrupt_deliver_here(h)),
+                    Some(S::BadState),
+                    "deliver_here on {what} after the destruction"
+                );
+            }
+            ensure_eq!(
+                st(sys::object_wait(y, sig::INTERRUPT, sys::clock_get() + 50)),
+                Some(S::TimedOut),
+                "the armed vector never fires again"
+            );
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(d.sup, 2)),
+                Some(S::BadState),
+                "a destroyed domain grants nothing"
+            );
+            Ok(())
+        })();
+        sys::handle_close(x);
+        sys::handle_close(y);
+        r
     });
     r.and(vectors_at_baseline(live, ids))
 }
@@ -18868,6 +18950,7 @@ pub fn app_main() -> i32 {
         ("msi_ungranted_vector_faults", msi_ungranted_vector_faults),
         ("msi_forgery_faults", msi_forgery_faults),
         ("msi_revoke_stops_the_vector", msi_revoke_stops_the_vector),
+        ("msi_destroy_revokes_every_vector", msi_destroy_revokes_every_vector),
         (
             "vector_calls_check_handles_rights_and_arguments",
             vector_calls_check_handles_rights_and_arguments,

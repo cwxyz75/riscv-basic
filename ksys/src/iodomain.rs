@@ -299,9 +299,9 @@ fn finish_destroy<E: IoEnv>(e: &mut E, x: Destroying) {
     if !wait(e, &mut w) {
         let Waiter::Destroy(x) = w else { return };
         // (IO8: the domain's vectors are leaked with it: their identities are never retired, an entry may stay cached)
-        let _ = e.irq_iommu(|c, s, _, _, _| {
+        let _ = e.irq_iommu(|c, s, mem, _, _| {
             if s.destroy_abandon(&x) {
-                c.vecs.domain_leaked(x.domain());
+                c.vecs.domain_leaked(mem, x.domain());
             }
         });
         return;
@@ -733,6 +733,9 @@ pub fn iodomain_destroy<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
             }
             // (another thread may have taken this destruction, or a second destroy found it under way: done before the return)
             settle_destructions(e);
+            // (6.3, 10.6: the domain's vectors ended at its fence; their identities retired by their harts and their charges given
+            // back before the call returns)
+            settle_vectors(e);
             Ok((None, None))
         }
         Err(s) => err(s),
@@ -911,8 +914,59 @@ fn grant_in<E: IoEnv>(e: &mut E, v: VectorRef, d: DomainId, k: u16) -> Reply {
     let cancel = |e: &mut E| {
         let _ = e.irq(|c, _| c.vecs.grant_cancel(c.ids, c.harts, v));
     };
-    // the entry, once the identity is open (its hart opens it; a hart going offline meanwhile places it again)
+    // the entry, once the identity is open (its hart opens it; a hart going offline meanwhile places it again; a hart that does not
+    // answer within the bound: an identity on the calling hart instead, opened at once)
     let mut written = None;
+    for attempt in 0..2 {
+        if attempt == 1 {
+            match e.irq(|c, _| c.vecs.grant_here(c.ids, c.harts, v)) {
+                Some(Ok(())) => {}
+                Some(Err(x)) => {
+                    cancel(e);
+                    return err(io_status(x));
+                }
+                None => {
+                    cancel(e);
+                    return err(Status::BadState);
+                }
+            }
+        }
+        if grant_written(e, v, &mut written) {
+            break;
+        }
+    }
+    match written {
+        Some(Ok(_)) => {}
+        Some(Err(x)) => {
+            cancel(e);
+            return err(io_status(x));
+        }
+        None => {
+            // (not reached: an identity on the calling hart is open at once)
+            cancel(e);
+            return err(Status::NoMemory);
+        }
+    }
+    if !wait_vector(e, d, k) {
+        // 6.4: the vector is leaked (IO8) and the call is NO_MEMORY
+        let _ = e.irq_iommu(|c, s, mem, _, _| c.vecs.abandon(s, mem, v));
+        return err(Status::NoMemory);
+    }
+    let live = e.irq_iommu(|c, s, _, _, _| c.vecs.fenced(c.ids, c.harts, s, v));
+    if live != Some(Ok(true)) {
+        // (the domain's destruction began meanwhile: it ends the route after its own fence, 10.6)
+        return err(Status::BadState);
+    }
+    resettle(e);
+    grant_attach(e, v, k)
+}
+
+/// The grant's entry, written once its identity is open (bounded): true when the write was tried (`written` says how it went).
+fn grant_written<E: IoEnv>(
+    e: &mut E,
+    v: VectorRef,
+    written: &mut Option<Result<Ticket, IoError>>,
+) -> bool {
     wait_until(e, |e| {
         let w = e.irq_iommu(|c, s, mem, regs, db| {
             c.vecs
@@ -921,37 +975,19 @@ fn grant_in<E: IoEnv>(e: &mut E, v: VectorRef, d: DomainId, k: u16) -> Reply {
         match w {
             Some(Err(IoError::NotDone)) => false,
             Some(x) => {
-                written = Some(x);
+                *written = Some(x);
                 true
             }
             None => {
-                written = Some(Err(IoError::BadState));
+                *written = Some(Err(IoError::BadState));
                 true
             }
         }
-    });
-    match written {
-        Some(Ok(_)) => {}
-        Some(Err(x)) => {
-            cancel(e);
-            return err(io_status(x));
-        }
-        None => {
-            // (its hart never opened the identity within the bound: nothing names it yet)
-            cancel(e);
-            return err(Status::NoMemory);
-        }
-    }
-    if !wait_vector(e, d, k) {
-        // 6.4: the vector is leaked (IO8) and the call is NO_MEMORY
-        let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.abandon(s, v));
-        return err(Status::NoMemory);
-    }
-    let live = e.irq_iommu(|c, s, _, _, _| c.vecs.fenced(c.ids, c.harts, s, v));
-    if live != Some(Ok(true)) {
-        // (the domain's destruction began meanwhile: it ends the route after its own fence, 10.6)
-        return err(Status::BadState);
-    }
+    })
+}
+
+/// 8.3, the end: the object, and the file armed.
+fn grant_attach<E: IoEnv>(e: &mut E, v: VectorRef, k: u16) -> Reply {
     // the object, and the file armed: in one section with the route's state, so a destruction cannot come between
     let made = e.irq_iommu(|c, s, mem, regs, _| -> Result<u64, Status> {
         if c.vecs.state(v) != Some(RState::Live) {
@@ -1014,7 +1050,7 @@ pub fn settle_vectors<E: IoEnv>(e: &mut E) {
             continue;
         };
         if !wait_vector(e, d, k) {
-            let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.revoke_abandon(s, v));
+            let _ = e.irq_iommu(|c, s, mem, _, _| c.vecs.revoke_abandon(s, mem, v));
             continue;
         }
         let _ = e.irq_iommu(|c, s, mem, _, db| {
@@ -1050,18 +1086,27 @@ pub fn move_vector_here<E: IoEnv>(e: &mut E, v: VectorRef) -> Result<(), MoveErr
             .unwrap_or(Err(MoveError::Dead));
         !matches!(started, Err(MoveError::Busy))
     });
-    match started? {
+    let r = match started? {
         Moved::Stays => Ok(()),
-        Moved::Retarget => {
-            retarget(e, v);
-            Ok(())
-        }
+        Moved::Retarget => retarget(e, v),
+    };
+    resettle(e);
+    r
+}
+
+/// A fence named an identity its route had moved away from meanwhile (a hart went offline during a grant or a move): the moves are
+/// settled now, before the call returns (8.5).
+fn resettle<E: IoEnv>(e: &mut E) {
+    if e.irq(|c, _| c.vecs.take_resettle()) == Some(true) {
+        settle_moves(e);
     }
 }
 
 /// A busy route's retarget (8.5, a move): the entry rewritten to the route's open identity, the fence, then the identities it left
-/// retired. A route that is not open yet is waited for (bounded); a revoke or a destruction meanwhile ends the move.
-fn retarget<E: IoEnv>(e: &mut E, v: VectorRef) {
+/// retired. A route that is not open yet is waited for (bounded); a revoke or a destruction meanwhile ends the move. `Ok` when the
+/// entry names the route's open identity; `Busy` when it did not open within the bound (the move is left to the settle that its
+/// opening asks for); `Dead` when the vector is being revoked or its domain destroyed, or the fence did not complete (leaked).
+fn retarget<E: IoEnv>(e: &mut E, v: VectorRef) -> Result<(), MoveError> {
     let mut queued = None;
     let ok = wait_until(e, |e| {
         let r = e.irq_iommu(|c, s, mem, regs, _| {
@@ -1078,29 +1123,37 @@ fn retarget<E: IoEnv>(e: &mut E, v: VectorRef) {
     });
     if !ok {
         let _ = e.irq(|c, _| c.vecs.unbusy(v));
-        return;
+        return Err(MoveError::Busy);
     }
-    let Some(Ok(Some(_))) = queued else {
-        return; // (nothing to rewrite, or the vector is being revoked or its domain destroyed)
-    };
+    match queued {
+        Some(Ok(Some(_))) => {}
+        Some(Ok(None)) => return Ok(()), // (the entry names it already)
+        _ => return Err(MoveError::Dead), // (the vector is being revoked or its domain destroyed)
+    }
     let Some(Some((d, k))) = e.irq(|c, _| c.vecs.vector_of(v)) else {
-        return;
+        return Err(MoveError::Dead);
     };
     if !wait_vector(e, d, k) {
-        let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.abandon(s, v));
-        return;
+        let _ = e.irq_iommu(|c, s, mem, _, _| c.vecs.abandon(s, mem, v));
+        return Err(MoveError::Dead);
     }
-    let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.fenced(c.ids, c.harts, s, v));
+    match e.irq_iommu(|c, s, _, _, _| c.vecs.fenced(c.ids, c.harts, s, v)) {
+        Some(Ok(true)) => Ok(()),
+        _ => Err(MoveError::Dead),
+    }
 }
 
 /// Finish the moves a hart's evacuation began (8.5, hart offline: `hart_set_online`, with no lock held after the evacuation): for
 /// each live vector whose entry does not name its open identity, the retarget. Bounded by the vectors.
 pub fn settle_moves<E: IoEnv>(e: &mut E) {
     for _ in 0..4096 {
-        let Some(Some(v)) = e.irq(|c, _| c.vecs.next_to_settle(c.ids)) else {
+        let Some(Some(v)) = e.irq(|c, _| {
+            c.vecs.take_resettle();
+            c.vecs.next_to_settle(c.ids)
+        }) else {
             return;
         };
-        retarget(e, v);
+        let _ = retarget(e, v);
     }
 }
 
@@ -1157,13 +1210,22 @@ pub fn interrupt_deliver_here_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Option
         }
     })??;
     Some(match r {
-        Ok(v) => match move_vector_here(e, v) {
-            Ok(()) => Ok((None, None)),
-            Err(MoveError::Dead) => err(Status::BadState),
-            Err(MoveError::NoMemory) => err(Status::NoMemory),
-            // (another move held it past the bound: the vector stays where that one put it)
-            Err(MoveError::Busy) => Ok((None, None)),
-        },
+        // (another move holding the vector past the bound ends within its own fence bound, completed or leaked: tried again, a few
+        // times; the call returns OK only when the entry names an identity on this hart)
+        Ok(v) => {
+            let mut r = Err(MoveError::Busy);
+            for _ in 0..4 {
+                r = move_vector_here(e, v);
+                if !matches!(r, Err(MoveError::Busy)) {
+                    break;
+                }
+            }
+            match r {
+                Ok(()) => Ok((None, None)),
+                Err(MoveError::NoMemory) => err(Status::NoMemory),
+                Err(MoveError::Dead | MoveError::Busy) => err(Status::BadState),
+            }
+        }
         Err(s) => err(s),
     })
 }

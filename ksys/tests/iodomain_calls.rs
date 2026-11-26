@@ -957,8 +957,21 @@ fn revoke_stops_the_vector_and_gives_everything_back() {
     let (x3, _) = h.grant(d, 1);
     assert!(h.signal(13, 1).is_ok());
     assert!(h.interrupt_pending(x3));
-    // the domain's destruction revokes the rest; the handles stay, dead
-    h.ok(nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
+    // the domain's destruction revokes the rest; the handles stay, dead. Before the call returns (6.3: the call alone, without
+    // the tail a later call would run) the identities are retired and the charges given back
+    h.dispatch(nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0])
+        .expect("handled")
+        .expect("destroyed");
+    assert_eq!(
+        h.ids.free_total(),
+        free_ids,
+        "every identity retired before the destroy returned"
+    );
+    assert_eq!(
+        h.vecs.counts().dead,
+        0,
+        "no route left to credit after the destroy"
+    );
     assert_eq!(vector_usage(&mut h, job).0, Some(0));
     assert_eq!(
         h.kernel_bytes(j),
@@ -1079,4 +1092,125 @@ fn placement_moves_and_hart_offline_keep_every_message() {
     h.close(x);
     h.close(d);
     at_baseline(&h, free_ids, frames);
+}
+
+/// 8.3 and 6.4 (review of IOMMU7): a grant whose chosen hart does not answer takes an identity on the calling hart instead and
+/// succeeds (NO_MEMORY is only for the causes 8.3 lists); the unanswered identity is retired when its hart answers.
+#[test]
+fn a_grant_whose_hart_does_not_answer_is_placed_on_the_calling_hart() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let free_ids = h.ids.free_total();
+    let frames = h.w.mm.db.free_count();
+    let res = h.resource();
+    let d = h.domain(res, 24);
+    // (hart 0 has the fewest routes and is chosen first; the caller runs on hart 3)
+    h.harts.here = 3;
+    h.harts.deaf = Some(0);
+    let (x, _) = h.grant(d, 0);
+    assert_eq!(hart_of(&h, x), 3, "placed on the calling hart");
+    assert!(h.signal(24, 0).is_ok());
+    assert!(h.interrupt_pending(x), "and delivered");
+    h.harts.deaf = None;
+    h.close(x);
+    h.close(d);
+    at_baseline(&h, free_ids, frames);
+}
+
+/// 8.5, hart offline (review of IOMMU7): the hart a move is going to goes offline before the move's fence. The evacuation's settle
+/// skips the busy route; the fence then names an identity the route has already left, which asks for a settle, and the settle moves
+/// the entry to the identity the evacuation opened. The vector ends on an online hart and is delivered.
+#[test]
+fn a_hart_going_offline_during_a_move_is_settled_when_the_move_fences() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let free_ids = h.ids.free_total();
+    let frames = h.w.mm.db.free_count();
+    let res = h.resource();
+    let d = h.domain(res, 26);
+    let (x, _) = h.grant(d, 0);
+    let v = vref(&h, x);
+    let from = hart_of(&h, x);
+    let to = (from + 1) % HARTS;
+    // the move begins on hart `to`: its identity, the entry rewritten, the fence queued (not yet run)
+    h.harts.here = to;
+    assert_eq!(
+        h.vecs.move_here(&mut h.ids, &mut h.harts, v),
+        Ok(kcore::iovec::Moved::Retarget)
+    );
+    let t = h
+        .vecs
+        .retarget_begin(&h.ids, &h.harts, &mut h.store, h.io, &mut h.sim, v);
+    let Ok(Some(ticket)) = t else {
+        panic!("the move's fence queued: {t:?}")
+    };
+    // hart `to` goes offline before the fence
+    h.harts.here = from;
+    assert!(offline(&mut h, to));
+    // the fence completes, naming the identity on `to` that the route has left
+    h.sim.process_commands();
+    let _ = h.store.poll(&mut h.sim, ticket);
+    assert_eq!(
+        h.vecs.fenced(&mut h.ids, &mut h.harts, &mut h.store, v),
+        Ok(true)
+    );
+    let (now, _) = h.vecs.current(&h.ids, v).unwrap();
+    assert_ne!(
+        Some(now),
+        h.vecs.named(v),
+        "the entry names the identity left"
+    );
+    assert!(h.vecs.take_resettle(), "the fence asks for a settle");
+    kio::settle_moves(&mut h);
+    h.settle();
+    let (now, ready) = h.vecs.current(&h.ids, v).unwrap();
+    assert!(ready);
+    assert_eq!(
+        Some(now),
+        h.vecs.named(v),
+        "settled: the entry names the open identity"
+    );
+    assert_ne!(now.hart, to, "on an online hart");
+    assert!(h.signal(26, 0).is_ok());
+    assert!(h.interrupt_pending(x), "delivered");
+    h.close(x);
+    h.close(d);
+    at_baseline(&h, free_ids, frames);
+}
+
+/// IO8 and 8.4 (review of IOMMU7): a move whose fence does not complete leaks the vector with its file disabled, so a device that
+/// goes on sending to it sends no notice (no flood); `interrupt_deliver_here` says the move did not happen (BAD_STATE).
+#[test]
+fn a_vector_leaked_by_a_fence_timeout_is_disabled() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let res = h.resource();
+    let d = h.domain(res, 25);
+    let (x, _) = h.grant(d, 0);
+    let from = hart_of(&h, x);
+    h.harts.here = (from + 1) % HARTS;
+    h.stall = true;
+    let tables = h.store.stats().tables_leaked;
+    assert_eq!(
+        h.err(nr::INTERRUPT_DELIVER_HERE, [x, 0, 0, 0, 0, 0]),
+        Status::BadState,
+        "the move's fence did not complete"
+    );
+    assert_eq!(h.vecs.counts().leaked, 1);
+    assert_eq!(
+        h.store.stats().tables_leaked,
+        tables + 1,
+        "the frame that holds its file is counted as leaked"
+    );
+    let notices = h.notices;
+    for _ in 0..4 {
+        let _ = h.signal(25, 0);
+    }
+    assert_eq!(h.notices, notices, "a leaked vector's file sends no notice");
+    assert!(!h.interrupt_pending(x));
+    assert_eq!(
+        h.err(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]),
+        Status::BadState,
+        "and cannot be armed again"
+    );
 }

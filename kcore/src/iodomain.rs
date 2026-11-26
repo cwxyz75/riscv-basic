@@ -550,6 +550,16 @@ fn file_of(dom: &Domain, index: u16) -> Option<u64> {
 }
 
 /// Free the frame of vector `index`'s file if no index of its eight is granted any more (free, every one: a leaked one keeps it).
+/// The vectors whose files share a frame with vector `index`'s.
+fn file_group(dom: &Domain, index: u16) -> impl Iterator<Item = &VSlot> {
+    let per = FILES_PER_FRAME as usize;
+    let first = usize::from(index)
+        .checked_div(per)
+        .unwrap_or(0)
+        .saturating_mul(per);
+    dom.vectors.iter().skip(first).take(per)
+}
+
 fn free_file_frame<F: TableFrames>(dom: &mut Domain, index: u16, frames: &mut F) {
     let per = FILES_PER_FRAME as usize;
     let group = usize::from(index).checked_div(per).unwrap_or(0);
@@ -641,8 +651,8 @@ pub struct IoStats {
     pub io_pages: u64,
     /// Vector indices granted (reserved, live, moving or revoking) in live domains (IOMMU7).
     pub vectors: u64,
-    /// Vector indices whose fence was abandoned (IO8), with their files (whose frames are counted in `tables_leaked` once their domain
-    /// goes).
+    /// Vector indices whose fence was abandoned (IO8), with their files (a frame that holds one is counted in `tables_leaked` when its
+    /// first file leaks).
     pub vectors_leaked: u64,
     /// Stray bits taken from vectors' interrupt files at revoke and release (8.4: a data word other than the granted one).
     pub strays: u64,
@@ -2127,7 +2137,21 @@ impl IoDomains {
         dom.leaks = true;
         let holds = dom.mappings.saturating_add(dom.pending_n);
         let pages = dom.io_pages.saturating_sub(dom.leaked_pages);
-        let files = dom.files.iter().filter(|&&f| f != 0).count() as u64;
+        // (a frame that holds a leaked vector's file was counted when that vector leaked)
+        let files = dom
+            .files
+            .iter()
+            .enumerate()
+            .filter(|&(g, &f)| {
+                f != 0
+                    && !dom
+                        .vectors
+                        .iter()
+                        .skip(g.saturating_mul(FILES_PER_FRAME as usize))
+                        .take(FILES_PER_FRAME as usize)
+                        .any(|v| v.state == VState::Leaked)
+            })
+            .count() as u64;
         let tables = dom
             .tables
             .saturating_add(ROOT_FRAMES + 1)
@@ -2440,6 +2464,8 @@ impl IoDomains {
         let Some(dom) = self.dom_mut(d).filter(|x| x.state == State::Attached) else {
             return false;
         };
+        // (the frame that holds this vector's file is never freed from now on: counted in `tables_leaked` with its first leaked file)
+        let frame_leaks = !file_group(dom, index).any(|v| v.state == VState::Leaked);
         let Some(v) = dom.vectors.get_mut(usize::from(index)) else {
             return false;
         };
@@ -2457,6 +2483,9 @@ impl IoDomains {
         s.vectors = s.vectors.saturating_sub(1);
         s.vectors_leaked = s.vectors_leaked.saturating_add(1);
         s.fence_timeouts = s.fence_timeouts.saturating_add(1);
+        if frame_leaks {
+            s.tables_leaked = s.tables_leaked.saturating_add(1);
+        }
         true
     }
 
