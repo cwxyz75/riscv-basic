@@ -133,6 +133,10 @@ fn a_malformed_node_is_the_refusal_not_a_guess() {
         "a two-cell specifier",
     );
     bad(
+        with(IOMMU, "#iommu-cells", Some(be(&[1, 1]))),
+        "#iommu-cells of two cells",
+    );
+    bad(
         with(
             PCI,
             "iommu-map",
@@ -183,6 +187,22 @@ fn a_pci_host_only_partly_behind_the_iommu_opens_no_window() {
             with(PCI, "iommu-map", Some(be(&[0, 0x7777, 0, 0x10000]))),
         ),
         ("a mask", with(PCI, "iommu-map-mask", Some(be(&[0xff00])))),
+        (
+            "two halves on one set of device ids (0x5 and 0x8005 are both device 5)",
+            with(
+                PCI,
+                "iommu-map",
+                Some(be(&[0, 0x8000, 0, 0x8000, 0x8000, 0x8000, 0, 0x8000])),
+            ),
+        ),
+        (
+            "an entry ahead of the whole map that shifts ids (first match: 0x0 is device 0x100)",
+            with(
+                PCI,
+                "iommu-map",
+                Some(be(&[0, 0x8000, 0x100, 0x10, 0, 0x8000, 0, 0x10000])),
+            ),
+        ),
         (
             "a malformed map",
             with(PCI, "iommu-map", Some(be(&[0, 0x8000, 0]))),
@@ -237,9 +257,28 @@ fn qemu_10_2s_map_is_an_iommu_whose_pci_host_misses_one_requester_id() {
     );
     assert_eq!(discover(&n), discover(&nodes()));
     assert_eq!(iommutree::pci_windows(&n), iommutree::pci_windows(&nodes()));
-    // a map of nothing but empty entries puts no id behind the IOMMU
-    let n = with(PCI, "iommu-map", Some(be(&[0, 0x8000, 0, 0])));
-    assert!(discover(&n).unwrap().pci.is_empty());
+    // an empty entry naming another IOMMU maps nothing either
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x1234, 0, 0, 0, 0x8000, 0, 0x10000])),
+    );
+    assert_eq!(discover(&n), discover(&nodes()));
+    assert_eq!(iommutree::pci_windows(&n), iommutree::pci_windows(&nodes()));
+    // a map of nothing but empty entries, or an empty property, puts no id behind the IOMMU (and is no refusal)
+    for v in [be(&[0, 0x8000, 0, 0]), vec![]] {
+        let n = with(PCI, "iommu-map", Some(v.clone()));
+        assert!(discover(&n).unwrap().pci.is_empty(), "{v:x?}");
+        assert!(iommutree::pci_windows(&n).is_empty(), "{v:x?}");
+    }
+    // a mask that folds nothing does not make a partial map whole
+    let mut n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x8000, 0, 0, 0, 0x8000, 0, 0xffff])),
+    );
+    let pci = n.iter_mut().find(|x| x.path == PCI).unwrap();
+    pci.props.push(("iommu-map-mask".into(), be(&[0xffff])));
     assert!(iommutree::pci_windows(&n).is_empty());
 }
 

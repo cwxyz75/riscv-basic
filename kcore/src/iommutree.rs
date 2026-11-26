@@ -43,7 +43,7 @@ pub struct MapEntry {
     pub len: u32,
 }
 
-/// The PCI host behind the IOMMU.
+/// A PCI host some of whose requester ids are behind the IOMMU (all of them only when `fully_behind_the_iommu` says so).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PciHost {
     /// The configuration window (ECAM): the host's `reg`.
@@ -63,7 +63,7 @@ pub struct Iommu {
     pub size: u64,
     /// Its wired sources in the tree's order ([`Cause`] is the index).
     pub sources: Vec<Source>,
-    /// The PCI hosts behind it (one on `virt`).
+    /// The PCI hosts with requester ids behind it (one on `virt`), wholly or in part.
     pub pci: Vec<PciHost>,
     /// One past the highest device id any `iommu-map` names (the directory must cover it).
     pub device_ids: u32,
@@ -162,12 +162,12 @@ struct RawEntry {
 
 /// The entries of `host`'s `iommu-map`: tuples of (rid-base, iommu phandle, iommu-base, length), one cell each (the binding's
 /// specifier is one cell, as `riscv,iommu`'s `#iommu-cells = <1>` makes it). An entry of length 0 maps nothing and is dropped
-/// (QEMU 10.2 and 11.0 write one ahead of their real entry). `None` if the property is empty or does not divide into whole
-/// entries.
+/// (QEMU 10.2 and 11.0 write one ahead of their real entry); an empty property maps nothing too. `None` if the property does
+/// not divide into whole entries.
 fn map_entries(host: &Node) -> Option<Vec<RawEntry>> {
     let cells = host.cells("iommu-map");
     let (quads, rest) = cells.as_chunks::<4>();
-    if quads.is_empty() || !rest.is_empty() {
+    if !rest.is_empty() {
         return None;
     }
     Some(
@@ -294,10 +294,11 @@ pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
 }
 
 /// Is every function of PCI host `host` behind the one platform IOMMU? Its `iommu-map` must name only that IOMMU, have no
-/// `iommu-map-mask` that folds requester ids together (one that keeps all 16 bits is the identity), and cover every requester
-/// id the host can issue (0 to 0xffff:
-/// bus, device and function). A host with no map, a partial map or a map naming anything else is not behind it (IOMMU-SPEC 2.6:
-/// fail closed; a function outside the map would reach memory untranslated).
+/// `iommu-map-mask` that folds requester ids together (one that keeps all 16 bits is the identity), map each requester id to
+/// the same device id (IOMMU-SPEC 2.2: device id = requester id; any other map can make two functions one device id, which one
+/// domain per function cannot express), and cover every requester id the host can issue (0 to 0xffff: bus, device and
+/// function). A host with no map, a partial map or a map naming anything else is not behind it (IOMMU-SPEC 2.6: fail closed; a
+/// function outside the map would reach memory untranslated).
 pub fn fully_behind_the_iommu(host: &Node, nodes: &[Node]) -> bool {
     let mut iommus = nodes
         .iter()
@@ -316,7 +317,11 @@ pub fn fully_behind_the_iommu(host: &Node, nodes: &[Node]) -> bool {
     let Some(map) = map_entries(host) else {
         return false;
     };
-    if map.is_empty() || map.iter().any(|e| e.iommu != me) {
+    if map.is_empty()
+        || map
+            .iter()
+            .any(|e| e.iommu != me || e.did_base != e.rid_base)
+    {
         return false;
     }
     let mut spans: Vec<(u64, u64)> = map
