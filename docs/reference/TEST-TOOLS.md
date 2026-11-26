@@ -169,7 +169,9 @@ overflow checks on.
 kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`,
 `os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-iommu-neg` (a machine without the platform IOMMU ends in `##PANIC ... no IOMMU`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
 mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`, `os-boot-test-iommu-bare` (`ddtp` Bare: `iommu_is_on_and_denies_by_default` must fail), `os-boot-test-iommu-inval`
-(`fault-iommu-skip-inval`, an unmap without its invalidation and fence: `iodomain_unmap_stops_the_device` must fail).
+(`fault-iommu-skip-inval`, an unmap without its invalidation and fence: `iodomain_unmap_stops_the_device` must fail),
+`os-boot-test-iommu-msi` (`fault-iommu-msi-basic`, basic-translate MSI entries that pass the device's data word to the hart:
+`msi_forgery_faults` must fail; `make os-models` also checks that the host model `iodomain_vectors_model` fails with it).
 
 **The network checks by tier.**
 

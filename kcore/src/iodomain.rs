@@ -543,7 +543,9 @@ pub const DOMAIN_BYTES: u64 = core::mem::size_of::<Domain>() as u64
 /// The interrupt file of vector `index` of `dom` (its frame must have been taken).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: index < 256, so the offset is below a frame
 fn file_of(dom: &Domain, index: u16) -> Option<u64> {
-    let frame = *dom.files.get(usize::from(index) / FILES_PER_FRAME as usize)?;
+    let frame = *dom
+        .files
+        .get(usize::from(index) / FILES_PER_FRAME as usize)?;
     (frame != 0).then(|| frame + (u64::from(index) % FILES_PER_FRAME) * MRIF_BYTES)
 }
 
@@ -924,7 +926,12 @@ impl Detached {
     /// job the domain's kernel bytes and its tables', and drop the domain's use of its job, unless a fence of the domain was abandoned
     /// (the leaked charges stay, and so does the use that keeps the job record: J2). Call after every record was taken. Allocates
     /// nothing.
-    pub fn finish<M: PhysMem64, F: IoFrames>(mut self, mem: &M, frames: &mut F, jobs: &mut Jobs) -> u64 {
+    pub fn finish<M: PhysMem64, F: IoFrames>(
+        mut self,
+        mem: &M,
+        frames: &mut F,
+        jobs: &mut Jobs,
+    ) -> u64 {
         debug_assert!(
             self.dom.pending.is_none() && self.dom.live.is_none(),
             "Detached::finish before every record was taken (their holds would be lost)"
@@ -974,11 +981,13 @@ impl Detached {
 
 /// A domain's granted vectors (granting, live, moving or revoking) and, of them, the ones being revoked.
 fn vector_counts(dom: &Domain) -> (u64, u64) {
-    dom.vectors.iter().fold((0u64, 0u64), |(g, r), v| match v.state {
-        VState::Free | VState::Leaked => (g, r),
-        VState::Revoking(_) => (g.saturating_add(1), r.saturating_add(1)),
-        _ => (g.saturating_add(1), r),
-    })
+    dom.vectors
+        .iter()
+        .fold((0u64, 0u64), |(g, r), v| match v.state {
+            VState::Free | VState::Leaked => (g, r),
+            VState::Revoking(_) => (g.saturating_add(1), r.saturating_add(1)),
+            _ => (g.saturating_add(1), r),
+        })
 }
 
 /// The commands that invalidate what an unmap (or a map's roll-back) of `rec` changed: page by page for a short range that emptied no
@@ -1050,6 +1059,11 @@ impl IoDomains {
         let i = usize::try_from((d.0 & 0xffff_ffff).checked_sub(1)?).ok()?;
         let s = self.slots.get(i)?;
         (s.dom.is_some() && u64::from(s.gen) == d.0 >> 32).then_some(i)
+    }
+
+    /// The physical address of domain `d`'s MSI page table (a test reads the entries the IOMMU walks, IOMMU7).
+    pub fn msi_root(&self, d: DomainId) -> Option<u64> {
+        Some(self.dom(d)?.msi.root())
     }
 
     fn dom(&self, d: DomainId) -> Option<&Domain> {
@@ -1299,10 +1313,7 @@ impl IoDomains {
             return Err(IoError::NoMemory);
         };
         let mut vectors = Vec::new();
-        if vectors
-            .try_reserve_exact(IO_VECTOR_PAGES as usize)
-            .is_err()
-        {
+        if vectors.try_reserve_exact(IO_VECTOR_PAGES as usize).is_err() {
             undo_frames(frames);
             return Err(IoError::NoMemory);
         }
@@ -2004,7 +2015,10 @@ impl IoDomains {
         // 10.6 step 2: every vector's enable bit is cleared (nothing more is noticed); the whole-context invalidation drops its entries
         if let Some(dom) = self.dom(d) {
             for (k, v) in dom.vectors.iter().enumerate() {
-                if matches!(v.state, VState::Granting(_) | VState::Live | VState::Moving(_)) {
+                if matches!(
+                    v.state,
+                    VState::Granting(_) | VState::Live | VState::Moving(_)
+                ) {
                     if let Some(f) = u16::try_from(k)
                         .ok()
                         .and_then(|k| file_of(dom, k))
@@ -2073,6 +2087,15 @@ impl IoDomains {
             freed: 0,
             tables_done: false,
         }))
+    }
+
+    /// Would `destroy_complete(x)` take the domain now (its fence done, and the destruction still the domain's)? The kernel ends the
+    /// domain's vector routes first (IOMMU7, 10.6 step 4), in the same section.
+    pub fn destroy_done(&self, x: &Destroying) -> bool {
+        self.done(x.ticket)
+            && self.dom(x.domain).is_some_and(|dom| {
+                dom.state == State::Detaching && dom.destroy_ticket == x.ticket.0
+            })
     }
 
     /// Keep a list of leaked records for good (a list of lists, linked through the heads' `left`: constant work).
@@ -2267,12 +2290,21 @@ impl IoDomains {
         Ok(ticket)
     }
 
-    /// The fence of a grant or a move (`t`) has completed: the vector is `Live`. `Ok(false)`: nothing to do (the domain's destruction
-    /// took the vector, or the ticket is not the vector's). `NotDone` before the fence.
-    pub fn vector_fenced(&mut self, d: DomainId, index: u16, t: Ticket) -> Result<bool, IoError> {
-        if !self.done(t) {
-            return Err(IoError::NotDone);
+    /// The fence a vector waits for (a grant's, a move's or a revoke's: its own ticket, which a waiter polls), `None` when it waits
+    /// for none (live, free, leaked, or its domain is being destroyed or gone: the destruction's fence covers it).
+    pub fn vector_ticket(&self, d: DomainId, index: u16) -> Option<Ticket> {
+        let dom = self.dom(d).filter(|x| x.state == State::Attached)?;
+        match dom.vectors.get(usize::from(index))?.state {
+            VState::Granting(x) | VState::Moving(x) | VState::Revoking(x) => Some(Ticket(x)),
+            _ => None,
         }
+    }
+
+    /// The fence of a grant or a move (the vector's own ticket) has completed: the vector is `Live`. `Ok(false)`: the write did not
+    /// take effect as a grant or a move (a revoke followed it, or the domain's destruction has begun: theirs end the vector). `NotDone`
+    /// before the fence.
+    pub fn vector_fenced(&mut self, d: DomainId, index: u16) -> Result<bool, IoError> {
+        let done = self.vector_ticket(d, index).map(|t| self.done(t));
         let Some(v) = self
             .dom_mut(d)
             .filter(|x| x.state == State::Attached)
@@ -2280,11 +2312,12 @@ impl IoDomains {
         else {
             return Ok(false);
         };
-        match v.state {
-            VState::Granting(x) | VState::Moving(x) if x == t.0 => {
+        match (v.state, done) {
+            (VState::Granting(_) | VState::Moving(_), Some(true)) => {
                 v.state = VState::Live;
                 Ok(true)
             }
+            (VState::Granting(_) | VState::Moving(_), _) => Err(IoError::NotDone),
             _ => Ok(false),
         }
     }
@@ -2321,8 +2354,8 @@ impl IoDomains {
         Some(ticket)
     }
 
-    /// Queue a vector's commands again (a grant's, a move's or a revoke's whose queue had no room); `t` updated. `Done` if the vector
-    /// no longer waits for this ticket (the domain's destruction took it, whose own fence covers it).
+    /// Queue a vector's commands again (a grant's, a move's or a revoke's whose queue had no room). `t` is the waiter's ticket: when
+    /// another waiter queued them meanwhile, `t` takes the vector's current ticket. `Done` if the vector waits for no fence any more.
     pub fn requeue_vector<M: PhysMem64, R: Regs>(
         &mut self,
         mem: &M,
@@ -2331,19 +2364,14 @@ impl IoDomains {
         index: u16,
         t: &mut Ticket,
     ) -> Fence {
-        if t.0 != NO_TICKET {
+        let Some(cur) = self.vector_ticket(d, index) else {
+            return Fence::Done;
+        };
+        if cur.0 != NO_TICKET {
+            *t = cur;
             return Fence::Waiting;
         }
-        let Some(gscid) = self
-            .dom(d)
-            .filter(|x| x.state == State::Attached)
-            .filter(|dom| {
-                dom.vectors.get(usize::from(index)).is_some_and(|v| {
-                    matches!(v.state, VState::Granting(x) | VState::Moving(x) | VState::Revoking(x) if x == NO_TICKET)
-                })
-            })
-            .map(|dom| dom.gscid)
-        else {
+        let Some(gscid) = self.dom(d).map(|dom| dom.gscid) else {
             return Fence::Done;
         };
         let Some(n) = self.requeue(mem, regs, &Self::vector_cmds(gscid, index)) else {
@@ -2364,28 +2392,33 @@ impl IoDomains {
         Fence::Waiting
     }
 
-    /// 8.5, revoke, the end, once the fence (`t`) has completed: the stray bits left in the file are taken and counted (8.4), and the
-    /// file is freed (its frame too, when it was the last of its eight). The index is free for a new grant. Returns the strays taken;
-    /// `Ok(None)`: nothing to do (the destruction took the vector: its release frees the file). `NotDone` before the fence. Allocates
-    /// nothing.
+    /// 8.5, revoke, the end, once the vector's fence has completed: the stray bits left in the file are taken and counted (8.4), and
+    /// the file is freed (its frame too, when it was the last of its eight). The index is free for a new grant. Returns the strays
+    /// taken. `Ok(None)`: the domain is gone (its destruction's fence covered the entry and its release freed the file), or the vector
+    /// is not being revoked. `NotDone`: the fence has not completed, or the domain's destruction has begun and its fence has not (the
+    /// destruction ends the vector). Allocates nothing.
     pub fn vector_revoked<M: PhysMem64, F: TableFrames>(
         &mut self,
         mem: &M,
         frames: &mut F,
         d: DomainId,
         index: u16,
-        t: Ticket,
     ) -> Result<Option<u64>, IoError> {
-        if !self.done(t) {
-            return Err(IoError::NotDone);
-        }
-        let Some(dom) = self.dom_mut(d).filter(|x| x.state == State::Attached) else {
+        let Some(dom) = self.dom(d) else {
             return Ok(None);
         };
-        match dom.vectors.get(usize::from(index)).map(|v| v.state) {
-            Some(VState::Revoking(x)) if x == t.0 => {}
-            _ => return Ok(None),
+        if dom.state != State::Attached {
+            return Err(IoError::NotDone);
         }
+        let Some(VState::Revoking(x)) = dom.vectors.get(usize::from(index)).map(|v| v.state) else {
+            return Ok(None);
+        };
+        if !self.done(Ticket(x)) {
+            return Err(IoError::NotDone);
+        }
+        let Some(dom) = self.dom_mut(d) else {
+            return Ok(None);
+        };
         let strays = file_of(dom, index)
             .and_then(|f| Mrif::new(f).ok())
             .and_then(|f| f.stray(mem, VECTOR_DATA).ok())
@@ -2401,8 +2434,9 @@ impl IoDomains {
     }
 
     /// A grant's, a move's or a revoke's fence will not complete (6.4): the vector is leaked (IO8): its index, its file and its
-    /// identities are never reused, and its charge stays. False if there was nothing to abandon (the destruction took it).
-    pub fn vector_abandon(&mut self, d: DomainId, index: u16, t: Ticket) -> bool {
+    /// identities are never reused, and its charge stays. False if there was nothing to abandon (no fence outstanding, or the
+    /// domain's destruction has begun: its own fence decides).
+    pub fn vector_abandon(&mut self, d: DomainId, index: u16) -> bool {
         let Some(dom) = self.dom_mut(d).filter(|x| x.state == State::Attached) else {
             return false;
         };
@@ -2410,8 +2444,8 @@ impl IoDomains {
             return false;
         };
         let revoking = match v.state {
-            VState::Granting(x) | VState::Moving(x) if x == t.0 => false,
-            VState::Revoking(x) if x == t.0 => true,
+            VState::Granting(_) | VState::Moving(_) => false,
+            VState::Revoking(_) => true,
             _ => return false,
         };
         v.state = VState::Leaked;

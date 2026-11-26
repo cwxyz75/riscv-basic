@@ -660,7 +660,8 @@ fn a_move_keeps_the_old_identity_until_the_new_one_is_opened_and_retired_after()
         o,
         Opened {
             route: Route::Wired(7),
-            retiring: Some(a)
+            retiring: Some(a),
+            held: None
         }
     );
     assert_eq!(

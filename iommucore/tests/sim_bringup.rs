@@ -406,3 +406,32 @@ fn the_negative_control_is_pass_through() {
     driver::write_bare(&mut sim);
     assert_eq!(sim.read(0x20, 0x8123_4000), Ok(0x8123_4000));
 }
+
+/// IOMMU-SPEC 7.2 and 8.4 (IOMMU7): the MSI causes (load fault, entry not valid, entry misconfigured, MRIF fault, MSI write
+/// fault) are printed like every other cause: the number, the device, the address (0 for an MSI fault, as QEMU reports it) and the
+/// direction, a message being a write.
+#[test]
+fn the_fault_line_names_the_msi_causes() {
+    for cause in [
+        faultq::CAUSE_MSI_LOAD_FAULT,
+        faultq::CAUSE_MSI_INVALID,
+        faultq::CAUSE_MSI_MISCONFIGURED,
+        faultq::CAUSE_MRIF_FAULT,
+        faultq::CAUSE_MSI_WRITE_FAULT,
+    ] {
+        let rec = FaultRecord {
+            cause,
+            ttype: TransactionType::UntranslatedWrite,
+            device_id: 0x20,
+            pv: false,
+            pid: 0,
+            privileged: false,
+            iotval: 0,
+            iotval2: 0,
+        };
+        assert_eq!(
+            driver::FaultLine(&rec).to_string(),
+            format!("## iommu: fault cause={cause} dev=00:04.0 iova=0x0 write")
+        );
+    }
+}

@@ -273,18 +273,22 @@ pub fn run_all() -> Report {
             && user::job_ledger() == (1, 0, 0, 0, 0, 0)
             // (IOMMU6) no device domain, no I/O-mapped page and no leaked mapping record is left
             && (159..=161).all(|w| crate::iommu::stat(w) == 0)
+            // (IOMMU7) no live vector and none leaked
+            && crate::aia::stat(146) == 0
+            && crate::aia::stat(149) == 0
         {
             Ok(())
         } else {
             Err(format!(
                 "{} processes and {} VMOs left (wanted 0 and {vmos_before}), {} futex sleepers, {} pager waiters or pagers; (jobs, \
-                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0); device domains, I/O-mapped pages, leaked holds {:?}",
+                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0); device domains, I/O-mapped pages, leaked holds {:?}; vectors live and                  leaked {:?}",
                 user::process_count(),
                 crate::irq::without(|| kmem::get().vmos.count()),
                 user::futex_sleepers(),
                 user::pager_leftovers(),
                 user::job_ledger(),
-                [159, 160, 161].map(crate::iommu::stat)
+                [159, 160, 161].map(crate::iommu::stat),
+                [146, 149].map(crate::aia::stat)
             ))
         },
     );

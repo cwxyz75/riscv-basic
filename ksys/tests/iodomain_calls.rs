@@ -11,6 +11,7 @@ use abi::Handle;
 use kcore::ipc;
 use kcore::job::{JobId, Resource, UNLIMITED};
 use kcore::pagetable::PhysMem;
+use ksys::iodomain as kio;
 
 mod common;
 use common::iohost::*;
@@ -678,4 +679,404 @@ fn a_fence_that_never_completes_leaks_and_the_call_reports_it() {
         h.w.vmos.pages(id).is_some(),
         "a leaked mapping's hold is never dropped"
     );
+}
+
+// ---- interrupt vectors (IOMMU7; IOMMU-SPEC 8.2 to 8.5, 6.2, 10.6) -------------------------------------------------------------------
+
+const MSI_INVALID: u16 = 262;
+const MSI_MISCONFIGURED: u16 = 263;
+
+/// The route of vector handle `x` (the kernel's name for it).
+fn vref(h: &Host<'_>, x: u64) -> ipc::VectorRef {
+    ipc::interrupt_kind_of(&h.w.objs, &h.w.handles, Handle(x), Rights::WAIT)
+        .unwrap()
+        .1
+        .expect("a vector")
+}
+
+/// Where vector handle `x` is placed: the hart of its open identity.
+fn hart_of(h: &Host<'_>, x: u64) -> u16 {
+    let (p, ready) = h.vecs.current(&h.ids, vref(h, x)).unwrap();
+    assert!(ready, "the vector's identity is open");
+    p.hart
+}
+
+/// Hart `f` goes offline as `hart_set_online` takes it: its routes evacuated, then the moves settled with no lock held.
+fn offline(h: &mut Host<'_>, f: u16) -> bool {
+    let usable: Vec<bool> = (0..HARTS)
+        .map(|g| g != f && !h.harts.offline[usize::from(g)])
+        .collect();
+    let asked = &mut h.harts.asked;
+    let r = h.ids.evacuate(
+        f,
+        |g| usable[usize::from(g)],
+        |c| match c {
+            kcore::msiid::Evacuated::Cancelled { at, .. } => {
+                asked.insert(at.hart);
+            }
+            kcore::msiid::Evacuated::Moved { to, .. } => {
+                asked.insert(to.hart);
+            }
+            kcore::msiid::Evacuated::Replaced { from, to, .. } => {
+                asked.insert(from.hart);
+                asked.insert(to.hart);
+            }
+        },
+    );
+    if r.is_err() {
+        return false;
+    }
+    h.harts.offline[usize::from(f)] = true;
+    h.relax_harts();
+    kio::settle_moves(h);
+    h.settle();
+    true
+}
+
+fn vector_usage(h: &mut Host<'_>, job: u64) -> (Option<u64>, Option<u64>) {
+    h.ok(nr::JOB_INFO, [job, 13, 0, 0, 0, 0])
+}
+
+/// The state every vector test ends in: no route, no identity, no file frame, no charge left behind (the leak oracle of 8.3).
+fn at_baseline(h: &Host<'_>, free_ids: u64, frames: usize) {
+    let c = h.vecs.counts();
+    assert_eq!((c.live, c.dead, c.leaked), (0, 0, 0), "{c:?}");
+    assert_eq!(h.ids.free_total(), free_ids, "every identity is free again");
+    assert_eq!(
+        h.w.mm.db.free_count(),
+        frames,
+        "every file frame is free again"
+    );
+    assert_eq!(
+        h.no_route, 0,
+        "no message reached an identity with no route"
+    );
+}
+
+#[test]
+fn iodomain_grant_vector_rows() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let res = h.resource();
+    let d = h.domain(res, 7);
+    let drv = h.narrow(d, Rights::IODOMAIN_DRIVER);
+    let v = h.dma(res, 1);
+    let g = nr::IODOMAIN_GRANT_VECTOR;
+    assert_eq!(h.err(g, [0x999, 0, 0, 0, 0, 0]), Status::BadHandle);
+    assert_eq!(h.err(g, [v, 0, 0, 0, 0, 0]), Status::WrongType);
+    assert_eq!(
+        h.err(g, [drv, 0, 0, 0, 0, 0]),
+        Status::AccessDenied,
+        "a driver's handle cannot grant"
+    );
+    let all_but = h.narrow(d, Rights(Rights::IODOMAIN.0 & !Rights::IO_GRANT.0));
+    assert_eq!(h.err(g, [all_but, 0, 0, 0, 0, 0]), Status::AccessDenied);
+    for bad in [256, 1 << 16, 1 << 32, u64::MAX] {
+        assert_eq!(h.err(g, [d, bad, 0, 0, 0, 0]), Status::InvalidArgs, "{bad}");
+    }
+    assert_eq!(
+        h.err(g, [drv, 256, 0, 0, 0, 0]),
+        Status::AccessDenied,
+        "ACCESS_DENIED before INVALID_ARGS"
+    );
+    // the pair to program: the window's page k, and the data word 1
+    let (x, addr) = h.grant(d, 3);
+    assert_eq!(addr, kcore::iodomain::IoDomains::vector_address(3));
+    assert_eq!(addr % 4096, 0);
+    assert_eq!(io::MSI_DATA, 1);
+    let e = h.w.handles.get(Handle(x)).unwrap();
+    assert_eq!(
+        e.rights,
+        Rights::INTERRUPT,
+        "the rights of an interrupt object"
+    );
+    assert_eq!(
+        h.err(g, [d, 3, 0, 0, 0, 0]),
+        Status::BadState,
+        "granted and live"
+    );
+    assert_eq!(
+        h.err(g, [d, 256, 0, 0, 0, 0]),
+        Status::InvalidArgs,
+        "INVALID_ARGS before BAD_STATE"
+    );
+    let (y, _) = h.grant(d, 255);
+    assert_ne!(x, y);
+    // a destroyed domain grants nothing
+    h.ok(nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
+    assert_eq!(h.err(g, [d, 4, 0, 0, 0, 0]), Status::BadState);
+    assert_eq!(h.err(g, [d, 256, 0, 0, 0, 0]), Status::InvalidArgs);
+    // its vectors are dead: acknowledgement is BAD_STATE, and they never fire
+    assert_eq!(
+        h.err(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]),
+        Status::BadState
+    );
+    assert_eq!(
+        h.err(nr::INTERRUPT_DELIVER_HERE, [y, 0, 0, 0, 0, 0]),
+        Status::BadState
+    );
+    assert!(
+        h.signal(7, 3).is_err(),
+        "the quarantined device cannot interrupt"
+    );
+    assert!(!h.interrupt_pending(x));
+    assert_eq!(h.vecs.counts().live, 0);
+    assert!(h.timeouts.is_empty());
+}
+
+#[test]
+fn a_granted_vector_fires_once_per_pending_bit_and_acknowledges() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let free_ids = h.ids.free_total();
+    let res = h.resource();
+    let d = h.domain(res, 9);
+    let frames = h.w.mm.db.free_count();
+    let (x, _) = h.grant(d, 0);
+    assert!(!h.interrupt_pending(x));
+    assert!(h.signal(9, 0).is_ok());
+    assert!(h.interrupt_pending(x), "the grant: its own vector fires");
+    assert_eq!((h.notices, h.fired), (1, 1));
+    // while fired, a message sets pending and sends nothing
+    assert!(h.signal(9, 0).is_ok());
+    assert_eq!(h.notices, 1, "masked: no notice");
+    // the acknowledgement finds the bit and fires again at once
+    let (claims, _) = h.ok(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+    assert!(claims.is_some());
+    assert!(
+        h.interrupt_pending(x),
+        "a message while masked fires again at once"
+    );
+    h.ok(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+    assert!(!h.interrupt_pending(x), "armed again");
+    assert_eq!(
+        h.err(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]),
+        Status::BadState,
+        "not fired"
+    );
+    assert!(h.signal(9, 0).is_ok());
+    assert!(h.interrupt_pending(x));
+    // the acknowledge right: a handle that can only wait cannot acknowledge or move it
+    let waiter = h.narrow(x, Rights::WAIT);
+    assert_eq!(
+        h.err(nr::INTERRUPT_ACK, [waiter, 0, 0, 0, 0, 0]),
+        Status::AccessDenied
+    );
+    assert_eq!(
+        h.err(nr::INTERRUPT_DELIVER_HERE, [waiter, 0, 0, 0, 0, 0]),
+        Status::AccessDenied
+    );
+    assert_eq!(
+        h.err(nr::INTERRUPT_DELIVER_HERE, [0x999, 0, 0, 0, 0, 0]),
+        Status::BadHandle
+    );
+    assert_eq!(
+        h.err(nr::INTERRUPT_DELIVER_HERE, [d, 0, 0, 0, 0, 0]),
+        Status::WrongType
+    );
+    h.close(waiter);
+    h.close(x);
+    at_baseline(&h, free_ids, frames);
+    assert!(h.signal(9, 0).is_err(), "revoked: the entry is invalid");
+    h.close(d);
+}
+
+#[test]
+fn an_ungranted_or_forged_message_faults_and_is_delivered_to_nobody() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let res = h.resource();
+    let d = h.domain(res, 11);
+    let (x, addr) = h.grant(d, 2);
+    let base = (h.notices, h.fired);
+    // a page of the window whose vector is not granted: the entry is invalid
+    assert_eq!(h.signal(11, 5), Err(MSI_INVALID));
+    let (w, a) = h.ok(nr::IODOMAIN_FAULT_READ, [d, 0, 0, 0, 0, 0]);
+    assert_eq!(w.unwrap() & 0xffff, u64::from(MSI_INVALID));
+    let _ = a; // (QEMU reports an MSI fault with no address: iotval 0)
+               // a data word no file holds, and a misaligned address: misconfigured
+    assert_eq!(h.signal_raw(11, addr, 4096), Err(MSI_MISCONFIGURED));
+    assert_eq!(h.signal_raw(11, addr + 2, 1), Err(MSI_MISCONFIGURED));
+    // a real interrupt file's page, from the device: an ordinary translation fault, nothing written
+    assert!(h.signal_raw(11, IMSIC_BASE, 1).is_err());
+    // another device's message to this domain's window reaches nothing
+    assert!(h.signal(12, 2).is_err());
+    assert_eq!((h.notices, h.fired), base, "nothing was delivered");
+    assert!(!h.interrupt_pending(x));
+    // a data word other than 1 on a granted page: a stray bit in its own file, found and counted at the acknowledgement
+    assert!(h.signal_raw(11, addr, 5).is_ok());
+    assert_eq!((h.notices, h.fired), base, "a stray bit sends nothing");
+    assert!(h.signal(11, 2).is_ok());
+    assert!(h.interrupt_pending(x));
+    let strays = |h: &Host<'_>| h.vecs.counts().strays + h.store.stats().strays;
+    assert_eq!(strays(&h), 0);
+    h.ok(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+    assert_eq!(strays(&h), 1, "the stray bit is cleared and counted");
+    // and at revoke
+    assert!(h.signal_raw(11, addr, 9).is_ok());
+    h.close(x);
+    assert_eq!(strays(&h), 2);
+    assert_eq!(h.no_route, 0);
+    h.close(d);
+}
+
+#[test]
+fn revoke_stops_the_vector_and_gives_everything_back() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let free_ids = h.ids.free_total();
+    let res = h.resource();
+    let job = h.child_job([NONE; 6]);
+    let j = h.job_of(job);
+    let frames = h.w.mm.db.free_count();
+    let d = h
+        .ok(nr::IODOMAIN_CREATE, [res, 13, job, 0, 0, 0])
+        .0
+        .unwrap();
+    let bytes = h.kernel_bytes(j);
+    let (x, _) = h.grant(d, 1);
+    let (y, _) = h.grant(d, 2);
+    assert_eq!(vector_usage(&mut h, job).0, Some(2));
+    assert!(h.kernel_bytes(j) > bytes, "a file each, charged");
+    assert_eq!(h.ids.free_total(), free_ids - 2);
+    assert!(h.signal(13, 1).is_ok());
+    assert!(h.interrupt_pending(x));
+    // a duplicate keeps it live; the last handle revokes it
+    let x2 = h.narrow(x, Rights::WAIT);
+    h.close(x);
+    assert!(h.signal(13, 1).is_ok(), "one handle is left");
+    h.close(x2);
+    assert_eq!(
+        h.signal(13, 1),
+        Err(MSI_INVALID),
+        "revoked: invalid, the cached entry dropped"
+    );
+    assert_eq!(vector_usage(&mut h, job).0, Some(1));
+    assert_eq!(h.ids.free_total(), free_ids - 1);
+    // the index can be granted again
+    let (x3, _) = h.grant(d, 1);
+    assert!(h.signal(13, 1).is_ok());
+    assert!(h.interrupt_pending(x3));
+    // the domain's destruction revokes the rest; the handles stay, dead
+    h.ok(nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
+    assert_eq!(vector_usage(&mut h, job).0, Some(0));
+    assert_eq!(
+        h.kernel_bytes(j),
+        0,
+        "the domain's bytes and its files', all given back"
+    );
+    assert_eq!(
+        h.err(nr::INTERRUPT_ACK, [x3, 0, 0, 0, 0, 0]),
+        Status::BadState
+    );
+    assert_eq!(
+        h.err(nr::INTERRUPT_ACK, [y, 0, 0, 0, 0, 0]),
+        Status::BadState
+    );
+    h.close(x3);
+    h.close(y);
+    h.close(d);
+    at_baseline(&h, free_ids, frames);
+    assert!(h.timeouts.is_empty());
+}
+
+#[test]
+fn the_vector_limit_is_hierarchical_and_a_refusal_charges_nothing() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let free_ids = h.ids.free_total();
+    let res = h.resource();
+    let parent = h.child_job([NONE; 6]);
+    h.ok(nr::JOB_SET_IO_LIMITS, [parent, NONE, 2, 0, 0, 0]);
+    let bytes: Vec<u8> = [NONE; 6].iter().flat_map(|v| v.to_le_bytes()).collect();
+    h.w.poke(BASE, &bytes);
+    let child = h.ok(nr::JOB_CREATE, [parent, BASE, 0, 0, 0, 0]).0.unwrap();
+    let a = h
+        .ok(nr::IODOMAIN_CREATE, [res, 14, child, 0, 0, 0])
+        .0
+        .unwrap();
+    let b = h
+        .ok(nr::IODOMAIN_CREATE, [res, 15, parent, 0, 0, 0])
+        .0
+        .unwrap();
+    let (x, _) = h.grant(a, 0);
+    let (_y, _) = h.grant(b, 0);
+    assert_eq!(
+        vector_usage(&mut h, parent),
+        (Some(2), Some(2)),
+        "the child's vector counts on the parent"
+    );
+    let used = h.ids.free_total();
+    assert_eq!(
+        h.err(nr::IODOMAIN_GRANT_VECTOR, [a, 1, 0, 0, 0, 0]),
+        Status::NoMemory
+    );
+    assert_eq!(vector_usage(&mut h, child).0, Some(1), "nothing charged");
+    assert_eq!(h.ids.free_total(), used, "no identity taken");
+    // the charge comes back when the vector's identity is free again, before the close returns
+    h.close(x);
+    assert_eq!(vector_usage(&mut h, parent).0, Some(1));
+    let (x, _) = h.grant(a, 1);
+    assert_eq!(vector_usage(&mut h, child).0, Some(1));
+    h.close(x);
+    h.close(_y);
+    h.close(a);
+    h.close(b);
+    assert_eq!(vector_usage(&mut h, parent).0, Some(0));
+    assert_eq!(h.ids.free_total(), free_ids);
+}
+
+#[test]
+fn placement_moves_and_hart_offline_keep_every_message() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let free_ids = h.ids.free_total();
+    let res = h.resource();
+    let frames = h.w.mm.db.free_count();
+    let d = h.domain(res, 17);
+    h.harts.here = 2;
+    let (x, _) = h.grant(d, 0);
+    // placed at the grant on the hart with the fewest routes (hart 0 has none taken here: identity counts decide)
+    let first = hart_of(&h, x);
+    // the first wait moves it to the hart that waits, once
+    h.harts.here = 3;
+    kio::first_wait_vector(&mut h, Handle(x));
+    h.settle();
+    assert_eq!(hart_of(&h, x), 3, "the first wait places it");
+    h.harts.here = 1;
+    kio::first_wait_vector(&mut h, Handle(x));
+    h.settle();
+    assert_eq!(hart_of(&h, x), 3, "only the first");
+    assert!(h.signal(17, 0).is_ok());
+    assert!(h.interrupt_pending(x));
+    h.ok(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        hart_of(&h, x),
+        3,
+        "an acknowledgement after placement issues no move"
+    );
+    // the explicit move
+    h.harts.here = 1;
+    h.ok(nr::INTERRUPT_DELIVER_HERE, [x, 0, 0, 0, 0, 0]);
+    assert_eq!(hart_of(&h, x), 1);
+    assert_eq!(
+        h.ids.free_total(),
+        free_ids - 1,
+        "the old identity was retired"
+    );
+    assert!(h.signal(17, 0).is_ok());
+    assert!(h.interrupt_pending(x), "delivered on the new identity");
+    h.ok(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+    // its hart goes offline: it moves to another, and a message right after still arrives
+    assert!(offline(&mut h, 1));
+    let now = hart_of(&h, x);
+    assert_ne!(now, 1);
+    assert_eq!(h.ids.free_total(), free_ids - 1);
+    assert!(h.signal(17, 0).is_ok());
+    assert!(h.interrupt_pending(x));
+    h.ok(nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+    let _ = first;
+    h.close(x);
+    h.close(d);
+    at_baseline(&h, free_ids, frames);
 }

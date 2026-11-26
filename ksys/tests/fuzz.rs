@@ -62,6 +62,7 @@ fn kind_of(w: &World, h: u64) -> Kind {
         Some(KObj::Job(_)) => Kind::Job,
         Some(KObj::Resource) => Kind::Resource,
         Some(KObj::IoDomain(_)) => Kind::IoDomain,
+        Some(KObj::Interrupt(i)) if i.vector.is_some() => Kind::Interrupt,
         _ => Kind::Any,
     }
 }
@@ -259,6 +260,17 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                 }
             }
         }
+        // (IOMMU7: now and then a device sends its vector's message, a forged one or one to a page it was not granted)
+        if i % 7 == 3 {
+            at.set(("device", i));
+            let did = (i / 7 % 6) as u32;
+            let k = (i / 42 % 5) as u64;
+            let _ = if i % 3 == 0 {
+                io.signal_raw(did, kcore::iodomain::IoDomains::vector_address(k as u16), 2)
+            } else {
+                io.signal(did, k)
+            };
+        }
         at.set(("cleanup", i));
         let dirty = cleanup_keep(&mut io.w);
         // (the kernel's tail: a dead domain's destruction is begun and completed)
@@ -288,6 +300,13 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
     cleanup(&mut io.w);
     io.settle_domains();
     let st = io.store.stats();
+    let c = io.vecs.counts();
+    if (c.live, c.dead, c.leaked, io.no_route) != (0, 0, 0, 0) {
+        return Err(format!(
+            "seed {seed}, at the end: vectors {c:?}, messages with no route {}",
+            io.no_route
+        ));
+    }
     if (st.domains, st.io_pages, st.holds_leaked) != (0, 0, 0) || !io.timeouts.is_empty() {
         return Err(format!(
             "seed {seed}, at the end: domains {}, I/O-mapped pages {}, leaked holds {}, fence timeouts {:?}",

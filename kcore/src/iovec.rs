@@ -21,7 +21,7 @@
 //! The kernel touches a vector's file only while its route is Live (granted, not revoked, its domain not destroyed), and only with
 //! atomic operations: the store frees the file after the fence that follows the route's end.
 
-use crate::iodomain::{DomainId, Fence, IoDomains, IoError, Ticket, VECTOR_DATA};
+use crate::iodomain::{DomainId, IoDomains, IoError, Ticket, VECTOR_DATA};
 use crate::ipc::{KObj, Kobjs, VectorRef};
 use crate::job::JobId;
 use crate::msiid::{MsiIds, Place, Route, Slot};
@@ -77,8 +77,6 @@ struct VecRoute {
     named: Option<Place>,
     /// The identity an entry write in flight names (a grant's or a move's).
     target: Option<Place>,
-    /// The fence the route waits for (a revoke's).
-    ticket: Option<Ticket>,
     /// A grant's or a move's entry write is in flight: one at a time.
     busy: bool,
     /// The first `object_wait` or `interrupt_ack` placed it (8.5).
@@ -95,7 +93,6 @@ const FREE: VecRoute = VecRoute {
     job: JobId::ROOT,
     named: None,
     target: None,
-    ticket: None,
     busy: false,
     placed: true,
 };
@@ -247,11 +244,22 @@ impl Vectors {
         let live = self
             .routes
             .iter()
-            .filter(|r| matches!(r.state, RState::Granting | RState::Live | RState::Revoking | RState::Dead))
+            .filter(|r| {
+                matches!(
+                    r.state,
+                    RState::Granting | RState::Live | RState::Revoking | RState::Dead
+                )
+            })
+            .count() as u64;
+        let dead = self
+            .routes
+            .iter()
+            .filter(|r| r.state == RState::Dead)
             .count() as u64;
         VecCounts {
             used: self.used,
             live,
+            dead,
             leaked: self.leaked,
             strays: self.strays,
             unplaced: self.unplaced,
@@ -334,7 +342,8 @@ impl Vectors {
         let p = self.grant_ready(ids, v)?.ok_or(IoError::NotDone)?;
         let r = self.at(v).ok_or(IoError::BadState)?;
         let (d, index) = (DomainId::from_raw(r.domain), r.index);
-        let (t, file) = store.vector_grant(mem, regs, frames, d, index, h.file_page(p.hart), p.id)?;
+        let (t, file) =
+            store.vector_grant(mem, regs, frames, d, index, h.file_page(p.hart), p.id)?;
         if let Some(r) = self.at_mut(v) {
             r.file = file;
             r.target = Some(p);
@@ -342,7 +351,7 @@ impl Vectors {
         Ok(t)
     }
 
-    /// The fence of a grant's or a move's entry write (`t`) has completed: the entry names the identity written (`Live` for a grant),
+    /// The fence of a grant's or a move's entry write has completed: the entry names the identity written (`Live` for a grant),
     /// and every identity the route moved away from is retired now (IO10). `Ok(false)`: the write did not take effect as a grant or a
     /// move (a revoke or the domain's destruction took the vector). `NotDone` before the fence.
     pub fn fenced(
@@ -351,13 +360,12 @@ impl Vectors {
         h: &mut dyn Harts,
         store: &mut IoDomains,
         v: VectorRef,
-        t: Ticket,
     ) -> Result<bool, IoError> {
         let Some(r) = self.at(v) else {
             return Ok(false);
         };
         let (d, index) = (DomainId::from_raw(r.domain), r.index);
-        let done = store.vector_fenced(d, index, t)?;
+        let done = store.vector_fenced(d, index)?;
         let Some(r) = self.at_mut(v) else {
             return Ok(false);
         };
@@ -383,13 +391,14 @@ impl Vectors {
 
     /// A grant's or a move's fence will not complete (6.4): the vector is leaked (IO8): its identities are never retired (an entry
     /// that names one may stay cached), and its charge stays.
-    pub fn abandon(&mut self, store: &mut IoDomains, v: VectorRef, t: Ticket) {
+    pub fn abandon(&mut self, store: &mut IoDomains, v: VectorRef) {
         let Some(r) = self.at(v) else {
             return;
         };
         let (d, index) = (DomainId::from_raw(r.domain), r.index);
-        let _ = store.vector_abandon(d, index, t);
-        self.leak(v);
+        if store.vector_abandon(d, index) {
+            self.leak(v);
+        }
     }
 
     fn leak(&mut self, v: VectorRef) {
@@ -543,7 +552,12 @@ impl Vectors {
     /// A move to the calling hart (`interrupt_deliver_here`, a first wait or acknowledgement), the first step under `OBJ`: an identity
     /// here, opened at once (the old one is Moved: still routed to the vector until the entry's rewrite is fenced). Then
     /// `retarget_begin`, the fence and `fenced`, with the route busy meanwhile.
-    pub fn move_here(&mut self, ids: &mut MsiIds, h: &mut dyn Harts, v: VectorRef) -> Result<Moved, MoveError> {
+    pub fn move_here(
+        &mut self,
+        ids: &mut MsiIds,
+        h: &mut dyn Harts,
+        v: VectorRef,
+    ) -> Result<Moved, MoveError> {
         let r = self.at(v).ok_or(MoveError::Dead)?;
         if r.state != RState::Live {
             return Err(MoveError::Dead);
@@ -650,29 +664,9 @@ impl Vectors {
         }
     }
 
-    /// Queue a grant's, a move's or a revoke's commands again (`t` updated); `Done` if nothing waits for this ticket any more.
-    pub fn requeue<M: PhysMem64, R: Regs>(
-        &mut self,
-        store: &mut IoDomains,
-        mem: &M,
-        regs: &mut R,
-        v: VectorRef,
-        t: &mut Ticket,
-    ) -> Fence {
-        let Some(r) = self.at(v) else {
-            return Fence::Done;
-        };
-        let (d, index) = (DomainId::from_raw(r.domain), r.index);
-        let f = store.requeue_vector(mem, regs, d, index, t);
-        if let Some(r) = self.at_mut(v).filter(|r| r.state == RState::Revoking) {
-            r.ticket = Some(*t);
-        }
-        f
-    }
-
     // ---- revoke and destruction -------------------------------------------------------------------------------------------------
 
-    /// The last handle of vector object `obj` went (its cleanup, under `OBJ` then `IOMMU`): 8.5 revoke, steps 1 to 3 (the enable bit
+    /// The last handle of route `v`'s vector object went (its cleanup, under `OBJ` then `IOMMU`; a route has one object, ever): 8.5 revoke, steps 1 to 3 (the enable bit
     /// cleared, the entry invalid, the invalidation and a fence queued: `IoDomains::vector_revoke`). The fence's ticket, for
     /// `revoke_end` (the kernel's drain waits for it with no lock held). `None`: nothing to wait for (a dead or leaked vector, or
     /// its domain's destruction has begun: that ends the route).
@@ -682,9 +676,30 @@ impl Vectors {
         mem: &M,
         regs: &mut R,
         v: VectorRef,
-        obj: ObjId,
     ) -> Option<Ticket> {
-        let r = self.at(v).filter(|r| r.obj == Some(obj))?;
+        self.revoke(store, mem, regs, v, true)
+    }
+
+    /// A live vector the grant could not give an object (the handle table was full): revoked as a closed one is.
+    pub fn revoke_orphan<M: PhysMem64, R: Regs>(
+        &mut self,
+        store: &mut IoDomains,
+        mem: &M,
+        regs: &mut R,
+        v: VectorRef,
+    ) -> Option<Ticket> {
+        self.revoke(store, mem, regs, v, false)
+    }
+
+    fn revoke<M: PhysMem64, R: Regs>(
+        &mut self,
+        store: &mut IoDomains,
+        mem: &M,
+        regs: &mut R,
+        v: VectorRef,
+        closing: bool,
+    ) -> Option<Ticket> {
+        let r = self.at(v).filter(|r| r.obj.is_some() == closing)?;
         let (d, index, state) = (DomainId::from_raw(r.domain), r.index, r.state);
         self.placed(v);
         if let Some(r) = self.at_mut(v) {
@@ -696,26 +711,27 @@ impl Vectors {
         let t = store.vector_revoke(mem, regs, d, index)?;
         if let Some(r) = self.at_mut(v) {
             r.state = RState::Revoking;
-            r.ticket = Some(t);
         }
         Some(t)
     }
 
     /// A revoke whose fence nobody has completed yet (the kernel's drain completes them: `revoke_end`).
-    pub fn next_revoking(&self) -> Option<(VectorRef, Ticket)> {
-        self.routes.iter().enumerate().find_map(|(k, r)| {
-            let t = r.ticket.filter(|_| r.state == RState::Revoking)?;
-            Some((
-                VectorRef {
+    /// The search starts at route `from` (a drain that cannot complete one yet goes on to the next).
+    pub fn next_revoking(&self, from: u32) -> Option<VectorRef> {
+        let from = usize::try_from(from).ok()?;
+        self.routes
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find_map(|(k, r)| {
+                (r.state == RState::Revoking).then_some(VectorRef {
                     n: u32::try_from(k).ok()?,
                     gen: r.gen,
-                },
-                t,
-            ))
-        })
+                })
+            })
     }
 
-    /// 8.5 revoke, the end, once the fence (`t`) has completed (under `OBJ` then `IOMMU`): the file freed by the store (its stray bits
+    /// 8.5 revoke, the end, once the fence has completed (under `OBJ` then `IOMMU`): the file freed by the store (its stray bits
     /// counted), then the route's identities end and are retired by their harts (IO10: after the fence). `NotDone` before the fence.
     #[allow(clippy::too_many_arguments)]
     pub fn revoke_end<M: PhysMem64, F: TableFrames>(
@@ -726,21 +742,20 @@ impl Vectors {
         mem: &M,
         frames: &mut F,
         v: VectorRef,
-        t: Ticket,
     ) -> Result<(), IoError> {
-        let Some(r) = self.at(v).filter(|r| r.state == RState::Revoking && r.ticket == Some(t)) else {
+        let Some(r) = self.at(v).filter(|r| r.state == RState::Revoking) else {
             return Ok(());
         };
         let (d, index) = (DomainId::from_raw(r.domain), r.index);
-        store.vector_revoked(mem, frames, d, index, t)?;
+        store.vector_revoked(mem, frames, d, index)?;
         self.end(ids, h, v);
         Ok(())
     }
 
     /// A revoke's fence will not complete: the vector is leaked (IO8).
-    pub fn revoke_abandon(&mut self, store: &mut IoDomains, v: VectorRef, t: Ticket) {
-        if self.at(v).is_some_and(|r| r.state == RState::Revoking && r.ticket == Some(t)) {
-            self.abandon(store, v, t);
+    pub fn revoke_abandon(&mut self, store: &mut IoDomains, v: VectorRef) {
+        if self.at(v).is_some_and(|r| r.state == RState::Revoking) {
+            self.abandon(store, v);
         }
     }
 
@@ -818,7 +833,9 @@ impl Vectors {
     /// domain ends and its identities are retired. Linear in the routes.
     pub fn domain_gone(&mut self, ids: &mut MsiIds, h: &mut dyn Harts, d: DomainId) {
         for k in 0..self.routes.len() {
-            let Some(r) = self.routes.get(k) else { continue };
+            let Some(r) = self.routes.get(k) else {
+                continue;
+            };
             if r.domain != d.raw()
                 || !matches!(r.state, RState::Granting | RState::Live | RState::Revoking)
             {
@@ -833,7 +850,9 @@ impl Vectors {
     /// Domain `d`'s destruction fence will not complete (6.4): every route of the domain that has not ended is leaked (IO8).
     pub fn domain_leaked(&mut self, d: DomainId) {
         for k in 0..self.routes.len() {
-            let Some(r) = self.routes.get(k) else { continue };
+            let Some(r) = self.routes.get(k) else {
+                continue;
+            };
             if r.domain != d.raw()
                 || !matches!(r.state, RState::Granting | RState::Live | RState::Revoking)
             {
@@ -852,6 +871,8 @@ pub struct VecCounts {
     pub used: u64,
     /// Granting, live, revoking or dead (identities not yet all free): the leak oracle wants 0 at the end.
     pub live: u64,
+    /// Ended, with identities still retiring.
+    pub dead: u64,
     pub leaked: u64,
     pub strays: u64,
     pub unplaced: u64,

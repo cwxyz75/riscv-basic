@@ -11,9 +11,12 @@ use iommucore::sim::{Sim, SimConfig};
 use iommucore::{PhysMem64, Regs};
 use kcore::frame::FrameDb;
 use kcore::iodomain::IoDomains;
+use kcore::iovec::{Harts, Vectors};
 use kcore::ipc::Quota;
 use kcore::job::{IoResource, Jobs};
-use ksys::iodomain::{self as kio, IoEnv, IoObj};
+use kcore::msiid::{MsiIds, Place, Route, Slot};
+use ksys::iodomain::{self as kio, IoEnv, IoObj, IrqCtx};
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 /// Physical memory as the IOMMU sees it (its directory, queues and tables; on the host apart from `FakeMem`, which holds the VMOs' data).
@@ -53,6 +56,42 @@ impl PhysMem64 for IoMem {
 }
 
 pub const FENCE_BOUND: u64 = 1000;
+/// The interrupt files of the host's harts (one page each), and how many identities each has (QEMU's `riscv,num-ids`).
+pub const IMSIC_BASE: u64 = 0x2800_0000;
+pub const HARTS: u16 = 4;
+pub const NUM_IDS: u32 = 255;
+
+/// The harts as the vector layer sees them (IOMMU7): which one is calling, which are online, and which were asked to do their work in
+/// their files (done at the next `relax` or call tail, as an inter-hart interrupt would be taken).
+pub struct HostHarts {
+    pub here: u16,
+    pub offline: [bool; HARTS as usize],
+    pub asked: BTreeSet<u16>,
+    /// A hart that does not answer: its work is never done (the bounded waits give up).
+    pub deaf: Option<u16>,
+}
+
+impl Harts for HostHarts {
+    fn here(&self) -> Option<u16> {
+        Some(self.here)
+    }
+    fn usable(&self, f: u16) -> bool {
+        f < HARTS && !self.offline[usize::from(f)]
+    }
+    fn leaving(&self, f: u16) -> bool {
+        !self.usable(f)
+    }
+    fn open_here(&mut self, _id: u16) {}
+    fn ask(&mut self, f: u16) {
+        // (an inter-hart interrupt in the kernel: the host's set is the fake machine's, exempt from the allocation-failure sweep)
+        EXEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.asked.insert(f);
+        EXEMPT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn file_page(&self, f: u16) -> u64 {
+        IMSIC_BASE + u64::from(f) * 4096
+    }
+}
 /// The frames the bring-up takes: the directory, the command and fault queues, and the quarantine root.
 pub const BOOT_FRAMES: usize = 7;
 
@@ -71,6 +110,16 @@ pub struct Host<'m> {
     /// A device access that faults, made at the next `relax` once the commands have run, with the fault interrupt taken there (a
     /// fault while a call waits: between a create's attach and its object, say).
     pub fault_in_relax: Option<(u32, u64)>,
+    /// The interrupt identities of every hart's file, the vectors' routes and the harts (IOMMU7).
+    pub ids: MsiIds,
+    pub vecs: Vectors,
+    pub harts: HostHarts,
+    /// How many of the simulated IOMMU's deliveries the harts have taken.
+    pub seen: usize,
+    /// Messages taken on a vector's identity, those that signalled its object, and those on an identity with no route (8.1).
+    pub notices: u64,
+    pub fired: u64,
+    pub no_route: u64,
 }
 
 impl<'m> IoEnv for Host<'m> {
@@ -136,9 +185,45 @@ impl<'m> IoEnv for Host<'m> {
             let _ = self.sim.write(did, iova, 1);
             self.fault_interrupt();
         }
+        // (the harts take their messages and do the work they were asked to: an interrupt window)
+        self.relax_harts();
     }
     fn fence_timeout(&mut self, device: Option<u32>) {
         self.timeouts.push(device);
+    }
+    fn irq<T>(&mut self, f: impl FnOnce(IrqCtx<'_>, &IoMem) -> T) -> Option<T> {
+        let w = &mut self.w;
+        Some(f(
+            IrqCtx {
+                objs: &mut w.objs,
+                caller: Some((&mut w.handles, w.job)),
+                jobs: &mut w.jobs,
+                ids: &mut self.ids,
+                vecs: &mut self.vecs,
+                harts: &mut self.harts,
+            },
+            self.io,
+        ))
+    }
+    fn irq_iommu<T>(
+        &mut self,
+        f: impl FnOnce(IrqCtx<'_>, &mut IoDomains, &IoMem, &mut Self::R, &mut FrameDb) -> T,
+    ) -> Option<T> {
+        let w = &mut self.w;
+        Some(f(
+            IrqCtx {
+                objs: &mut w.objs,
+                caller: Some((&mut w.handles, w.job)),
+                jobs: &mut w.jobs,
+                ids: &mut self.ids,
+                vecs: &mut self.vecs,
+                harts: &mut self.harts,
+            },
+            &mut self.store,
+            self.io,
+            &mut self.sim,
+            &mut w.mm.db,
+        ))
     }
 }
 
@@ -182,6 +267,18 @@ impl<'m> Host<'m> {
             stall: false,
             timeouts: vec![],
             fault_in_relax: None,
+            ids: MsiIds::new(usize::from(HARTS), NUM_IDS).unwrap(),
+            vecs: Vectors::new(usize::from(HARTS) * NUM_IDS as usize * 2).unwrap(),
+            harts: HostHarts {
+                here: 0,
+                offline: [false; HARTS as usize],
+                asked: BTreeSet::new(),
+                deaf: None,
+            },
+            seen: 0,
+            notices: 0,
+            fired: 0,
+            no_route: 0,
         }
     }
 
@@ -194,6 +291,18 @@ impl<'m> Host<'m> {
             nr::IODOMAIN_DESTROY => kio::iodomain_destroy(self, a),
             nr::IODOMAIN_FAULT_READ => kio::iodomain_fault_read(self, a),
             nr::VMO_CREATE_DMA_IN => kio::vmo_create_dma_in(self, a),
+            nr::IODOMAIN_GRANT_VECTOR => kio::iodomain_grant_vector(self, a),
+            nr::INTERRUPT_ACK => match kio::interrupt_ack_vector(self, a) {
+                Some(r) => r,
+                None => return self.w.call(n, a),
+            },
+            // (the host has no wired sources: a handle that is no vector's is the wired path's, which the host does not run)
+            nr::INTERRUPT_DELIVER_HERE => kio::interrupt_deliver_here_vector(self, a)
+                .unwrap_or(Err((Status::NotSupported, None, None))),
+            nr::OBJECT_WAIT => {
+                kio::first_wait_vector(self, Handle(a[0]));
+                return self.w.call(n, a);
+            }
             _ => return self.w.call(n, a),
         })
     }
@@ -238,6 +347,17 @@ impl<'m> Host<'m> {
                         kio::iodomain_closed(&mut self.store, self.io, &mut self.sim, d.domain);
                         self.w.jobs.release(d.job);
                     }
+                    KObj::Interrupt(i) => {
+                        if let Some(v) = i.vector {
+                            kio::vector_closed(
+                                &mut self.vecs,
+                                &mut self.store,
+                                self.io,
+                                &mut self.sim,
+                                v,
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -253,8 +373,128 @@ impl<'m> Host<'m> {
             kio::iodomain_closed(&mut self.store, self.io, &mut self.sim, d.domain);
             self.w.jobs.release(d.job);
         }
+        for v in std::mem::take(&mut self.w.vec_dead) {
+            kio::vector_closed(&mut self.vecs, &mut self.store, self.io, &mut self.sim, v);
+        }
         kio::settle_destructions(self);
+        // (IOMMU7, the kernel's `drain`: the harts' work, the moves an evacuation began, the revokes a close began, the charges given back)
+        self.relax_harts();
+        kio::settle_moves(self);
+        kio::settle_vectors(self);
         self.w.vmos.drain_all(&mut self.w.mm, &mut self.w.jobs);
+    }
+
+    /// The harts take their messages and do their work, with no clock tick.
+    pub fn relax_harts(&mut self) {
+        self.take_messages();
+        self.hart_work();
+    }
+
+    /// Every message the simulated IOMMU delivered since the last look, taken by the hart whose file it names (an offline hart still
+    /// takes its file's).
+    pub fn take_messages(&mut self) {
+        while let Some(d) = self.sim.deliveries().get(self.seen).copied() {
+            self.seen += 1;
+            let f = d.page.wrapping_sub(IMSIC_BASE) / 4096;
+            let (Ok(hart), Ok(id)) = (u16::try_from(f), u16::try_from(d.identity)) else {
+                self.no_route += 1;
+                continue;
+            };
+            if hart >= HARTS || d.page & 0xfff != 0 {
+                self.no_route += 1;
+                continue;
+            }
+            self.deliver_one(Place { hart, id });
+        }
+    }
+
+    /// One message on identity `p`, as the kernel's `deliver_one`.
+    pub fn deliver_one(&mut self, p: Place) {
+        match self.ids.slot(p) {
+            Some(
+                Slot::Live {
+                    route: Route::Vector(_),
+                    ..
+                }
+                | Slot::Moved {
+                    route: Route::Vector(_),
+                    ..
+                }
+                | Slot::Retiring {
+                    route: Route::Vector(_),
+                    moved: true,
+                },
+            ) => {
+                self.notices += 1;
+                if self.vecs.notice(&mut self.w.objs, &self.ids, self.io, p) == Some(true) {
+                    self.fired += 1;
+                }
+            }
+            Some(Slot::Retiring { moved: false, .. }) => {}
+            _ => self.no_route += 1,
+        }
+    }
+
+    /// The harts asked to work in their files open their Opening identities and retire their Retiring ones (the kernel's `deliver`).
+    pub fn hart_work(&mut self) {
+        let mut skipped = BTreeSet::new();
+        while let Some(f) = self.harts.asked.pop_first() {
+            if self.harts.deaf == Some(f) {
+                skipped.insert(f);
+                continue;
+            }
+            for id in 2..=self.ids.num_ids() {
+                let p = Place { hart: f, id };
+                match self.ids.slot(p) {
+                    Some(Slot::Opening { .. }) => {
+                        if let Some(o) = self.ids.opened(p) {
+                            if let Some(r) = o.retiring {
+                                self.harts.asked.insert(r.hart);
+                            }
+                        }
+                    }
+                    Some(Slot::Retiring { .. }) => {
+                        if let Some((Route::Vector(n), _)) = self.ids.retired(p) {
+                            self.vecs.retired(&self.ids, n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // (a deaf hart keeps its request, as an unanswered inter-hart interrupt stays pending)
+        self.harts.asked.extend(skipped);
+    }
+
+    /// Device `did` writes the MSI-X message of vector `k` (its address and the data word), then the harts take what it sent.
+    pub fn signal(&mut self, did: u32, k: u64) -> Result<iommucore::sim::WriteOutcome, u16> {
+        self.signal_raw(
+            did,
+            IoDomains::vector_address(k as u16),
+            abi::iodomain::MSI_DATA as u32,
+        )
+    }
+    /// Device `did` writes `data` at `addr` (a message, forged or not), then the fault interrupt and the harts take what it did.
+    pub fn signal_raw(
+        &mut self,
+        did: u32,
+        addr: u64,
+        data: u32,
+    ) -> Result<iommucore::sim::WriteOutcome, u16> {
+        let r = self.sim.write(did, addr, data);
+        self.fault_interrupt();
+        self.relax_harts();
+        r
+    }
+
+    /// `iodomain_grant_vector`: the interrupt handle and the MSI-X address.
+    pub fn grant(&mut self, d: u64, k: u64) -> (u64, u64) {
+        let (h, addr) = self.ok(nr::IODOMAIN_GRANT_VECTOR, [d, k, 0, 0, 0, 0]);
+        (h.unwrap(), addr.unwrap())
+    }
+    /// Is interrupt object `h` signalled (INTERRUPT)?
+    pub fn interrupt_pending(&self, h: u64) -> bool {
+        matches!(self.w.objs.get(self.obj_of(h)), Some(KObj::Interrupt(i)) if i.fired)
     }
 
     pub fn resource(&mut self) -> u64 {

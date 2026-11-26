@@ -21,8 +21,10 @@ use kcore::iodomain::{
     self as iod, Destroying, DomainId, Fence, IoDomains, IoError, IoFrames, MapFailed, MapStep,
     Mapped, Pending, Record, Released, Ticket, UnmapStep, RANGE_STEP,
 };
-use kcore::ipc::{self, KObj, Kobjs, Quota};
+use kcore::iovec::{Harts, MoveError, Moved, RState, Vectors};
+use kcore::ipc::{self, KObj, Kobjs, Quota, VectorRef};
 use kcore::job::{JobId, Jobs};
+use kcore::msiid::MsiIds;
 use kcore::pagetable::PhysMem;
 use kcore::Mm;
 
@@ -35,6 +37,18 @@ pub struct IoObj<'a, M: PhysMem> {
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
     pub jobs: &'a mut Jobs,
+}
+
+/// What the interrupt side of a call sees under `OBJ` (IOMMU7, IOMMU-SPEC 11.1 and 11.2): the objects, the caller's handles and job
+/// (`None` when the caller's process is gone, or for the kernel's own drain), the job ledger (`JOBS` inside `OBJ`, as object quotas
+/// are), the interrupt identities and the vector routes, and the harts' interrupt files.
+pub struct IrqCtx<'a> {
+    pub objs: &'a mut Kobjs,
+    pub caller: Option<(&'a mut HandleTable, JobId)>,
+    pub jobs: &'a mut Jobs,
+    pub ids: &'a mut MsiIds,
+    pub vecs: &'a mut Vectors,
+    pub harts: &'a mut dyn Harts,
 }
 
 /// The machine under the device-domain calls: its locks, each a closure run with exactly those held, its clock and its console.
@@ -73,6 +87,13 @@ pub trait IoEnv {
     fn relax(&mut self);
     /// A fence did not complete within the bound or the queue failed: count it and say so (6.4), naming the device.
     fn fence_timeout(&mut self, device: Option<u32>);
+    /// `OBJ` with the interrupt side and `JOBS` (IOMMU7). `None` (and `f` not run) on a machine without interrupt identities.
+    fn irq<T>(&mut self, f: impl FnOnce(IrqCtx<'_>, &Self::P) -> T) -> Option<T>;
+    /// `irq`, then `IOMMU` inside it, then `FRAME` inside that (an interrupt file's frame).
+    fn irq_iommu<T>(
+        &mut self,
+        f: impl FnOnce(IrqCtx<'_>, &mut IoDomains, &Self::P, &mut Self::R, &mut FrameDb) -> T,
+    ) -> Option<T>;
 }
 
 /// Table frames from the frame database, zeroed through the IOMMU's view of memory (inside `FRAME`).
@@ -151,15 +172,25 @@ enum Waiter {
     Map(DomainId, Mapped),
     Unmap(Pending),
     Destroy(Destroying),
+    /// A vector's grant, move or revoke (IOMMU7): the vector's own ticket, which the store keeps (`vector_ticket`).
+    Vector(DomainId, u16, Ticket),
 }
 
 impl Waiter {
     fn look<P: PhysMem64, R: Regs>(&mut self, s: &mut IoDomains, mem: &P, regs: &mut R) -> Fence {
+        if let Waiter::Vector(d, k, t) = self {
+            // (the store's ticket for the vector: none when it waits for no fence any more, a destruction's fence covering it)
+            match s.vector_ticket(*d, *k) {
+                None => return Fence::Done,
+                Some(cur) => *t = cur,
+            }
+        }
         let t = match self {
             Waiter::Create(_, t) => *t,
             Waiter::Map(_, m) => m.ticket,
             Waiter::Unmap(p) => p.ticket(),
             Waiter::Destroy(x) => x.ticket(),
+            Waiter::Vector(_, _, t) => *t,
         };
         match s.poll(regs, t) {
             Fence::Unqueued => match self {
@@ -167,6 +198,7 @@ impl Waiter {
                 Waiter::Map(d, m) => s.requeue_map(mem, regs, *d, m),
                 Waiter::Unmap(p) => s.requeue_unmap(mem, regs, p),
                 Waiter::Destroy(x) => s.requeue_destroy(mem, regs, x),
+                Waiter::Vector(d, k, t) => s.requeue_vector(mem, regs, *d, *k, t),
             },
             f => f,
         }
@@ -177,6 +209,7 @@ impl Waiter {
             Waiter::Create(d, _) | Waiter::Map(d, _) => *d,
             Waiter::Unmap(p) => p.range().0,
             Waiter::Destroy(x) => x.domain(),
+            Waiter::Vector(d, _, _) => *d,
         }
     }
 }
@@ -265,11 +298,26 @@ fn finish_destroy<E: IoEnv>(e: &mut E, x: Destroying) {
     let mut w = Waiter::Destroy(x);
     if !wait(e, &mut w) {
         let Waiter::Destroy(x) = w else { return };
-        e.iommu(|s, _, _, _| s.destroy_abandon(&x));
+        // (IO8: the domain's vectors are leaked with it: their identities are never retired, an entry may stay cached)
+        let _ = e.irq_iommu(|c, s, _, _, _| {
+            if s.destroy_abandon(&x) {
+                c.vecs.domain_leaked(x.domain());
+            }
+        });
         return;
     }
     let Waiter::Destroy(x) = w else { return };
-    let det = e.iommu(|s, mem, _, _| s.destroy_complete(mem, &x));
+    // 10.6 step 4: the fence is done, so no entry of the domain names an identity any more, cached or not: the vectors' routes end and
+    // their identities are retired (OBJ), before the store hands the files over to be freed (IOMMU)
+    let det = match e.irq_iommu(|c, s, mem, _, _| {
+        if s.destroy_done(&x) {
+            c.vecs.domain_gone(c.ids, c.harts, x.domain());
+        }
+        s.destroy_complete(mem, &x)
+    }) {
+        Some(d) => d,
+        None => e.iommu(|s, mem, _, _| s.destroy_complete(mem, &x)),
+    };
     let Ok(Some(mut det)) = det else {
         return; // (another thread completed or abandoned it)
     };
@@ -281,7 +329,7 @@ fn finish_destroy<E: IoEnv>(e: &mut E, x: Destroying) {
     while !e.frame(|db, _, p| det.step(p, &mut DbFrames { db, mem: p })) {
         e.relax();
     }
-    e.mem(|mm, _, jobs, p| {
+    let strays = e.mem(|mm, _, jobs, p| {
         det.finish(
             p,
             &mut DbFrames {
@@ -291,7 +339,10 @@ fn finish_destroy<E: IoEnv>(e: &mut E, x: Destroying) {
             jobs,
         )
     });
-    e.iommu(|s, _, _, _| s.destroy_released());
+    e.iommu(|s, _, _, _| {
+        s.count_strays(strays);
+        s.destroy_released()
+    });
 }
 
 /// Destroy a domain now and wait for it (a create that cannot finish).
@@ -791,4 +842,344 @@ pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     });
     release_job(e, job);
     r
+}
+
+// ---- interrupt vectors (IOMMU7; IOMMU-SPEC 8.3 to 8.5, 6.2, 10.6, 11.2) ---------------------------------------------------------------
+
+/// Wait for a vector's fence with no lock held; false if it did not complete (counted and reported).
+fn wait_vector<E: IoEnv>(e: &mut E, d: DomainId, index: u16) -> bool {
+    let Some(t) = e.iommu(|s, _, _, _| s.vector_ticket(d, index)) else {
+        return true; // (it waits for no fence: a destruction's covers it)
+    };
+    wait(e, &mut Waiter::Vector(d, index, t))
+}
+
+/// Wait (no lock held, `relax` between looks, at most a fence bound) until `ready` says the step can go on; false on the bound.
+fn wait_until<E: IoEnv>(e: &mut E, mut ready: impl FnMut(&mut E) -> bool) -> bool {
+    let t0 = e.now();
+    let bound = e.fence_bound();
+    loop {
+        let expired = e.now().wrapping_sub(t0) > bound;
+        if ready(e) {
+            return true;
+        }
+        if expired {
+            return false;
+        }
+        e.relax();
+    }
+}
+
+/// `iodomain_grant_vector(domain, index) -> (interrupt, msi_address)` (8.3; the MSI-X data word is always `abi::iodomain::MSI_DATA`,
+/// 1). The order of 11.2: under `OBJ` (with `IOMMU` inside for the index's state) the handle, the charge (`JOBS` under `OBJ`) and an
+/// identity; its hart opens it; under `OBJ` then `IOMMU` the entry; the fence waited for with no lock held; under `OBJ` the object.
+pub fn iodomain_grant_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
+    let index = a[1];
+    let begun = e.irq_iommu(
+        |c, s, _, _, _| -> Result<(VectorRef, DomainId, u16), Status> {
+            let (handles, _) = c.caller.ok_or(Status::BadState)?;
+            let d = ipc::iodomain_of(c.objs, handles, Handle(a[0]), Rights::IO_GRANT)?;
+            let k = u16::try_from(index)
+                .ok()
+                .filter(|&k| u64::from(k) < iod::IO_VECTOR_PAGES)
+                .ok_or(Status::InvalidArgs)?;
+            let dom = DomainId::from_raw(d.domain);
+            if d.destroyed || s.vector_state(dom, k) != Some(iod::VectorState::Free) {
+                return Err(Status::BadState);
+            }
+            iod::charge_vector(c.jobs, d.job).map_err(|_| Status::NoMemory)?;
+            match c.vecs.grant_begin(c.ids, c.harts, dom, k, d.job) {
+                Ok(v) => Ok((v, dom, k)),
+                Err(_) => {
+                    iod::credit_vector(c.jobs, d.job);
+                    Err(Status::NoMemory)
+                }
+            }
+        },
+    );
+    let (v, d, k) = match begun.unwrap_or(Err(Status::NotSupported)) {
+        Ok(x) => x,
+        Err(s) => return err(s),
+    };
+    let r = grant_in(e, v, d, k);
+    // (a grant that failed gave its route back: its identity is retired and its charge credited before the call returns)
+    settle_vectors(e);
+    r
+}
+
+fn grant_in<E: IoEnv>(e: &mut E, v: VectorRef, d: DomainId, k: u16) -> Reply {
+    let cancel = |e: &mut E| {
+        let _ = e.irq(|c, _| c.vecs.grant_cancel(c.ids, c.harts, v));
+    };
+    // the entry, once the identity is open (its hart opens it; a hart going offline meanwhile places it again)
+    let mut written = None;
+    wait_until(e, |e| {
+        let w = e.irq_iommu(|c, s, mem, regs, db| {
+            c.vecs
+                .grant_write(c.ids, &*c.harts, s, mem, regs, &mut DbFrames { db, mem }, v)
+        });
+        match w {
+            Some(Err(IoError::NotDone)) => false,
+            Some(x) => {
+                written = Some(x);
+                true
+            }
+            None => {
+                written = Some(Err(IoError::BadState));
+                true
+            }
+        }
+    });
+    match written {
+        Some(Ok(_)) => {}
+        Some(Err(x)) => {
+            cancel(e);
+            return err(io_status(x));
+        }
+        None => {
+            // (its hart never opened the identity within the bound: nothing names it yet)
+            cancel(e);
+            return err(Status::NoMemory);
+        }
+    }
+    if !wait_vector(e, d, k) {
+        // 6.4: the vector is leaked (IO8) and the call is NO_MEMORY
+        let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.abandon(s, v));
+        return err(Status::NoMemory);
+    }
+    let live = e.irq_iommu(|c, s, _, _, _| c.vecs.fenced(c.ids, c.harts, s, v));
+    if live != Some(Ok(true)) {
+        // (the domain's destruction began meanwhile: it ends the route after its own fence, 10.6)
+        return err(Status::BadState);
+    }
+    // the object, and the file armed: in one section with the route's state, so a destruction cannot come between
+    let made = e.irq_iommu(|c, s, mem, regs, _| -> Result<u64, Status> {
+        if c.vecs.state(v) != Some(RState::Live) {
+            return Err(Status::BadState);
+        }
+        let made = match c.caller {
+            Some((handles, job)) => ipc::vector_object_create_in(
+                c.objs,
+                handles,
+                v,
+                &mut Quota {
+                    jobs: c.jobs,
+                    job: Some(job),
+                },
+            ),
+            None => Err(Status::BadState),
+        };
+        match made {
+            Ok((h, obj)) => {
+                c.vecs.attach(c.objs, mem, v, obj);
+                Ok(h.0)
+            }
+            Err(x) => {
+                // (no object: the vector is revoked like a closed one, and the call's drain completes it)
+                let _ = c.vecs.revoke_orphan(s, mem, regs, v);
+                Err(x)
+            }
+        }
+    });
+    match made.unwrap_or(Err(Status::BadState)) {
+        Ok(h) => Ok((Some(h), Some(IoDomains::vector_address(k)))),
+        Err(x) => err(x),
+    }
+}
+
+/// The last handle of a vector object went (its cleanup, under `OBJ`, may run inside another call's critical section): 8.5 revoke,
+/// steps 1 to 3 under `IOMMU` (nothing waits). The kernel's drain (`settle_vectors`) completes it with no lock held before the call
+/// that closed the handle returns.
+pub fn vector_closed<P: PhysMem64, R: Regs>(
+    vecs: &mut Vectors,
+    s: &mut IoDomains,
+    mem: &P,
+    regs: &mut R,
+    v: VectorRef,
+) {
+    let _ = vecs.revoke_begin(s, mem, regs, v);
+}
+
+/// Complete what vectors left to do, with no lock held (the tail of a call that closed a vector's last handle, granted, moved or
+/// destroyed one; the end of a teardown): every revoke whose fence is outstanding (waited for, then its file freed and its identities
+/// ended), then the identities retiring on their harts (waited for, within a few fence bounds), then the charges of the routes
+/// whose identities are all free.
+pub fn settle_vectors<E: IoEnv>(e: &mut E) {
+    // (a revoke on a domain being destroyed is the destruction's to end: the destructions go first)
+    drain_destructions(e);
+    let mut from = 0u32;
+    while let Some(Some(v)) = e.irq(|c, _| c.vecs.next_revoking(from)) {
+        from = v.n.saturating_add(1);
+        let Some(Some((d, k))) = e.irq(|c, _| c.vecs.vector_of(v)) else {
+            continue;
+        };
+        if !wait_vector(e, d, k) {
+            let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.revoke_abandon(s, v));
+            continue;
+        }
+        let _ = e.irq_iommu(|c, s, mem, _, db| {
+            c.vecs
+                .revoke_end(c.ids, c.harts, s, mem, &mut DbFrames { db, mem }, v)
+        });
+    }
+    // the identities' harts retire them (an inter-hart message each): bounded; a hart that does not answer leaves the charge for the
+    // next drain
+    let t0 = e.now();
+    let bound = e.fence_bound().saturating_mul(4);
+    loop {
+        let dead = e.irq(|c, _| {
+            while let Some(job) = c.vecs.take_spent() {
+                iod::credit_vector(c.jobs, job);
+            }
+            c.vecs.counts().dead
+        });
+        if dead.unwrap_or(0) == 0 || e.now().wrapping_sub(t0) > bound {
+            return;
+        }
+        e.relax();
+    }
+}
+
+/// Move vector `v` to the calling hart (`interrupt_deliver_here`, a first wait or acknowledgement: 8.5): an identity here, the entry's
+/// notice rewritten with one store, the fence, then the old identity retired. A move already in flight is waited for first (bounded).
+pub fn move_vector_here<E: IoEnv>(e: &mut E, v: VectorRef) -> Result<(), MoveError> {
+    let mut started = Err(MoveError::Busy);
+    wait_until(e, |e| {
+        started = e
+            .irq(|c, _| c.vecs.move_here(c.ids, c.harts, v))
+            .unwrap_or(Err(MoveError::Dead));
+        !matches!(started, Err(MoveError::Busy))
+    });
+    match started? {
+        Moved::Stays => Ok(()),
+        Moved::Retarget => {
+            retarget(e, v);
+            Ok(())
+        }
+    }
+}
+
+/// A busy route's retarget (8.5, a move): the entry rewritten to the route's open identity, the fence, then the identities it left
+/// retired. A route that is not open yet is waited for (bounded); a revoke or a destruction meanwhile ends the move.
+fn retarget<E: IoEnv>(e: &mut E, v: VectorRef) {
+    let mut queued = None;
+    let ok = wait_until(e, |e| {
+        let r = e.irq_iommu(|c, s, mem, regs, _| {
+            c.vecs.retarget_begin(c.ids, &*c.harts, s, mem, regs, v)
+        });
+        match r {
+            Some(Err(IoError::NotDone)) => false,
+            Some(x) => {
+                queued = Some(x);
+                true
+            }
+            None => true,
+        }
+    });
+    if !ok {
+        let _ = e.irq(|c, _| c.vecs.unbusy(v));
+        return;
+    }
+    let Some(Ok(Some(_))) = queued else {
+        return; // (nothing to rewrite, or the vector is being revoked or its domain destroyed)
+    };
+    let Some(Some((d, k))) = e.irq(|c, _| c.vecs.vector_of(v)) else {
+        return;
+    };
+    if !wait_vector(e, d, k) {
+        let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.abandon(s, v));
+        return;
+    }
+    let _ = e.irq_iommu(|c, s, _, _, _| c.vecs.fenced(c.ids, c.harts, s, v));
+}
+
+/// Finish the moves a hart's evacuation began (8.5, hart offline: `hart_set_online`, with no lock held after the evacuation): for
+/// each live vector whose entry does not name its open identity, the retarget. Bounded by the vectors.
+pub fn settle_moves<E: IoEnv>(e: &mut E) {
+    for _ in 0..4096 {
+        let Some(Some(v)) = e.irq(|c, _| c.vecs.next_to_settle(c.ids)) else {
+            return;
+        };
+        retarget(e, v);
+    }
+}
+
+/// `interrupt_ack` on an interrupt object (8.5): for a vector, the file protocol under `OBJ` and, the first time, the move to the
+/// calling hart with no lock held; `None` for a wired source (the kernel's own path).
+pub fn interrupt_ack_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Option<Reply> {
+    let r = e.irq(
+        |c, mem| -> Option<Result<(u64, Option<VectorRef>), Status>> {
+            let Some((handles, _)) = c.caller else {
+                return Some(Err(Status::BadState));
+            };
+            let (obj, kind) =
+                match ipc::interrupt_kind_of(c.objs, handles, Handle(a[0]), Rights::MANAGE) {
+                    Ok(x) => x,
+                    Err(s) => return Some(Err(s)),
+                };
+            let v = kind?;
+            Some(
+                c.vecs
+                    .ack(c.objs, mem, obj, v)
+                    .map(|(claims, place)| (claims, place.then_some(v))),
+            )
+        },
+    )??;
+    Some(match r {
+        Ok((claims, place)) => {
+            if let Some(v) = place {
+                let _ = move_vector_here(e, v);
+            }
+            Ok((Some(claims), None))
+        }
+        Err(s) => err(s),
+    })
+}
+
+/// `interrupt_deliver_here(interrupt)` on a vector (8.5): needs the acknowledge right (MANAGE); BAD_STATE for a dead vector, NO_MEMORY
+/// when the calling hart has no free identity. `None` for a wired source (the kernel re-aims it as an acknowledgement does).
+pub fn interrupt_deliver_here_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Option<Reply> {
+    let r = e.irq(|c, _| -> Option<Result<VectorRef, Status>> {
+        let Some((handles, _)) = c.caller else {
+            return Some(Err(Status::BadState));
+        };
+        match ipc::interrupt_kind_of(c.objs, handles, Handle(a[0]), Rights::MANAGE) {
+            Ok((obj, Some(v))) => {
+                if c.vecs.state(v) != Some(RState::Live) {
+                    return Some(Err(Status::BadState)); // (a dead vector: its route ended or is ending)
+                }
+                // (an explicit placement is the vector's placement: no first wait moves it again)
+                c.vecs.first_wait(c.objs, obj);
+                Some(Ok(v))
+            }
+            Ok((_, None)) => None,
+            Err(s) => Some(Err(s)),
+        }
+    })??;
+    Some(match r {
+        Ok(v) => match move_vector_here(e, v) {
+            Ok(()) => Ok((None, None)),
+            Err(MoveError::Dead) => err(Status::BadState),
+            Err(MoveError::NoMemory) => err(Status::NoMemory),
+            // (another move held it past the bound: the vector stays where that one put it)
+            Err(MoveError::Busy) => Ok((None, None)),
+        },
+        Err(s) => err(s),
+    })
+}
+
+/// The first `object_wait` on a vector object (8.5, placement): it is moved to the calling hart once. One look when no vector is
+/// unplaced.
+pub fn first_wait_vector<E: IoEnv>(e: &mut E, h: Handle) {
+    let v = e.irq(|c, _| {
+        if c.vecs.unplaced() == 0 {
+            return None;
+        }
+        let (handles, _) = c.caller?;
+        let (obj, _) = ipc::interrupt_kind_of(c.objs, handles, h, Rights::WAIT).ok()?;
+        c.vecs.first_wait(c.objs, obj)
+    });
+    if let Some(Some(v)) = v {
+        let _ = move_vector_here(e, v);
+    }
 }

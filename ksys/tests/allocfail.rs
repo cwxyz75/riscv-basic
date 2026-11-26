@@ -1118,6 +1118,35 @@ fn iscenarios() -> Vec<IScenario> {
                 let _ = go(h, nr::IODOMAIN_FAULT_READ, [d, 0, 0, 0, 0, 0]);
             },
         },
+        // (IOMMU7) a vector granted, signalled, acknowledged, moved and revoked; and a destruction that revokes them
+        IScenario {
+            name: "iodomain_grant_vector",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                let _ = go(h, nr::IODOMAIN_GRANT_VECTOR, [d, 3, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "vector_ack_and_move",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                let (x, _) = h.grant(d, 0);
+                let _ = h.signal(5, 0);
+                let _ = go(h, nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+                h.harts.here = 2;
+                let _ = go(h, nr::INTERRUPT_DELIVER_HERE, [x, 0, 0, 0, 0, 0]);
+                let _ = go(h, nr::HANDLE_CLOSE, [x, 0, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "iodomain_destroy_with_vectors",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                h.grant(d, 0);
+                h.grant(d, 9);
+                let _ = go(h, nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
+            },
+        },
         IScenario {
             name: "job_set_io_limits",
             run: |h, go| {
@@ -1139,6 +1168,7 @@ fn ichild(name: &str, n: usize, persist: bool) {
     let mut h = Host::new(&mem);
     h.w.poke(BASE, &[0; 64]); // (the scenarios' scratch page, committed before the free frames are counted)
     let free = h.w.mm.db.free_count();
+    let free_ids = h.ids.free_total();
     PERSIST.store(usize::from(persist), Ordering::Relaxed);
     let mut made = 0;
     start(n);
@@ -1191,6 +1221,19 @@ fn ichild(name: &str, n: usize, persist: bool) {
     assert!(
         h.timeouts.is_empty(),
         "scenario {name}, failing allocation {n}: a fence timed out"
+    );
+    // (IOMMU7) no vector route, identity or charge left behind
+    let c = h.vecs.counts();
+    assert_eq!(
+        (c.live, c.dead, c.leaked, h.ids.free_total(), h.no_route),
+        (0, 0, 0, free_ids, 0),
+        "scenario {name}, failing allocation {n}: a vector or an identity left: {c:?}"
+    );
+    assert_eq!(
+        h.w.jobs
+            .io_usage(kcore::job::JobId::ROOT, kcore::job::IoResource::Vectors),
+        Some(0),
+        "scenario {name}, failing allocation {n}: vectors still charged"
     );
     assert_eq!(
         h.w.objs.live(),

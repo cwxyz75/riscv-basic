@@ -27,6 +27,8 @@ pub enum Kind {
     Resource,
     /// A device domain (IOMMU6).
     IoDomain,
+    /// An interrupt object of the kind vector (IOMMU7).
+    Interrupt,
     /// Received through a channel: the kind is not known to the model.
     Any,
 }
@@ -136,6 +138,7 @@ impl Model {
             nr::VMO_CREATE => self.add(a1.unwrap_or(0), Kind::Vmo),
             nr::JOB_CREATE => self.add(a1.unwrap_or(0), Kind::Job),
             nr::IODOMAIN_CREATE => self.add(a1.unwrap_or(0), Kind::IoDomain),
+            nr::IODOMAIN_GRANT_VECTOR => self.add(a1.unwrap_or(0), Kind::Interrupt),
             nr::VMO_CREATE_DMA_IN => {
                 self.add(a1.unwrap_or(0), Kind::Vmo);
                 self.dma.push(a1.unwrap_or(0));
@@ -240,6 +243,9 @@ pub const CALLS: &[usize] = &[
     nr::IODOMAIN_UNMAP,
     nr::IODOMAIN_DESTROY,
     nr::IODOMAIN_FAULT_READ,
+    nr::IODOMAIN_GRANT_VECTOR,
+    nr::INTERRUPT_ACK,
+    nr::INTERRUPT_DELIVER_HERE,
 ];
 
 /// The kind of handle each call wants first.
@@ -252,9 +258,12 @@ fn wants(n: usize) -> Option<Kind> {
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_COMMIT => Kind::Vmo,
         nr::JOB_CREATE | nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_SET_IO_LIMITS => Kind::Job,
         nr::VMO_CREATE_DMA_IN | nr::IODOMAIN_CREATE => Kind::Resource,
-        nr::IODOMAIN_MAP | nr::IODOMAIN_UNMAP | nr::IODOMAIN_DESTROY | nr::IODOMAIN_FAULT_READ => {
-            Kind::IoDomain
-        }
+        nr::IODOMAIN_MAP
+        | nr::IODOMAIN_UNMAP
+        | nr::IODOMAIN_DESTROY
+        | nr::IODOMAIN_FAULT_READ
+        | nr::IODOMAIN_GRANT_VECTOR => Kind::IoDomain,
+        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE => Kind::Interrupt,
         _ => return None,
     })
 }
@@ -581,6 +590,14 @@ impl Gen {
                 c.args = match self.pick(&mine) {
                     Some((d, io, pages)) if self.below(10) != 0 => [d, io, pages, 0, 0, 0],
                     _ => [handle, self.below(64) * 4096, 1 + self.below(4), 0, 0, 0],
+                };
+            }
+            // (IOMMU7: a few indices, so a grant meets a granted one; now and then one past the 256)
+            nr::IODOMAIN_GRANT_VECTOR => {
+                c.args[1] = if self.below(10) == 0 {
+                    256 + self.below(4)
+                } else {
+                    self.below(4)
                 };
             }
             _ => {}

@@ -476,11 +476,13 @@ pub fn stat(which: u64) -> u64 {
         155 => &LAST_CAUSE,
         157 => &FENCE_TIMEOUTS,
         // (156: every command the store queued, the calls' and the kernel's own, with their fences: IOMMU6)
-        156 | 158..=161 => {
+        156 | 158..=161 | 147 => {
             let st = STATE.lock().as_ref().map(|s| s.store.stats());
             let Some(st) = st else { return 0 };
             return match which {
                 156 => st.commands,
+                // (IOMMU7: the stray bits the store took at revoke and release, with the ones `aia` took at acknowledgement)
+                147 => st.strays.saturating_add(crate::aia::stat(147)),
                 158 => st.pages_leaked.saturating_add(st.tables_leaked),
                 159 => st.domains,
                 160 => st.io_pages,
@@ -589,6 +591,59 @@ impl ksys::iodomain::IoEnv for Kenv {
     fn fence_timeout(&mut self, device: Option<u32>) {
         timed_out(device);
     }
+    fn irq<T>(&mut self, f: impl FnOnce(ksys::iodomain::IrqCtx<'_>, &Direct) -> T) -> Option<T> {
+        crate::user::with_caller_opt(|objs, caller| {
+            // (`JOBS` inside `OBJ`, as object quotas are: IOMMU-SPEC 11.2)
+            let j = crate::kmem::jobs();
+            crate::aia::with_irq(|ids, vecs, harts| {
+                f(
+                    ksys::iodomain::IrqCtx {
+                        objs,
+                        caller,
+                        jobs: j.jobs,
+                        ids,
+                        vecs,
+                        harts,
+                    },
+                    &Direct,
+                )
+            })
+        })
+    }
+    fn irq_iommu<T>(
+        &mut self,
+        f: impl FnOnce(
+            ksys::iodomain::IrqCtx<'_>,
+            &mut IoDomains,
+            &Direct,
+            &mut Mmio,
+            &mut kcore::frame::FrameDb,
+        ) -> T,
+    ) -> Option<T> {
+        crate::user::with_caller_opt(|objs, caller| {
+            let j = crate::kmem::jobs();
+            crate::aia::with_irq(|ids, vecs, harts| {
+                // (`OBJ`, `JOBS`, then `IOMMU` and `FRAME` inside it: 11.1)
+                Kenv::locked(|s, r| {
+                    let k = crate::kmem::frames();
+                    f(
+                        ksys::iodomain::IrqCtx {
+                            objs,
+                            caller,
+                            jobs: j.jobs,
+                            ids,
+                            vecs,
+                            harts,
+                        },
+                        s,
+                        &Direct,
+                        r,
+                        &mut k.mm.db,
+                    )
+                })
+            })
+        })
+    }
 }
 
 /// The device-domain calls (IOMMU-SPEC 4, 7.4): `iodomain_create`, `iodomain_map`, `iodomain_unmap`, `iodomain_destroy`,
@@ -604,9 +659,67 @@ pub fn call(n: usize, a: [u64; 6]) -> Option<ksys::Reply> {
         nr::IODOMAIN_DESTROY => io::iodomain_destroy(e, a),
         nr::IODOMAIN_FAULT_READ => io::iodomain_fault_read(e, a),
         nr::VMO_CREATE_DMA_IN => io::vmo_create_dma_in(e, a),
+        nr::IODOMAIN_GRANT_VECTOR => io::iodomain_grant_vector(e, a),
+        // (IOMMU7: a vector's acknowledgement and placement; a wired source's are the kernel's own path, `None` here)
+        nr::INTERRUPT_ACK => io::interrupt_ack_vector(e, a)?,
+        nr::INTERRUPT_DELIVER_HERE => io::interrupt_deliver_here_vector(e, a)?,
         _ => return None,
     };
     Some(r)
+}
+
+/// A message on vector identity `p` of this hart's file (the interrupt path, under the object lock): the notice of IOMMU-SPEC 8.5 on
+/// the vector's file, with atomic operations and no other lock. Whether its object fired.
+pub fn vector_notice(p: kcore::msiid::Place) -> bool {
+    crate::user::with_objs(|objs| {
+        crate::aia::with_irq(|ids, vecs, _| vecs.notice(objs, ids, &Direct, p))
+            .flatten()
+            .unwrap_or(false)
+    })
+}
+
+/// The last handle of a vector object went (its cleanup, under the object lock): revoke steps 1 to 3 under `IOMMU` (IOMMU-SPEC 8.5);
+/// `drain` completes it with no lock held.
+pub fn vector_closed(v: kcore::ipc::VectorRef) {
+    crate::aia::with_irq(|_, vecs, _| {
+        let mut g = STATE.lock();
+        if let (Some(s), Some(mut r)) = (g.as_mut(), Mmio::new()) {
+            ksys::iodomain::vector_closed(vecs, &mut s.store, &Direct, &mut r, v);
+            UNFINISHED.store(s.store.unfinished(), Ordering::Release);
+        }
+    });
+    crate::aia::VECTORS_DUE.store(true, Ordering::Release);
+}
+
+/// The first `object_wait` on an interrupt object (IOMMU-SPEC 8.5, placement): a vector is moved to the calling hart once. No lock
+/// held; one look when no vector waits for its placement.
+pub fn first_wait(h: u64) {
+    if crate::bkl::holds() {
+        return;
+    }
+    ksys::iodomain::first_wait_vector(&mut Kenv, abi::Handle(h));
+}
+
+/// Finish the vector moves a hart's evacuation began (`hart_set_online`, with no lock held): the entries rewritten and fenced, the old
+/// identities retired (IOMMU-SPEC 8.5, hart offline).
+pub fn settle_moves() {
+    if crate::bkl::holds() {
+        return;
+    }
+    ksys::iodomain::settle_moves(&mut Kenv);
+}
+
+/// Where the vector of interrupt handle `h` (the caller's) sends its notices: (interrupt file << 16) | identity of the fenced entry's
+/// target, `None` for anything else (`debug_stat` 148). Under the object lock.
+pub fn vector_route(
+    objs: &kcore::ipc::Kobjs,
+    handles: &kcore::handle::HandleTable,
+    h: u64,
+) -> Option<u64> {
+    let (_, v) =
+        kcore::ipc::interrupt_kind_of(objs, handles, abi::Handle(h), abi::rights::Rights::WAIT)
+            .ok()?;
+    crate::aia::vector_route_of(v?)
 }
 
 /// The last handle of a device domain went (the object's cleanup, under the object lock): 6.3 step 1, which allocates nothing and does
@@ -623,10 +736,17 @@ pub fn closed(domain: u64) {
 /// completing: the tail of every call and fault, and the end of a teardown, so a close returns only when its domain is gone (6.3).
 /// One load when nothing is pending; a caller that holds the object lock leaves it to the next.
 pub fn drain() {
-    if crate::bkl::holds() || !UNFINISHED.load(Ordering::Acquire) {
+    if crate::bkl::holds() {
+        return;
+    }
+    let vectors = crate::aia::VECTORS_DUE.swap(false, Ordering::AcqRel);
+    if !UNFINISHED.load(Ordering::Acquire) && !vectors {
         return;
     }
     ksys::iodomain::settle_destructions(&mut Kenv);
+    // (IOMMU7: the revokes a close began, the moves a hart's evacuation began, and the charges of vectors whose identities are free)
+    ksys::iodomain::settle_moves(&mut Kenv);
+    ksys::iodomain::settle_vectors(&mut Kenv);
     let g = STATE.lock();
     if let Some(s) = g.as_ref() {
         UNFINISHED.store(s.store.unfinished(), Ordering::Release);

@@ -293,6 +293,9 @@ pub mod iodomain {
     pub const DIR_READ: u64 = 1;
     pub const DIR_WRITE: u64 = 2;
     pub const DIR_EXEC: u64 = 3;
+    /// The data word of every granted vector's MSI-X entry (IOMMU-SPEC 8.2): the kernel enables only identity 1 in a vector's own
+    /// interrupt file. `iodomain_grant_vector` returns the address (`a2`); the data word is this constant.
+    pub const MSI_DATA: u64 = 1;
 }
 
 pub mod signals {
@@ -555,6 +558,10 @@ pub mod syscall {
         JOB_SET_IO_LIMITS = 124,
         /// `vmo_create_dma_in(resource, pages, job) -> vmo` (4.7).
         VMO_CREATE_DMA_IN = 125,
+        /// `iodomain_grant_vector(domain, index) -> (interrupt, msi_address)` (8.3; the data word is `iodomain::MSI_DATA`).
+        IODOMAIN_GRANT_VECTOR = 126,
+        /// `interrupt_deliver_here(interrupt)` (8.5): move the interrupt's delivery to the calling hart.
+        INTERRUPT_DELIVER_HERE = 127,
     }
     /// One more than the largest number in the table.
     pub const LIMIT: usize = 128;

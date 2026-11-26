@@ -69,6 +69,8 @@ pub struct World {
     pub job_sched: kcore::jobsched::JobSchedTable,
     /// Device-domain objects that died in `cleanup_keep`, for the IOMMU harness (`iohost::Host::settle`) to destroy (IOMMU6).
     pub io_dead: Vec<kcore::ipc::IoDomainObj>,
+    /// The vectors whose interrupt object `cleanup_keep` found dead (IOMMU7): the device-domain host revokes them.
+    pub vec_dead: Vec<kcore::ipc::VectorRef>,
     /// Frames a harness took for itself (the IOMMU's directory, queues and quarantine table): `frame_accounting` counts them.
     pub extra_frames: usize,
 }
@@ -106,6 +108,7 @@ pub fn world_with_frames(handles: usize, frames: usize) -> World {
         faults: Faults::default(),
         job_sched: kcore::jobsched::JobSchedTable::new(),
         io_dead: Vec::new(),
+        vec_dead: Vec::new(),
         extra_frames: 0,
     }
 }
@@ -213,6 +216,11 @@ pub fn cleanup_keep(w: &mut World) -> kcore::object::Dirty {
                 }
                 KObj::Job(id) => w.jobs.release(id),
                 KObj::IoDomain(d) => w.io_dead.push(d),
+                KObj::Interrupt(i) => {
+                    if let Some(v) = i.vector {
+                        w.vec_dead.push(v);
+                    }
+                }
                 _ => {}
             }
         }
