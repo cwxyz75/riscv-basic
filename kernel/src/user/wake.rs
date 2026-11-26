@@ -153,14 +153,14 @@ fn cleanup_dead_held() {
                     super::waits::wake_pager_waiters();
                 }
                 ipc::KObj::Interrupt(i) => with_state(|s| {
-                    // mask the source unless a newer object already owns it
+                    // mask the source and end its route (its identity is retired by its hart) unless a newer object already owns it
                     let owned = matches!(s.irq_objs.get(i.irq as usize), Some(Some(o))
                         if matches!(s.objs.get(*o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
                     if !owned {
                         if let Some(slot) = s.irq_objs.get_mut(i.irq as usize) {
                             *slot = None;
                         }
-                        crate::aia::disable(i.irq);
+                        crate::aia::release(i.irq);
                     }
                 }),
                 _ => {}

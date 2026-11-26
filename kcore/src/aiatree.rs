@@ -19,8 +19,14 @@ pub struct Aia {
     /// The firmware ids of the harts in the order of the IMSIC's interrupt files: the position of a hart here is its hart index in an
     /// APLIC target register.
     pub hart_order: Vec<u32>,
-    /// The sources a process may take (sorted, unique, each at most 62: a source is delivered as message id source + 1, and one IMSIC `eie` register holds ids 0 to 63, id 1 being the inter-hart interrupt).
+    /// The identities of each hart's interrupt file (`riscv,num-ids`: 1 to this, 63 to 2047). Every identity the kernel uses is
+    /// allocated per hart (`kcore::msiid`, IOMMU-SPEC 8.1); none is derived from a source number.
+    pub num_ids: u32,
+    /// The sources a process may take (sorted, unique, each from 1 to `num_sources`).
     pub sources: Vec<u32>,
+    /// Sources an admitted device on this APLIC names that the APLIC does not have (0, or above `num_sources`): not usable. The
+    /// kernel says so at boot instead of dropping them quietly (T183).
+    pub dropped: Vec<u32>,
 }
 
 /// The first cell of a property of this node or, failing that, of the nearest ancestor that has it (how `interrupt-parent` is inherited).
@@ -105,6 +111,11 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
         return None;
     }
     let (imsic_base, imsic_size) = *imsic.regs().first()?;
+    // the identities of each file: the IMSIC binding requires the property, and the AIA specification allows 63 to 2047
+    let num_ids = *imsic.cells("riscv,num-ids").first()?;
+    if !(63..=2047).contains(&num_ids) {
+        return None;
+    }
     // interrupts-extended: (cpu interrupt controller phandle, interrupt number) per hart, in hart-index order; the interrupt number must be
     // 9, the supervisor external interrupt (11 is the machine's file: not ours to use)
     let ext = imsic.cells("interrupts-extended");
@@ -116,12 +127,16 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
         }
         hart_order.push(hart_of_intc(nodes, *ph)?);
     }
-    // one page per file, all inside the node's register window
-    if hart_order.is_empty() || imsic_size < (hart_order.len() as u64).checked_mul(0x1000)? {
+    // one page per file, all inside the node's register window; a hart index is 14 bits in an APLIC target word
+    if hart_order.is_empty()
+        || hart_order.len() > 1 << 14
+        || imsic_size < (hart_order.len() as u64).checked_mul(0x1000)?
+    {
         return None;
     }
     let aplic_ph = phandle(aplic);
     let mut sources: Vec<u32> = Vec::new();
+    let mut dropped: Vec<u32> = Vec::new();
     for n in admitted(nodes) {
         // only devices whose interrupts go to this APLIC (a device that names its parents in `interrupts-extended` is not read), and only
         // sources it has
@@ -130,18 +145,24 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
             continue;
         }
         if let Some(&src) = n.cells("interrupts").first() {
-            if (1..=62).contains(&src) && src <= num_sources {
+            if (1..=num_sources).contains(&src) {
                 sources.push(src);
+            } else {
+                dropped.push(src);
             }
         }
     }
     sources.sort_unstable();
     sources.dedup();
+    dropped.sort_unstable();
+    dropped.dedup();
     Some(Aia {
         aplic_base,
         num_sources,
         imsic_base,
         hart_order,
+        num_ids,
         sources,
+        dropped,
     })
 }

@@ -641,17 +641,12 @@ fn window_trap(frame: &mut TrapFrame, cause: u64) {
                 .store(true, Ordering::SeqCst);
         }
     } else {
-        let ids = crate::aia::claim();
-        let devices = ids & !crate::aia::IPI_BIT;
-        let reasons = if ids & crate::aia::IPI_BIT != 0 {
-            crate::smp::ipi_interrupt()
-        } else {
-            0
-        };
+        let (ipi, devices) = claim_file();
+        let reasons = if ipi { crate::smp::ipi_interrupt() } else { 0 };
         let mut ask = reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::reschedule_fast();
-        if devices != 0 {
+        if !devices.is_empty() || crate::aia::has_work() {
             crate::bkl::lock();
-            if crate::aia::deliver(devices, crate::user::irq_fired) {
+            if crate::aia::deliver(&devices, crate::user::irq_fired) {
                 crate::user::wake_signal_waiters();
             }
             ask = true;
@@ -696,27 +691,39 @@ fn ipi_trap(frame: &mut TrapFrame) {
     }
 }
 
+/// Take every message in this hart's IMSIC file: whether the inter-hart identity was among them, and the others (looked up under the
+/// lock by `aia::deliver`).
+#[inline(always)]
+fn claim_file() -> (bool, kcore::msiid::IdSet) {
+    let mut ipi = false;
+    let mut devices = kcore::msiid::IdSet::new();
+    crate::aia::claim(|id| {
+        if id == crate::aia::IPI_ID {
+            ipi = true;
+        } else {
+            devices.insert(id);
+        }
+    });
+    (ipi, devices)
+}
+
 /// A supervisor external interrupt: take every message in this hart's IMSIC file. The inter-hart interrupt (message 1) is the hot one and needs
 /// no lock unless the hart must switch; a device message goes to its interrupt object under the big lock (S6a-2).
 #[inline(never)] // (as `ipi_trap`)
 fn external_trap(frame: &mut TrapFrame, from_user: bool) {
-    let ids = crate::aia::claim();
-    let devices = ids & !crate::aia::IPI_BIT;
-    if devices == 0 {
-        if ids & crate::aia::IPI_BIT != 0 {
+    let (ipi, devices) = claim_file();
+    // (identities to open or retire in this hart's file are work under the lock, like a device message: IOMMU4)
+    if devices.is_empty() && !crate::aia::has_work() {
+        if ipi {
             ipi_trap(frame);
         }
         return;
     }
     // (the inter-hart part first, with no lock: its test jobs probe the lock)
-    let reasons = if ids & crate::aia::IPI_BIT != 0 {
-        crate::smp::ipi_interrupt()
-    } else {
-        0
-    };
+    let reasons = if ipi { crate::smp::ipi_interrupt() } else { 0 };
     crate::bkl::lock();
     crate::fp::trap_entry(frame);
-    let any = crate::aia::deliver(devices, crate::user::irq_fired);
+    let any = crate::aia::deliver(&devices, crate::user::irq_fired);
     if (any || reasons & crate::percpu::IPI_RESCHED != 0) && crate::thread::scheduler_ready() {
         if any {
             crate::user::wake_signal_waiters();

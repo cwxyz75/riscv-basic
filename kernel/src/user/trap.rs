@@ -1365,10 +1365,18 @@ fn dispatch_in(
                 return fail(Status::InvalidArgs);
             }
             let slot = irq as usize;
-            let owned = matches!(*irq_objs.get(slot).unwrap_or(&None), Some(o)
+            // (T183: the table is sized by the highest allowed source, so an allowed source has a slot; a missing one is refused, not ignored)
+            let Some(&current) = irq_objs.get(slot) else {
+                return fail(Status::InvalidArgs);
+            };
+            let owned = matches!(current, Some(o)
                 if matches!(objs.get(o), Some(ipc::KObj::Interrupt(i)) if i.irq == irq as u32));
             if owned {
                 return fail(Status::BadState);
+            }
+            // an identity on the calling hart's interrupt file first (IOMMU4: the kernel's choice, never source + 1), then the object
+            if let Err(e) = crate::aia::take(irq as u32) {
+                return fail(e);
             }
             match ipc::interrupt_object_create_in(
                 objs,
@@ -1383,7 +1391,11 @@ fn dispatch_in(
                     crate::aia::enable(irq as u32);
                     Ok((Some(hd.0), None))
                 }
-                Err(e) => fail(e),
+                Err(e) => {
+                    // (the identity goes back; the source stays masked, as it was)
+                    crate::aia::release(irq as u32);
+                    fail(e)
+                }
             }
         }
         nr::INTERRUPT_ACK => {

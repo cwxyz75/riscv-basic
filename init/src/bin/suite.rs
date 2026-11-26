@@ -13774,6 +13774,323 @@ fn device_interrupts_arrive_where_asked() -> Outcome {
         0,
         "interrupts taken on a hart they were not aimed at"
     );
+    // IOMMU4: no message was taken on an identity with no route (IO12)
+    ensure_eq!(
+        sys::debug_stat(140),
+        0,
+        "messages on interrupt identities with no route"
+    );
+    Ok(())
+}
+
+// --- Interrupt identities (IOMMU4, IOMMU-SPEC 8.1, IO12) ---------------------------------------------------------------------------
+//
+// The goldfish RTC of QEMU `virt` (source 11, page 0x10_1000) is a wired source a kernel-only boot has with no disk: an alarm set at the
+// current time raises its line at once, and the line stays high (level) until `CLEAR_INTERRUPT`, while `IRQ_ENABLED` gates it. So it
+// fires as often as the tests like, and fires again after every acknowledgement while it stays high.
+
+const RTC_PA: u64 = 0x10_1000;
+const RTC_IRQ: u32 = 11;
+const RTC_VA: u64 = 0x700_0000;
+
+/// Map the RTC page at `RTC_VA`; false when the machine has no such window.
+fn rtc_map(res: u64) -> Result<bool, Detail> {
+    let r = sys::vmo_create_physical(res, RTC_PA, 4096);
+    if st(r) != Some(S::Ok) {
+        return Ok(false);
+    }
+    let v = r.a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let m = sys::process_map(me, v, RTC_VA, 0, 4096, PF_R | PF_W);
+    sys::handle_close(v);
+    sys::handle_close(me);
+    ensure_eq!(st(m), Some(S::Ok), "map the RTC page");
+    Ok(true)
+}
+
+/// Lower the RTC's line and unmap its page: every way out of a test that mapped it comes through here, so the next test can map it again.
+fn rtc_unmap() {
+    rtc_quiet();
+    let me = sys::process_self();
+    if st(me) == Some(S::Ok) {
+        sys::process_unmap(me.a1 as u64, RTC_VA);
+        sys::handle_close(me.a1 as u64);
+    }
+}
+
+fn rtc_wr(off: u64, v: u32) {
+    // SAFETY: RTC_VA maps the RTC's page (`rtc_map`); `off` is one of its 32-bit registers.
+    unsafe { core::ptr::write_volatile((RTC_VA + off) as *mut u32, v) }
+}
+
+fn rtc_rd(off: u64) -> u32 {
+    // SAFETY: as `rtc_wr`.
+    unsafe { core::ptr::read_volatile((RTC_VA + off) as *const u32) }
+}
+
+/// Raise the RTC's line and keep it high: interrupts enabled, an alarm at the current time (it fires at once and stays pending).
+fn rtc_raise() {
+    let lo = rtc_rd(0x00); // TIME_LOW (latches TIME_HIGH)
+    let hi = rtc_rd(0x04);
+    rtc_wr(0x10, 1); // IRQ_ENABLED
+    rtc_wr(0x0c, hi); // ALARM_HIGH
+    rtc_wr(0x08, lo); // ALARM_LOW: sets the alarm, already due, so it fires now
+}
+
+/// Lower the RTC's line for good: interrupts off, alarm cleared, interrupt cleared.
+fn rtc_quiet() {
+    rtc_wr(0x10, 0);
+    rtc_wr(0x14, 1); // CLEAR_ALARM
+    rtc_wr(0x1c, 1); // CLEAR_INTERRUPT
+}
+
+/// An interrupt object for the RTC, or `None` when this machine has no interrupt controller or does not admit the RTC's source.
+fn rtc_object(res: u64) -> Result<Option<u64>, Detail> {
+    let r = sys::interrupt_create(res, RTC_IRQ);
+    match st(r) {
+        Some(S::Ok) => Ok(Some(r.a1 as u64)),
+        Some(S::NotSupported) | Some(S::InvalidArgs) => Ok(None),
+        other => {
+            ensure!(false, "interrupt_create on the RTC: {other:?}");
+            Ok(None)
+        }
+    }
+}
+
+/// Run `body` with the RTC mapped and a root resource handle, and undo both on every way out. Ok without running it when the machine
+/// has no RTC window.
+fn with_rtc(body: impl FnOnce(u64) -> Outcome) -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let r = match rtc_map(res) {
+        Ok(true) => {
+            let r = body(res);
+            rtc_unmap();
+            r
+        }
+        Ok(false) => Ok(()), // (no RTC window: nothing to fire)
+        Err(e) => Err(e),
+    };
+    sys::handle_close(res);
+    r
+}
+
+fn hart_count(res: u64) -> u64 {
+    let mut n = 0;
+    while st(sys::hart_info(res, n)) == Some(S::Ok) {
+        n += 1;
+    }
+    n
+}
+
+/// IOMMU4: identities are allocated per hart, next-fit, so an object re-created again and again walks the whole identity space of a
+/// file; an object routed through an identity of 64 or more (every `eie` register, up to `riscv,num-ids`) fires, stays masked until it
+/// is acknowledged and fires again after (D5). Before IOMMU4 the identity was source + 1 and `claim` dropped every identity above 63.
+fn interrupt_identities_above_63_work() -> Outcome {
+    with_rtc(identities_above_63)
+}
+
+fn identities_above_63(res: u64) -> Outcome {
+    let Some(probe) = rtc_object(res)? else {
+        return Ok(()); // (no interrupt controller, or the RTC is not admitted: the harness checks which machine this is)
+    };
+    sys::handle_close(probe);
+    let num_ids = sys::debug_stat(144);
+    ensure!(
+        (63..=2047).contains(&num_ids),
+        "riscv,num-ids reads {num_ids}"
+    );
+    let (no_route, misrouted) = (sys::debug_stat(140), sys::debug_stat(5));
+    let harts = hart_count(res);
+    rtc_raise();
+    let limit = harts * num_ids + 64;
+    let mut i = 0;
+    while sys::debug_stat(142) < num_ids {
+        ensure!(
+            i < limit,
+            "after {i} objects the highest identity a message was taken on is {}, not {num_ids}",
+            sys::debug_stat(142)
+        );
+        let irq = ok(sys::interrupt_create(res, RTC_IRQ), "interrupt_create")?.a1 as u64;
+        let r = one_identity(irq, i);
+        sys::handle_close(irq);
+        r?;
+        i += 1;
+    }
+    ensure_eq!(sys::debug_stat(140), no_route, "messages with no route");
+    ensure_eq!(sys::debug_stat(5), misrouted, "misrouted messages");
+    sys::debug_write(
+        alloc::format!(
+            "irq: {i} objects walked the identities up to {} of {num_ids}\n",
+            sys::debug_stat(142)
+        )
+        .as_bytes(),
+    );
+    Ok(())
+}
+
+/// The `i`-th object of `identities_above_63`: it fires, takes one claim until acknowledged, and fires again after.
+fn one_identity(irq: u64, i: u64) -> Outcome {
+    let r = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 2000);
+    ensure_eq!(
+        st(r),
+        Some(S::Ok),
+        "object {i} fired (highest identity so far {})",
+        sys::debug_stat(142)
+    );
+    if i.is_multiple_of(32) {
+        // masked while fired: the line stays high, and the kernel takes nothing more until the acknowledgement
+        nap_ticks(2);
+    }
+    let ack = ok(sys::interrupt_ack(irq), "interrupt_ack")?;
+    ensure_eq!(
+        ack.a1,
+        1,
+        "object {i}: one claim before the acknowledgement"
+    );
+    let r = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 2000);
+    ensure_eq!(
+        st(r),
+        Some(S::Ok),
+        "object {i} fired again after its acknowledgement (the line is still high)"
+    );
+    Ok(())
+}
+
+static MV_IRQ: AtomicU64 = AtomicU64::new(0);
+static MV_STOP: AtomicU32 = AtomicU32::new(0);
+static MV_DONE: AtomicU64 = AtomicU64::new(0);
+static MV_LOST: AtomicU32 = AtomicU32::new(0);
+
+/// One of the acknowledging threads: wait for the interrupt and acknowledge it (whichever thread is first; the others find it
+/// acknowledged already, BAD_STATE, and wait again). A wait that times out is a request that never completed: the object did not fire
+/// within 3 s although the line stays high. (`object_wait` says OK when the signal ended the wait, even if another thread acknowledged
+/// it before this one returned: before IOMMU4 it read the signals again after the sleep and could say TIMED_OUT early.)
+extern "C" fn mv_acker(_: usize) -> ! {
+    let irq = MV_IRQ.load(Ordering::SeqCst);
+    while MV_STOP.load(Ordering::SeqCst) == 0 {
+        let r = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 3000);
+        if st(r) != Some(S::Ok) {
+            if MV_STOP.load(Ordering::SeqCst) == 0 {
+                MV_LOST.store(1, Ordering::SeqCst);
+            }
+            break;
+        }
+        if st(sys::interrupt_ack(irq)) == Some(S::Ok) {
+            MV_DONE.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    sys::thread_exit(0)
+}
+
+/// IOMMU4: an object acknowledged from changing harts a few thousand times while its device keeps firing, and moved off harts taken
+/// offline under it: every request completes, no message reaches an identity with no route, and every identity comes back (the free
+/// count at the end equals the start). At two harts and more the route must have moved.
+fn interrupt_moves_do_not_lose_or_leak() -> Outcome {
+    with_rtc(moves_do_not_lose_or_leak)
+}
+
+fn moves_do_not_lose_or_leak(res: u64) -> Outcome {
+    let free0 = sys::debug_stat(141);
+    let (no_route, misrouted, moves) = (
+        sys::debug_stat(140),
+        sys::debug_stat(5),
+        sys::debug_stat(143),
+    );
+    let Some(irq) = rtc_object(res)? else {
+        return Ok(());
+    };
+    let harts = hart_count(res);
+    MV_IRQ.store(irq, Ordering::SeqCst);
+    MV_STOP.store(0, Ordering::SeqCst);
+    MV_DONE.store(0, Ordering::SeqCst);
+    MV_LOST.store(0, Ordering::SeqCst);
+    rtc_raise();
+    let mut threads = Vec::new();
+    let mut failed: Option<alloc::string::String> = None;
+    for _ in 0..harts.clamp(2, 4) {
+        match new_thread(mv_acker, 0) {
+            Ok(t) => threads.push(t),
+            Err(_) => {
+                failed = Some("an acknowledging thread could not be made".into());
+                break;
+            }
+        }
+    }
+    const WANT: u64 = 3000;
+    let until = sys::clock_get() + 60_000;
+    let mut cycled = 0u64;
+    while failed.is_none()
+        && MV_DONE.load(Ordering::SeqCst) < WANT
+        && MV_LOST.load(Ordering::SeqCst) == 0
+    {
+        if sys::clock_get() > until {
+            failed = Some(alloc::format!(
+                "only {} of {WANT} acknowledgements in a minute",
+                MV_DONE.load(Ordering::SeqCst)
+            ));
+            break;
+        }
+        // every 500 acknowledgements a hart other than 0 goes offline and comes back: the routes on it move (IOMMU-SPEC 8.5), and
+        // the threads on it run elsewhere, so the acknowledgements come from other harts
+        let done = MV_DONE.load(Ordering::SeqCst);
+        if harts > 1 && done / 500 > cycled {
+            cycled = done / 500;
+            let h = 1 + cycled % (harts - 1);
+            if st(sys::hart_set_online(res, h, 0)) != Some(S::Ok) {
+                failed = Some(alloc::format!("hart {h} did not go offline"));
+                break;
+            }
+            nap_ticks(2);
+            if st(sys::hart_set_online(res, h, 1)) != Some(S::Ok) {
+                failed = Some(alloc::format!("hart {h} did not come back"));
+                break;
+            }
+        }
+        nap_ticks(1);
+    }
+    MV_STOP.store(1, Ordering::SeqCst);
+    for t in &threads {
+        let r = sys::object_wait(*t, sig::TERMINATED, sys::clock_get() + 10_000);
+        if st(r) != Some(S::Ok) && failed.is_none() {
+            failed = Some("an acknowledging thread did not end".into());
+        }
+        sys::handle_close(*t);
+    }
+    rtc_quiet();
+    sys::handle_close(irq);
+    if let Some(f) = failed {
+        ensure!(false, "{f}");
+    }
+    ensure_eq!(
+        MV_LOST.load(Ordering::SeqCst),
+        0,
+        "a request never completed (no interrupt within 3 s of the acknowledgement), after {} acknowledgements",
+        MV_DONE.load(Ordering::SeqCst)
+    );
+    // the identities come back: the old ones are retired by their harts after the last move and the close
+    let until = sys::clock_get() + 2000;
+    while sys::debug_stat(141) != free0 && sys::clock_get() < until {
+        nap_ticks(2);
+    }
+    let free1 = sys::debug_stat(141);
+    let moved = sys::debug_stat(143) - moves;
+    sys::debug_write(
+        alloc::format!(
+            "irq: {} acknowledgements on {harts} harts, {moved} identities retired after a move, free identities {free0} then {free1}\n",
+            MV_DONE.load(Ordering::SeqCst)
+        )
+        .as_bytes(),
+    );
+    ensure_eq!(
+        free1,
+        free0,
+        "free interrupt identities at the end and at the start"
+    );
+    ensure_eq!(sys::debug_stat(140), no_route, "messages with no route");
+    ensure_eq!(sys::debug_stat(5), misrouted, "misrouted messages");
+    if harts > 1 {
+        ensure!(moved > 0, "the route never moved on {harts} harts");
+    }
     Ok(())
 }
 
@@ -16793,6 +17110,14 @@ pub fn app_main() -> i32 {
         (
             "device_interrupts_arrive_where_asked",
             device_interrupts_arrive_where_asked,
+        ),
+        (
+            "interrupt_identities_above_63_work",
+            interrupt_identities_above_63_work,
+        ),
+        (
+            "interrupt_moves_do_not_lose_or_leak",
+            interrupt_moves_do_not_lose_or_leak,
         ),
         (
             "socket_ends_travel_over_channels",

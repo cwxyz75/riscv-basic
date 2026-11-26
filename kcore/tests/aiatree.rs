@@ -18,7 +18,9 @@ fn the_real_virt_trees_give_the_supervisor_aplic_the_hart_order_and_the_device_s
     assert_eq!(a.num_sources, 96);
     assert_eq!(a.imsic_base, 0x2800_0000);
     assert_eq!(a.hart_order, vec![0]);
+    assert_eq!(a.num_ids, 255, "QEMU 11.1.3: riscv,num-ids = <0xff>");
     assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+    assert!(a.dropped.is_empty());
     let a = discover(&fdt::parse(FOUR).unwrap()).unwrap();
     assert_eq!(a.aplic_base, 0xd00_0000);
     assert_eq!(
@@ -26,6 +28,7 @@ fn the_real_virt_trees_give_the_supervisor_aplic_the_hart_order_and_the_device_s
         vec![0, 1, 2, 3],
         "phandles 8, 6, 4, 2 name cpu0 .. cpu3"
     );
+    assert_eq!(a.num_ids, 255);
     assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
 }
 
@@ -73,6 +76,7 @@ fn machine(
         .collect();
     d.u32s("interrupts-extended", &ext);
     d.reg(&[(0x2800_0000, 0x4000)]);
+    d.u32s("riscv,num-ids", &[255]);
     d.prop("compatible", b"riscv,imsics\0");
     d.end();
     d.begin("aplic@d000000");
@@ -126,13 +130,15 @@ fn only_admitted_devices_on_this_aplic_and_within_its_sources_are_interrupts_a_p
         ("virtio,mmio", 4, "disabled", true), // disabled
         ("virtio,mmio", 5, "", false),        // interrupts go to some other controller
         ("acme,unknown", 6, "", true),        // not an admitted device
-        ("virtio,mmio", 90, "", true),        // beyond the 64 an IMSIC register holds
-        ("virtio,mmio", 0, "", true),         // source 0 does not exist
-        ("virtio,mmio", 70, "", true),        // beyond 63
+        ("virtio,mmio", 90, "", true), // above 63: as good as any (IOMMU4: no identity is source + 1)
+        ("virtio,mmio", 0, "", true),  // source 0 does not exist
+        ("virtio,mmio", 70, "", true), // above 63
+        ("virtio,mmio", 97, "", true), // past the controller's 96: said at boot, not used
     ];
     let t = machine(&[0], &[0], &devices, 96);
     let a = discover(&fdt::parse(&t).unwrap()).unwrap();
-    assert_eq!(a.sources, vec![3, 11]);
+    assert_eq!(a.sources, vec![3, 11, 70, 90]);
+    assert_eq!(a.dropped, vec![0, 97]);
     // beyond the controller's own source count
     let t = machine(
         &[0],
@@ -140,7 +146,9 @@ fn only_admitted_devices_on_this_aplic_and_within_its_sources_are_interrupts_a_p
         &[("virtio,mmio", 20, "", true), ("virtio,mmio", 7, "", true)],
         10,
     );
-    assert_eq!(discover(&fdt::parse(&t).unwrap()).unwrap().sources, vec![7]);
+    let a = discover(&fdt::parse(&t).unwrap()).unwrap();
+    assert_eq!(a.sources, vec![7]);
+    assert_eq!(a.dropped, vec![20]);
 }
 
 #[test]
@@ -196,6 +204,7 @@ fn two_levels(
     d.u32s("phandle", &[0x21]);
     d.u32s("interrupts-extended", &[0x105, 11, 0x103, 11, 0x101, 11]);
     d.reg(&[(0x2400_0000, 0x4000)]);
+    d.u32s("riscv,num-ids", &[255]);
     d.prop("compatible", b"riscv,imsics\0");
     d.end();
     d.begin("aplic@c000000");
@@ -214,6 +223,7 @@ fn two_levels(
         &[0x101, s_irq_cell, 0x103, s_irq_cell, 0x105, s_irq_cell],
     );
     d.reg(&[(0x2800_0000, 0x4000)]);
+    d.u32s("riscv,num-ids", &[255]);
     imsic_extra(&mut d);
     d.prop("compatible", b"riscv,imsics\0");
     d.end();
@@ -257,12 +267,11 @@ fn the_supervisor_controller_and_its_own_imsic_are_chosen_over_the_machine_level
 
 #[test]
 fn the_source_limits_are_exact() {
-    // each of: 62 (the last: its message id, 63, is the last an eie register holds), 63 (past it), the controller's own count as a source, one past it
+    // each of: the controller's own count as a source, one past it; nothing about 62 or 63 any more (the identities are allocated)
     let t = two_levels(&|_| {}, 62, 9, &[(62, false), (63, false), (61, false)]);
-    assert_eq!(
-        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
-        vec![61, 62]
-    );
+    let a = discover(&fdt::parse(&t).unwrap()).unwrap();
+    assert_eq!(a.sources, vec![61, 62]);
+    assert_eq!(a.dropped, vec![63]);
     let t = two_levels(&|_| {}, 62, 9, &[(62, false)]);
     assert_eq!(
         discover(&fdt::parse(&t).unwrap()).unwrap().sources,
@@ -275,11 +284,16 @@ fn the_source_limits_are_exact() {
         vec![61],
         "one past the count is not"
     );
-    // on a big controller the 62 bound alone decides: 63 would be message id 64, which the one `eie` register the kernel opens lacks
-    let t = two_levels(&|_| {}, 96, 9, &[(63, false), (62, false), (64, false)]);
+    // on a big controller every source it has is usable: 63, 64 and the last
+    let t = two_levels(
+        &|_| {},
+        1023,
+        9,
+        &[(63, false), (62, false), (64, false), (1023, false)],
+    );
     assert_eq!(
         discover(&fdt::parse(&t).unwrap()).unwrap().sources,
-        vec![62]
+        vec![62, 63, 64, 1023]
     );
     // an APLIC has at most 1023 sources
     assert_eq!(
@@ -354,6 +368,7 @@ fn a_device_behind_an_interrupt_nexus_does_not_inherit_the_roots_parent() {
     d.u32s("phandle", &[0x20]);
     d.u32s("interrupts-extended", &[0x101, 9]);
     d.reg(&[(0x2800_0000, 0x4000)]);
+    d.u32s("riscv,num-ids", &[255]);
     d.prop("compatible", b"riscv,imsics\0");
     d.end();
     d.begin("aplic@d000000");
@@ -397,4 +412,36 @@ fn the_imsic_window_must_hold_a_page_per_listed_hart() {
     assert!(discover(&fdt::parse(&ok).unwrap()).is_some());
     let small = machine(&ids, &ids, &[], 96);
     assert_eq!(discover(&fdt::parse(&small).unwrap()), None);
+}
+
+#[test]
+fn the_identities_of_a_file_come_from_num_ids_which_is_required_and_bounded() {
+    // the IMSIC binding requires `riscv,num-ids` (63 to 2047): without it, or out of range, the controller is not used. The supervisor
+    // IMSIC of the two-level tree is the one changed (the machine-level one keeps its 255).
+    let with = |n: Option<u32>| {
+        let mut nodes = fdt::parse(&two_levels(&|_| {}, 96, 9, &[(5, false)])).unwrap();
+        let imsic = nodes
+            .iter_mut()
+            .find(|x| x.path.ends_with("imsic@28000000"))
+            .unwrap();
+        imsic.props.retain(|(name, _)| name != "riscv,num-ids");
+        if let Some(n) = n {
+            imsic
+                .props
+                .push(("riscv,num-ids".into(), n.to_be_bytes().to_vec()));
+        }
+        discover(&nodes).map(|a| a.num_ids)
+    };
+    for (n, ok) in [
+        (63, true),
+        (64, true),
+        (255, true),
+        (2047, true),
+        (62, false),
+        (2048, false),
+        (0, false),
+    ] {
+        assert_eq!(with(Some(n)), ok.then_some(n), "num-ids {n}");
+    }
+    assert_eq!(with(None), None, "no riscv,num-ids: not used");
 }

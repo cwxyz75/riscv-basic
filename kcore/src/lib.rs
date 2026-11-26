@@ -48,6 +48,7 @@ pub mod latch;
 pub mod limits;
 pub mod linestate;
 pub mod memmap;
+pub mod msiid;
 pub mod object;
 pub mod pagemap;
 pub mod pager;
