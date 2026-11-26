@@ -7,8 +7,8 @@ horizon: long
 complexity: H
 change_risk: H
 epic: iommu-kernel
-blocked_by: [IOMMU3, IOMMU5, Q-IOMMU-WORKBOUND]
-refs: [T42, OD148, OD162, OD164, OD166, IOMMU-SPEC, SYSCALLS, INVARIANTS, T262, T177, T273, T274, T275, FZ1]
+blocked_by: [IOMMU3, IOMMU5]
+refs: [T42, OD148, OD162, OD164, OD166, OD168, OD169, IOMMU-SPEC, SYSCALLS, INVARIANTS, T262, T177, T273, T274, T275, FZ1]
 ---
 
 Child 6 of the IOMMU epic (`work/T42.md`): the kernel half of the mechanism. It wires `kcore::iodomain` (IOMMU3) to the IOMMU
@@ -20,6 +20,13 @@ kernel epic (IOMMU7, MSI translation and vector grants, follows and its smoke me
 the domain object's rights include the **grant** right bit from the start; the device context is written in the extended format
 with an empty MSI page table and the mask and pattern; the quarantine context has `msiptp` off; `destroy` runs the phases in the
 order IOMMU-SPEC 6.3 and 10 give, with the vector step empty until IOMMU7.
+
+**Added 2026-11-26** (Q-IOMMU-WORKBOUND and Q-IOMMU-NONLEAF answered: OD168, OD169, IOMMU-SPEC amendment 2026-11-26).
+This slice builds the stepped work of OD168: map, unmap and the destruction's completion take `IOMMU` once per `RANGE_STEP`
+pages of work, a map in progress gives way to a destruction, and `vmo_create_dma_in` zeroes in steps outside `VMO`; the
+acceptance table gains host checks for each, including a mapping and a domain far larger than one step. It also adds the
+page-walk cache of OD169 (assumption A18) to `iommucore::sim`, with a mutation check that a page-wise `inval_for` where a
+table frame was freed fails a test.
 
 **The rights split** (Q-IOMMU-MODEL 3, OD164; IOMMU-SPEC 4.1). `iodomain_create` returns the control handle, which the
 **supervisor** keeps: IO_MAP, IO_UNMAP, IO_GRANT, IO_DESTROY, DUPLICATE, TRANSFER, WAIT and INSPECT. The **driver** is given a

@@ -1042,3 +1042,64 @@ or not established). The body above is not rewritten; this amendment says what i
    Quarantined device's faults are suppressed by a valid context with reporting off) is untested. A11: the debug translation
    interface exists, but its use is not established; the self-test stays a counted skip until it works. A1, A2 (as to the
    ratified text), A4, A6, A7, A12 and A16 remain as written: nothing in QEMU settles them against hardware.
+
+## Amendment 2026-11-26: bounded work under `IOMMU`, and the invalidation of freed table frames (Q-IOMMU-WORKBOUND, Q-IOMMU-NONLEAF)
+
+Amendment authorized by the owner, 2026-11-26, who answered the two questions the Fable review of IOMMU3 (PR #580) raised:
+Q-IOMMU-WORKBOUND option 2 (OD168) and Q-IOMMU-NONLEAF option 1 (OD169). The body above is not rewritten; this amendment says
+what it changes. `RANGE_STEP` is the kernel's step for bulk work on a range (`kcore::aspace::RANGE_STEP`, 64 pages), the step the
+VMO store already uses.
+
+### 1. Work under `IOMMU` is done in steps (OD168)
+
+11.1 takes `IOMMU` with interrupts off. A range is bounded only by the job's limit on I/O-mapped pages and the window, so one call
+could otherwise write or clear about 262,000 leaves with interrupts off. From this amendment **every hold of `IOMMU` is bounded by
+`RANGE_STEP` pages of work, not by the size of a mapping or of a domain**:
+
+1. **Map (4.3, 11.2).** `iodomain_map` reserves the I/O range under `IOMMU` and then writes its leaves `RANGE_STEP` pages at a
+   time, releasing and retaking `IOMMU` between steps. The range stays **reserved** throughout (4.6: it is never handed out), and
+   the mapping's record is linked into the domain's index (**published**) only after the last step, so no other call can name the
+   mapping while it is partly written. The invalidation and fence of 4.3 follow the last step. If a table-frame allocation fails
+   partway, the roll-back clears the leaves already written in steps of the same size and is then an unmap under 6.1 (as
+   amended in part 2 below).
+2. **Unmap (4.4, 6.1).** `iodomain_unmap` clears the leaves in steps of `RANGE_STEP` pages, releasing `IOMMU` between steps. The
+   range is marked **pending** at the first step and stays pending across the steps. One invalidation and one fence cover the
+   whole range, queued in the last step (6.1 step 1 is the sequence of steps, the queueing in the last of them). The table frames
+   and the range are freed only after that fence, as 6.1 steps 2 to 4 say.
+3. **Destroy against a map in progress (4.5, 6.3).** A stepped map checks, each time it retakes `IOMMU`, whether its domain has
+   been marked destroyed. If it has, it rolls back its own leaves (in steps, as in 1) and fails with **BAD_STATE**, the error
+   4.3 already gives for a map on a destroyed domain; its record was never published, so the destruction does not see it, and
+   its range and hold are released after the roll-back's fence as for any failed map. **A destruction never waits for a map in
+   progress.**
+4. **The destruction's completion (6.3 step 4, 11.2).** Detaching the domain's table frames and flattening its mapping records
+   under `IOMMU` is done in steps of `RANGE_STEP` pages of work too, releasing the lock between steps. Nothing a step leaves
+   behind is reachable by the device: the context is already Quarantined and the fence of step 2 has completed.
+5. **`vmo_create_dma_in` (4.7).** The new VMO's pages are zeroed in steps of `RANGE_STEP` pages **outside the `VMO` lock**, while
+   the VMO is not yet visible (no handle names it), as the other bulk paths of the VMO store do.
+
+Why. A real kernel does not hold an interrupts-off lock across a quarter of a million leaf writes. The reserved and pending states
+of 4.6 and 6.1 already make the intermediate states invisible: a partly written map is reachable by nobody but its own call, and a
+partly cleared unmap's range is handed out to nobody until its fence. A per-call limit on pages (option 1) would still need steps
+below its limit and would push the splitting of a large buffer onto every driver. Taking `IOMMU` with interrupts enabled outside
+the fault drain (option 3) would change the lock rules of 11.1, and the lock ordering is not negotiable.
+
+The rows of 11.2 read accordingly: where a path takes `IOMMU` for a map's leaves, an unmap's leaves or the destruction's detach,
+it takes it once per step, with the same locks inside (`FRAME`, `HEAP`) and nothing held between steps. The order of 11.1 is
+unchanged.
+
+### 2. A table frame freed by an unmap is invalidated for the whole soft context (OD169)
+
+6.1 step 1 asks for "the invalidation that covers every page of the range", and step 4 frees the table frames the unmap emptied.
+`IOTINVAL.GVMA` with an address (AV=1) is specified for the leaf translation of that address; an IOMMU that caches non-leaf
+entries (a page-walk cache) could keep a pointer into a table frame that a page-wise invalidation did not drop, and the frame,
+freed and reused, would then be walked by the device: IO3 for table frames. A rule is added to **6.1**:
+
+* **An unmap, or a map's roll-back, that empties and frees a table frame is invalidated with `IOTINVAL.GVMA` for the whole soft
+  context** (the domain's soft-context id, no address), not page by page. A short unmap that frees no table frame may still be
+  invalidated page by page.
+
+And a row is added to **15.2**:
+
+| # | Assumed | The design needs it for | Settled by |
+|---|---|---|---|
+| A18 | `IOTINVAL.GVMA` with an address (AV=1) drops the leaf entries for that address only; the whole-context form (AV=0) drops the non-leaf (page-walk cache) entries of the soft context too | 6.1 (as amended: the whole-context form whenever a table frame is freed); IO3 for table frames | the IOMMU specification's text ("Command queue", the `IOTINVAL` commands); and a page-walk cache added to `iommucore::sim`, so that a mutation of `kcore::iodomain::inval_for` (a page-wise invalidation where a table frame was freed) fails a test. QEMU caches no non-leaf entries, so nothing in the machine settles it (as L4) |
