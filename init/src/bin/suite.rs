@@ -14924,6 +14924,8 @@ fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
         .a1 as u64;
         let root = root_job()?;
         let small = job(root, u64::MAX, u64::MAX, 2)?;
+        // (the domain's job: its tables are charged as pages, so not the small one; it maps nothing)
+        let iojob = job(root, u64::MAX, u64::MAX, u64::MAX)?;
         let r = (|| {
             // vmo_create_dma_in
             ensure_eq!(
@@ -14973,11 +14975,11 @@ fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
                 "create: a device id past the tree's"
             );
             ensure_eq!(
-                st(sys::job_set_io_limits(small, 0, 0)),
+                st(sys::job_set_io_limits(iojob, 0, 0)),
                 Some(S::Ok),
-                "the small job maps nothing"
+                "the domain's job maps nothing"
             );
-            let d = ok(sys::iodomain_create(res, IOMMU_TEST_DID, small), "create")?.a1 as u64;
+            let d = ok(sys::iodomain_create(res, IOMMU_TEST_DID, iojob), "create")?.a1 as u64;
             let r = (|| {
                 ensure_eq!(
                     st(sys::iodomain_create(res, IOMMU_TEST_DID, 0)),
@@ -15118,7 +15120,7 @@ fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
             );
             Ok(())
         })();
-        for h in [ev, plain, weak_res, no_limits, small, root] {
+        for h in [ev, plain, weak_res, no_limits, small, iojob, root] {
             sys::handle_close(h);
         }
         r.and(r2)
