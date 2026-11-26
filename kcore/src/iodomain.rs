@@ -65,6 +65,12 @@ pub const ROOT_FRAMES: u64 = 4;
 /// Ranges of at most this many pages are invalidated page by page; a longer one by its domain's whole soft context (one command, so a
 /// removal always fits the queue).
 const INVAL_PAGES: usize = 4;
+/// Every hold of `IOMMU` does at most this many pages of work (IOMMU-SPEC amendment 2026-11-26 part 1, OD168): a map writes, an unmap
+/// clears and a destroyed domain's completion frees this many leaves or tables at a time, the lock released between steps.
+pub const RANGE_STEP: u64 = crate::aspace::RANGE_STEP as u64;
+/// The ticket of an unmap whose invalidation and fence the negative-control kernel skips (`fault-iommu-skip-inval`): done at once.
+#[cfg(feature = "fault-iommu-skip-inval")]
+const SKIPPED: u64 = u64::MAX - 1;
 /// The ticket of commands that could not be queued (the queue had no room and the IOMMU did not drain it): never done.
 const NO_TICKET: u64 = u64::MAX;
 /// The soft-context id of the shared empty table of quarantined devices.
@@ -80,6 +86,17 @@ pub trait IoFrames: TableFrames {
 /// A domain: (generation << 32) | (slot + 1). A destroyed domain's id never names a later one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DomainId(u64);
+
+impl DomainId {
+    /// The id as a word (what the kernel's domain object stores).
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+    /// An id from a word `raw` gave (any other word names no domain: every lookup checks the slot and its generation).
+    pub const fn from_raw(raw: u64) -> DomainId {
+        DomainId(raw)
+    }
+}
 
 /// The command-queue position of a fence: done once the IOMMU's head has passed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +225,9 @@ type Link = Option<FBox<Mapping>>;
 pub struct Mapping {
     page: u64,
     pages: u64,
+    /// Leaves an unmap (or a roll-back) has cleared so far: a record in the pending list with fewer than `pages` cleared is being
+    /// unmapped in steps (OD168, OD170), and has no fence yet.
+    cleared: u64,
     vmo: u64,
     vmo_page: u64,
     access: Access,
@@ -233,6 +253,7 @@ impl Record {
         FBox::try_new(Mapping {
             page: 0,
             pages,
+            cleared: 0,
             vmo,
             vmo_page,
             access,
@@ -443,10 +464,16 @@ struct Domain {
     /// Live mappings, by I/O address.
     live: Link,
     mappings: u64,
-    /// Mappings whose leaves are cleared and whose fence is outstanding.
+    /// Mappings whose leaves are being cleared or are cleared and whose fence is outstanding, how many, and the table frames their
+    /// removals detached (so an abandoned destruction counts its leak without a walk).
     pending: Link,
-    /// Mappings whose fence was abandoned: never freed (IO8).
+    pending_n: u64,
+    pending_tables: u64,
+    /// Mappings whose fence was abandoned: never freed (IO8), and their pages (counted in `io_pages` too: a leaked range stays taken).
     leaked: Link,
+    leaked_pages: u64,
+    /// The caller's name for the domain (the kernel's object), handed back with a fault (`FaultOutcome::tag`).
+    tag: [u64; 2],
     /// Table frames in the page table (the root not counted).
     tables: u64,
     /// Pages of the live and pending mappings (charged to the job as I/O-mapped pages).
@@ -470,6 +497,21 @@ pub const DOMAIN_BYTES: u64 = core::mem::size_of::<Domain>() as u64
     + 2 * IO_WINDOW_PAGES.div_ceil(64) * 8;
 
 impl Domain {
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the counts are of the list's records and their chained frames
+    fn push_pending(&mut self, rec: FBox<Mapping>) {
+        self.pending_n += 1;
+        self.pending_tables += rec.chain.n;
+        push(&mut self.pending, rec);
+    }
+
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as push_pending: the record was counted when it joined
+    fn unlink_pending(&mut self, pred: impl Fn(&Mapping) -> bool) -> Link {
+        let rec = unlink(&mut self.pending, pred)?;
+        self.pending_n -= 1;
+        self.pending_tables -= rec.chain.n;
+        Some(rec)
+    }
+
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: ring_head < FAULT_RING and ring_len <= FAULT_RING, so the index is reduced modulo FAULT_RING
     fn store_fault(&mut self, rec: FaultRecord) {
         if self.ring_len == FAULT_RING {
@@ -539,9 +581,15 @@ pub struct IoDomains {
     slots: Vec<Slot>,
     free: Vec<u32>,
     gscids: Vec<u64>,
-    /// Records leaked by abandoned fences of domains that are gone.
+    /// Records leaked by abandoned fences of domains that are gone: a list of lists, the heads linked through `left`.
     leaked: Link,
     leaked_domains: Option<FBox<Domain>>,
+    /// Destructions abandoned (a map in steps whose domain went meanwhile leaks its record if this moved: `MapFailed::Leaked`).
+    abandons: u64,
+    /// Destructions past `destroy_complete` whose release (records, tables, charges) runs with no lock held and has not ended
+    /// (`destroy_released`): with the domains still detaching, what `unfinished` waits for (IOMMU-SPEC 6.3: done before the call
+    /// that began it returns).
+    releasing: u64,
     stats: IoStats,
     window_start: u64,
     window_lines: u32,
@@ -559,6 +607,8 @@ pub struct FaultOutcome {
     pub domain: Option<DomainId>,
     /// Print the line (within the rate).
     pub print: bool,
+    /// The domain's tag (`IoDomains::set_tag`: the kernel's object), if a ring took the record.
+    pub tag: Option<[u64; 2]>,
 }
 
 /// The oldest unread fault of a domain, the faults dropped since the previous read, and whether more are waiting (DEVICE_FAULT stays).
@@ -583,8 +633,93 @@ pub enum MapFailed {
     /// Nothing was written: the record comes back, the caller drops the hold and refunds the charge.
     Refused(IoError, Record),
     /// Leaves were written and are cleared again: the roll-back is an unmap (4.3), to be waited for and completed like one; `tables`
-    /// settles the prepayment.
-    RolledBack { pending: Pending, tables: u64 },
+    /// settles the prepayment; `error` is the map's (NO_MEMORY for a table frame, BAD_STATE for a destruction that began meanwhile).
+    RolledBack {
+        pending: Pending,
+        tables: u64,
+        error: IoError,
+    },
+    /// The domain's destruction completed while the map was in steps (OD168 point c): its fence covered every leaf the map wrote and
+    /// its tables went with the domain. The record comes back at once, to be settled (its hold dropped) like a completed unmap's; the
+    /// map is BAD_STATE.
+    Dropped { released: Released, tables: u64 },
+    /// As `Dropped`, but a destruction's fence was abandoned since the map began: the record was leaked with its hold (IO8). The map
+    /// is BAD_STATE; the caller settles `tables` and keeps the record's charges.
+    Leaked { tables: u64 },
+}
+
+/// A map in steps (OD168): its range is reserved and its record is the map's alone until the last step publishes it.
+#[derive(Debug)]
+#[must_use = "a map in progress owns its record and hold: step it to the end"]
+pub struct MapCursor {
+    domain: DomainId,
+    job: JobId,
+    rec: FBox<Mapping>,
+    /// Leaves written so far (the record's `cleared` counts the leaves a roll-back has cleared again).
+    written: u64,
+    /// Table frames the map allocated.
+    allocs: u64,
+    /// The map is failing with this error, and its steps clear what it wrote.
+    back: Option<IoError>,
+    /// The store's count of abandoned destructions when the map began.
+    abandons: u64,
+}
+
+impl MapCursor {
+    /// The VMO pages whose frames the next step writes: (first VMO page, count, at most `RANGE_STEP`); `None` when the next step
+    /// writes nothing (the last step published the record, or the map is rolling back).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: written <= pages; vmo_page + pages was checked by the VMO's hold
+    pub fn next_frames(&self) -> Option<(u64, u64)> {
+        if self.back.is_some() || self.written >= self.rec.pages {
+            return None;
+        }
+        Some((
+            self.rec.vmo_page + self.written,
+            (self.rec.pages - self.written).min(RANGE_STEP),
+        ))
+    }
+    pub fn domain(&self) -> DomainId {
+        self.domain
+    }
+    pub fn vmo(&self) -> u64 {
+        self.rec.vmo
+    }
+    pub fn pages(&self) -> u64 {
+        self.rec.pages
+    }
+    /// The I/O address the map will have.
+    pub fn io_address(&self) -> u64 {
+        self.rec.page << PAGE_SHIFT
+    }
+}
+
+/// One step of a map.
+#[derive(Debug)]
+pub enum MapStep {
+    /// Take `IOMMU` again (after reading the next frames: `MapCursor::next_frames`).
+    More(MapCursor),
+    /// The map is published; wait for its fence.
+    Done(Mapped),
+    Failed(MapFailed),
+}
+
+/// An unmap in steps (OD168): its record is in the domain's pending list, its range pending, and its leaves are being cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an unmap in progress is stepped to the end"]
+pub struct Unmapping {
+    domain: DomainId,
+    page: u64,
+}
+
+/// One step of an unmap.
+#[derive(Debug)]
+pub enum UnmapStep {
+    /// Take `IOMMU` again.
+    More(Unmapping),
+    /// Every leaf is clear and the invalidation and fence are queued: wait, then `complete`.
+    Queued(Pending),
+    /// The domain's destruction took the record (OD170): the unmap is OK, and the destruction releases the record after its own fence.
+    Taken,
 }
 
 /// An unmap (or a map's roll-back) waiting for its fence.
@@ -638,6 +773,10 @@ impl Released {
     pub fn pages(&self) -> u64 {
         self.rec.pages
     }
+    /// The first VMO page the record maps.
+    pub fn vmo_page(&self) -> u64 {
+        self.rec.vmo_page
+    }
     /// Free the table frames the removal detached, credit the job (the I/O-mapped pages, the record's kernel bytes and the tables'), and
     /// free the record. Allocates nothing.
     pub fn settle<M: PhysMem64, F: TableFrames>(
@@ -656,46 +795,79 @@ impl Released {
     }
 }
 
-/// A destroyed domain, out of the store after its fence: its mappings ([`Detached::next_record`], each settled as a [`Released`]), then
-/// its tables, root, MSI page table and charge ([`Detached::finish`]).
+/// A destroyed domain, out of the store after its fence (nothing can walk its tables any more, so it is worked on with no lock): its
+/// mappings ([`Detached::next_record`], each settled as a [`Released`]), its tables a step at a time ([`Detached::step`]), then its
+/// root, MSI page table and charge ([`Detached::finish`]). Every call does a bounded amount of work (OD168).
 #[must_use = "a detached domain owns its mappings' holds, its frames and its charge: take every record, then finish it"]
 pub struct Detached {
     dom: FBox<Domain>,
-    records: Link,
-    chain: Chain,
-    root: u64,
+    cursor: u64,
+    freed: u64,
+    tables_done: bool,
 }
 
 impl Detached {
-    /// The next of the domain's mappings (live or pending at the destruction), whose hold the caller drops and which it settles.
+    /// The next of the domain's mappings (live, pending or being unmapped at the destruction), whose hold the caller drops and which it
+    /// settles. Amortized constant work: the index is taken apart by rotations, never by recursion.
     pub fn next_record(&mut self) -> Option<Released> {
-        let rec = pop(&mut self.records)?;
-        Some(Released {
-            rec,
-            job: self.dom.job,
-        })
+        let job = self.dom.job;
+        if let Some(rec) = pop(&mut self.dom.pending) {
+            return Some(Released { rec, job });
+        }
+        let mut root = self.dom.live.take()?;
+        // rotate right until the root has no left child, then the root is the smallest record: pop it
+        while let Some(mut l) = root.left.take() {
+            root.left = l.right.take();
+            l.right = Some(root);
+            root = l;
+        }
+        self.dom.live = root.right.take();
+        Some(Released { rec: root, job })
     }
 
     pub fn job(&self) -> JobId {
         self.dom.job
     }
 
-    /// Free the page-table frames, the root and the MSI page table, credit the job the domain's kernel bytes and its tables', and drop
-    /// the domain's use of its job, unless a fence of the domain was abandoned (the leaked charges stay, and so does the use that keeps
-    /// the job record: J2). Call after every record was taken. Allocates nothing.
+    /// Free at most `RANGE_STEP` of the domain's table frames; true when they are all freed. Allocates nothing.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: freed counts frames of one table
+    pub fn step<M: PhysMem64, F: TableFrames>(&mut self, mem: &M, frames: &mut F) -> bool {
+        if self.tables_done {
+            return true;
+        }
+        let Some(iopt) = self.dom.iopt.as_ref() else {
+            self.tables_done = true;
+            return true;
+        };
+        let (k, done) = iopt.destroy_step(mem, frames, &mut self.cursor, RANGE_STEP);
+        self.freed += k;
+        self.tables_done = done;
+        done
+    }
+
+    /// Free what is left of the page table (call `step` first to keep each call bounded), the root and the MSI page table, credit the
+    /// job the domain's kernel bytes and its tables', and drop the domain's use of its job, unless a fence of the domain was abandoned
+    /// (the leaked charges stay, and so does the use that keeps the job record: J2). Call after every record was taken. Allocates
+    /// nothing.
     pub fn finish<M: PhysMem64, F: IoFrames>(mut self, mem: &M, frames: &mut F, jobs: &mut Jobs) {
         debug_assert!(
-            self.records.is_none(),
+            self.dom.pending.is_none() && self.dom.live.is_none(),
             "Detached::finish before every record was taken (their holds would be lost)"
         );
-        let tables = self.chain.free_all(mem, frames);
-        frames.free_root(self.root);
+        while !self.step(mem, frames) {}
+        debug_assert_eq!(
+            self.freed, self.dom.tables,
+            "every table frame of the domain was freed"
+        );
+        if let Some(iopt) = self.dom.iopt.take() {
+            frames.free_root(iopt.root());
+        }
         frames.free(self.dom.msi.root());
         let job = self.dom.job;
         jobs.credit(
             job,
             Resource::KernelBytes,
-            DOMAIN_BYTES.saturating_add(tables.saturating_mul(PAGE_SIZE)),
+            DOMAIN_BYTES.saturating_add(self.freed.saturating_mul(PAGE_SIZE)),
         );
         if !self.dom.leaks {
             jobs.release(job);
@@ -750,6 +922,8 @@ impl IoDomains {
             gscids,
             leaked: None,
             leaked_domains: None,
+            abandons: 0,
+            releasing: 0,
             stats: IoStats::default(),
             window_start: 0,
             window_lines: 0,
@@ -860,6 +1034,10 @@ impl IoDomains {
     }
 
     fn done(&self, t: Ticket) -> bool {
+        #[cfg(feature = "fault-iommu-skip-inval")]
+        if t.0 == SKIPPED {
+            return true;
+        }
         t.0 != NO_TICKET && self.cmdq.is_done(t.0)
     }
 
@@ -887,10 +1065,30 @@ impl IoDomains {
         Ticket(self.cmdq.ticket())
     }
 
+    /// Queue the kernel's own commands (the boot invalidation, the self-test's) and a fence through the store's queue, the only
+    /// writer of the command queue: the fence's ticket, for `poll` (`Fence::Unqueued` when the queue had no room).
+    pub fn queue<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        cmds: &[Command],
+    ) -> Ticket {
+        self.submit(mem, regs, cmds)
+    }
+
+    /// The device directory, for the kernel's self-test (a context for a device id beyond every id a device has: no domain names it).
+    pub fn directory(&mut self) -> &mut Ddt {
+        &mut self.ddt
+    }
+
     /// Poll a fence (no lock is held between polls; the kernel stops at `IOMMU_FENCE_BOUND`).
     pub fn poll<R: Regs>(&mut self, regs: &mut R, t: Ticket) -> Fence {
         if t.0 == NO_TICKET {
             return Fence::Unqueued;
+        }
+        #[cfg(feature = "fault-iommu-skip-inval")]
+        if t.0 == SKIPPED {
+            return Fence::Done;
         }
         if !self.refresh(regs) {
             return Fence::Failed;
@@ -1013,7 +1211,11 @@ impl IoDomains {
             live: None,
             mappings: 0,
             pending: None,
+            pending_n: 0,
+            pending_tables: 0,
             leaked: None,
+            leaked_pages: 0,
+            tag: [0; 2],
             tables: 0,
             io_pages: 0,
             leaks: false,
@@ -1114,9 +1316,10 @@ impl IoDomains {
     // ---- map ------------------------------------------------------------------------------------------------------------
 
     /// Map the record's VMO pages, whose frames are `pfns` (from `retain_for_io`, whose hold the record now owns), at the lowest free
-    /// range of the domain's window, with the record's access. Table frames come from `frames` (prepaid by `charge_map`). Queues the
-    /// invalidation of the range and a fence: the caller waits, and on a failed fence unmaps again (4.3).
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page + i stays inside the window the allocator handed out; i < pfns.len()
+    /// range of the domain's window, with the record's access: every step of [`IoDomains::map_begin`] and [`IoDomains::map_step`] in
+    /// one call (the host tests' single critical section; the kernel takes `IOMMU` once per step). Table frames come from `frames`
+    /// (prepaid by `charge_map`). Queues the invalidation of the range and a fence: the caller waits, and on a failed fence unmaps
+    /// again (4.3).
     pub fn map<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,
@@ -1126,88 +1329,202 @@ impl IoDomains {
         rec: Record,
         pfns: &[Pfn],
     ) -> Result<Mapped, MapFailed> {
+        if rec.0.pages == 0 || pfns.len() as u64 != rec.0.pages {
+            return Err(MapFailed::Refused(IoError::InvalidArgs, rec));
+        }
+        let mut cur = self.map_begin(d, rec)?;
+        loop {
+            let chunk = match cur.next_frames() {
+                Some((first, n)) => {
+                    let at = usize::try_from(first.saturating_sub(cur.rec.vmo_page))
+                        .unwrap_or(usize::MAX);
+                    pfns.get(at..at.saturating_add(usize::try_from(n).unwrap_or(usize::MAX)))
+                        .unwrap_or(&[])
+                }
+                None => &[],
+            };
+            match self.map_step(mem, regs, frames, cur, chunk) {
+                MapStep::More(c) => cur = c,
+                MapStep::Done(m) => return Ok(m),
+                MapStep::Failed(f) => return Err(f),
+            }
+        }
+    }
+
+    /// The first hold of a map (OD168 point a): reserve the lowest free range of the record's length in the domain's window. The range
+    /// stays reserved (never handed out) through the steps; the record is not published until the last one. Allocates nothing.
+    pub fn map_begin(&mut self, d: DomainId, rec: Record) -> Result<MapCursor, MapFailed> {
         let mut rec = rec.0;
         let n = rec.pages;
-        if n == 0 || pfns.len() as u64 != n {
+        if n == 0 {
             return Err(MapFailed::Refused(IoError::InvalidArgs, Record(rec)));
         }
-        let Some(dom) = self.dom_mut(d).filter(|x| x.state == State::Attached) else {
+        let prio = next_prio(&mut self.prio_state);
+        let Some(dom) = self
+            .dom_mut(d)
+            .filter(|x| x.state == State::Attached && x.iopt.is_some())
+        else {
             return Err(MapFailed::Refused(IoError::BadState, Record(rec)));
         };
-        if dom.iopt.is_none() {
-            return Err(MapFailed::Refused(IoError::BadState, Record(rec))); // (not reached: an attached domain has its table)
-        }
+        let job = dom.job;
         let Some(page) = dom.iova.alloc(n) else {
             return Err(MapFailed::Refused(IoError::NoMemory, Record(rec)));
         };
         rec.page = page;
-        rec.prio = next_prio(&mut self.prio_state);
-        let Some(dom) = self.dom_mut(d) else {
-            return Err(MapFailed::Refused(IoError::BadState, Record(rec))); // (not reached: looked up just above)
-        };
-        let Some(iopt) = dom.iopt.as_mut() else {
-            return Err(MapFailed::Refused(IoError::BadState, Record(rec))); // (not reached: checked above)
-        };
-        let access = rec.access;
-        let before = rec.chain.n;
-        let mut df = Deferring {
-            mem,
-            frames,
-            chain: &mut rec.chain,
+        rec.cleared = 0;
+        rec.prio = prio;
+        Ok(MapCursor {
+            domain: d,
+            job,
+            rec,
+            written: 0,
             allocs: 0,
+            back: None,
+            abandons: self.abandons,
+        })
+    }
+
+    /// One more step of a map, one hold of `IOMMU` (OD168 points a and c): write the leaves of the next `RANGE_STEP` pages, whose
+    /// frames are `pfns` (`MapCursor::next_frames` says which: the caller reads them under `VMO` between steps), or, once the map is
+    /// failing, clear `RANGE_STEP` of the leaves it wrote. The last write publishes the record and queues the invalidation and the
+    /// fence (`Done`). A domain marked destroyed since the last step makes the map roll back its own leaves and fail with BAD_STATE;
+    /// a table frame that cannot be allocated, with NO_MEMORY. A finished roll-back is an unmap (`MapFailed::RolledBack`: its
+    /// fence is waited for and completed like one); a domain whose destruction has completed meanwhile took the leaves with its
+    /// tables after its own fence, and the record comes back at once (`MapFailed::Dropped`). A destruction never waits for a map.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page + i stays inside the reserved range; written, undone <= pages; tables counts frames in the table
+    pub fn map_step<M: PhysMem64, R: Regs, F: TableFrames>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        frames: &mut F,
+        mut cur: MapCursor,
+        pfns: &[Pfn],
+    ) -> MapStep {
+        let Some(dom) = self.dom_mut(cur.domain) else {
+            let tables = cur.allocs;
+            if self.abandons != cur.abandons {
+                // a destruction was abandoned since the map began, perhaps this domain's: its tables may still be walked, so the
+                // record keeps its hold for good (counted as leaked, IO8). Only an IOMMU that has stopped completing fences gets here.
+                let rec = cur.rec;
+                let s = &mut self.stats;
+                s.holds_leaked = s.holds_leaked.saturating_add(1);
+                s.pages_leaked = s.pages_leaked.saturating_add(rec.pages);
+                s.tables_leaked = s.tables_leaked.saturating_add(rec.chain.n);
+                self.leak_list(rec);
+                return MapStep::Failed(MapFailed::Leaked { tables });
+            }
+            // the destruction completed: its fence covered every leaf this map wrote, and its tables went with it
+            return MapStep::Failed(MapFailed::Dropped {
+                released: Released {
+                    rec: cur.rec,
+                    job: cur.job,
+                },
+                tables,
+            });
         };
-        let mut written = 0u64;
-        let mut failed = false;
-        for (i, pfn) in pfns.iter().enumerate() {
-            let at = (page + i as u64) << PAGE_SHIFT;
-            if iopt
-                .map(mem, &mut df, at, pfn << PAGE_SHIFT, access)
-                .is_err()
-            {
-                failed = true;
-                break;
-            }
-            written += 1;
+        if dom.state != State::Attached && cur.back.is_none() {
+            cur.back = Some(IoError::BadState);
+            cur.rec.cleared = 0;
         }
-        if failed {
-            for i in 0..written {
-                iopt.unmap(mem, &mut df, (page + i) << PAGE_SHIFT);
+        let Some(iopt) = dom.iopt.as_mut() else {
+            // (not reached: a domain in the store keeps its table until its destruction completes)
+            cur.back.get_or_insert(IoError::BadState);
+            return MapStep::More(cur);
+        };
+        let n = cur.rec.pages;
+        let page = cur.rec.page;
+        let access = cur.rec.access;
+        if cur.back.is_none() {
+            let want = (n - cur.written).min(RANGE_STEP);
+            if pfns.len() as u64 != want {
+                debug_assert!(false, "a map step is given the frames next_frames names");
+                cur.back = Some(IoError::InvalidArgs);
+                return MapStep::More(cur);
             }
+            let before = cur.rec.chain.n;
+            let mut df = Deferring {
+                mem,
+                frames,
+                chain: &mut cur.rec.chain,
+                allocs: 0,
+            };
+            for pfn in pfns {
+                let at = (page + cur.written) << PAGE_SHIFT;
+                if iopt
+                    .map(mem, &mut df, at, pfn << PAGE_SHIFT, access)
+                    .is_err()
+                {
+                    cur.back = Some(IoError::NoMemory);
+                    break;
+                }
+                cur.written += 1;
+            }
+            let allocs = df.allocs;
+            cur.allocs += allocs;
+            dom.tables = dom.tables + allocs - (cur.rec.chain.n - before);
+            if cur.back.is_none() {
+                if cur.written < n {
+                    return MapStep::More(cur);
+                }
+                // published: from here an unmap or the destruction can name it
+                dom.mappings += 1;
+                dom.io_pages += n;
+                let gscid = dom.gscid;
+                let tables = cur.allocs;
+                insert(&mut dom.live, cur.rec);
+                self.stats.io_pages += n;
+                let (cmds, k) = inval_range(gscid, page, n);
+                let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
+                return MapStep::Done(Mapped {
+                    iova: page << PAGE_SHIFT,
+                    ticket,
+                    tables,
+                });
+            }
+            return MapStep::More(cur); // (the roll-back starts at the next hold)
         }
-        let allocs = df.allocs;
-        let chained = rec.chain.n - before;
-        dom.tables = dom.tables + allocs - chained;
+        // rolling back: clear what was written, a step at a time (`cleared` counts the leaves undone)
+        let mut cleared = cur.rec.cleared;
+        let undo = (cur.written - cleared).min(RANGE_STEP);
+        let before = cur.rec.chain.n;
+        let mut na = NoAlloc {
+            mem,
+            chain: &mut cur.rec.chain,
+        };
+        for _ in 0..undo {
+            iopt.unmap(mem, &mut na, (page + cleared) << PAGE_SHIFT);
+            cleared += 1;
+        }
+        cur.rec.cleared = cleared;
+        dom.tables -= cur.rec.chain.n - before;
+        if cur.rec.cleared < cur.written {
+            return MapStep::More(cur);
+        }
+        // every leaf is cleared: the roll-back is an unmap (4.3, 6.1): the range pending, the record waiting for a fence
+        if dom.iova.release(page, n).is_err() {
+            debug_assert!(false, "a range a map reserved is live");
+        }
         dom.io_pages += n;
         let gscid = dom.gscid;
-        if failed {
-            if dom.iova.release(page, n).is_err() {
-                debug_assert!(false, "a range just allocated is live");
-            }
-            let (cmds, k) = inval_for(gscid, &rec);
-            let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
-            rec.ticket = ticket.0;
-            self.stats.io_pages += n;
-            if let Some(dom) = self.dom_mut(d) {
-                push(&mut dom.pending, rec);
-            }
-            return Err(MapFailed::RolledBack {
-                pending: Pending {
-                    domain: d,
-                    page,
-                    ticket,
-                },
-                tables: allocs,
-            });
-        }
-        dom.mappings += 1;
-        insert(&mut dom.live, rec);
-        self.stats.io_pages += n;
-        let (cmds, k) = inval_range(gscid, page, n);
+        let error = cur.back.unwrap_or(IoError::NoMemory);
+        let tables = cur.allocs;
+        let mut rec = cur.rec;
+        rec.cleared = rec.pages;
+        let (cmds, k) = inval_for(gscid, &rec);
         let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
-        Ok(Mapped {
-            iova: page << PAGE_SHIFT,
-            ticket,
-            tables: allocs,
+        rec.ticket = ticket.0;
+        self.stats.io_pages += n;
+        if let Some(dom) = self.dom_mut(cur.domain) {
+            dom.push_pending(rec);
+        }
+        MapStep::Failed(MapFailed::RolledBack {
+            pending: Pending {
+                domain: cur.domain,
+                page,
+                ticket,
+            },
+            tables,
+            error,
         })
     }
 
@@ -1297,8 +1614,9 @@ impl IoDomains {
         };
         let gscid = dom.gscid;
         let (page, ticket) = (p.page, p.ticket.0);
-        let Some(rec) = find_list_mut(&mut dom.pending, |m| m.page == page && m.ticket == ticket)
-        else {
+        let Some(rec) = find_list_mut(&mut dom.pending, |m| {
+            m.page == page && m.ticket == ticket && m.cleared == m.pages
+        }) else {
             return Fence::Done;
         };
         let (cmds, k) = inval_for(gscid, rec);
@@ -1306,7 +1624,9 @@ impl IoDomains {
             return Fence::Unqueued;
         };
         if let Some(rec) = self.dom_mut(p.domain).and_then(|dom| {
-            find_list_mut(&mut dom.pending, |m| m.page == page && m.ticket == ticket)
+            find_list_mut(&mut dom.pending, |m| {
+                m.page == page && m.ticket == ticket && m.cleared == m.pages
+            })
         }) {
             rec.ticket = n.0;
         }
@@ -1347,9 +1667,9 @@ impl IoDomains {
 
     // ---- unmap ----------------------------------------------------------------------------------------------------------
 
-    /// 6.1 step 1: clear the leaves of exactly one live mapping, make its range pending (never handed out until `complete`), queue the
-    /// invalidation of the range and a fence. Allocates nothing; the table frames the unmap emptied go onto the record's chain.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page + i is inside the mapping's range, inside the window
+    /// 6.1 step 1 in one call: every step of [`IoDomains::unmap_begin`] and [`IoDomains::unmap_step`] (the host tests' single critical
+    /// section; the kernel takes `IOMMU` once per step). Allocates nothing; the table frames the unmap emptied go onto the record's
+    /// chain.
     pub fn unmap<M: PhysMem64, R: Regs>(
         &mut self,
         mem: &M,
@@ -1358,6 +1678,27 @@ impl IoDomains {
         io_address: u64,
         pages: u64,
     ) -> Result<Pending, IoError> {
+        let mut u = self.unmap_begin(d, io_address, pages)?;
+        loop {
+            match self.unmap_step(mem, regs, u) {
+                UnmapStep::More(n) => u = n,
+                UnmapStep::Queued(p) => return Ok(p),
+                // (not reached: nothing can destroy the domain inside one call)
+                UnmapStep::Taken => return Err(IoError::BadState),
+            }
+        }
+    }
+
+    /// The first hold of an unmap (6.1 step 1, OD168): exactly one live mapping leaves the index (no later call can name it), its range
+    /// becomes pending (never handed out until `complete`) and its record joins the pending list, its leaves still to clear. Allocates
+    /// nothing.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: mappings counts the index's records, and one is removed
+    pub fn unmap_begin(
+        &mut self,
+        d: DomainId,
+        io_address: u64,
+        pages: u64,
+    ) -> Result<Unmapping, IoError> {
         let dom = self
             .dom_mut(d)
             .filter(|x| x.state == State::Attached)
@@ -1373,32 +1714,91 @@ impl IoDomains {
             return Err(IoError::InvalidArgs);
         };
         dom.mappings -= 1;
+        if dom.iova.release(page, pages).is_err() {
+            debug_assert!(false, "a live mapping's range is live in the allocator");
+        }
+        rec.cleared = 0;
+        rec.ticket = NO_TICKET;
+        dom.push_pending(rec);
+        Ok(Unmapping { domain: d, page })
+    }
+
+    /// One more hold of an unmap: clear the next `RANGE_STEP` leaves; after the last, queue the invalidation (page-wise, or of the whole
+    /// soft context if a table frame was freed: OD169) and a fence (`Queued`). A domain whose destruction has begun takes the record
+    /// as it is (`Taken`, OD170: the unmap is OK, the destruction's fence covers its leaves and its completion releases the record).
+    /// Allocates nothing.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: cleared <= pages; page + cleared is inside the mapping's range; the table counts are frames moved from the table to the chain
+    pub fn unmap_step<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        u: Unmapping,
+    ) -> UnmapStep {
+        let Some(dom) = self
+            .dom_mut(u.domain)
+            .filter(|x| x.state == State::Attached)
+        else {
+            return UnmapStep::Taken;
+        };
+        let Domain {
+            pending,
+            iopt,
+            tables,
+            pending_tables,
+            gscid,
+            ..
+        } = dom;
+        let Some(rec) = find_list_mut(pending, |m| {
+            m.page == u.page && m.ticket == NO_TICKET && m.cleared < m.pages
+        }) else {
+            return UnmapStep::Taken; // (not reached: only the destruction takes a pending record before its fence)
+        };
+        let mut cleared = rec.cleared;
+        let k = (rec.pages - cleared).min(RANGE_STEP);
         let before = rec.chain.n;
-        if let Some(iopt) = dom.iopt.as_mut() {
+        if let Some(iopt) = iopt.as_mut() {
             let mut na = NoAlloc {
                 mem,
                 chain: &mut rec.chain,
             };
-            for i in 0..pages {
-                iopt.unmap(mem, &mut na, (page + i) << PAGE_SHIFT);
+            for _ in 0..k {
+                iopt.unmap(mem, &mut na, (u.page + cleared) << PAGE_SHIFT);
+                cleared += 1;
             }
         }
-        dom.tables -= rec.chain.n - before;
-        if dom.iova.release(page, pages).is_err() {
-            debug_assert!(false, "a live mapping's range is live in the allocator");
+        rec.cleared = cleared;
+        let chained = rec.chain.n - before;
+        *tables -= chained;
+        *pending_tables += chained;
+        if cleared < rec.pages {
+            return UnmapStep::More(u);
         }
-        let gscid = dom.gscid;
-        let (cmds, k) = inval_for(gscid, &rec);
-        let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
-        rec.ticket = ticket.0;
-        if let Some(dom) = self.dom_mut(d) {
-            push(&mut dom.pending, rec);
+        let (cmds, n) = inval_for(*gscid, rec);
+        #[cfg(not(feature = "fault-iommu-skip-inval"))]
+        let ticket = self.submit(mem, regs, cmds.get(..n).unwrap_or(&cmds));
+        // (the negative control: the leaves are clear but nothing is invalidated and no fence is waited for)
+        #[cfg(feature = "fault-iommu-skip-inval")]
+        let ticket = {
+            let _ = (regs, cmds, n);
+            Ticket(SKIPPED)
+        };
+        if let Some(rec) = self.dom_mut(u.domain).and_then(|dom| {
+            find_list_mut(&mut dom.pending, |m| {
+                m.page == u.page && m.ticket == NO_TICKET
+            })
+        }) {
+            rec.ticket = ticket.0;
         }
-        Ok(Pending {
-            domain: d,
-            page,
+        UnmapStep::Queued(Pending {
+            domain: u.domain,
+            page: u.page,
             ticket,
         })
+    }
+
+    /// The pending record of `p`, once its leaves are all clear.
+    fn is_pending(p: &Pending) -> impl Fn(&Mapping) -> bool + '_ {
+        move |m: &Mapping| m.page == p.page && m.ticket == p.ticket.0 && m.cleared == m.pages
     }
 
     /// 6.1 step 3, once the fence has completed: the range becomes free and the record leaves the domain, to be settled by the caller
@@ -1409,14 +1809,13 @@ impl IoDomains {
         let Some(dom) = self.dom_mut(p.domain) else {
             return Ok(None);
         };
-        let pending = |m: &Mapping| m.page == p.page && m.ticket == p.ticket.0;
-        if !find_list(&dom.pending, pending) {
+        if !find_list(&dom.pending, Self::is_pending(p)) {
             return Ok(None);
         }
         if !done {
             return Err(IoError::NotDone);
         }
-        let Some(rec) = unlink(&mut dom.pending, pending) else {
+        let Some(rec) = dom.unlink_pending(Self::is_pending(p)) else {
             return Ok(None);
         };
         if dom.iova.complete(rec.page, rec.pages).is_err() {
@@ -1434,13 +1833,12 @@ impl IoDomains {
         let Some(dom) = self.dom_mut(p.domain) else {
             return false;
         };
-        let Some(rec) = unlink(&mut dom.pending, |m| {
-            m.page == p.page && m.ticket == p.ticket.0
-        }) else {
+        let Some(rec) = dom.unlink_pending(Self::is_pending(p)) else {
             return false;
         };
         dom.leaks = true;
         let (pages, tables) = (rec.pages, rec.chain.n);
+        dom.leaked_pages = dom.leaked_pages.saturating_add(pages);
         push(&mut dom.leaked, rec);
         let s = &mut self.stats;
         s.io_pages = s.io_pages.saturating_sub(pages);
@@ -1492,12 +1890,14 @@ impl IoDomains {
     }
 
     /// 6.3 steps 2 to 4, once the fence has completed (IOMMU7 retires the domain's interrupt identities before this): the domain leaves
-    /// the store with every table frame, its mappings (live, and pending ones whose waiters have not completed them: this fence covers
-    /// them) and its soft-context id, which is free again. Mappings whose own fence was abandoned stay leaked. `NotDone` before the fence;
-    /// `Ok(None)` if there is nothing (another caller completed or abandoned it). Allocates nothing.
+    /// the store with every table frame and its mappings (live, pending ones whose waiters have not completed them, and ones being
+    /// unmapped in steps: this fence covers them all), and its soft-context id is free again. Mappings whose own fence was abandoned
+    /// stay leaked. Constant work: the tables and the records are released by the caller from the [`Detached`] with no lock held, a
+    /// step at a time (OD168). `NotDone` before the fence; `Ok(None)` if there is nothing (another caller completed or abandoned it).
+    /// Allocates nothing.
     pub fn destroy_complete<M: PhysMem64>(
         &mut self,
-        mem: &M,
+        _mem: &M,
         x: &Destroying,
     ) -> Result<Option<Detached>, IoError> {
         if !self.done(x.ticket) {
@@ -1517,48 +1917,34 @@ impl IoDomains {
         let Some(mut dom) = self.take(i) else {
             return Ok(None);
         };
-        let mut chain = Chain::default();
-        let mut root = 0;
-        if let Some(iopt) = dom.iopt.take() {
-            root = iopt.destroy(
-                mem,
-                &mut NoAlloc {
-                    mem,
-                    chain: &mut chain,
-                },
-            );
+        if let Some(head) = dom.leaked.take() {
+            self.leak_list(head);
         }
-        debug_assert_eq!(chain.n, dom.tables, "every table frame is on the chain");
-        let mut records = None;
-        flatten(dom.live.take(), &mut records);
-        while let Some(r) = pop(&mut dom.pending) {
-            push(&mut records, r);
-        }
-        while let Some(r) = pop(&mut dom.leaked) {
-            push(&mut self.leaked, r);
-        }
-        let mut live_pages = 0u64;
-        let mut l = &records;
-        while let Some(r) = l {
-            live_pages = live_pages.saturating_add(r.pages);
-            l = &r.next;
-        }
-        self.stats.io_pages = self.stats.io_pages.saturating_sub(live_pages);
-        dom.io_pages = dom.io_pages.saturating_sub(live_pages);
+        let held = dom.io_pages.saturating_sub(dom.leaked_pages);
+        self.stats.io_pages = self.stats.io_pages.saturating_sub(held);
+        dom.io_pages = held;
         dom.mappings = 0;
         let gscid = dom.gscid;
         self.free_gscid(gscid);
+        self.releasing = self.releasing.saturating_add(1);
         Ok(Some(Detached {
             dom,
-            records,
-            chain,
-            root,
+            cursor: 0,
+            freed: 0,
+            tables_done: false,
         }))
+    }
+
+    /// Keep a list of leaked records for good (a list of lists, linked through the heads' `left`: constant work).
+    fn leak_list(&mut self, mut head: FBox<Mapping>) {
+        head.left = self.leaked.take();
+        self.leaked = Some(head);
     }
 
     /// The destruction's fence will not complete (6.4): everything it would have released is leaked and counted: the domain's tables,
     /// root and MSI page table, its mappings with their holds, its soft-context id (never reused) and its charges. The device id is free
-    /// for a new domain (whose own context write and fence follow). False if there was nothing to abandon.
+    /// for a new domain (whose own context write and fence follow). A map in steps on the domain leaks its record too
+    /// (`MapFailed::Leaked`). False if there was nothing to abandon. Constant work.
     pub fn destroy_abandon(&mut self, x: &Destroying) -> bool {
         let Some(i) = self.index_of(x.domain) else {
             return false;
@@ -1574,24 +1960,14 @@ impl IoDomains {
         let Some(mut dom) = self.take(i) else {
             return false;
         };
+        self.abandons = self.abandons.wrapping_add(1);
         dom.leaks = true;
-        // (the live records join the pending list: the whole domain is leaked, and a list is walked without recursion)
-        let mut live = None;
-        flatten(dom.live.take(), &mut live);
-        while let Some(r) = pop(&mut live) {
-            push(&mut dom.pending, r);
-        }
-        dom.mappings = 0;
-        let mut holds = 0u64;
-        let mut pages = 0u64;
-        let mut tables = dom.tables.saturating_add(ROOT_FRAMES + 1);
-        let mut l = &dom.pending;
-        while let Some(r) = l {
-            holds = holds.saturating_add(1);
-            pages = pages.saturating_add(r.pages);
-            tables = tables.saturating_add(r.chain.n);
-            l = &r.next;
-        }
+        let holds = dom.mappings.saturating_add(dom.pending_n);
+        let pages = dom.io_pages.saturating_sub(dom.leaked_pages);
+        let tables = dom
+            .tables
+            .saturating_add(ROOT_FRAMES + 1)
+            .saturating_add(dom.pending_tables);
         let s = &mut self.stats;
         s.io_pages = s.io_pages.saturating_sub(pages);
         s.fence_timeouts = s.fence_timeouts.saturating_add(1);
@@ -1613,6 +1989,7 @@ impl IoDomains {
         s.faults = s.faults.saturating_add(1);
         s.last_fault = Some((rec.device_id, rec.iotval, rec.cause));
         let mut domain = None;
+        let mut tag = None;
         if let Some(i) = self.by_device(rec.device_id) {
             if let Some(slot) = self.slots.get_mut(i) {
                 let gen = slot.gen;
@@ -1622,6 +1999,7 @@ impl IoDomains {
                     .filter(|x| x.state == State::Attached)
                 {
                     dom.store_fault(rec);
+                    tag = Some(dom.tag);
                     domain = u64::try_from(i)
                         .ok()
                         .map(|i| DomainId((u64::from(gen) << 32) | i.saturating_add(1)));
@@ -1638,7 +2016,42 @@ impl IoDomains {
         } else {
             self.stats.faults_unprinted = self.stats.faults_unprinted.saturating_add(1);
         }
-        FaultOutcome { domain, print }
+        FaultOutcome { domain, print, tag }
+    }
+
+    /// A domain whose destruction has begun and not completed (the kernel drains these with no lock held: a destruction begun under
+    /// another lock, a handle close or a teardown, completes before the call returns to user mode: 6.3). Linear in the slots.
+    pub fn next_detaching(&self) -> Option<Destroying> {
+        self.slots.iter().enumerate().find_map(|(i, s)| {
+            let dom = s.dom.as_deref().filter(|d| d.state == State::Detaching)?;
+            let i = u64::try_from(i).ok()?.checked_add(1)?;
+            Some(Destroying {
+                domain: DomainId((u64::from(s.gen) << 32) | i),
+                ticket: Ticket(dom.destroy_ticket),
+            })
+        })
+    }
+
+    /// The release of a `Detached` from `destroy_complete` has ended (its `finish` ran).
+    pub fn destroy_released(&mut self) {
+        self.releasing = self.releasing.saturating_sub(1);
+    }
+
+    /// Is a destruction begun and not ended: a domain still detaching (its fence not yet waited for, or waited for by another
+    /// thread), or a release under way with no lock held? A caller that began one waits until this is false before it returns
+    /// (IOMMU-SPEC 6.3, 4.5). Work in the number of slots.
+    pub fn unfinished(&self) -> bool {
+        self.releasing > 0 || self.next_detaching().is_some()
+    }
+
+    /// Name the domain for its faults (`FaultOutcome::tag`): the kernel stores its object's id. False if the domain is gone.
+    pub fn set_tag(&mut self, d: DomainId, tag: [u64; 2]) -> bool {
+        self.dom_mut(d).map(|dom| dom.tag = tag).is_some()
+    }
+
+    /// Are there unread faults in the domain's ring (its DEVICE_FAULT signal)?
+    pub fn has_faults(&self, d: DomainId) -> bool {
+        self.dom(d).is_some_and(|dom| dom.ring_len > 0)
     }
 
     /// `iodomain_fault_read` (7.4): the oldest unread record of the domain's ring, with the faults dropped since the previous successful
@@ -1651,7 +2064,11 @@ impl IoDomains {
 impl Drop for IoDomains {
     fn drop(&mut self) {
         // (only the host tests drop a store; long lists are dropped one record at a time, never by recursion)
-        drop_list(&mut self.leaked);
+        while let Some(mut head) = self.leaked.take() {
+            self.leaked = head.left.take();
+            let mut l = Some(head);
+            drop_list(&mut l);
+        }
         while let Some(mut d) = self.leaked_domains.take() {
             self.leaked_domains = d.next.take();
             drop_list(&mut d.pending);

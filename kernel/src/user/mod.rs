@@ -145,6 +145,25 @@ pub(crate) fn any_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
     }
 }
 
+/// The calling thread's handle table and job, with the object registry, in a section of the object lock of their own (the device-domain
+/// calls, IOMMU6, which leave the lock between their phases). `None` (and `f` not run) if the calling thread has no process.
+pub(crate) fn with_caller<R>(
+    f: impl FnOnce(&mut ipc::Kobjs, &mut HandleTable, JobId) -> R,
+) -> Option<R> {
+    locked_state(|s| {
+        let pid = s.pid_of(thread::current())?;
+        let UserState { objs, procs, .. } = s;
+        let p = procs.get_mut(&pid)?;
+        let job = p.job;
+        Some(f(objs, &mut p.handles, job))
+    })
+}
+
+/// The object registry, under the object lock this hart already holds (the IOMMU's fault interrupt raises DEVICE_FAULT through it).
+pub(crate) fn with_objs<R>(f: impl FnOnce(&mut ipc::Kobjs) -> R) -> R {
+    with_state(|s| f(&mut s.objs))
+}
+
 /// `with_state` for the code that does not hold the object lock yet (a kernel thread, a boot-time check): it takes the lock for the closure.
 #[track_caller]
 pub(crate) fn locked_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {

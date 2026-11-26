@@ -357,6 +357,7 @@ name = "ksys"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "iommucore",
  "kcore",
  "kfuzz-gen",
  "klock",

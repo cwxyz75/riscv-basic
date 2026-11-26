@@ -393,6 +393,68 @@ impl Iopt {
         self.root
     }
 
+    /// Free at most `budget` tables below the root, in address order from `*cursor` (an I/O address the caller starts at 0 and
+    /// keeps between calls), and return how many were freed and whether every table is gone (the root is then clear and the
+    /// caller frees it). Allocates nothing. For a table that nothing can walk any more (a destroyed domain after its fence): the
+    /// work of freeing a large table is cut into bounded steps (IOMMU-SPEC amendment 2026-11-26 part 1, OD168).
+    pub fn destroy_step<M: PhysMem64, F: TableFrames>(
+        &self,
+        mem: &M,
+        frames: &mut F,
+        cursor: &mut u64,
+        budget: u64,
+    ) -> (u64, bool) {
+        let mut left = budget;
+        let done = self.free_from(
+            mem,
+            frames,
+            self.root,
+            self.mode.levels().wrapping_sub(1),
+            0,
+            cursor,
+            &mut left,
+        );
+        (budget.saturating_sub(left), done)
+    }
+
+    /// `destroy_step`'s walk of `table` (at `level`, covering addresses from `base`): true when everything below it is freed.
+    #[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: i < entries <= 2048; level >= 1 before the recursion; the address is built from in-range indices
+    fn free_from<M: PhysMem64, F: TableFrames>(
+        &self,
+        mem: &M,
+        frames: &mut F,
+        table: u64,
+        level: u32,
+        base: u64,
+        cursor: &mut u64,
+        left: &mut u64,
+    ) -> bool {
+        let span = 1u64 << (PAGE_SHIFT + 9 * level);
+        for i in 0..self.entries(level) {
+            let at = base | (i * span);
+            if at.saturating_add(span) <= *cursor {
+                continue; // (freed by an earlier step)
+            }
+            let pte = mem.read(table + i * 8);
+            if pte & PTE_V == 0 || pte & (PTE_R | PTE_W | PTE_X) != 0 || level == 0 {
+                continue;
+            }
+            let child = ppn_addr(pte);
+            if !self.free_from(mem, frames, child, level - 1, at, cursor, left) {
+                return false;
+            }
+            if *left == 0 {
+                *cursor = at; // (its children are gone: the next step frees it first)
+                return false;
+            }
+            frames.free(child);
+            mem.write(table + i * 8, 0);
+            *left -= 1;
+            *cursor = at.saturating_add(span);
+        }
+        true
+    }
+
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < entries <= 2048; level >= 1 before the recursion
     fn free_below<M: PhysMem64, F: TableFrames>(
         &self,

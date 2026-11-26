@@ -159,6 +159,12 @@ fn the_directory_follows_the_reference_and_the_simulated_iommu_agrees() {
                 predicted_pages(levels, format, &model),
                 "{ctx}: directory pages"
             );
+            // (IOMMU6: the walk the kernel's leak check uses counts the same pages, and the root)
+            assert_eq!(
+                d.pages(&mem) as usize,
+                1 + predicted_pages(levels, format, &model),
+                "{ctx}: Ddt::pages"
+            );
             for _ in 0..6 {
                 let probe = if !model.is_empty() && rng.chance(70) {
                     *model

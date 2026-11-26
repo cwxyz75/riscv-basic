@@ -225,7 +225,7 @@ fn map(k: &Kernel, d: DomainId, vmo: u64, first: u64, pages: u64) -> Option<u64>
             release_vmo(k, rec.vmo());
             None
         }
-        Err(MapFailed::RolledBack { .. }) => panic!("no table allocation fails here"),
+        Err(e) => panic!("no table allocation fails here: {e:?}"),
     }
 }
 

@@ -19,6 +19,9 @@ fault-skip-overloaded = []
 fault-offline-skip-blocked = []
 # IOMMU4's negative control: an interrupt identity is freed when its route moves, not when its old hart retired it; `msiid_model` must fail.
 fault-msiid-free-at-move = []
+# IOMMU6's negative control: an unmap clears its leaves and its record is released without the invalidation and the fence;
+# the suite's `iodomain_unmap_stops_the_device` must fail (the device still reaches the frame through the IOMMU's cache).
+fault-iommu-skip-inval = []
 
 # Concurrency checkers, host only (they are dependencies, not dev-dependencies,
 # because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")

@@ -68,8 +68,15 @@ its object kind defines; rights can only be removed, never added (INVARIANTS H3)
 | INSPECT | 9 | reading its properties |
 | KILL | 10 | ending a process with `process_kill` (so a service can be given the power to stop a job without being able to map memory into it or add threads) |
 | SET_LIMITS | 11 | changing a job's limits (`job_set_limits`); separate from MANAGE so that making things inside a job does not allow lifting its limits |
-| DMA | 12 | learning a DMA VMO's physical address (`vmo_phys_addr`) |
+| DMA | 12 | on a VMO: it may be mapped into a device domain (`iodomain_map`, IOMMU-SPEC 4.1); also learning the physical address of a contiguous DMA VMO (`vmo_phys_addr`, until IOMMU12) |
 | COMMIT | 13 | committing a VMO's pages now (`vmo_commit`); the pages are charged to the VMO's creating job |
+| IO_MAP | 14 | on a device domain: `iodomain_map` |
+| IO_UNMAP | 15 | on a device domain: `iodomain_unmap` |
+| IO_GRANT | 16 | on a device domain: `iodomain_grant_vector` (IOMMU7) |
+| IO_DESTROY | 17 | on a device domain: `iodomain_destroy` |
+
+A device-domain handle from `iodomain_create` carries IO_MAP, IO_UNMAP, IO_GRANT, IO_DESTROY, DUPLICATE, TRANSFER, WAIT and INSPECT
+(the supervisor's); the driver is given a duplicate with IO_MAP and IO_UNMAP only (IOMMU-SPEC 4.1), which cannot be duplicated again.
 
 `SAME_RIGHTS` (bit 31) is not a right: as the `rights` argument of `handle_duplicate` or
 `handle_replace` it means "the same as the source handle".
@@ -88,6 +95,7 @@ change.
 | TERMINATED | 3 | a process or a thread has ended |
 | INTERRUPT | 5 | an interrupt object's source fired and has not been acknowledged |
 | WRITE_CLOSED | 4 | the peer socket end called `socket_shutdown`: no data beyond what is queued will arrive |
+| DEVICE_FAULT | 6 | a device domain has a fault record waiting in its ring (IOMMU-SPEC 7.4); cleared by the `iodomain_fault_read` that empties it |
 | USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
 
 ## Limits
@@ -222,6 +230,13 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | vmo_create | `a0` bytes, `a1` job (0: the caller's), `a2` flags | `a1` handle |
 | vmo_create_child | `a0` vmo, `a1` offset, `a2` bytes, `a3` job (0: the caller's), `a4` flags | `a1` handle |
 | vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
+| vmo_create_dma_in | `a0` resource, `a1` pages, `a2` job (0: the caller's) | `a1` handle |
+| iodomain_create | `a0` resource, `a1` device id, `a2` job (0: the caller's) | `a1` handle |
+| iodomain_map | `a0` domain, `a1` vmo, `a2` vmo offset, `a3` pages, `a4` access (1 READ, 2 WRITE) | `a1` I/O address |
+| iodomain_unmap | `a0` domain, `a1` I/O address, `a2` pages |  |
+| iodomain_destroy | `a0` domain |  |
+| iodomain_fault_read | `a0` domain | `a1` cause \| direction << 16 \| dropped << 32, `a2` I/O address |
+| job_set_io_limits | `a0` job, `a1` I/O-mapped pages, `a2` vectors |  |
 | vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
 | vmo_decommit | `a0` vmo, `a1` offset, `a2` length |  |
 | vmo_get_size | `a0` vmo | `a1` bytes |
@@ -279,7 +294,10 @@ a device's message at an identity the kernel gave an interrupt object, to see th
 `which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
 (over the console limit of 16 a second), 152 the fault-queue overflows, 153 the device id of the last fault record, 154 its I/O address,
 155 its cause | (transaction type << 32), 156 the commands submitted to the command queue, 157 the fences that did not complete within
-their bound or could not be submitted (always 0 on a healthy machine: the boot script fails a run that prints one).
+their bound or could not be submitted (always 0 on a healthy machine: the boot script fails a run that prints one). `which` 158 to 161
+(IOMMU6): 158 the frames leaked by fence timeouts (mapped pages and table frames, IO8), 159 the live device domains (attached or being
+destroyed), 160 the I/O-mapped pages of live and pending mappings, 161 the mapping records leaked with their holds. The end-of-run
+check `no_process_or_vmo_survives_init` wants 159, 160 and 161 at zero.
 
 `which` 110 and 111 (PL7) are the executable pages mapped by faults so far and the times the instruction caches were synchronised for them (once per fault that mapped any: `fence.i` here and SBI `remote_fence_i` on every other online hart); a page that was already mapped adds nothing.
 
@@ -495,6 +513,17 @@ system (INVALID_ARGS past either, or for 0); NO_MEMORY if the job is out of page
 free aligned block of the size rounded up to a power of two exists (a 33-page request needs a free aligned 64-page block; the frame
 allocator is a buddy allocator, MM2). The returned handle has VMO rights without EXECUTE plus **DMA**.
 
+### vmo_create_dma_in(resource, pages, job) -> status, handle
+
+The only call that makes a DMA VMO for a device domain (IOMMU-SPEC 4.7). `resource` is the root resource with MANAGE; `job` a job
+handle with MANAGE, or 0 for the caller's job: it is charged the pages (and the VMO's index as kernel bytes). The frames come from the
+ordinary allocator, **not promised contiguous**, with no per-object page limit; the VMO is pinned, committed and zeroed at creation and
+fixed (no decommit, resize, copy-on-write child or pager). The frames are taken and zeroed `RANGE_STEP` (64) at a time under the frame
+lock only, while no handle names the VMO (amendment 2026-11-26, OD168). Limits: the job's pages; the system DMA backstop (RAM / 16).
+Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (`resource`, `job`: the kinds rank across both handles); INVALID_ARGS (`pages`
+is 0 or past the backstop); NO_MEMORY (the job's pages or kernel bytes, the backstop's room, the frames). The handle has the VMO
+rights without EXECUTE, plus DMA. `vmo_phys_addr` on it is WRONG_TYPE (it has no single address).
+
 ### vmo_phys_addr(vmo) -> status, address
 
 The physical address of a DMA VMO's first byte. Needs the DMA right (ACCESS_DENIED without it, so
@@ -536,6 +565,62 @@ Returns in `a1` the state of hart `index`: 0 offline, 1 starting, 2 online, 3 dr
 Suspends the machine to RAM through the firmware (PM3, KERNEL-V1-SPEC 5.5). `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; NOT_SUPPORTED, with nothing changed: the firmware has no system-suspend extension (`debug_stat` 126 says
 whether it has), or it has and the kernel cannot yet stop its harts the way the extension requires (T229). **As built, the call is always NOT_SUPPORTED**: the QEMU `virt` firmware has no such extension, so the suspend path itself has never run; what is built is the
 save and restore sequence (`kcore::powerseq`, host-tested over a fake machine) the path will use.
+
+### Device domains (IOMMU6; IOMMU-SPEC 4, 6, 7.4)
+
+A device domain is the I/O address space of one device id behind the platform IOMMU. The supervisor creates it and keeps the control
+handle; it gives the driver a duplicate with IO_MAP and IO_UNMAP only, through which the driver maps DMA VMOs it holds and learns their
+I/O addresses. The kernel chooses every I/O address (lowest fit, never reused before its fence). A mapping holds its VMO until its
+removal's fence has completed. Each call takes the object lock, `IOMMU` and the memory locks in separate sections in the order of
+IOMMU-SPEC 11.2 and waits for its fences with no lock held, bounded by `IOMMU_FENCE_BOUND` (100 ms); large maps, unmaps and destructions
+go `RANGE_STEP` (64) pages per hold of `IOMMU`. The handle errors rank across the handles of a call: every BAD_HANDLE first, then
+WRONG_TYPE, then ACCESS_DENIED.
+
+### iodomain_create(resource, device_id, job) -> status, handle
+
+A domain for `device_id`, attached at once (the device leaves the empty directory or the quarantine). `resource`: the root resource
+with MANAGE. `job`: a job handle with MANAGE, or 0 for the caller's: it pays for everything the domain holds (IOMMU-SPEC 5.3) and the
+domain holds a use of it until its record is freed. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (either handle);
+INVALID_ARGS (`device_id` is not an id the tree's `iommu-map` covers); BAD_STATE (a live domain exists for the id, including one whose
+destruction has not completed); NO_MEMORY (the job's kernel bytes or objects, the handle table, table frames, a soft-context id, a fence
+that did not complete). On failure nothing is left and the device's state is unchanged. The handle has the rights listed under Rights.
+
+### iodomain_map(domain, vmo, vmo_offset, pages, access) -> status, io_address
+
+Maps `pages` pages of `vmo` from byte `vmo_offset` at an I/O address the kernel chooses, and returns it once the invalidation and fence
+that follow are complete. `access` is 1 (READ: the device may read) or 3 (READ and WRITE). Needs IO_MAP on `domain`; on `vmo`, DMA,
+READ, and WRITE when `access` has WRITE (IO4: never wider than the handle). The same page may be mapped any number of times; each mapping
+is charged. Errors, in order: BAD_HANDLE; WRONG_TYPE (`domain` not a domain, `vmo` not a VMO or not a DMA VMO from
+`vmo_create_dma_in` or `vmo_create_dma`); ACCESS_DENIED; INVALID_ARGS (`pages` 0, `vmo_offset` not page aligned, the range not inside
+the VMO, a bit of `access` other than READ and WRITE, or READ missing); BAD_STATE (the domain was destroyed, also when its destruction
+begins while a large map is under way: the map gives way and is rolled back); NO_MEMORY (the job's I/O-mapped pages, its kernel bytes
+for the record or the tables, no free I/O range, a fence that did not complete). A failed map is rolled back as an unmap: nothing is
+left mapped and nothing freed before its fence.
+
+### iodomain_unmap(domain, io_address, pages) -> status
+
+Removes the one mapping `iodomain_map` returned at exactly `io_address` and `pages`. When it returns, the device can no longer reach the
+frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (not
+exactly a live mapping of this domain: `pages` 0, `io_address` not page aligned, no such mapping, or the domain was destroyed, which
+took every mapping); BAD_STATE (the domain was destroyed; as IOMMU-SPEC 4.4 orders it, never reached, since the INVALID_ARGS before it
+covers it: Q-IOMMU-UNMAPORDER).
+Never NO_MEMORY. A fence that does not complete within its bound still returns OK and leaks the frames (counted, `debug_stat` 158). An
+unmap under way when the domain's destruction begins returns OK: the destruction's fence covers it (OD170).
+
+### iodomain_destroy(domain) -> status
+
+Detaches the device (it becomes Quarantined: an empty table, fault reporting off) and empties the domain: every mapping is removed,
+then the domain's tables, root and record are freed after the fence (IOMMU-SPEC 6.3), and its job credited. Needs IO_DESTROY. Errors:
+BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED. A destroyed domain's destroy is OK and does nothing. **Closing the last handle** destroys the
+domain the same way (and so does the teardown of the last process that held one), completed before the closing call returns to user
+mode. A destroyed domain's other handles stay valid: `iodomain_map` is BAD_STATE and `iodomain_unmap` INVALID_ARGS.
+
+### iodomain_fault_read(domain) -> status, word, io_address
+
+The oldest unread record of the domain's ring of 16 (IOMMU-SPEC 7.4), removed: `a1` = cause | direction << 16 | dropped << 32
+(direction 0 none, 1 read, 2 write, 3 execute; dropped: the faults not stored since the previous successful read, reset by this one),
+`a2` the I/O address. DEVICE_FAULT stays raised while a record waits. Needs INSPECT. Errors, in order: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; SHOULD_WAIT (the ring is empty).
 
 ### futex_wait(address, expected, deadline) -> status
 
@@ -709,10 +794,19 @@ its ancestors applies, and the hard backstop `MAX_REGIONS` caps it; a new job ha
 `process_protect` that splits a region, `thread_spawn`'s stack, `process_clone`) is NO_MEMORY; a space already above a lowered limit keeps its regions, can unmap, and can add none.
 Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
 
+### job_set_io_limits(job, io_pages, vectors) -> status
+
+The job's own limits on I/O-mapped pages (pages mapped into device domains whose job this is, one per page per mapping) and on interrupt
+vectors (charged from IOMMU7 on); `u64::MAX` for none of its own (IOMMU-SPEC 5.3). Needs SET_LIMITS. The smallest value set on the job
+and its ancestors applies, and usage is counted on every ancestor; there is no default. A limit below the usage is not an error: later
+charges fail with NO_MEMORY. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
+
 ### job_info(job, which) -> status, used, limit
 
 Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet), 9 the real-time CPU time (SCHED-SMP-SPEC 4.5, task 8): `a1` the nanoseconds the job's own threads have run **at a real-time base priority** in the current 100 ms window (the windows are aligned to multiples of 100 ms since boot; the figure restarts at zero with each), `a2` the job's `rt_budget` (enforced: a job that has used it has its real-time threads demoted to priority 31, round robin, until the window ends), 10 the CPU time (`a1`: the nanoseconds run by the threads of the job and of the jobs below it since each was created; the root job also holds the kernel's own threads, which are charged to it; a job that has been freed is no longer counted; `a2` 0), 8 kernel memory in bytes (MM5: the memory the kernel holds because of the job's programs, other than pages they map; its limit is an eighth of the job's page limit in bytes, none without one); `used` counts the job and everything
-below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
+below it. `which` 12 and 13 (IOMMU6): the I/O-mapped pages and the interrupt vectors of the device domains of the job and of those
+below it, and the effective limit (the smallest along the ancestors; `u64::MAX` for none). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
+INVALID_ARGS (`which`).
 
 **Kernel bytes (`which` 8)** are charged for object bodies (every call that creates an object: `channel_create`, `event_create`, `socket_create`, `port_create`, `vmo_create`, `thread_spawn`, `process_create`, `job_create`, ... returns NO_MEMORY when the job or an ancestor would pass its kernel-byte limit) and for the growth of a process's handle table (charged when the call that grew it returns: a job that cannot pay leaves the table unable to grow, so the calls that insert a handle return NO_MEMORY, while closing and reusing handles still work; the table stays unable to grow until the next call the process makes after its job has room again, so the first insert after room returns can still be refused once) and for a thread's floating-point and vector register state, charged at the thread's first use of the unit. A job at its limit that makes a thread use floating point or vector instructions for the first time ends the process with the illegal-instruction exit code: the instruction faults like any illegal one (a program built for RVA23 whose start-up code is vectorised dies this way in a job whose kernel-byte limit is too small to run a single thread's register state).
 
@@ -1059,6 +1153,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | socket_shutdown | specified and implemented (tidy-up, T17) |
 | vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
+| vmo_create_dma_in, iodomain_create, iodomain_map, iodomain_unmap, iodomain_destroy, iodomain_fault_read, job_set_io_limits | specified and implemented (IOMMU6) |
 | resource_dtb | specified and implemented (S6c) |
 | system_set_placement | specified and implemented (PM4) |
 | hart_set_online, hart_info | specified and implemented (PM1) |

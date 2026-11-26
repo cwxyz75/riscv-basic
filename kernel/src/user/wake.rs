@@ -141,6 +141,12 @@ fn cleanup_dead_held() {
                     crate::heap::nofail(|| request_kill(p.pid, -2000))
                 }
                 ipc::KObj::Job(id) => kmem::jobs().jobs.release(id),
+                // the last handle of a device domain (IOMMU-SPEC 4.5): its destruction begins (6.3 step 1, under `IOMMU`) and is completed
+                // with no lock held at the tail of this call or fault (`iommu::drain`); the object's use of its job goes
+                ipc::KObj::IoDomain(d) => {
+                    crate::iommu::closed(d.domain);
+                    kmem::jobs().jobs.release(d.job);
+                }
                 // the last handle to an exception was closed without a decision: it is NEXT (EX2)
                 ipc::KObj::Exception(e) => crate::heap::nofail(|| {
                     act_on_resolution(with_state(|s| {

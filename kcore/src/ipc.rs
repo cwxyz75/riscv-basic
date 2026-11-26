@@ -127,6 +127,26 @@ pub struct IrqObj {
     pub claims: u64,
 }
 
+/// A device domain (IOMMU-SPEC 4): the domain's id in the kernel's store (`kcore::iodomain::DomainId::raw`), the job that pays for it
+/// (the object holds a use of it until its last handle goes: 4.5), and whether a fault record waits in its ring (DEVICE_FAULT, 7.4).
+/// The last handle destroys the domain (`needs_cleanup`).
+pub struct IoDomainObj {
+    pub domain: u64,
+    pub job: JobId,
+    pub fault: bool,
+    /// `iodomain_destroy` was called (maps are BAD_STATE from then on; a second destroy does nothing).
+    pub destroyed: bool,
+}
+
+/// A resolved device-domain handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoDomainRef {
+    pub obj: ObjId,
+    pub domain: u64,
+    pub job: JobId,
+    pub destroyed: bool,
+}
+
 /// One binding of a port: watch `obj` for `mask`, report as `key`.
 struct Binding {
     /// The table and handle the binding was made through (L21c): it ends when that handle is closed, replaced or sent away.
@@ -167,6 +187,8 @@ pub enum KObj {
     Interrupt(IrqObj),
     /// The root resource (S6): the authority to mint device memory, DMA buffers and interrupts.
     Resource,
+    /// A device domain (IOMMU6).
+    IoDomain(IoDomainObj),
     /// The debug resource (HD4): the authority to write to the kernel's console and read its counters.
     Debug,
 }
@@ -210,6 +232,7 @@ impl Object for KObj {
                 | KObj::Process(_)
                 | KObj::Job(_)
                 | KObj::Interrupt(_)
+                | KObj::IoDomain(_)
                 | KObj::Exception(_)
                 | KObj::Pager(_)
         )
@@ -794,6 +817,13 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
         KObj::Interrupt(i) => {
             if i.fired {
                 signals::INTERRUPT
+            } else {
+                0
+            }
+        }
+        KObj::IoDomain(d) => {
+            if d.fault {
+                signals::DEVICE_FAULT
             } else {
                 0
             }
@@ -1542,6 +1572,84 @@ pub fn interrupt_ack(reg: &mut Kobjs, obj: ObjId) -> Result<(u32, u64), Status> 
         }
         Some(KObj::Interrupt(_)) => Err(Status::BadState),
         _ => Err(Status::BadHandle),
+    }
+}
+
+/// A new device-domain object for store domain `domain`, paid for by `job` (whose use it takes: released by the object's cleanup), with a
+/// handle carrying `Rights::IODOMAIN` (IOMMU-SPEC 4.1). The object and the handle are charged to `q`'s job (the caller's).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn iodomain_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    domain: u64,
+    job: JobId,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    q.jobs.retain(job);
+    let obj = reg.create_charged(
+        KObj::IoDomain(IoDomainObj {
+            domain,
+            job,
+            fault: false,
+            destroyed: false,
+        }),
+        q.job,
+    );
+    let h = table
+        .insert(reg, obj, Rights::IODOMAIN)
+        .expect("room was checked");
+    Ok((h, obj))
+}
+
+/// The domain of a device-domain handle that carries `need`: (object, store domain, job).
+pub fn iodomain_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<IoDomainRef, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::IoDomain(d)) => {
+            if entry.rights.contains(need) {
+                Ok(IoDomainRef {
+                    obj: entry.obj,
+                    domain: d.domain,
+                    job: d.job,
+                    destroyed: d.destroyed,
+                })
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// Raise or clear DEVICE_FAULT on a device-domain object (the fault path and `iodomain_fault_read`); false if `obj` is not one.
+pub fn iodomain_set_fault(reg: &mut Kobjs, obj: ObjId, fault: bool) -> bool {
+    match reg.get_mut(obj) {
+        Some(KObj::IoDomain(d)) => {
+            d.fault = fault;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mark a device-domain object destroyed (`iodomain_destroy`); true if it was not already.
+pub fn iodomain_mark_destroyed(reg: &mut Kobjs, obj: ObjId) -> bool {
+    match reg.get_mut(obj) {
+        Some(KObj::IoDomain(d)) if !d.destroyed => {
+            d.destroyed = true;
+            true
+        }
+        _ => false,
     }
 }
 

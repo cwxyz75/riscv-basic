@@ -10,6 +10,10 @@
 //! * a **translation cache** and a **device-context cache** that only the invalidation commands drop (QEMU has both);
 //! * an **MSI-entry cache**, dropped only by `IOTINVAL.GVMA` for the entry's soft context and address (QEMU has none; hardware
 //!   may: IOMMU0 item 12, A6), so a missing invalidation after an MSI entry changes is visible;
+//! * a **page-walk cache** of non-leaf entries (QEMU has none; hardware may: IOMMU-SPEC amendment 2026-11-26 part 2, A18): a walk
+//!   starts at the deepest table it cached for the soft context and address, and only the whole-context form of `IOTINVAL.GVMA`
+//!   (no address) drops these entries; the address form drops leaves only. So a table frame freed after a page-wise invalidation
+//!   is still walked from the cache, and a kernel that does not invalidate the whole context when it frees one is caught;
 //! * a page-table entry with any of bits 63:54 set is a fault (this system never writes them);
 //! * `ddtp` can be handed over in any mode, with its queues on, and can model the busy bit and an IOMMU that will not go Off
 //!   (IOMMU-SPEC 2.4 step 1, A17); every value written to `ddtp` is recorded.
@@ -341,6 +345,8 @@ pub struct Sim<'m, M: PhysMem64> {
     ctx_cache: BTreeMap<u32, Ctx>,
     tlb: BTreeMap<(Tag, u64), Tlbe>,
     msi_cache: BTreeMap<(Tag, u64), [u64; 2]>,
+    /// Non-leaf entries: (soft context, level of the table, the address bits above that table's span) to the table's address.
+    pwc: RefCell<BTreeMap<(Tag, u32, u64), u64>>,
     deliveries: Vec<Delivery>,
     executed: Vec<Command>,
     faults_reported: u64,
@@ -383,6 +389,7 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
             ctx_cache: BTreeMap::new(),
             tlb: BTreeMap::new(),
             msi_cache: BTreeMap::new(),
+            pwc: RefCell::new(BTreeMap::new()),
             deliveries: Vec::new(),
             executed: Vec::new(),
             faults_reported: 0,
@@ -430,6 +437,11 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
     /// Cached translations, device contexts and MSI entries (for tests that check a flush happened).
     pub fn cached(&self) -> (usize, usize, usize) {
         (self.tlb.len(), self.ctx_cache.len(), self.msi_cache.len())
+    }
+
+    /// Non-leaf entries in the page-walk cache.
+    pub fn walk_cached(&self) -> usize {
+        self.pwc.borrow().len()
     }
 
     fn caps(&self) -> Caps {
@@ -624,6 +636,13 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
                 };
                 self.tlb.retain(|(t, p), _| !hit(t, *p));
                 self.msi_cache.retain(|(t, p), _| !hit(t, *p));
+                if !av {
+                    // (A18: only the whole-context form drops the non-leaf entries; the address form drops leaves only)
+                    self.pwc.borrow_mut().retain(|(t, _, _), _| match t {
+                        Tag::G(g) => gv && *g != gscid,
+                        Tag::S(_) => true,
+                    });
+                }
                 true
             }
             (1, 0) => {
@@ -639,6 +658,12 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
                     };
                     self.tlb.retain(|(t, p), _| !hit(t, *p));
                     self.msi_cache.retain(|(t, p), _| !hit(t, *p));
+                    if !av {
+                        self.pwc.borrow_mut().retain(|(t, _, _), _| match t {
+                            Tag::S(p) => pscv && *p != pscid,
+                            Tag::G(_) => true,
+                        });
+                    }
                 }
                 true
             }
@@ -857,7 +882,9 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
     // ---- page tables --------------------------------------------------------------------------------------------------
 
     /// The specification's two-stage translation process for one stage, top down: `Ok((pa, writable))` or a fault.
-    fn walk(&self, c: &Ctx, iova: u64, write: bool) -> Result<(u64, bool), ()> {
+    /// With `cache`, the walk starts at the deepest table the page-walk cache holds for the address and caches every table it
+    /// descends into (a device's access); without, it reads the tables only (the debug interface).
+    fn walk(&self, c: &Ctx, iova: u64, write: bool, cache: bool) -> Result<(u64, bool), ()> {
         let g = c.g_mode() != 0;
         let (atp, ade) = if g {
             (c.iohgatp, c.tc & TC_GADE != 0)
@@ -883,6 +910,17 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
         }
         let mut a = (atp & crate::PPN_MASK) << 12;
         let mut i = levels - 1;
+        let tag = c.tag();
+        if cache {
+            let pwc = self.pwc.borrow();
+            if let Some((j, t)) = (0..levels - 1).find_map(|j| {
+                pwc.get(&(tag, j, iova >> (12 + 9 * (j + 1))))
+                    .map(|&t| (j, t))
+            }) {
+                a = t;
+                i = j;
+            }
+        }
         let pte_addr;
         let pte = loop {
             let width = if g && i == levels - 1 { 11 } else { 9 };
@@ -902,6 +940,11 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
             }
             i -= 1;
             a = ((pte >> 10) & crate::PPN_MASK) << 12;
+            if cache {
+                self.pwc
+                    .borrow_mut()
+                    .insert((tag, i, iova >> (12 + 9 * (i + 1))), a);
+            }
         };
         let ppn = (pte >> 10) & crate::PPN_MASK;
         let (r, w, u, acc, dirty) = (
@@ -958,7 +1001,7 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
                 return Ok(Target::Memory(e.pa | (iova & 0xfff)));
             }
         }
-        match self.walk(&ctx, iova, write) {
+        match self.walk(&ctx, iova, write, report) {
             Ok((pa, writable)) => {
                 if !s_bare && write && self.msi_match(&ctx, pa) {
                     return Ok(Target::Msi(ctx, pa));

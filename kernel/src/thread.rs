@@ -1761,7 +1761,7 @@ pub fn wake_stat(which: u64) -> u64 {
         2 => WAKES.load(Relaxed),
         3..=5 | 140..=144 => crate::aia::stat(which),
         // 150 to 157: the IOMMU's counters (IOMMU5, IOMMU-SPEC 7.3)
-        150..=157 => crate::iommu::stat(which),
+        150..=161 => crate::iommu::stat(which),
         // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),

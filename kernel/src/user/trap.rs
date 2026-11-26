@@ -995,6 +995,20 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
         nr::VMO_READ | nr::VMO_WRITE => reply(frame, vmo_rw_call(n == nr::VMO_WRITE, a)),
         nr::VMO_COMMIT => reply(frame, vmo_commit_call(a)),
+        // (IOMMU6) the device-domain calls: phases under the object lock, `IOMMU` and the memory locks, and the fence waits with none
+        nr::IODOMAIN_CREATE
+        | nr::IODOMAIN_MAP
+        | nr::IODOMAIN_UNMAP
+        | nr::IODOMAIN_DESTROY
+        | nr::IODOMAIN_FAULT_READ
+        | nr::VMO_CREATE_DMA_IN => {
+            let r = match ksys::wide_argument_error(n, &a) {
+                Some(s) => fail(s),
+                None => crate::iommu::call(n, a).unwrap_or_else(|| fail(Status::BadSyscall)),
+            };
+            notify();
+            reply(frame, r);
+        }
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)

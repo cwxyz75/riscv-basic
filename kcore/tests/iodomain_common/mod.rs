@@ -368,10 +368,13 @@ impl<'m> World<'m> {
                     .unwrap();
                 MapStart::Refused(e)
             }
-            Err(MapFailed::RolledBack { pending, tables }) => {
+            Err(MapFailed::RolledBack {
+                pending, tables, ..
+            }) => {
                 charge.settle(&mut self.jobs, tables);
                 MapStart::RolledBack(pending)
             }
+            Err(e) => panic!("a map in one call meets no destruction: {e:?}"),
         }
     }
 
@@ -482,6 +485,7 @@ pub fn destroy_ok(w: &mut World, d: DomainId) -> Vec<(u64, u64)> {
         w.settle(rel);
     }
     w.finish(det);
+    w.store.destroy_released();
     got
 }
 

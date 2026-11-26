@@ -206,3 +206,55 @@ fn misaligned_and_out_of_range_arguments_change_nothing() {
     assert_eq!(frames.live(), 0);
     assert_eq!(t.translate(&mem, 1 << 41, Op::Read), Err(PageFault));
 }
+
+/// `destroy_step` (IOMMU-SPEC amendment 2026-11-26 part 1, OD168): a large table is freed in steps of at most the budget, each step
+/// freeing what it says, and at the end every table is freed and the root names nothing.
+#[test]
+fn destroy_in_steps_frees_every_table_within_each_budget() {
+    let mut rng = Rng::new(0x5eed);
+    for mode in MODES {
+        for budget in [1u64, 3, 64] {
+            let mem = FakeMem::new();
+            let mut frames = FakeFrames::new(&mem, 0x1_0000_0000, 4096);
+            let mut t = Iopt::new(&mem, 0x8000_0000, mode).unwrap();
+            let mut n = 0u64;
+            while n < 300 {
+                let iova = random_iova(&mut rng, mode);
+                if t.map(
+                    &mem,
+                    &mut frames,
+                    iova,
+                    0x4000_0000 + (n << 12),
+                    Access::Read,
+                )
+                .is_ok()
+                {
+                    n += 1;
+                }
+            }
+            let tables = frames.live() as u64;
+            assert!(tables > 3);
+            let (mut cursor, mut freed, mut steps) = (0u64, 0u64, 0u64);
+            loop {
+                let (k, done) = t.destroy_step(&mem, &mut frames, &mut cursor, budget);
+                assert!(k <= budget, "a step frees at most its budget");
+                freed += k;
+                steps += 1;
+                assert_eq!(frames.live() as u64, tables - freed);
+                if done {
+                    break;
+                }
+                assert!(steps < 100_000);
+            }
+            assert_eq!(
+                frames.live(),
+                0,
+                "{mode:?}: every table but the root is freed"
+            );
+            assert!(steps >= tables.div_ceil(budget));
+            let mut any = false;
+            t.for_each_leaf(&mem, |_, _, _| any = true);
+            assert!(!any, "the root names nothing");
+        }
+    }
+}

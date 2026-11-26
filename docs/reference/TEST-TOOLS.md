@@ -168,7 +168,8 @@ overflow checks on.
 **The matrix and the negative controls** (soak): `os-boot-test` (the normal, fail-demo, round-robin and release
 kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`,
 `os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-iommu-neg` (a machine without the platform IOMMU ends in `##PANIC ... no IOMMU`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
-mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`, `os-boot-test-iommu-bare` (`ddtp` Bare: `iommu_is_on_and_denies_by_default` must fail).
+mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`, `os-boot-test-iommu-bare` (`ddtp` Bare: `iommu_is_on_and_denies_by_default` must fail), `os-boot-test-iommu-inval`
+(`fault-iommu-skip-inval`, an unmap without its invalidation and fence: `iodomain_unmap_stops_the_device` must fail).
 
 **The network checks by tier.**
 

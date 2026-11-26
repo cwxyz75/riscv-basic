@@ -7,10 +7,13 @@ description = "OS track: the kernel's syscall layer as host-testable logic behin
 [dependencies]
 abi = { path = "../abi" }
 kcore = { path = "../kcore" }
+# IOMMU6: the device-domain calls drive `kcore::iodomain` over the IOMMU's formats and registers.
+iommucore = { path = "../iommucore" }
 klock = { path = "../klock" }
 
 [dev-dependencies]
 kfuzz-gen = { path = "../kfuzz-gen" }
+iommucore = { path = "../iommucore", features = ["sim"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }

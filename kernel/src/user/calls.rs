@@ -390,6 +390,8 @@ pub(crate) fn cow_sync() {
     if kcore::aspace::DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         drain_dying();
     }
+    // (IOMMU6) a device domain whose last handle went in this call or fault is destroyed before the thread is back in user mode (6.3)
+    crate::iommu::drain();
     if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }

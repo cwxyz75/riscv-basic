@@ -55,6 +55,9 @@ fault-skip-shootdown = []
 # IOMMU5 (IOMMU-SPEC 13): the IOMMU is brought up and then `ddtp` is written Bare (pass-through, no isolation): the forbidden state of IO2.
 # `iommu_is_on_and_denies_by_default` must then fail (`make os-boot-test-iommu-bare`).
 fault-iommu-bare = ["iommucore/fault-iommu-bare"]
+# IOMMU6's negative control: an unmap clears the leaves and frees, without the invalidation and the fence (`iodomain_unmap_stops_the_device`
+# must fail on it)
+fault-iommu-skip-inval = ["kcore/fault-iommu-skip-inval"]
 # MM8: a SNAPSHOT leaves the source's writable translations as they were; a write through them then reaches the child's pages
 fault-skip-cow-protect = []
 # MM6/MM7: a decommit, or a protect that takes a permission away, leaves the other harts' translations alone; the sibling-thread tests must then fail

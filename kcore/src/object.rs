@@ -40,6 +40,20 @@ impl ObjId {
     pub fn hash_bits(self) -> u64 {
         u64::from(self.index) ^ self.gen.rotate_left(32)
     }
+
+    /// The id as two words (a name kept outside the registry, such as a device domain's tag for its faults: IOMMU6).
+    pub fn to_words(self) -> [u64; 2] {
+        [u64::from(self.index), self.gen]
+    }
+
+    /// An id from `to_words`; any other pair names no live object (the registry checks the slot's generation), or `None` if it
+    /// cannot be an id at all.
+    pub fn from_words(w: [u64; 2]) -> Option<ObjId> {
+        Some(ObjId {
+            index: u32::try_from(w[0]).ok()?,
+            gen: w[1],
+        })
+    }
 }
 
 /// What the registry needs from the objects it stores.
