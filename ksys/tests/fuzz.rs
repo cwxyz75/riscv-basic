@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 mod common;
+use common::iohost::{Host, IoMem, BOOT_FRAMES};
 use common::*;
 
 fn seeds() -> Vec<u64> {
@@ -59,6 +60,8 @@ fn kind_of(w: &World, h: u64) -> Kind {
         Some(KObj::Port(_)) => Kind::Port,
         Some(KObj::Vmo(_)) => Kind::Vmo,
         Some(KObj::Job(_)) => Kind::Job,
+        Some(KObj::Resource) => Kind::Resource,
+        Some(KObj::IoDomain(_)) => Kind::IoDomain,
         _ => Kind::Any,
     }
 }
@@ -67,11 +70,14 @@ fn kind_of(w: &World, h: u64) -> Kind {
 fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result<u64, String> {
     at.set(("setup", 0));
     // (one seed in four runs short of frames, so a commit that cannot get one rolls back: T176)
-    let mut w = if seed % 4 == 3 {
-        world_with_frames(256, 24 + (seed as usize / 4) % 20)
+    // (IOMMU6: on the IOMMU host, whose bring-up takes `BOOT_FRAMES` of the world's frames)
+    let world = if seed % 4 == 3 {
+        world_with_frames(256, BOOT_FRAMES + 24 + (seed as usize / 4) % 20)
     } else {
-        world_with(256)
+        world_with_frames(256, BOOT_FRAMES + 400)
     };
+    let iomem = IoMem::default();
+    let mut io = Host::with_world(&iomem, world);
     let mut waits = kcore::wait::WaitTable::new();
     let mut masks: BTreeMap<u64, (ObjId, u32)> = BTreeMap::new(); // what each registered thread waits for
     for t in 1..=WAITERS {
@@ -80,13 +86,13 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
     // a handle to the root job, to give the job calls something to act on (the generator never closes it or sets limits on it)
     let jh = {
         let mut q = Quota {
-            jobs: &mut w.jobs,
+            jobs: &mut io.w.jobs,
             job: Some(JobId::ROOT),
         };
 
         ipc::job_object_create(
-            &mut w.objs,
-            &mut w.handles,
+            &mut io.w.objs,
+            &mut io.w.handles,
             JobId::ROOT,
             Rights::JOB,
             &mut q,
@@ -94,7 +100,9 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
         .map_err(|e| format!("{e:?}"))?
         .0
     };
-    let mut model = Model::with(&[(jh, Kind::Job)]);
+    // a root resource, so the device calls can make domains and DMA VMOs (IOMMU6)
+    let res = io.resource();
+    let mut model = Model::with(&[(jh, Kind::Job), (res, Kind::Resource)]);
     model.pin(jh);
     let window = Window {
         base: BASE,
@@ -114,9 +122,11 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                 .filter(|&&(_, k)| k == Kind::Job)
                 .map(|&(h, _)| h)
                 .collect();
-            w.job = jobs
+            io.w.job = jobs
                 .get(i / 40 % (jobs.len() + 1))
-                .and_then(|&h| ipc::job_of(&w.objs, &w.handles, Handle(h), Rights::MANAGE).ok())
+                .and_then(|&h| {
+                    ipc::job_of(&io.w.objs, &io.w.handles, Handle(h), Rights::MANAGE).ok()
+                })
                 .unwrap_or(JobId::ROOT);
         }
         at.set(("poke", i));
@@ -124,10 +134,10 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             if *p >= BASE && p + bytes.len() as u64 <= BASE + 0x10000 {
                 // (the pokes can fail once the fake machine is out of frames: the call then runs on whatever the buffer held)
                 let _ = kcore::usercopy::copy_to_user(
-                    &mut w.aspace,
-                    &mut w.mm,
-                    &mut w.vmos,
-                    &mut w.jobs,
+                    &mut io.w.aspace,
+                    &mut io.w.mm,
+                    &mut io.w.vmos,
+                    &mut io.w.jobs,
                     *p,
                     bytes,
                 );
@@ -135,15 +145,15 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
         }
         at.set(("call", i));
         // (T176 6: what the call may have changed is in the dirty log, which the kernel's wake-up pass reads: a signal word that moved, or an object that went, with no entry would never wake its waiters)
-        let before: Vec<(ObjId, u32)> = w
-            .objs
-            .live_ids()
-            .into_iter()
-            .filter_map(|o| ipc::signals_of_object(&w.objs, o).map(|s| (o, s)))
-            .collect();
+        let before: Vec<(ObjId, u32)> =
+            io.w.objs
+                .live_ids()
+                .into_iter()
+                .filter_map(|o| ipc::signals_of_object(&io.w.objs, o).map(|s| (o, s)))
+                .collect();
         let r = match ksys::wide_argument_error(call.nr, &call.args) {
             Some(st) => Some(Err((st, None, None))), // refused before it runs, as in the kernel
-            None => w.call(call.nr, call.args),
+            None => io.dispatch(call.nr, call.args),
         };
         format!("{} {:?} {r:?}", call.nr, call.args).hash(&mut hasher);
         let (ok, a1, a2) = match &r {
@@ -156,10 +166,10 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
         at.set(("dirty", i));
         {
             let mut logged: std::collections::HashSet<ObjId> =
-                w.objs.peek_dirty().iter().map(|&(o, _)| o).collect();
+                io.w.objs.peek_dirty().iter().map(|&(o, _)| o).collect();
             // (a port's READABLE follows what it binds: the wait table releases a port's waiters when something it binds is touched, L21a)
             for (o, _) in &before {
-                if ipc::port_bound_objects(&w.objs, *o)
+                if ipc::port_bound_objects(&io.w.objs, *o)
                     .iter()
                     .any(|b| logged.contains(b))
                 {
@@ -167,11 +177,11 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                 }
             }
             for (o, was) in &before {
-                let now = ipc::signals_of_object(&w.objs, *o);
+                let now = ipc::signals_of_object(&io.w.objs, *o);
                 // (a signal that is only cleared wakes nobody: a waiter wants a bit that is set)
                 if now.is_none_or(|n| n & !*was != 0)
                     && !logged.contains(o)
-                    && !w.objs.dirty_overflowed()
+                    && !io.w.objs.dirty_overflowed()
                 {
                     return Err(format!(
                         "seed {seed}, call {i} ({call:?}): {o:?} gained signals ({was:#x} to {now:?}) or died and the dirty log does not name it"
@@ -197,10 +207,10 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             );
             if n > 0 {
                 if let Ok(raw) = kcore::usercopy::copy_from_user(
-                    &mut w.aspace,
-                    &mut w.mm,
-                    &mut w.vmos,
-                    &mut w.jobs,
+                    &mut io.w.aspace,
+                    &mut io.w.mm,
+                    &mut io.w.vmos,
+                    &mut io.w.jobs,
                     list,
                     n * 4,
                 ) {
@@ -209,7 +219,7 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                         .0
                         .iter()
                         .map(|c| u64::from(u32::from_le_bytes(*c)))
-                        .map(|h| (h, kind_of(&w, h)))
+                        .map(|h| (h, kind_of(&io.w, h)))
                         .collect();
                     model.received(&got);
                 }
@@ -228,17 +238,17 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             if let Some(&p) = ports.get(i / 5 % ports.len().max(1)) {
                 if i % 10 == 2 {
                     if let Ok(Some((key, seen))) =
-                        ipc::port_poll_in(&mut w.objs, &w.handles, Handle(p), &mut w.jobs)
+                        ipc::port_poll_in(&mut io.w.objs, &io.w.handles, Handle(p), &mut io.w.jobs)
                     {
                         if seen == 0 {
                             return Err(format!("seed {seed}, call {i}: a poll of port {p} delivered key {key} with no signal"));
                         }
                     }
                 } else if let Ok(got) = ipc::port_poll_many_in(
-                    &mut w.objs,
-                    &w.handles,
+                    &mut io.w.objs,
+                    &io.w.handles,
                     Handle(p),
-                    &mut w.jobs,
+                    &mut io.w.jobs,
                     1 + i % 4,
                 ) {
                     if got.len() > 1 + i % 4 || got.iter().any(|&(_, seen)| seen == 0) {
@@ -250,27 +260,42 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             }
         }
         at.set(("cleanup", i));
-        let dirty = cleanup_keep(&mut w);
+        let dirty = cleanup_keep(&mut io.w);
+        // (the kernel's tail: a dead domain's destruction is begun and completed)
+        io.settle_domains();
         at.set(("waits", i));
         // (T176 7: the threads of the wait table, which the kernel keeps outside `ksys`, wait on what the fuzzer makes and breaks)
-        check_waits(&mut w, &mut waits, &mut masks, dirty, seed, i)?;
+        check_waits(&mut io.w, &mut waits, &mut masks, dirty, seed, i)?;
         at.set(("audit", i));
-        audit(&mut w).map_err(|e| format!("seed {seed}, call {i} ({call:?}): {e}"))?;
+        audit(&mut io.w).map_err(|e| format!("seed {seed}, call {i} ({call:?}): {e}"))?;
     }
     at.set(("baseline", calls));
     // (what is left waiting is released by the destruction of everything: one last commit, then every thread leaves)
-    let dirty = cleanup_keep(&mut w);
-    check_waits(&mut w, &mut waits, &mut masks, dirty, seed, calls)?;
+    let dirty = cleanup_keep(&mut io.w);
+    check_waits(&mut io.w, &mut waits, &mut masks, dirty, seed, calls)?;
     for t in 1..=WAITERS {
         waits.forget(t);
         waits.retire(t);
     }
     waits
-        .audit(|o| w.objs.is_alive(o))
+        .audit(|o| io.w.objs.is_alive(o))
         .map_err(|e| format!("seed {seed}, after the waiters left: {e}"))?;
-    w.job = JobId::ROOT;
-    baseline(&mut w).map_err(|e| format!("seed {seed}, at the end: {e}"))?;
-    (w.objs.live(), w.handles.len()).hash(&mut hasher);
+    io.w.job = JobId::ROOT;
+    // (every handle closed and the sweep run, the dead domains are destroyed before the baseline counts the frames)
+    io.w.handles.drain(&mut io.w.objs);
+    cleanup(&mut io.w);
+    io.w.objs.sweep(&[]);
+    cleanup(&mut io.w);
+    io.settle_domains();
+    let st = io.store.stats();
+    if (st.domains, st.io_pages, st.holds_leaked) != (0, 0, 0) || !io.timeouts.is_empty() {
+        return Err(format!(
+            "seed {seed}, at the end: domains {}, I/O-mapped pages {}, leaked holds {}, fence timeouts {:?}",
+            st.domains, st.io_pages, st.holds_leaked, io.timeouts
+        ));
+    }
+    baseline(&mut io.w).map_err(|e| format!("seed {seed}, at the end: {e}"))?;
+    (io.w.objs.live(), io.w.handles.len()).hash(&mut hasher);
     Ok(hasher.finish())
 }
 

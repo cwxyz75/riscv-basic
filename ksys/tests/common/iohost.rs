@@ -53,6 +53,8 @@ impl PhysMem64 for IoMem {
 }
 
 pub const FENCE_BOUND: u64 = 1000;
+/// The frames the bring-up takes: the directory, the command and fault queues, and the quarantine root.
+pub const BOOT_FRAMES: usize = 7;
 
 /// The machine: the ksys world, the simulated IOMMU brought up as the kernel does (2.4 steps 3 to 5), the store, a clock that runs
 /// only while a call waits, and the fence timeouts it reported.
@@ -135,7 +137,11 @@ impl<'m> IoEnv for Host<'m> {
 
 impl<'m> Host<'m> {
     pub fn new(io: &'m IoMem) -> Host<'m> {
-        let mut w = world_with_frames(64, 2048);
+        Host::with_world(io, world_with_frames(64, 2048))
+    }
+
+    /// The IOMMU brought up over `w`, from its frames (`BOOT_FRAMES` of them, counted in `w.extra_frames`).
+    pub fn with_world(io: &'m IoMem, mut w: World) -> Host<'m> {
         let mut sim = Sim::new(
             io,
             SimConfig {
@@ -158,6 +164,7 @@ impl<'m> Host<'m> {
         sim.write32(regs::FQCSR, regs::QCSR_EN);
         sim.write64(regs::DDTP, Ddtp::directory(Levels::One, dir).bits());
         let store = IoDomains::new(ddt, cmdq, &quarantine, 0x5eed_6666).unwrap();
+        w.extra_frames += BOOT_FRAMES;
         Host {
             w,
             io,
@@ -170,16 +177,21 @@ impl<'m> Host<'m> {
         }
     }
 
-    pub fn call(&mut self, n: usize, a: [u64; 6]) -> Reply {
-        let r = match n {
+    /// The call alone, as the kernel's dispatch runs it (`None`: not a call the host layer handles).
+    pub fn dispatch(&mut self, n: usize, a: [u64; 6]) -> Option<Reply> {
+        Some(match n {
             nr::IODOMAIN_CREATE => kio::iodomain_create(self, a),
             nr::IODOMAIN_MAP => kio::iodomain_map(self, a),
             nr::IODOMAIN_UNMAP => kio::iodomain_unmap(self, a),
             nr::IODOMAIN_DESTROY => kio::iodomain_destroy(self, a),
             nr::IODOMAIN_FAULT_READ => kio::iodomain_fault_read(self, a),
             nr::VMO_CREATE_DMA_IN => kio::vmo_create_dma_in(self, a),
-            _ => self.w.call(n, a).expect("handled"),
-        };
+            _ => return self.w.call(n, a),
+        })
+    }
+
+    pub fn call(&mut self, n: usize, a: [u64; 6]) -> Reply {
+        let r = self.dispatch(n, a).expect("handled");
         // the tail of every call: what died is cleaned up and the destructions it began are completed
         self.settle();
         r
@@ -222,6 +234,16 @@ impl<'m> Host<'m> {
                 }
             }
             self.w.objs.recycle(dead);
+        }
+        self.settle_domains();
+    }
+
+    /// The domains `cleanup_keep` found dead begin their destruction; then every destruction begun is completed and the VMOs
+    /// whose last holder went are freed.
+    pub fn settle_domains(&mut self) {
+        for d in std::mem::take(&mut self.w.io_dead) {
+            kio::iodomain_closed(&mut self.store, self.io, &mut self.sim, d.domain);
+            self.w.jobs.release(d.job);
         }
         kio::drain_destructions(self);
         self.w.vmos.drain_all(&mut self.w.mm, &mut self.w.jobs);

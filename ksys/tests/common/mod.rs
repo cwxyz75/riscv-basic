@@ -67,6 +67,10 @@ pub struct World {
     pub job: JobId,
     pub faults: Faults,
     pub job_sched: kcore::jobsched::JobSchedTable,
+    /// Device-domain objects that died in `cleanup_keep`, for the IOMMU harness (`iohost::Host::settle`) to destroy (IOMMU6).
+    pub io_dead: Vec<kcore::ipc::IoDomainObj>,
+    /// Frames a harness took for itself (the IOMMU's directory, queues and quarantine table): `frame_accounting` counts them.
+    pub extra_frames: usize,
 }
 
 pub fn world_with(handles: usize) -> World {
@@ -101,6 +105,8 @@ pub fn world_with_frames(handles: usize, frames: usize) -> World {
         job: JobId::ROOT,
         faults: Faults::default(),
         job_sched: kcore::jobsched::JobSchedTable::new(),
+        io_dead: Vec::new(),
+        extra_frames: 0,
     }
 }
 
@@ -206,6 +212,7 @@ pub fn cleanup_keep(w: &mut World) -> kcore::object::Dirty {
                     let _ = w.vmos.release(&mut w.mm, &mut w.jobs, id);
                 }
                 KObj::Job(id) => w.jobs.release(id),
+                KObj::IoDomain(d) => w.io_dead.push(d),
                 _ => {}
             }
         }
@@ -343,7 +350,7 @@ pub fn table_frames(w: &World) -> usize {
 /// and the space's, with the tables under its user half) and the pages the VMOs still hold.
 pub fn frame_accounting(w: &World) -> Result<(), String> {
     let allocated = w.mm.db.total() - w.mm.db.free_count();
-    let tables = 1 + table_frames(w);
+    let tables = 1 + table_frames(w) + w.extra_frames;
     let pages = w.vmos.frames_held() as usize;
     if allocated != tables + pages {
         return Err(format!(

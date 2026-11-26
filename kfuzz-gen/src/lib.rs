@@ -23,6 +23,10 @@ pub enum Kind {
     Port,
     Vmo,
     Job,
+    /// The root resource (the host harness holds one; the guest program does not, so its device calls only meet the handle errors).
+    Resource,
+    /// A device domain (IOMMU6).
+    IoDomain,
     /// Received through a channel: the kind is not known to the model.
     Any,
 }
@@ -52,6 +56,10 @@ pub struct Model {
     /// A handle the generator never closes, replaces, sends or sets limits on (the harness's root job handle: the job calls need a job to act
     /// on, and limits on the root would starve every other call).
     pinned: Option<u64>,
+    /// VMOs made by `vmo_create_dma_in`, which `iodomain_map` can map (IOMMU6).
+    dma: Vec<u64>,
+    /// Live device mappings: (domain handle, I/O address, pages), from the `iodomain_map` calls that succeeded.
+    maps: Vec<(u64, u64, u64)>,
 }
 
 impl Model {
@@ -61,6 +69,8 @@ impl Model {
             live: handles.to_vec(),
             closed: Vec::new(),
             pinned: None,
+            dma: Vec::new(),
+            maps: Vec::new(),
         }
     }
 
@@ -86,6 +96,7 @@ impl Model {
     }
 
     fn remove(&mut self, h: u64) {
+        self.dma.retain(|&d| d != h);
         if let Some(i) = self.live.iter().position(|&(x, _)| x == h) {
             self.live.swap_remove(i);
             // (a ring: the stale handles are the recent ones too, not only the first 64)
@@ -124,6 +135,18 @@ impl Model {
             nr::PORT_CREATE => self.add(a1.unwrap_or(0), Kind::Port),
             nr::VMO_CREATE => self.add(a1.unwrap_or(0), Kind::Vmo),
             nr::JOB_CREATE => self.add(a1.unwrap_or(0), Kind::Job),
+            nr::IODOMAIN_CREATE => self.add(a1.unwrap_or(0), Kind::IoDomain),
+            nr::VMO_CREATE_DMA_IN => {
+                self.add(a1.unwrap_or(0), Kind::Vmo);
+                self.dma.push(a1.unwrap_or(0));
+            }
+            nr::IODOMAIN_MAP => self
+                .maps
+                .push((call.args[0], a1.unwrap_or(0), call.args[3])),
+            nr::IODOMAIN_UNMAP => {
+                let at = (call.args[0], call.args[1], call.args[2]);
+                self.maps.retain(|&m| m != at);
+            }
             nr::HANDLE_CLOSE => self.remove(call.args[0]),
             nr::HANDLE_DUPLICATE => {
                 let k = kind_of(self, call.args[0]);
@@ -211,6 +234,12 @@ pub const CALLS: &[usize] = &[
     nr::JOB_SET_LIMITS,
     nr::JOB_INFO,
     nr::JOB_SET_IO_LIMITS,
+    nr::VMO_CREATE_DMA_IN,
+    nr::IODOMAIN_CREATE,
+    nr::IODOMAIN_MAP,
+    nr::IODOMAIN_UNMAP,
+    nr::IODOMAIN_DESTROY,
+    nr::IODOMAIN_FAULT_READ,
 ];
 
 /// The kind of handle each call wants first.
@@ -222,6 +251,10 @@ fn wants(n: usize) -> Option<Kind> {
         nr::PORT_BIND | nr::PORT_REARM | nr::PORT_UNBIND => Kind::Port,
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_COMMIT => Kind::Vmo,
         nr::JOB_CREATE | nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_SET_IO_LIMITS => Kind::Job,
+        nr::VMO_CREATE_DMA_IN | nr::IODOMAIN_CREATE => Kind::Resource,
+        nr::IODOMAIN_MAP | nr::IODOMAIN_UNMAP | nr::IODOMAIN_DESTROY | nr::IODOMAIN_FAULT_READ => {
+            Kind::IoDomain
+        }
         _ => return None,
     })
 }
@@ -325,7 +358,7 @@ impl Gen {
         // set-limits on a job and a permanent shutdown are rarer than the calls that make things happen
         let n = if matches!(
             n,
-            nr::SOCKET_SHUTDOWN | nr::JOB_SET_LIMITS | nr::JOB_SET_IO_LIMITS
+            nr::SOCKET_SHUTDOWN | nr::JOB_SET_LIMITS | nr::JOB_SET_IO_LIMITS | nr::IODOMAIN_DESTROY
         ) && self.below(4) != 0
         {
             nr::SOCKET_WRITE
@@ -502,9 +535,67 @@ impl Gen {
                 c.args[1] = self.limit();
                 c.args[2] = self.limit();
             }
+            // (IOMMU6: device ids the host's tree has, now and then one past them; small DMA VMOs, now and then more than a step)
+            nr::IODOMAIN_CREATE => {
+                c.args[1] = if self.below(10) == 0 {
+                    64 + self.below(4)
+                } else {
+                    self.below(6)
+                };
+                c.args[2] = self.job(m);
+            }
+            nr::VMO_CREATE_DMA_IN => {
+                c.args[1] = match self.below(10) {
+                    0 => 0,
+                    1 => 65 + self.below(80),
+                    _ => 1 + self.below(8),
+                };
+                c.args[2] = self.job(m);
+            }
+            nr::IODOMAIN_MAP => {
+                let vmo = match self.pick(&m.dma) {
+                    Some(v) if self.below(10) != 0 => v,
+                    _ => self.pick(&m.of(Kind::Vmo)).unwrap_or(0),
+                };
+                let pages = if self.below(10) == 0 {
+                    65 + self.below(80)
+                } else {
+                    1 + self.below(4)
+                };
+                c.args = [
+                    handle,
+                    vmo,
+                    self.below(4) * 4096,
+                    pages,
+                    [1, 3, 3, 2, 7][self.below(5) as usize],
+                    0,
+                ];
+            }
+            nr::IODOMAIN_UNMAP => {
+                let mine: Vec<(u64, u64, u64)> = m
+                    .maps
+                    .iter()
+                    .copied()
+                    .filter(|&(d, _, _)| d == handle)
+                    .collect();
+                c.args = match self.pick(&mine) {
+                    Some((d, io, pages)) if self.below(10) != 0 => [d, io, pages, 0, 0, 0],
+                    _ => [handle, self.below(64) * 4096, 1 + self.below(4), 0, 0, 0],
+                };
+            }
             _ => {}
         }
         c
+    }
+
+    /// The job a creation charges: one the process holds (three times in ten), else 0 for its own.
+    fn job(&mut self, m: &Model) -> u64 {
+        let jobs = m.of(Kind::Job);
+        if self.below(10) < 3 {
+            self.pick(&jobs).unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     /// A limit word: none, zero, or small.
