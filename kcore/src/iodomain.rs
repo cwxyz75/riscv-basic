@@ -586,6 +586,10 @@ pub struct IoDomains {
     leaked_domains: Option<FBox<Domain>>,
     /// Destructions abandoned (a map in steps whose domain went meanwhile leaks its record if this moved: `MapFailed::Leaked`).
     abandons: u64,
+    /// Destructions past `destroy_complete` whose release (records, tables, charges) runs with no lock held and has not ended
+    /// (`destroy_released`): with the domains still detaching, what `unfinished` waits for (IOMMU-SPEC 6.3: done before the call
+    /// that began it returns).
+    releasing: u64,
     stats: IoStats,
     window_start: u64,
     window_lines: u32,
@@ -919,6 +923,7 @@ impl IoDomains {
             leaked: None,
             leaked_domains: None,
             abandons: 0,
+            releasing: 0,
             stats: IoStats::default(),
             window_start: 0,
             window_lines: 0,
@@ -1921,6 +1926,7 @@ impl IoDomains {
         dom.mappings = 0;
         let gscid = dom.gscid;
         self.free_gscid(gscid);
+        self.releasing = self.releasing.saturating_add(1);
         Ok(Some(Detached {
             dom,
             cursor: 0,
@@ -2024,6 +2030,18 @@ impl IoDomains {
                 ticket: Ticket(dom.destroy_ticket),
             })
         })
+    }
+
+    /// The release of a `Detached` from `destroy_complete` has ended (its `finish` ran).
+    pub fn destroy_released(&mut self) {
+        self.releasing = self.releasing.saturating_sub(1);
+    }
+
+    /// Is a destruction begun and not ended: a domain still detaching (its fence not yet waited for, or waited for by another
+    /// thread), or a release under way with no lock held? A caller that began one waits until this is false before it returns
+    /// (IOMMU-SPEC 6.3, 4.5). Work in the number of slots.
+    pub fn unfinished(&self) -> bool {
+        self.releasing > 0 || self.next_detaching().is_some()
     }
 
     /// Name the domain for its faults (`FaultOutcome::tag`): the kernel stores its object's id. False if the domain is gone.

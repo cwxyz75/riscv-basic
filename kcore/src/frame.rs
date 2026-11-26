@@ -225,10 +225,12 @@ impl FrameDb {
         match m.refs {
             0 => Err(FrameError::NotAllocated),
             1 => {
-                debug_assert_eq!(
-                    m.io, 0,
+                // (a saturated count, `u16::MAX`, is no longer known: it is not asserted on, and is reset by the free)
+                debug_assert!(
+                    m.io == 0 || m.io == u16::MAX,
                     "IO3: frame {pfn:#x} is freed while a device mapping names it"
                 );
+                m.io = 0;
                 m.refs = 0;
                 range.buddy.free_block(window, pfn, 0);
                 Ok(true)
@@ -252,7 +254,8 @@ impl FrameDb {
         }
     }
 
-    /// Drop one `io_mark` (a saturated count stays: it can only under-count, never stop a free that is allowed).
+    /// Drop one `io_mark`. A saturated count stays saturated (the true count is no longer known), and the IO3 assertion of the free
+    /// skips it: a frame mapped more than 65,534 times at once loses the check, never a free that is allowed.
     #[cfg(debug_assertions)]
     #[allow(clippy::indexing_slicing)] // INVARIANT: as io_mark
     pub fn io_unmark(&mut self, pfn: Pfn) {

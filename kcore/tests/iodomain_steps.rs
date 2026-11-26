@@ -197,6 +197,33 @@ fn a_destruction_begun_during_a_map_makes_it_roll_back_with_bad_state() {
     );
 }
 
+/// IOMMU6 (6.3, 4.5): a destruction is unfinished from its beginning until its release has ended, also while another thread holds
+/// it past `destroy_complete`: what a closing call waits for before it returns.
+#[test]
+fn a_destruction_is_unfinished_until_its_release_has_ended() {
+    let mem = IoMem::new();
+    let (mut w, d, v, _) = setup(&mem, 4);
+    map_ok(&mut w, d, v, 0, 4, Access::ReadWrite);
+    assert!(!w.store.unfinished());
+    let x = w.destroy(d).unwrap();
+    assert!(w.store.unfinished(), "begun: detaching");
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, x.ticket()), Fence::Done);
+    assert!(w.store.unfinished(), "fenced, not yet completed");
+    let mut det = w.store.destroy_complete(w.mem, &x).unwrap().unwrap();
+    assert!(
+        w.store.unfinished(),
+        "the release runs with no lock held: still unfinished"
+    );
+    while let Some(rel) = det.next_record() {
+        w.settle(rel);
+    }
+    w.finish(det);
+    assert!(w.store.unfinished(), "until the releaser says so");
+    w.store.destroy_released();
+    assert!(!w.store.unfinished());
+}
+
 #[test]
 fn a_destruction_completed_during_a_map_hands_the_record_back() {
     let mem = IoMem::new();

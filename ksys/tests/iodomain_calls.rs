@@ -276,7 +276,8 @@ fn iodomain_unmap_rows() {
     );
     let again = h.map(d, v, 0, 4, RW);
     h.ok(nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
-    assert_eq!(h.err(u, [d, again, 4, 0, 0, 0]), Status::BadState);
+    // (4.4's order: a destroyed domain has no live mapping, INVALID_ARGS comes first and BAD_STATE is not reached; Q-IOMMU-UNMAPORDER)
+    assert_eq!(h.err(u, [d, again, 4, 0, 0, 0]), Status::InvalidArgs);
     assert_eq!(h.err(u, [d, again, 0, 0, 0, 0]), Status::InvalidArgs);
 }
 
@@ -581,6 +582,29 @@ fn job_set_io_limits_and_job_info() {
         h.ok(nr::JOB_INFO, [parent, 12, 0, 0, 0, 0]),
         (Some(0), Some(2))
     );
+}
+
+/// 7.4: a device that faults the moment it is attached (a device a killed supervisor left running, 10.3), before the call has made
+/// the domain's object: the record is kept, and DEVICE_FAULT is up when the handle is returned.
+#[test]
+fn a_fault_during_the_create_raises_device_fault_on_the_new_handle() {
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    let res = h.resource();
+    h.fault_in_relax = Some((23, 0x5000));
+    let d = h.domain(res, 23);
+    assert!(
+        h.fault_in_relax.is_none(),
+        "the fault was taken during the create"
+    );
+    let sig = ipc::signals_of(&h.w.objs, &h.w.handles, Handle(d)).unwrap();
+    assert_ne!(
+        sig & signals::DEVICE_FAULT,
+        0,
+        "DEVICE_FAULT is up on the new handle"
+    );
+    let (_, a) = h.ok(nr::IODOMAIN_FAULT_READ, [d, 0, 0, 0, 0, 0]);
+    assert_eq!(a, Some(0x5000));
 }
 
 #[test]

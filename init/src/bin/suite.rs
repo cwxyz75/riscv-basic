@@ -14911,6 +14911,220 @@ fn iodomain_outlives_its_makers() -> Outcome {
     })
 }
 
+/// IOMMU6 (SYSCALLS.md "Device domains", `vmo_create_dma_in`, `job_set_io_limits`): each call's handle, rights and argument errors on
+/// the real kernel (the host's `iodomain_calls.rs` has every row in order; this is the machine's side of it).
+fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
+    with_test_function(|res, _, _| {
+        let ev = ok(sys::event_create(), "event")?.a1 as u64;
+        let plain = ok(sys::vmo_create(1), "a plain VMO")?.a1 as u64;
+        let weak_res = ok(
+            sys::handle_duplicate(res, Rights::DUPLICATE.0),
+            "a resource without MANAGE",
+        )?
+        .a1 as u64;
+        let root = root_job()?;
+        let small = job(root, u64::MAX, u64::MAX, 2)?;
+        let r = (|| {
+            // vmo_create_dma_in
+            ensure_eq!(
+                st(sys::vmo_create_dma_in(BAD, 1, 0)),
+                Some(S::BadHandle),
+                "dma_in: no resource"
+            );
+            ensure_eq!(
+                st(sys::vmo_create_dma_in(ev, 1, 0)),
+                Some(S::WrongType),
+                "dma_in: an event"
+            );
+            ensure_eq!(
+                st(sys::vmo_create_dma_in(weak_res, 1, 0)),
+                Some(S::AccessDenied),
+                "dma_in: no MANAGE"
+            );
+            ensure_eq!(
+                st(sys::vmo_create_dma_in(res, 0, 0)),
+                Some(S::InvalidArgs),
+                "dma_in: no pages"
+            );
+            ensure_eq!(
+                st(sys::vmo_create_dma_in(res, 4, small)),
+                Some(S::NoMemory),
+                "dma_in: past the job's pages"
+            );
+            // iodomain_create
+            ensure_eq!(
+                st(sys::iodomain_create(BAD, IOMMU_TEST_DID, 0)),
+                Some(S::BadHandle),
+                "create: no resource"
+            );
+            ensure_eq!(
+                st(sys::iodomain_create(ev, IOMMU_TEST_DID, 0)),
+                Some(S::WrongType),
+                "create: an event"
+            );
+            ensure_eq!(
+                st(sys::iodomain_create(weak_res, IOMMU_TEST_DID, 0)),
+                Some(S::AccessDenied),
+                "create: no MANAGE"
+            );
+            ensure_eq!(
+                st(sys::iodomain_create(res, 1 << 30, 0)),
+                Some(S::InvalidArgs),
+                "create: a device id past the tree's"
+            );
+            ensure_eq!(
+                st(sys::job_set_io_limits(small, 0, 0)),
+                Some(S::Ok),
+                "the small job maps nothing"
+            );
+            let d = ok(sys::iodomain_create(res, IOMMU_TEST_DID, small), "create")?.a1 as u64;
+            let r = (|| {
+                ensure_eq!(
+                    st(sys::iodomain_create(res, IOMMU_TEST_DID, 0)),
+                    Some(S::BadState),
+                    "create: a second domain for a live device"
+                );
+                let buf = ok(sys::vmo_create_dma_in(res, 1, 0), "a buffer")?.a1 as u64;
+                let no_map = ok(
+                    sys::handle_duplicate(d, Rights::IO_UNMAP.0 | Rights::IO_DESTROY.0),
+                    "no IO_MAP",
+                )?
+                .a1 as u64;
+                let drv = ok(
+                    sys::handle_duplicate(d, Rights::IODOMAIN_DRIVER.0),
+                    "the driver's",
+                )?
+                .a1 as u64;
+                // iodomain_map
+                ensure_eq!(
+                    st(sys::iodomain_map(BAD, buf, 0, 1, 3)),
+                    Some(S::BadHandle),
+                    "map: no domain"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_map(ev, buf, 0, 1, 3)),
+                    Some(S::WrongType),
+                    "map: an event"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_map(d, plain, 0, 1, 3)),
+                    Some(S::WrongType),
+                    "map: a VMO that is not DMA"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_map(no_map, buf, 0, 1, 3)),
+                    Some(S::AccessDenied),
+                    "map: no IO_MAP"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_map(d, buf, 0, 0, 3)),
+                    Some(S::InvalidArgs),
+                    "map: no pages"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_map(d, buf, 0, 1, 3)),
+                    Some(S::NoMemory),
+                    "map: past the job's I/O pages"
+                );
+                // iodomain_unmap
+                ensure_eq!(
+                    st(sys::iodomain_unmap(BAD, 0, 1)),
+                    Some(S::BadHandle),
+                    "unmap: no domain"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_unmap(ev, 0, 1)),
+                    Some(S::WrongType),
+                    "unmap: an event"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_unmap(drv, 0, 1)),
+                    Some(S::InvalidArgs),
+                    "unmap: no such mapping"
+                );
+                let no_unmap =
+                    ok(sys::handle_duplicate(d, Rights::IO_MAP.0), "no IO_UNMAP")?.a1 as u64;
+                ensure_eq!(
+                    st(sys::iodomain_unmap(no_unmap, 0, 1)),
+                    Some(S::AccessDenied),
+                    "unmap: no IO_UNMAP"
+                );
+                // iodomain_fault_read, iodomain_destroy
+                ensure_eq!(
+                    st(sys::iodomain_fault_read(BAD)),
+                    Some(S::BadHandle),
+                    "fault_read: no domain"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_fault_read(ev)),
+                    Some(S::WrongType),
+                    "fault_read: an event"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_destroy(BAD)),
+                    Some(S::BadHandle),
+                    "destroy: no domain"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_destroy(ev)),
+                    Some(S::WrongType),
+                    "destroy: an event"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_destroy(drv)),
+                    Some(S::AccessDenied),
+                    "destroy: the driver's"
+                );
+                ok(sys::iodomain_destroy(no_map), "destroy")?;
+                ensure_eq!(
+                    st(sys::iodomain_destroy(d)),
+                    Some(S::Ok),
+                    "a second destroy does nothing"
+                );
+                ensure_eq!(
+                    st(sys::iodomain_map(drv, buf, 0, 1, 3)),
+                    Some(S::BadState),
+                    "map: a destroyed domain"
+                );
+                for h in [buf, no_map, drv, no_unmap] {
+                    sys::handle_close(h);
+                }
+                Ok(())
+            })();
+            sys::handle_close(d);
+            r
+        })();
+        // job_set_io_limits
+        let no_limits = ok(
+            sys::handle_duplicate(small, Rights::INSPECT.0),
+            "a job without SET_LIMITS",
+        )?
+        .a1 as u64;
+        let r2 = (|| {
+            ensure_eq!(
+                st(sys::job_set_io_limits(BAD, 1, 1)),
+                Some(S::BadHandle),
+                "set_io_limits: no job"
+            );
+            ensure_eq!(
+                st(sys::job_set_io_limits(ev, 1, 1)),
+                Some(S::WrongType),
+                "set_io_limits: an event"
+            );
+            ensure_eq!(
+                st(sys::job_set_io_limits(no_limits, 1, 1)),
+                Some(S::AccessDenied),
+                "set_io_limits: no SET_LIMITS"
+            );
+            Ok(())
+        })();
+        for h in [ev, plain, weak_res, no_limits, small, root] {
+            sys::handle_close(h);
+        }
+        r.and(r2)
+    })
+}
+
 /// IOMMU4: identities are allocated per hart, next-fit, so an object re-created again and again walks the whole identity space of a
 /// file; an object routed through an identity of 64 or more (every `eie` register, up to `riscv,num-ids`) fires, stays masked until it
 /// is acknowledged and fires again after (D5). Before IOMMU4 the identity was source + 1 and `claim` dropped every identity above 63.
@@ -18171,6 +18385,10 @@ pub fn app_main() -> i32 {
         (
             "iodomain_outlives_its_makers",
             iodomain_outlives_its_makers,
+        ),
+        (
+            "iodomain_calls_check_handles_rights_and_arguments",
+            iodomain_calls_check_handles_rights_and_arguments,
         ),
         (
             "socket_ends_travel_over_channels",

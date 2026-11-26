@@ -69,7 +69,7 @@ pub trait IoEnv {
     /// The `time` counter, and `IOMMU_FENCE_BOUND` in its ticks (6.4).
     fn now(&self) -> u64;
     fn fence_bound(&self) -> u64;
-    /// Between two looks at a fence (no lock is held).
+    /// Between two looks at a fence, and between the steps of a long call (no lock is held: an interrupt window, OD168).
     fn relax(&mut self);
     /// A fence did not complete within the bound or the queue failed: count it and say so (6.4), naming the device.
     fn fence_timeout(&mut self, device: Option<u32>);
@@ -228,6 +228,9 @@ fn mark<E: IoEnv>(e: &mut E, vmo: u64, first: u64, pages: u64, on: bool) {
                 }
             });
             done = done.saturating_add(n);
+            if done < pages {
+                e.relax(); // (between steps, with no lock held: OD168)
+            }
         }
     }
 }
@@ -270,10 +273,14 @@ fn finish_destroy<E: IoEnv>(e: &mut E, x: Destroying) {
     let Ok(Some(mut det)) = det else {
         return; // (another thread completed or abandoned it)
     };
+    // (the release in steps, with an interrupt window between them: OD168)
     while let Some(rel) = det.next_record() {
         release(e, rel);
+        e.relax();
     }
-    while !e.frame(|db, _, p| det.step(p, &mut DbFrames { db, mem: p })) {}
+    while !e.frame(|db, _, p| det.step(p, &mut DbFrames { db, mem: p })) {
+        e.relax();
+    }
     e.mem(|mm, _, jobs, p| {
         det.finish(
             p,
@@ -284,6 +291,7 @@ fn finish_destroy<E: IoEnv>(e: &mut E, x: Destroying) {
             jobs,
         )
     });
+    e.iommu(|s, _, _, _| s.destroy_released());
 }
 
 /// Destroy a domain now and wait for it (a create that cannot finish).
@@ -298,6 +306,20 @@ fn destroy_now<E: IoEnv>(e: &mut E, d: DomainId) {
 pub fn drain_destructions<E: IoEnv>(e: &mut E) {
     while let Some(x) = e.iommu(|s, _, _, _| s.next_detaching()) {
         finish_destroy(e, x);
+    }
+}
+
+/// `drain_destructions`, then wait (with `relax`, no lock held) until no destruction is left unfinished, also one another thread
+/// took: the tail of a call that began one, so that it returns only when the domain is gone and its charges are back (6.3, 4.5). Each
+/// destruction ends within its fence bound (completed, or abandoned and leaked), so the wait is bounded; it gives up after a few
+/// bounds all the same, rather than spin behind destructions that others keep beginning.
+pub fn settle_destructions<E: IoEnv>(e: &mut E) {
+    drain_destructions(e);
+    let t0 = e.now();
+    let bound = e.fence_bound().saturating_mul(4);
+    while e.iommu(|s, _, _, _| s.unfinished()) && e.now().saturating_sub(t0) < bound {
+        e.relax();
+        drain_destructions(e);
     }
 }
 
@@ -386,7 +408,14 @@ fn create_in<E: IoEnv>(e: &mut E, a: [u64; 6], job: JobId) -> Reply {
     });
     match made.unwrap_or(Err(Status::BadState)) {
         Ok((h, obj)) => {
-            e.iommu(|s, _, _, _| s.set_tag(d, obj.to_words()));
+            // (the tag and the signal in one section, OBJ then IOMMU: a fault the device took between the attach and here is in the
+            // ring with no object named, and raises DEVICE_FAULT now, 7.4)
+            let _ = e.obj_iommu(|objs, _, s, _, _| {
+                s.set_tag(d, obj.to_words());
+                if s.has_faults(d) {
+                    ipc::iodomain_set_fault(objs, obj, true);
+                }
+            });
             Ok((Some(h.0), None))
         }
         Err(s) => {
@@ -528,7 +557,10 @@ fn map_in<E: IoEnv>(
         match e
             .iommu(|s, mem, regs, db| s.map_step(mem, regs, &mut DbFrames { db, mem }, cur, frames))
         {
-            MapStep::More(c) => cur = c,
+            MapStep::More(c) => {
+                cur = c;
+                e.relax(); // (between steps, with no lock held: OD168)
+            }
             other => break other,
         }
     };
@@ -596,14 +628,15 @@ pub fn iodomain_unmap<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
         Err(s) => return err(s),
     };
     let (io_address, pages) = (a[1], a[2]);
-    if pages == 0 || io_address % 4096 != 0 {
+    // (4.4's order: INVALID_ARGS, "not exactly a live mapping", comes before BAD_STATE; a destroyed domain has no live mapping, its
+    // mappings went with it, so its unmap is INVALID_ARGS and BAD_STATE is not reached: the owner's question is decision Q-IOMMU-UNMAPORDER)
+    if pages == 0 || io_address % 4096 != 0 || d.destroyed {
         return err(Status::InvalidArgs);
-    }
-    if d.destroyed {
-        return err(Status::BadState);
     }
     match unmap_in(e, DomainId::from_raw(d.domain), io_address, pages) {
         Ok(()) => Ok((None, None)),
+        // (a destruction begun since the handle was resolved took the mapping: not a live mapping, as above)
+        Err(IoError::BadState) => err(Status::InvalidArgs),
         Err(x) => err(io_status(x)),
     }
 }
@@ -612,7 +645,10 @@ fn unmap_in<E: IoEnv>(e: &mut E, d: DomainId, io_address: u64, pages: u64) -> Re
     let mut u = e.iommu(|s, _, _, _| s.unmap_begin(d, io_address, pages))?;
     loop {
         match e.iommu(|s, mem, regs, _| s.unmap_step(mem, regs, u)) {
-            UnmapStep::More(n) => u = n,
+            UnmapStep::More(n) => {
+                u = n;
+                e.relax(); // (between steps, with no lock held: OD168)
+            }
             // OD170: the destruction took the record; what the caller asked for is guaranteed by it
             UnmapStep::Taken => return Ok(()),
             UnmapStep::Queued(p) => {
@@ -638,11 +674,14 @@ pub fn iodomain_destroy<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
         },
     );
     match started.unwrap_or(Err(Status::BadState)) {
-        Ok(Some(x)) => {
-            finish_destroy(e, x);
+        Ok(x) => {
+            if let Some(x) = x {
+                finish_destroy(e, x);
+            }
+            // (another thread may have taken this destruction, or a second destroy found it under way: done before the return)
+            settle_destructions(e);
             Ok((None, None))
         }
-        Ok(None) => Ok((None, None)),
         Err(s) => err(s),
     }
 }
@@ -705,7 +744,7 @@ pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     };
     let built = loop {
         match e.frame(|db, mem, _| b.step_with(db, mem)) {
-            Ok(false) => {}
+            Ok(false) => e.relax(), // (between steps, with no lock held: OD168)
             Ok(true) => break true,
             Err(_) => break false,
         }

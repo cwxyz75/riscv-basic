@@ -576,7 +576,7 @@ IOMMU-SPEC 11.2 and waits for its fences with no lock held, bounded by `IOMMU_FE
 go `RANGE_STEP` (64) pages per hold of `IOMMU`. The handle errors rank across the handles of a call: every BAD_HANDLE first, then
 WRONG_TYPE, then ACCESS_DENIED.
 
-#### iodomain_create(resource, device_id, job) -> status, handle
+### iodomain_create(resource, device_id, job) -> status, handle
 
 A domain for `device_id`, attached at once (the device leaves the empty directory or the quarantine). `resource`: the root resource
 with MANAGE. `job`: a job handle with MANAGE, or 0 for the caller's: it pays for everything the domain holds (IOMMU-SPEC 5.3) and the
@@ -585,7 +585,7 @@ INVALID_ARGS (`device_id` is not an id the tree's `iommu-map` covers); BAD_STATE
 destruction has not completed); NO_MEMORY (the job's kernel bytes or objects, the handle table, table frames, a soft-context id, a fence
 that did not complete). On failure nothing is left and the device's state is unchanged. The handle has the rights listed under Rights.
 
-#### iodomain_map(domain, vmo, vmo_offset, pages, access) -> status, io_address
+### iodomain_map(domain, vmo, vmo_offset, pages, access) -> status, io_address
 
 Maps `pages` pages of `vmo` from byte `vmo_offset` at an I/O address the kernel chooses, and returns it once the invalidation and fence
 that follow are complete. `access` is 1 (READ: the device may read) or 3 (READ and WRITE). Needs IO_MAP on `domain`; on `vmo`, DMA,
@@ -597,23 +597,25 @@ begins while a large map is under way: the map gives way and is rolled back); NO
 for the record or the tables, no free I/O range, a fence that did not complete). A failed map is rolled back as an unmap: nothing is
 left mapped and nothing freed before its fence.
 
-#### iodomain_unmap(domain, io_address, pages) -> status
+### iodomain_unmap(domain, io_address, pages) -> status
 
 Removes the one mapping `iodomain_map` returned at exactly `io_address` and `pages`. When it returns, the device can no longer reach the
-frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`pages`
-0 or `io_address` not page aligned); BAD_STATE (the domain was destroyed); INVALID_ARGS (not exactly a live mapping of this domain).
+frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (not
+exactly a live mapping of this domain: `pages` 0, `io_address` not page aligned, no such mapping, or the domain was destroyed, which
+took every mapping); BAD_STATE (the domain was destroyed; as IOMMU-SPEC 4.4 orders it, never reached, since the INVALID_ARGS before it
+covers it: Q-IOMMU-UNMAPORDER).
 Never NO_MEMORY. A fence that does not complete within its bound still returns OK and leaks the frames (counted, `debug_stat` 158). An
 unmap under way when the domain's destruction begins returns OK: the destruction's fence covers it (OD170).
 
-#### iodomain_destroy(domain) -> status
+### iodomain_destroy(domain) -> status
 
 Detaches the device (it becomes Quarantined: an empty table, fault reporting off) and empties the domain: every mapping is removed,
 then the domain's tables, root and record are freed after the fence (IOMMU-SPEC 6.3), and its job credited. Needs IO_DESTROY. Errors:
 BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED. A destroyed domain's destroy is OK and does nothing. **Closing the last handle** destroys the
 domain the same way (and so does the teardown of the last process that held one), completed before the closing call returns to user
-mode. A destroyed domain's other handles stay valid: `iodomain_map` is BAD_STATE and `iodomain_unmap` BAD_STATE.
+mode. A destroyed domain's other handles stay valid: `iodomain_map` is BAD_STATE and `iodomain_unmap` INVALID_ARGS.
 
-#### iodomain_fault_read(domain) -> status, word, io_address
+### iodomain_fault_read(domain) -> status, word, io_address
 
 The oldest unread record of the domain's ring of 16 (IOMMU-SPEC 7.4), removed: `a1` = cause | direction << 16 | dropped << 32
 (direction 0 none, 1 read, 2 write, 3 execute; dropped: the faults not stored since the previous successful read, reset by this one),

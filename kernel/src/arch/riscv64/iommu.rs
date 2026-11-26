@@ -192,8 +192,9 @@ static STATE: klock::Spin<Option<State>, crate::bkl::Machine> =
 
 /// The directory is written and every device is denied (step 5 done): the device windows may be built.
 static ON: AtomicBool = AtomicBool::new(false);
-/// A destruction was begun under another lock (a handle close, a teardown) and may wait for `drain`.
-static DETACHING: AtomicBool = AtomicBool::new(false);
+/// A destruction is begun and not ended (`IoDomains::unfinished`), as last seen under the IOMMU lock: written only while it is
+/// held, so a `drain` that reads it after its own `closed` sees true until every destruction has ended.
+static UNFINISHED: AtomicBool = AtomicBool::new(false);
 /// The counters of IOMMU-SPEC 7.3 this slice has (`debug_stat` 150 to 157, SYSCALLS.md).
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -201,7 +202,6 @@ static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static LAST_DID: AtomicU64 = AtomicU64::new(0);
 static LAST_IOVA: AtomicU64 = AtomicU64::new(0);
 static LAST_CAUSE: AtomicU64 = AtomicU64::new(0);
-static COMMANDS: AtomicU64 = AtomicU64::new(0);
 static FENCE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 /// Is the IOMMU on, every device denied (IOMMU-SPEC 2.4 step 5)?
@@ -347,7 +347,6 @@ fn fence(cmds: &[Command], device: Option<u32>) -> Result<(), ()> {
     let Some(mut ticket) = queue() else {
         return Err(());
     };
-    COMMANDS.fetch_add(cmds.len() as u64, Ordering::Relaxed);
     let t0 = crate::timer::now();
     let bound = crate::timer::cycles_from_ns(FENCE_BOUND_NS);
     loop {
@@ -475,12 +474,13 @@ pub fn stat(which: u64) -> u64 {
         153 => &LAST_DID,
         154 => &LAST_IOVA,
         155 => &LAST_CAUSE,
-        156 => &COMMANDS,
         157 => &FENCE_TIMEOUTS,
-        158..=161 => {
+        // (156: every command the store queued, the calls' and the kernel's own, with their fences: IOMMU6)
+        156 | 158..=161 => {
             let st = STATE.lock().as_ref().map(|s| s.store.stats());
             let Some(st) = st else { return 0 };
             return match which {
+                156 => st.commands,
                 158 => st.pages_leaked.saturating_add(st.tables_leaked),
                 159 => st.domains,
                 160 => st.io_pages,
@@ -612,31 +612,25 @@ pub fn call(n: usize, a: [u64; 6]) -> Option<ksys::Reply> {
 /// The last handle of a device domain went (the object's cleanup, under the object lock): 6.3 step 1, which allocates nothing and does
 /// not wait; `drain` completes it.
 pub fn closed(domain: u64) {
-    let started = {
-        let mut g = STATE.lock();
-        match (g.as_mut(), Mmio::new()) {
-            (Some(s), Some(mut r)) => {
-                ksys::iodomain::iodomain_closed(&mut s.store, &Direct, &mut r, domain);
-                true
-            }
-            _ => false,
-        }
-    };
-    if started {
-        DETACHING.store(true, Ordering::Release);
+    let mut g = STATE.lock();
+    if let (Some(s), Some(mut r)) = (g.as_mut(), Mmio::new()) {
+        ksys::iodomain::iodomain_closed(&mut s.store, &Direct, &mut r, domain);
+        UNFINISHED.store(s.store.unfinished(), Ordering::Release);
     }
 }
 
-/// Complete every destruction begun under another lock (6.3 steps 2 to 4), with no lock held: the tail of every call and fault, and
-/// the end of a teardown. One load when nothing is pending; a caller that holds the object lock leaves it to the next.
+/// Complete every destruction begun under another lock (6.3 steps 2 to 4), with no lock held, and wait for those other harts are
+/// completing: the tail of every call and fault, and the end of a teardown, so a close returns only when its domain is gone (6.3).
+/// One load when nothing is pending; a caller that holds the object lock leaves it to the next.
 pub fn drain() {
-    if crate::bkl::holds()
-        || !DETACHING.load(Ordering::Acquire)
-        || !DETACHING.swap(false, Ordering::AcqRel)
-    {
+    if crate::bkl::holds() || !UNFINISHED.load(Ordering::Acquire) {
         return;
     }
-    ksys::iodomain::drain_destructions(&mut Kenv);
+    ksys::iodomain::settle_destructions(&mut Kenv);
+    let g = STATE.lock();
+    if let Some(s) = g.as_ref() {
+        UNFINISHED.store(s.store.unfinished(), Ordering::Release);
+    }
 }
 
 /// Directory and table frames for the self-test: zeroed on the way in; on the way out kept off the free lists until the fence

@@ -68,6 +68,9 @@ pub struct Host<'m> {
     /// The device stalls: the commands are not processed while a call waits.
     pub stall: bool,
     pub timeouts: Vec<Option<u32>>,
+    /// A device access that faults, made at the next `relax` once the commands have run, with the fault interrupt taken there (a
+    /// fault while a call waits: between a create's attach and its object, say).
+    pub fault_in_relax: Option<(u32, u64)>,
 }
 
 impl<'m> IoEnv for Host<'m> {
@@ -129,6 +132,10 @@ impl<'m> IoEnv for Host<'m> {
             self.sim.process_commands();
             EXEMPT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some((did, iova)) = self.fault_in_relax.take() {
+            let _ = self.sim.write(did, iova, 1);
+            self.fault_interrupt();
+        }
     }
     fn fence_timeout(&mut self, device: Option<u32>) {
         self.timeouts.push(device);
@@ -174,6 +181,7 @@ impl<'m> Host<'m> {
             clock: 0,
             stall: false,
             timeouts: vec![],
+            fault_in_relax: None,
         }
     }
 
@@ -245,7 +253,7 @@ impl<'m> Host<'m> {
             kio::iodomain_closed(&mut self.store, self.io, &mut self.sim, d.domain);
             self.w.jobs.release(d.job);
         }
-        kio::drain_destructions(self);
+        kio::settle_destructions(self);
         self.w.vmos.drain_all(&mut self.w.mm, &mut self.w.jobs);
     }
 

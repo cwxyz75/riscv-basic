@@ -485,6 +485,7 @@ pub fn destroy_ok(w: &mut World, d: DomainId) -> Vec<(u64, u64)> {
         w.settle(rel);
     }
     w.finish(det);
+    w.store.destroy_released();
     got
 }
 
