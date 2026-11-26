@@ -14749,9 +14749,12 @@ fn iodomain_faults_reach_the_supervisor() -> Outcome {
                 sys::thread_yield();
             }
         }
-        // (the device faults more than once for one request: QEMU 11.1.3's virtio reads the available ring's index three times. The loop above
-        // waits only for the first fault of each, so the last requests' later faults can still be on their way: the count is read once it has
-        // stayed still, or a fault the domain stores after the read would count as dropped and not in the total)
+        // The device faults more than once for one request (QEMU 11.1.3's virtio reads the available ring's index three times), and the loop
+        // above waits only for the first fault of each, so the last requests' later faults can still be on their way: a count read at any one
+        // moment can be short of what the domain has stored and dropped by the time it is read. What holds at every moment is the ledger
+        // (IOMMU-SPEC 7.4: the count and the ring change under one lock): every fault is either a record read from the ring or counted as
+        // dropped. So the count is read once it has stayed still, the ring is drained, the count is let settle again and anything stored since
+        // is drained too, and the sum is checked against the final count.
         let total = iommu_wait_faults(before).unwrap_or(before) - before;
         ensure!(total >= 20, "twenty faults at least ({total})");
         ensure!(
@@ -14759,13 +14762,23 @@ fn iodomain_faults_reach_the_supervisor() -> Outcome {
             "DEVICE_FAULT is up"
         );
         let recs = drain_domain_faults(d.sup);
-        ensure_eq!(recs.len(), 16, "the ring holds sixteen");
-        let dropped: u64 = recs.iter().map(|r| r.3).sum();
-        ensure_eq!(dropped, total - 16, "the rest are counted as dropped");
+        // (a fault that arrives while the ring is being read finds room in it: the drain reads it too, so the ring holds at least sixteen)
+        ensure!(recs.len() >= 16, "the ring holds sixteen ({})", recs.len());
+        // (the first read reports what was dropped before it: at least the faults counted so far beyond the sixteen it kept)
+        ensure!(
+            recs[0].3 >= total - 16,
+            "the dropped count comes with the first read: {} for {total} faults",
+            recs[0].3
+        );
+        let settled = iommu_wait_faults(before).unwrap_or(before) - before;
+        let late = drain_domain_faults(d.sup);
+        let dropped: u64 = recs.iter().chain(late.iter()).map(|r| r.3).sum();
         ensure_eq!(
-            recs[0].3,
-            total - 16,
-            "the dropped count comes with the first read and resets"
+            recs.len() as u64 + late.len() as u64 + dropped,
+            settled,
+            "every fault was read or counted as dropped ({} read, {} late, {dropped} dropped)",
+            recs.len(),
+            late.len()
         );
         ensure!(
             recs.windows(2).all(|w| w[0].1 <= w[1].1),
@@ -17505,14 +17518,10 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::NoMemory),
         "a thread whose stack does not fit the job"
     );
-    // (nothing of the stack is charged; a page-table page that the attempt needed, where the random placement put the stack's end, may stay, so the room below is
-    // counted from what the job has now: T238)
+    // (nothing is charged: with the caller's stack already mapped the only charge is the thread's, all or nothing, and the stopped child
+    // charges nothing more: T238)
     let after = job_use(j, 2)?.0;
-    ensure!(
-        after >= used && after - used <= 1,
-        "a refused thread charged nothing but at most a page-table page: {used} -> {after}"
-    );
-    used = after;
+    ensure_eq!(after, used, "a refused thread charges nothing");
     ensure_eq!(
         job_use(j, 1)?.0,
         1,

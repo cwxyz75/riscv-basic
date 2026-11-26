@@ -1042,6 +1042,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, object_wait(a))
         }
         // (IOMMU7) a vector's acknowledgement and `interrupt_deliver_here` are the device-domain layer's; a wired source's are `dispatch`'s
+        // (the guard is the call: `device_domain_call` answers a vector's and replies; false sends a wired source on to `dispatch`)
         nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE if device_domain_call(frame, n, a, true) => {
         }
         nr::PORT_WAIT => {
