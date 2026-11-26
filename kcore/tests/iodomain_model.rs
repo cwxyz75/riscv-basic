@@ -1697,3 +1697,103 @@ fn a_map_rolled_back_after_writing_leaves_clears_them() {
     unmap_ok(&mut w, d, a, 1);
     destroy_ok(&mut w, d);
 }
+
+/// A record of no pages, or one whose frame list does not match its length, is refused with nothing changed.
+#[test]
+fn a_map_of_no_pages_or_the_wrong_frame_count_is_refused() {
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 2, job)
+        .unwrap();
+    let pfns = [w.vmos.frame(v, 0).unwrap(), w.vmos.frame(v, 1).unwrap()];
+    let tables = w.counts.tables;
+    for (pages, given) in [(0u64, 0usize), (2, 1), (1, 2)] {
+        let rec = Record::new(v, 0, pages, Access::Read).unwrap();
+        let World {
+            mem,
+            sim,
+            store,
+            mm,
+            counts,
+            ..
+        } = &mut w;
+        let mut f = DbFrames {
+            db: &mut mm.db,
+            mem,
+            counts,
+            fail: None,
+        };
+        match store.map(*mem, sim, &mut f, d, rec, &pfns[..given]) {
+            Err(MapFailed::Refused(e, rec)) => {
+                assert_eq!(e, IoError::InvalidArgs, "{pages} pages, {given} frames");
+                assert_eq!(rec.pages(), pages);
+            }
+            _ => panic!("{pages} pages with {given} frames is refused"),
+        }
+        assert_eq!(w.store.counts(d), Some((0, 0, 0)));
+        assert_eq!(w.counts.tables, tables);
+    }
+    destroy_ok(&mut w, d);
+}
+
+/// The queue is called full only when a map's commands and its fence do not fit: with an odd number of entries outstanding first (a
+/// create on a quarantined device: two commands and a fence), the maps (an invalidation and a fence each) fill it to the last entry.
+#[test]
+fn the_queue_is_full_only_when_the_commands_and_fence_do_not_fit() {
+    use iommucore::Regs;
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let q = ready(&mut w, 2, job);
+    destroy_ok(&mut w, q);
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 1, job)
+        .unwrap();
+    let entries = 1u32 << ((w.sim.read64(iommucore::regs::CQB) & 0x1f) + 1);
+    let used = |w: &mut World| {
+        let (head, tail) = (
+            w.sim.read32(iommucore::regs::CQH),
+            w.sim.read32(iommucore::regs::CQT),
+        );
+        (tail + entries - head) % entries
+    };
+    assert_eq!(used(&mut w), 0);
+    let (q, t) = w.create(2, job).unwrap();
+    assert_eq!(used(&mut w), 3, "a create on a quarantined device");
+    let (queued, m) = fill_queue(&mut w, d, v);
+    assert_eq!(
+        used(&mut w),
+        3 + 2 * queued.len() as u32,
+        "two entries a map"
+    );
+    assert_eq!(
+        used(&mut w),
+        entries - 1,
+        "every entry used before the queue is called full"
+    );
+    // drain: every fence completes, and the unqueued map goes in after
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, t), Fence::Done);
+    for x in &queued {
+        assert_eq!(w.store.poll(&mut w.sim, x.ticket), Fence::Done);
+    }
+    let mut m = m;
+    assert_eq!(
+        w.store.requeue_map(w.mem, &mut w.sim, d, &mut m),
+        Fence::Waiting
+    );
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, m.ticket), Fence::Done);
+    for x in queued.iter().chain([&m]) {
+        unmap_ok(&mut w, d, x.iova, 1);
+    }
+    destroy_ok(&mut w, q);
+    destroy_ok(&mut w, d);
+    w.close_vmo(v);
+}
