@@ -127,9 +127,14 @@ fn a_malformed_node_is_the_refusal_not_a_guess() {
         with(IOMMU, "interrupts", Some(be(&[2000, 1, 0x25, 1]))),
         "past 1023",
     );
+    bad(with(IOMMU, "#iommu-cells", None), "no #iommu-cells");
     bad(
-        with(PCI, "iommu-map", Some(be(&[0, 0x1234, 0, 0x10000]))),
-        "a map naming another IOMMU",
+        with(IOMMU, "#iommu-cells", Some(be(&[2]))),
+        "a two-cell specifier",
+    );
+    bad(
+        with(IOMMU, "#iommu-cells", Some(be(&[1, 1]))),
+        "#iommu-cells of two cells",
     );
     bad(
         with(
@@ -183,6 +188,22 @@ fn a_pci_host_only_partly_behind_the_iommu_opens_no_window() {
         ),
         ("a mask", with(PCI, "iommu-map-mask", Some(be(&[0xff00])))),
         (
+            "two halves on one set of device ids (0x5 and 0x8005 are both device 5)",
+            with(
+                PCI,
+                "iommu-map",
+                Some(be(&[0, 0x8000, 0, 0x8000, 0x8000, 0x8000, 0, 0x8000])),
+            ),
+        ),
+        (
+            "an entry ahead of the whole map that shifts ids (first match: 0x0 is device 0x100)",
+            with(
+                PCI,
+                "iommu-map",
+                Some(be(&[0, 0x8000, 0x100, 0x10, 0, 0x8000, 0, 0x10000])),
+            ),
+        ),
+        (
             "a malformed map",
             with(PCI, "iommu-map", Some(be(&[0, 0x8000, 0]))),
         ),
@@ -197,6 +218,122 @@ fn a_pci_host_only_partly_behind_the_iommu_opens_no_window() {
         Some(be(&[0, 0x8000, 0, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000])),
     );
     assert_eq!(iommutree::pci_windows(&n), iommutree::pci_windows(&nodes()));
+}
+
+/// The tree CI's QEMU (Ubuntu 26.04's 10.2.1; 11.0 writes the same) gives the machine: `iommu-map = <0 0x8000 0 0>, <0 0x8000 0
+/// 0xffff>` (its `virt.c` at v10.2.1; 11.1 writes the one entry `<0 0x8000 0 0x10000>` of the fixture). The empty first entry
+/// maps nothing, as the binding reads it, and is no refusal: the epic's smoke at 29a950e panicked on it ("device ids past 24
+/// bits"). The second leaves requester id 0xffff outside the IOMMU, so the host is only partly behind it and opens no window.
+#[test]
+fn qemu_10_2s_map_is_an_iommu_whose_pci_host_misses_one_requester_id() {
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x8000, 0, 0, 0, 0x8000, 0, 0xffff])),
+    );
+    let i = discover(&n).expect("an empty entry is no refusal");
+    assert_eq!(
+        i.pci[0].map,
+        vec![MapEntry {
+            rid_base: 0,
+            did_base: 0,
+            len: 0xffff
+        }]
+    );
+    assert_eq!(i.device_ids, 0xffff);
+    assert!(i.covers(0) && i.covers(0xfffe));
+    assert!(!i.covers(0xffff) && !i.covers(0x1_0000));
+    assert!(iommutree::pci_windows(&n).is_empty());
+    let closed = vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
+    assert_eq!(
+        device_windows(&n, &[CONSOLE], &fdt::memory_ranges(&n)),
+        closed
+    );
+    // an empty entry beside a whole one changes nothing
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0x20, 0x8000, 0x20, 0, 0, 0x8000, 0, 0x10000])),
+    );
+    assert_eq!(discover(&n), discover(&nodes()));
+    assert_eq!(iommutree::pci_windows(&n), iommutree::pci_windows(&nodes()));
+    // an empty entry naming another IOMMU maps nothing either
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x1234, 0, 0, 0, 0x8000, 0, 0x10000])),
+    );
+    assert_eq!(discover(&n), discover(&nodes()));
+    assert_eq!(iommutree::pci_windows(&n), iommutree::pci_windows(&nodes()));
+    // a map of nothing but empty entries, or an empty property, puts no id behind the IOMMU (and is no refusal)
+    for v in [be(&[0, 0x8000, 0, 0]), vec![]] {
+        let n = with(PCI, "iommu-map", Some(v.clone()));
+        assert!(discover(&n).unwrap().pci.is_empty(), "{v:x?}");
+        assert!(iommutree::pci_windows(&n).is_empty(), "{v:x?}");
+    }
+    // a mask that folds nothing does not make a partial map whole
+    let mut n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x8000, 0, 0, 0, 0x8000, 0, 0xffff])),
+    );
+    let pci = n.iter_mut().find(|x| x.path == PCI).unwrap();
+    pci.props.push(("iommu-map-mask".into(), be(&[0xffff])));
+    assert!(iommutree::pci_windows(&n).is_empty());
+}
+
+/// A map may send some requester ids to another IOMMU (the binding allows it): this IOMMU is still usable and owns its own
+/// entries, but the host is not wholly behind it and opens no window.
+#[test]
+fn a_map_naming_another_iommu_too_keeps_this_one_but_opens_no_window() {
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x8000, 0, 0x8000, 0x8000, 0x1234, 0, 0x8000])),
+    );
+    let i = discover(&n).unwrap();
+    assert_eq!(
+        i.pci[0].map,
+        vec![MapEntry {
+            rid_base: 0,
+            did_base: 0,
+            len: 0x8000
+        }]
+    );
+    assert!(i.covers(0x7fff) && !i.covers(0x8000));
+    assert!(iommutree::pci_windows(&n).is_empty());
+    // a hole below the highest id: an id in it is none of this IOMMU's (`iodomain_attach` refuses it)
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x8000, 0, 0x100, 0x200, 0x8000, 0x200, 0xfe00])),
+    );
+    let i = discover(&n).unwrap();
+    assert_eq!(i.device_ids, 0x1_0000);
+    assert!(i.covers(0xff) && i.covers(0x200) && i.covers(0xffff));
+    assert!(!i.covers(0x100) && !i.covers(0x1ff));
+    // wholly another's: nothing of this host is behind this IOMMU
+    let n = with(PCI, "iommu-map", Some(be(&[0, 0x1234, 0, 0x10000])));
+    assert!(discover(&n).unwrap().pci.is_empty());
+    assert!(iommutree::pci_windows(&n).is_empty());
+}
+
+/// `iommu-map-mask` is ANDed with the requester id before the lookup: a mask that keeps all 16 bits is the identity and the
+/// windows open; one that folds functions together, or is not one cell, opens none.
+#[test]
+fn a_mask_that_folds_nothing_is_the_identity() {
+    for m in [0xffff_u32, 0xffff_ffff] {
+        let n = with(PCI, "iommu-map-mask", Some(be(&[m])));
+        assert_eq!(
+            iommutree::pci_windows(&n),
+            iommutree::pci_windows(&nodes()),
+            "{m:#x}"
+        );
+    }
+    for m in [&[0xfff8_u32][..], &[0xff00], &[0, 0xffff], &[]] {
+        let n = with(PCI, "iommu-map-mask", Some(be(m)));
+        assert!(iommutree::pci_windows(&n).is_empty(), "{m:x?}");
+    }
 }
 
 /// The kernel programs rising-edge and level-high sources only: a falling-edge or level-low source is a refusal.

@@ -487,6 +487,20 @@ pub fn init() {
         driven.extend(crate::finisher::base().map(|b| (b, 0x1000)));
         driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
         driven.extend(crate::iommu::page().map(|p| (p, 0x1000)));
+        // a host whose map puts only some of its functions behind the IOMMU gets no window (IOMMU-SPEC 2.6): say so, or the
+        // cause of every later PCI failure is invisible
+        for host in nodes.iter().filter(|n| {
+            n.is_compatible(kcore::iommutree::PCI_HOST)
+                && n.prop("iommu-map").is_some()
+                && !kcore::iommutree::fully_behind_the_iommu(n, &nodes)
+        }) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                crate::console::Console,
+                "kernel: iommu: PCI host {} is not wholly behind the IOMMU (its iommu-map): no device window",
+                host.path
+            );
+        }
         // SAFETY: boot code, one hart, before anything reads it.
         unsafe { *addr_of_mut!(WINDOW_INPUTS) = Some((nodes, driven, ram)) };
     }
