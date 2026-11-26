@@ -1103,3 +1103,17 @@ And a row is added to **15.2**:
 | # | Assumed | The design needs it for | Settled by |
 |---|---|---|---|
 | A18 | `IOTINVAL.GVMA` with an address (AV=1) drops the leaf entries for that address only; the whole-context form (AV=0) drops the non-leaf (page-walk cache) entries of the soft context too | 6.1 (as amended: the whole-context form whenever a table frame is freed); IO3 for table frames | the IOMMU specification's text ("Command queue", the `IOTINVAL` commands); and a page-walk cache added to `iommucore::sim`, so that a mutation of `kcore::iodomain::inval_for` (a page-wise invalidation where a table frame was freed) fails a test. QEMU caches no non-leaf entries, so nothing in the machine settles it (as L4) |
+
+### 3. Destroy against an unmap in progress (OD170)
+
+Amendment authorized by the owner, 2026-11-26 (a gap left by part 1, which settled only a map in progress).
+
+A stepped unmap's mapping record stays in the domain, marked as being unmapped, until the unmap's own fence has completed. If
+the unmap, on retaking `IOMMU` between steps, finds its domain marked destroyed, it **stops clearing leaves, leaves its record to
+the destruction, and returns OK**. The destruction's completion (6.3) clears whatever leaves remain, its fence covers the whole
+domain, and the record's frames and hold are released after that fence, as for every other record of the domain. The unmap's
+range is not returned to the allocator on its own: the allocator goes with the domain. **A destruction never waits for an unmap
+in progress**, as part 1 point 3 says for a map.
+
+Why OK and not BAD_STATE: what the caller asked for (the device no longer reaches those pages) is guaranteed by the destruction,
+and no frame is freed before a fence that covers it. A map is different: its effect does not happen, so it fails (part 1 point 3).
