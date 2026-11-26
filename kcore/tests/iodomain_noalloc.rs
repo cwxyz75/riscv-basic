@@ -369,3 +369,150 @@ fn map_fails_cleanly_at_every_allocation_point_the_record_among_them() {
     w.close_vmo(v);
     assert_eq!(kernel_bytes(&w, job), 0);
 }
+
+#[test]
+fn create_fails_cleanly_at_every_frame_allocation_on_a_three_level_directory() {
+    use iommucore::ddt::Levels;
+    let mem = IoMem::new();
+    let mut w = World::with_levels(&mem, false, 2048, true, Levels::Three);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let base = w.mm.db.free_count();
+    // a device id whose two directory pages below the root do not exist yet: the root, the MSI table, then the two pages
+    let did = 0x1_2345;
+    let before = snapshot(&w, job, None, None);
+    let mut n = 0;
+    let mut unlinked = false;
+    let mut waited = 0;
+    let (d, t) = loop {
+        charge_create(&mut w.jobs, job).unwrap();
+        let r = {
+            let World {
+                mem,
+                sim,
+                store,
+                mm,
+                counts,
+                ..
+            } = &mut w;
+            let mut f = DbFrames {
+                db: &mut mm.db,
+                mem,
+                counts,
+                fail: Some(n),
+            };
+            store.create(*mem, sim, &mut f, did, job)
+        };
+        match r {
+            Ok(x) => break x,
+            Err(e) => {
+                uncharge_create(&mut w.jobs, job);
+                assert_eq!(e, IoError::NoMemory, "frame allocation {n}");
+                assert_eq!(w.store.domain_of(did), None);
+                assert_eq!(w.store.device_state(w.mem, did), DeviceState::Unclaimed);
+                // a directory page linked and unlinked again waits for its fence, out of the free lists
+                let waiting = w.store.stats().dir_pages_waiting;
+                unlinked |= waiting > 0;
+                // the queue does not run during the sweep: no dead page may be freed (its fence has not completed)
+                assert!(
+                    waiting >= waited,
+                    "a directory page was freed before its fence (allocation {n})"
+                );
+                waited = waiting;
+                let mut s = snapshot(&w, job, None, None);
+                assert_eq!(
+                    s.counts.tables,
+                    before.counts.tables + waiting,
+                    "frame allocation {n}"
+                );
+                s.free += waiting as usize;
+                s.counts.tables -= waiting;
+                assert_eq!(s, before, "create failing at frame allocation {n}");
+            }
+        }
+        n += 1;
+        assert!(n < 10, "create never succeeded");
+    };
+    assert!(
+        w.store.stats().dir_pages_waiting >= waited,
+        "not freed by the create that succeeded either: its fence has not run"
+    );
+    assert!(
+        unlinked,
+        "the sweep reached a failure after a directory page was linked"
+    );
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, t), Fence::Done);
+    // the next create finds the whole-directory fence done and frees the dead page
+    let d2 = ready(&mut w, did + 1, job);
+    assert_eq!(
+        w.store.stats().dir_pages_waiting,
+        0,
+        "freed after its fence"
+    );
+    destroy_ok(&mut w, d);
+    destroy_ok(&mut w, d2);
+    assert_eq!(kernel_bytes(&w, job), 0);
+    // the directory pages of the two devices stay (the directory does not shrink); nothing else is held
+    assert_eq!(w.counts.roots, 0);
+    assert_eq!(w.mm.db.free_count() + w.counts.tables as usize, base);
+}
+
+#[test]
+fn queueing_again_allocates_nothing() {
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 1, job)
+        .unwrap();
+    let iova = map_ok(&mut w, d, v, 0, 1, Access::Read);
+    // fill the stalled queue with maps until one is not queued
+    let mut m = loop {
+        match w.map(d, v, 0, 1, Access::Read, None) {
+            MapStart::Wait(m) => {
+                if w.store.poll(&mut w.sim, m.ticket) == Fence::Unqueued {
+                    break m;
+                }
+            }
+            _ => panic!("map refused"),
+        }
+    };
+    let mut p = none("unmap", || w.store.unmap(w.mem, &mut w.sim, d, iova, 1)).unwrap();
+    assert_eq!(
+        none("poll", || w.store.poll(&mut w.sim, p.ticket())),
+        Fence::Unqueued
+    );
+    let mut x = none("destroy", || w.store.destroy(w.mem, &mut w.sim, d)).unwrap();
+    assert_eq!(
+        none("poll", || w.store.poll(&mut w.sim, x.ticket())),
+        Fence::Unqueued
+    );
+    w.sim.process_commands();
+    none("requeue", || {
+        assert_eq!(
+            w.store.requeue_map(w.mem, &mut w.sim, d, &mut m),
+            Fence::Done,
+            "the domain is being destroyed: its own fence covers the mapping"
+        );
+        assert_eq!(
+            w.store.requeue_unmap(w.mem, &mut w.sim, &mut p),
+            Fence::Waiting
+        );
+        assert_eq!(
+            w.store.requeue_destroy(w.mem, &mut w.sim, &mut x),
+            Fence::Waiting
+        );
+    });
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, x.ticket()), Fence::Done);
+    let det = w.store.destroy_complete(w.mem, &x).unwrap().unwrap();
+    finish_counted(&mut w, det);
+    assert!(
+        w.store.complete(&p).unwrap().is_none(),
+        "the destruction took it"
+    );
+    w.close_vmo(v);
+    assert_eq!(kernel_bytes(&w, job), 0);
+}

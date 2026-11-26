@@ -97,7 +97,10 @@ pub enum Fence {
     Done,
     /// Not yet: poll again (the kernel, until `IOMMU_FENCE_BOUND`).
     Waiting,
-    /// The command queue reported an error, or the commands could not be queued: the fence will never complete (6.4).
+    /// The commands found the queue full and were not queued: queue them again with the operation's `requeue_*` (which allocates
+    /// nothing) and keep waiting, within the same bound. A full queue is not a failure (6.4): only the bound or a queue error is.
+    Unqueued,
+    /// The command queue reported an error: the fence will never complete (6.4).
     Failed,
 }
 
@@ -209,6 +212,7 @@ pub struct Mapping {
     vmo_page: u64,
     access: Access,
     ticket: u64,
+    prio: u64,
     chain: Chain,
     left: Link,
     right: Link,
@@ -233,6 +237,7 @@ impl Record {
             vmo_page,
             access,
             ticket: NO_TICKET,
+            prio: 0,
             chain: Chain::default(),
             left: None,
             right: None,
@@ -249,10 +254,11 @@ impl Record {
     }
 }
 
-/// The treap's priority of a mapping at `page`: a mix of the address, so the shape is balanced in expectation whatever the order of
-/// the addresses (the allocator hands them out lowest first).
-fn prio(page: u64) -> u64 {
-    let mut z = page.wrapping_add(0x9e37_79b9_7f4a_7c15);
+/// The next priority for the treap (splitmix64 over the store's secret state): random and unknown to callers, so the shape is
+/// balanced in expectation whatever addresses are kept (the recursion of `split`, `merge` and `insert` is bounded by the depth).
+fn next_prio(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
@@ -281,7 +287,7 @@ fn merge(a: Link, b: Link) -> Link {
     match (a, b) {
         (None, x) | (x, None) => x,
         (Some(mut a), Some(mut b)) => {
-            if prio(a.page) > prio(b.page) {
+            if a.prio > b.prio {
                 a.right = merge(a.right.take(), Some(b));
                 Some(a)
             } else {
@@ -294,7 +300,7 @@ fn merge(a: Link, b: Link) -> Link {
 
 fn insert(t: &mut Link, mut n: FBox<Mapping>) {
     match t {
-        Some(cur) if prio(cur.page) >= prio(n.page) => {
+        Some(cur) if cur.prio >= n.prio => {
             if n.page < cur.page {
                 insert(&mut cur.left, n);
             } else {
@@ -378,6 +384,38 @@ fn unlink(list: &mut Link, pred: impl Fn(&Mapping) -> bool) -> Link {
     }
     let mut n = cur.take()?;
     *cur = n.next.take();
+    Some(n)
+}
+
+/// Is there a record in `list` that `pred` accepts?
+fn find_list(list: &Link, pred: impl Fn(&Mapping) -> bool) -> bool {
+    let mut cur = list;
+    while let Some(n) = cur {
+        if pred(n) {
+            return true;
+        }
+        cur = &n.next;
+    }
+    false
+}
+
+/// Find the first record of `list` that `pred` accepts.
+fn find_list_mut(list: &mut Link, pred: impl Fn(&Mapping) -> bool) -> Option<&mut Mapping> {
+    // (found by position first: a borrow returned from inside the walk would outlive the loop's own)
+    let mut at = 0usize;
+    let mut cur = &*list;
+    loop {
+        let n = cur.as_deref()?;
+        if pred(n) {
+            break;
+        }
+        at = at.saturating_add(1);
+        cur = &n.next;
+    }
+    let mut n = list.as_deref_mut()?;
+    for _ in 0..at {
+        n = n.next.as_deref_mut()?;
+    }
     Some(n)
 }
 
@@ -477,15 +515,17 @@ pub struct IoStats {
     pub commands: u64,
     /// Fences abandoned (a timeout or a failed queue).
     pub fence_timeouts: u64,
-    /// Times the command queue had no room and the commands were not queued (their fence fails).
+    /// Times the command queue had no room and the commands were not queued (the waiter queues them again).
     pub queue_stuck: u64,
+    /// Directory pages a failed `create` unlinked, waiting for their fence before they are freed.
+    pub dir_pages_waiting: u64,
     /// Mapping records leaked with their holds, the pages they mapped, and table frames leaked (roots and MSI tables included).
     pub holds_leaked: u64,
     pub pages_leaked: u64,
     pub tables_leaked: u64,
     /// Live domains (attached or detaching).
     pub domains: u64,
-    /// Pages of live and pending mappings, and of leaked ones.
+    /// Pages of live and pending mappings (leaked ones are counted apart, in `pages_leaked`).
     pub io_pages: u64,
 }
 
@@ -503,6 +543,11 @@ pub struct IoDomains {
     stats: IoStats,
     window_start: u64,
     window_lines: u32,
+    /// The state of the generator of the treap's priorities (secret, so no caller can choose addresses that unbalance it).
+    prio_state: u64,
+    /// Directory pages a failed `create` unlinked, freed once `dir_dead_ticket`'s fence (after a whole-directory invalidation) is done.
+    dir_dead: Chain,
+    dir_dead_ticket: Ticket,
 }
 
 /// A fault handed to the store: which domain stored it, and whether the console line is due.
@@ -577,6 +622,7 @@ impl Destroying {
 /// A mapping whose fence has completed, out of the store: the caller drops the hold (`Vmos::release` of [`Released::vmo`], under `VMO`)
 /// and settles the record ([`Released::settle`]).
 #[derive(Debug)]
+#[must_use = "a released mapping owns a hold on its VMO and charges: drop the hold and settle it"]
 pub struct Released {
     rec: FBox<Mapping>,
     job: JobId,
@@ -610,6 +656,7 @@ impl Released {
 
 /// A destroyed domain, out of the store after its fence: its mappings ([`Detached::next_record`], each settled as a [`Released`]), then
 /// its tables, root, MSI page table and charge ([`Detached::finish`]).
+#[must_use = "a detached domain owns its mappings' holds, its frames and its charge: take every record, then finish it"]
 pub struct Detached {
     dom: FBox<Domain>,
     records: Link,
@@ -654,6 +701,16 @@ impl Detached {
     }
 }
 
+/// The commands that invalidate what an unmap (or a map's roll-back) of `rec` changed: page by page for a short range that emptied no
+/// table; otherwise the whole soft context. An address-specific `IOTINVAL.GVMA` need not drop the IOMMU's cached non-leaf entries
+/// (page-walk caches), so a table frame the unmap detached is covered only by the whole-context form, which drops them all.
+fn inval_for(gscid: u16, rec: &Mapping) -> ([Command; INVAL_PAGES], usize) {
+    if rec.chain.n > 0 {
+        return ([Command::iotinval_gvma(gscid, None); INVAL_PAGES], 1);
+    }
+    inval_range(gscid, rec.page, rec.pages)
+}
+
 /// The commands that invalidate `pages` pages from `page` in soft context `gscid`: page by page for a short range, the whole soft
 /// context for a long one.
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)] // INVARIANT: i < pages <= INVAL_PAGES in the loop; page + i is inside the window
@@ -671,7 +728,10 @@ fn inval_range(gscid: u16, page: u64, pages: u64) -> ([Command; INVAL_PAGES], us
 impl IoDomains {
     /// The store over the directory `ddt` (already written to `ddtp`) and the command queue `cmdq` (already enabled), with `quarantine`
     /// the kernel's empty second-stage table that quarantined devices translate through (soft-context id 0). `None` without memory.
-    pub fn new(ddt: Ddt, cmdq: CmdQueue, quarantine: &Iopt) -> Option<IoDomains> {
+    ///
+    /// `seed` seeds the priorities of the mapping index (a treap): the kernel passes entropy, so the index's depth stays logarithmic in
+    /// expectation whatever addresses a driver keeps.
+    pub fn new(ddt: Ddt, cmdq: CmdQueue, quarantine: &Iopt, seed: u64) -> Option<IoDomains> {
         let quarantine = quarantine.context_root(u32::from(QUARANTINE_GSCID))?;
         let mut gscids = Vec::new();
         gscids.try_reserve_exact(1024).ok()?;
@@ -691,6 +751,9 @@ impl IoDomains {
             stats: IoStats::default(),
             window_start: 0,
             window_lines: 0,
+            prio_state: seed,
+            dir_dead: Chain::default(),
+            dir_dead_ticket: Ticket(NO_TICKET),
         })
     }
 
@@ -798,7 +861,7 @@ impl IoDomains {
     }
 
     /// Queue `cmds` and a fence (with PR and PW) and tell the IOMMU; the fence's ticket. A queue without room for all of them (after
-    /// reading the head again) takes none, and the ticket is one that never completes: the caller's wait fails and abandons (6.4).
+    /// reading the head again) takes none, and the ticket says so (`poll` gives `Unqueued`): the waiter queues them again.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: outstanding < entries (one slot is always free), so the room is not negative; cmds has at most INVAL_PAGES + 2 commands
     fn submit<M: PhysMem64, R: Regs>(&mut self, mem: &M, regs: &mut R, cmds: &[Command]) -> Ticket {
         let Some(fence) = Command::iofence_c(None) else {
@@ -824,7 +887,7 @@ impl IoDomains {
     /// Poll a fence (no lock is held between polls; the kernel stops at `IOMMU_FENCE_BOUND`).
     pub fn poll<R: Regs>(&mut self, regs: &mut R, t: Ticket) -> Fence {
         if t.0 == NO_TICKET {
-            return Fence::Failed;
+            return Fence::Unqueued;
         }
         if !self.refresh(regs) {
             return Fence::Failed;
@@ -840,6 +903,35 @@ impl IoDomains {
     }
 
     // ---- create ---------------------------------------------------------------------------------------------------------
+
+    /// Queue the invalidation of the whole directory and a fence for the dead directory pages (a later fence covers earlier pages
+    /// too: fences complete in order). Allocates nothing; a full queue leaves the ticket unqueued for the next create to retry.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the counter is the chain's length, a count of frames
+    fn queue_dir_dead<M: PhysMem64, R: Regs>(&mut self, mem: &M, regs: &mut R) {
+        self.dir_dead_ticket = self.submit(mem, regs, &[Command::iodir_inval_ddt(None)]);
+        self.stats.dir_pages_waiting = self.dir_dead.n;
+    }
+
+    /// Free the dead directory pages once their fence is done (or queue it, if it found the queue full).
+    fn free_dir_dead<M: PhysMem64, R: Regs, F: TableFrames>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        frames: &mut F,
+    ) {
+        if self.dir_dead.n == 0 {
+            return;
+        }
+        if self.dir_dead_ticket.0 == NO_TICKET {
+            self.queue_dir_dead(mem, regs);
+            return;
+        }
+        self.refresh(regs);
+        if self.done(self.dir_dead_ticket) {
+            self.dir_dead.free_all(mem, frames);
+            self.stats.dir_pages_waiting = 0;
+        }
+    }
 
     /// The state of `device_id` in the directory.
     pub fn device_state<M: PhysMem64>(&self, mem: &M, device_id: u32) -> DeviceState {
@@ -872,6 +964,7 @@ impl IoDomains {
         if self.by_device(device_id).is_some() {
             return Err(IoError::BadState);
         }
+        self.free_dir_dead(mem, regs, frames);
         self.reserve_slot()?;
         let mut iova =
             Iova::new(IO_BASE >> PAGE_SHIFT, IO_WINDOW_PAGES).map_err(|_| IoError::NoMemory)?;
@@ -936,19 +1029,28 @@ impl IoDomains {
             }
         };
         let was_quarantined = self.device_state(mem, device_id) == DeviceState::Quarantined;
-        if self
-            .ddt
-            .set(
-                mem,
-                frames,
-                device_id,
-                &DeviceContext::translate(ctx_root, Some(&msi)),
-            )
-            .is_err()
-        {
+        // (a directory page the write links and then unlinks again on a failure may already be in the IOMMU's directory cache: it is
+        // freed only after a whole-directory invalidation and its fence, by a later create)
+        let before = self.dir_dead.n;
+        let mut df = Deferring {
+            mem,
+            frames,
+            chain: &mut self.dir_dead,
+            allocs: 0,
+        };
+        let set = self.ddt.set(
+            mem,
+            &mut df,
+            device_id,
+            &DeviceContext::translate(ctx_root, Some(&msi)),
+        );
+        if set.is_err() {
             drop(dom);
             self.free_gscid(gscid);
             undo_frames(frames);
+            if self.dir_dead.n > before {
+                self.queue_dir_dead(mem, regs);
+            }
             return Err(IoError::NoMemory);
         }
         // the context left behind: the directory entry, and (from quarantine) the shared empty table's soft context
@@ -962,6 +1064,10 @@ impl IoDomains {
         Ok((self.place(dom), ticket))
     }
 
+    /// The domain's job, while it is in the store. A `JobId` is an index that is reused once its job is freed, so the kernel does not
+    /// carry this across a lock release to charge later: it charges the job its domain *object* names, whose own use keeps the job
+    /// alive until the last handle and vector object are gone (IOMMU-SPEC 4.5; the use the store holds, `charge_create`'s, ends at
+    /// `Detached::finish`).
     pub fn job_of(&self, d: DomainId) -> Option<JobId> {
         Some(self.dom(d)?.job)
     }
@@ -1025,12 +1131,19 @@ impl IoDomains {
         let Some(dom) = self.dom_mut(d).filter(|x| x.state == State::Attached) else {
             return Err(MapFailed::Refused(IoError::BadState, Record(rec)));
         };
+        if dom.iopt.is_none() {
+            return Err(MapFailed::Refused(IoError::BadState, Record(rec))); // (not reached: an attached domain has its table)
+        }
         let Some(page) = dom.iova.alloc(n) else {
             return Err(MapFailed::Refused(IoError::NoMemory, Record(rec)));
         };
         rec.page = page;
+        rec.prio = next_prio(&mut self.prio_state);
+        let Some(dom) = self.dom_mut(d) else {
+            return Err(MapFailed::Refused(IoError::BadState, Record(rec))); // (not reached: looked up just above)
+        };
         let Some(iopt) = dom.iopt.as_mut() else {
-            return Err(MapFailed::Refused(IoError::BadState, Record(rec)));
+            return Err(MapFailed::Refused(IoError::BadState, Record(rec))); // (not reached: checked above)
         };
         let access = rec.access;
         let before = rec.chain.n;
@@ -1067,7 +1180,7 @@ impl IoDomains {
             if dom.iova.release(page, n).is_err() {
                 debug_assert!(false, "a range just allocated is live");
             }
-            let (cmds, k) = inval_range(gscid, page, n);
+            let (cmds, k) = inval_for(gscid, &rec);
             let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
             rec.ticket = ticket.0;
             self.stats.io_pages += n;
@@ -1093,6 +1206,140 @@ impl IoDomains {
             ticket,
             tables: allocs,
         })
+    }
+
+    // ---- queueing again (a fence that found the queue full: `Fence::Unqueued`) ----------------------------------------------
+
+    /// Queue `cmds` again for a waiter whose ticket is unqueued: the new ticket, or `None` if the queue is still full.
+    fn requeue(
+        &mut self,
+        mem: &impl PhysMem64,
+        regs: &mut impl Regs,
+        cmds: &[Command],
+    ) -> Option<Ticket> {
+        let t = self.submit(mem, regs, cmds);
+        (t.0 != NO_TICKET).then_some(t)
+    }
+
+    /// Queue a create's commands again (`t` is its ticket, updated). `Done` if the domain is gone (nothing is left to wait for).
+    pub fn requeue_create<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        d: DomainId,
+        t: &mut Ticket,
+    ) -> Fence {
+        if t.0 != NO_TICKET {
+            return Fence::Waiting;
+        }
+        let Some(device) = self.dom(d).map(|x| x.device) else {
+            return Fence::Done;
+        };
+        let cmds = [
+            Command::iodir_inval_ddt(Some(device)),
+            Command::iotinval_gvma(QUARANTINE_GSCID, None),
+        ];
+        match self.requeue(mem, regs, &cmds) {
+            Some(n) => {
+                *t = n;
+                Fence::Waiting
+            }
+            None => Fence::Unqueued,
+        }
+    }
+
+    /// Queue a map's commands again (`m.ticket` updated). `Done` if the mapping is no longer live (an unmap or the domain's destruction
+    /// has its own fence).
+    pub fn requeue_map<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        d: DomainId,
+        m: &mut Mapped,
+    ) -> Fence {
+        if m.ticket.0 != NO_TICKET {
+            return Fence::Waiting;
+        }
+        let Some((gscid, page, pages)) = self
+            .dom(d)
+            .filter(|x| x.state == State::Attached)
+            .and_then(|x| Some((x.gscid, find(&x.live, m.iova >> PAGE_SHIFT)?)))
+            .map(|(g, r)| (g, r.page, r.pages))
+        else {
+            return Fence::Done;
+        };
+        let (cmds, k) = inval_range(gscid, page, pages);
+        match self.requeue(mem, regs, cmds.get(..k).unwrap_or(&cmds)) {
+            Some(n) => {
+                m.ticket = n;
+                Fence::Waiting
+            }
+            None => Fence::Unqueued,
+        }
+    }
+
+    /// Queue an unmap's (or a roll-back's) commands again (`p`'s ticket and its record's updated). `Done` if the record is no longer
+    /// pending (the domain's destruction took it: `complete` then gives `Ok(None)`).
+    pub fn requeue_unmap<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        p: &mut Pending,
+    ) -> Fence {
+        if p.ticket.0 != NO_TICKET {
+            return Fence::Waiting;
+        }
+        let Some(dom) = self.dom_mut(p.domain) else {
+            return Fence::Done;
+        };
+        let gscid = dom.gscid;
+        let (page, ticket) = (p.page, p.ticket.0);
+        let Some(rec) = find_list_mut(&mut dom.pending, |m| m.page == page && m.ticket == ticket)
+        else {
+            return Fence::Done;
+        };
+        let (cmds, k) = inval_for(gscid, rec);
+        let Some(n) = self.requeue(mem, regs, cmds.get(..k).unwrap_or(&cmds)) else {
+            return Fence::Unqueued;
+        };
+        if let Some(rec) = self.dom_mut(p.domain).and_then(|dom| {
+            find_list_mut(&mut dom.pending, |m| m.page == page && m.ticket == ticket)
+        }) {
+            rec.ticket = n.0;
+        }
+        p.ticket = n;
+        Fence::Waiting
+    }
+
+    /// Queue a destruction's commands again (`x`'s ticket and the domain's updated). `Done` if there is no such destruction any more.
+    pub fn requeue_destroy<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        x: &mut Destroying,
+    ) -> Fence {
+        if x.ticket.0 != NO_TICKET {
+            return Fence::Waiting;
+        }
+        let Some((device, gscid)) = self
+            .dom(x.domain)
+            .filter(|dom| dom.state == State::Detaching && dom.destroy_ticket == NO_TICKET)
+            .map(|dom| (dom.device, dom.gscid))
+        else {
+            return Fence::Done;
+        };
+        let cmds = [
+            Command::iodir_inval_ddt(Some(device)),
+            Command::iotinval_gvma(gscid, None),
+        ];
+        let Some(n) = self.requeue(mem, regs, &cmds) else {
+            return Fence::Unqueued;
+        };
+        if let Some(dom) = self.dom_mut(x.domain) {
+            dom.destroy_ticket = n.0;
+        }
+        x.ticket = n;
+        Fence::Waiting
     }
 
     // ---- unmap ----------------------------------------------------------------------------------------------------------
@@ -1138,7 +1385,7 @@ impl IoDomains {
             debug_assert!(false, "a live mapping's range is live in the allocator");
         }
         let gscid = dom.gscid;
-        let (cmds, k) = inval_range(gscid, page, pages);
+        let (cmds, k) = inval_for(gscid, &rec);
         let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
         rec.ticket = ticket.0;
         if let Some(dom) = self.dom_mut(d) {
@@ -1155,15 +1402,18 @@ impl IoDomains {
     /// with no lock held (step 4). `Ok(None)` when the domain's destruction already took the record (its own fence covered it).
     /// `NotDone` before the fence.
     pub fn complete(&mut self, p: &Pending) -> Result<Option<Released>, IoError> {
-        if !self.done(p.ticket) {
-            return Err(IoError::NotDone);
-        }
+        let done = self.done(p.ticket);
         let Some(dom) = self.dom_mut(p.domain) else {
             return Ok(None);
         };
-        let Some(rec) = unlink(&mut dom.pending, |m| {
-            m.page == p.page && m.ticket == p.ticket.0
-        }) else {
+        let pending = |m: &Mapping| m.page == p.page && m.ticket == p.ticket.0;
+        if !find_list(&dom.pending, pending) {
+            return Ok(None);
+        }
+        if !done {
+            return Err(IoError::NotDone);
+        }
+        let Some(rec) = unlink(&mut dom.pending, pending) else {
             return Ok(None);
         };
         if dom.iova.complete(rec.page, rec.pages).is_err() {
@@ -1190,6 +1440,7 @@ impl IoDomains {
         let (pages, tables) = (rec.pages, rec.chain.n);
         push(&mut dom.leaked, rec);
         let s = &mut self.stats;
+        s.io_pages = s.io_pages.saturating_sub(pages);
         s.fence_timeouts = s.fence_timeouts.saturating_add(1);
         s.holds_leaked = s.holds_leaked.saturating_add(1);
         s.pages_leaked = s.pages_leaked.saturating_add(pages);
@@ -1321,10 +1572,16 @@ impl IoDomains {
             return false;
         };
         dom.leaks = true;
+        // (the live records join the pending list: the whole domain is leaked, and a list is walked without recursion)
+        let mut live = None;
+        flatten(dom.live.take(), &mut live);
+        while let Some(r) = pop(&mut live) {
+            push(&mut dom.pending, r);
+        }
+        dom.mappings = 0;
         let mut holds = 0u64;
         let mut pages = 0u64;
         let mut tables = dom.tables.saturating_add(ROOT_FRAMES + 1);
-        count_tree(&dom.live, &mut holds, &mut pages, &mut tables);
         let mut l = &dom.pending;
         while let Some(r) = l {
             holds = holds.saturating_add(1);
@@ -1333,6 +1590,7 @@ impl IoDomains {
             l = &r.next;
         }
         let s = &mut self.stats;
+        s.io_pages = s.io_pages.saturating_sub(pages);
         s.fence_timeouts = s.fence_timeouts.saturating_add(1);
         s.holds_leaked = s.holds_leaked.saturating_add(holds);
         s.pages_leaked = s.pages_leaked.saturating_add(pages);
@@ -1387,17 +1645,6 @@ impl IoDomains {
     }
 }
 
-/// Count a treap's records, pages and detached tables (recursion is bounded by the treap's depth, logarithmic in expectation).
-fn count_tree(t: &Link, holds: &mut u64, pages: &mut u64, tables: &mut u64) {
-    if let Some(n) = t {
-        *holds = holds.saturating_add(1);
-        *pages = pages.saturating_add(n.pages);
-        *tables = tables.saturating_add(n.chain.n);
-        count_tree(&n.left, holds, pages, tables);
-        count_tree(&n.right, holds, pages, tables);
-    }
-}
-
 impl Drop for IoDomains {
     fn drop(&mut self) {
         // (only the host tests drop a store; long lists are dropped one record at a time, never by recursion)
@@ -1425,8 +1672,10 @@ impl Drop for IoDomains {
 // ---------------------------------------------------------------------------------------------------------------------------
 // charging (the caller's steps under `JOBS`: IOMMU-SPEC 5.3, J1, J2)
 
-/// Charge `job` a domain's kernel bytes and take the use the domain holds of it (from creation until its record is freed: J2). Undo with
-/// `uncharge_create` if the creation fails.
+/// Charge `job` a domain's kernel bytes and take the use the store's domain record holds of it (from creation until `Detached::finish`,
+/// or for good if a fence of the domain was abandoned: J2). Undo with `uncharge_create` if the creation fails. This is the record's use
+/// only: the kernel's domain object takes its own, held to its last handle and vector object (IOMMU-SPEC 4.5), so a map that read the job
+/// from the object cannot charge a job that a finished destruction let go.
 pub fn charge_create(jobs: &mut Jobs, job: JobId) -> Result<(), JobError> {
     jobs.charge(job, Resource::KernelBytes, DOMAIN_BYTES)?;
     jobs.retain(job);

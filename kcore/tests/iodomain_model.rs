@@ -20,6 +20,7 @@ use common::Rng;
 use iodomain_common::*;
 use iommucore::faultq::{FaultQueue, FaultRecord, TransactionType};
 use iommucore::iopt::Access;
+use iommucore::PhysMem64;
 use kcore::iodomain::*;
 use kcore::job::{IoResource, JobId, Limits, Resource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +38,7 @@ struct RMap {
     page: u64,
     pages: u64,
     vmo: u64,
+    vmo_page: u64,
     pfns: Vec<u64>,
     write: bool,
     /// The map's fence completed: the address was given to the caller.
@@ -257,12 +259,7 @@ fn check_counts(w: &World, r: &Ref, seed: u64, step: u64) {
             };
             assert_eq!(
                 w.store.mapping_at(d, m.page << 12),
-                Some((
-                    m.pages,
-                    m.vmo,
-                    w.store.mapping_at(d, m.page << 12).unwrap().2,
-                    access
-                )),
+                Some((m.pages, m.vmo, m.vmo_page, access)),
                 "{ctx}: the record of {:#x}",
                 m.page
             );
@@ -341,10 +338,19 @@ fn check_counts(w: &World, r: &Ref, seed: u64, step: u64) {
         .live
         .values()
         .chain(r.pending.iter().map(|(_, m)| m))
-        .chain(r.leaked.iter())
         .map(|m| m.pages)
         .sum();
-    assert_eq!(s.io_pages, io_all, "{ctx}: I/O-mapped pages counter");
+    assert_eq!(
+        s.io_pages, io_all,
+        "{ctx}: I/O-mapped pages counter (live and pending)"
+    );
+    let leaked: u64 = r.leaked.iter().map(|m| m.pages).sum();
+    assert_eq!(s.pages_leaked, leaked, "{ctx}: leaked pages counted apart");
+    assert_eq!(
+        s.holds_leaked,
+        r.leaked.len() as u64,
+        "{ctx}: leaked holds counted"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -504,6 +510,40 @@ fn settle_op(w: &mut World, r: &mut Ref, i: usize, timeout: bool, rng: &mut Rng)
     }
 }
 
+/// Queue an operation's commands again (its fence found the queue full).
+fn requeue_op(w: &mut World, op: &mut Op) -> Fence {
+    match op {
+        Op::Create(d, t) => w.store.requeue_create(w.mem, &mut w.sim, *d, t),
+        Op::Map(d, page, t) => {
+            let mut m = Mapped {
+                iova: *page << 12,
+                ticket: *t,
+                tables: 0,
+            };
+            let f = w.store.requeue_map(w.mem, &mut w.sim, *d, &mut m);
+            *t = m.ticket;
+            f
+        }
+        Op::Unmap(p) => w.store.requeue_unmap(w.mem, &mut w.sim, p),
+        Op::Destroy(x) => w.store.requeue_destroy(w.mem, &mut w.sim, x),
+    }
+}
+
+/// At the end, with the device running: poll, queueing again while the queue was full.
+fn finish_poll(w: &mut World, op: &mut Op) -> Fence {
+    loop {
+        match w.store.poll(&mut w.sim, op_ticket(op)) {
+            Fence::Unqueued => {
+                if requeue_op(w, op) == Fence::Done {
+                    return Fence::Done;
+                }
+                w.sim.process_commands();
+            }
+            f => return f,
+        }
+    }
+}
+
 fn op_ticket(op: &Op) -> Ticket {
     match op {
         Op::Create(_, t) | Op::Map(_, _, t) => *t,
@@ -636,6 +676,7 @@ fn random_maps_unmaps_fences_and_destructions_agree_with_the_model() {
                         page: 0,
                         pages,
                         vmo: v,
+                        vmo_page: first,
                         pfns,
                         write,
                         visible: false,
@@ -746,11 +787,29 @@ fn random_maps_unmaps_fences_and_destructions_agree_with_the_model() {
                     match w.store.poll(&mut w.sim, t) {
                         Fence::Done => settle_op(&mut w, &mut r, i, false, &mut rng),
                         Fence::Failed => settle_op(&mut w, &mut r, i, true, &mut rng),
+                        Fence::Unqueued => {
+                            // the queue was full: queue again, or (the device stalled) let the bound pass
+                            if requeue_op(&mut w, &mut r.ops[i]) == Fence::Unqueued
+                                && stalled
+                                && rng.chance(30)
+                            {
+                                settle_op(&mut w, &mut r, i, true, &mut rng);
+                            }
+                        }
                         Fence::Waiting => {
                             // a step that runs too early is refused and changes nothing
                             match &r.ops[i] {
                                 Op::Unmap(p) => {
-                                    assert_eq!(w.store.complete(p).unwrap_err(), IoError::NotDone)
+                                    // (a record the domain's destruction took is not there: nothing to hand out)
+                                    let there = r.pending.iter().any(|(q, _)| q == p);
+                                    match w.store.complete(p) {
+                                        Err(IoError::NotDone) => assert!(there),
+                                        Ok(None) => assert!(!there),
+                                        other => panic!(
+                                            "an early complete: {:?}",
+                                            other.map(|x| x.is_some())
+                                        ),
+                                    }
                                 }
                                 Op::Destroy(x) => assert_eq!(
                                     w.store.destroy_complete(w.mem, x).err(),
@@ -829,8 +888,7 @@ fn random_maps_unmaps_fences_and_destructions_agree_with_the_model() {
         // the end: the device runs again, every operation finishes, every domain goes, every handle closes
         w.sim.process_commands();
         while !r.ops.is_empty() {
-            let t = op_ticket(&r.ops[0]);
-            let f = w.store.poll(&mut w.sim, t);
+            let f = finish_poll(&mut w, &mut r.ops[0]);
             settle_op(&mut w, &mut r, 0, f != Fence::Done, &mut rng);
             w.sim.process_commands();
         }
@@ -840,8 +898,7 @@ fn random_maps_unmaps_fences_and_destructions_agree_with_the_model() {
         }
         w.sim.process_commands();
         while !r.ops.is_empty() {
-            let t = op_ticket(&r.ops[0]);
-            let f = w.store.poll(&mut w.sim, t);
+            let f = finish_poll(&mut w, &mut r.ops[0]);
             settle_op(&mut w, &mut r, 0, f != Fence::Done, &mut rng);
             w.sim.process_commands();
         }
@@ -866,6 +923,14 @@ fn random_maps_unmaps_fences_and_destructions_agree_with_the_model() {
                 assert_eq!(w.jobs.io_usage(job, IoResource::MappedPages), Some(0));
             }
             assert_eq!(w.vmos.count(), 0);
+            // J2: every domain gave its job's use back: the creator's is the last
+            for &job in &r.jobs {
+                w.jobs.release(job);
+                assert!(
+                    !w.jobs.exists(job),
+                    "seed {seed}: a domain kept its job's use"
+                );
+            }
         } else {
             // IO8: what is missing is exactly what was leaked, and it is counted
             assert!(s.fence_timeouts > 0);
@@ -885,6 +950,25 @@ fn random_maps_unmaps_fences_and_destructions_agree_with_the_model() {
                 r.leaked.len() as u64,
                 "seed {seed}: leaked holds counted"
             );
+            assert_eq!(
+                s.tables_leaked,
+                w.counts.tables + 4 * w.counts.roots,
+                "seed {seed}: leaked table frames, roots and MSI tables counted exactly"
+            );
+            // J2: a job whose charges were leaked keeps its record (its usage stays); every other one goes with its creator's use
+            for &job in &r.jobs {
+                let leaks = r.leaked.iter().any(|m| m.job == job)
+                    || r.leaked_doms.iter().any(|(j, _)| *j == job);
+                if !leaks {
+                    assert_eq!(w.jobs.usage(job).unwrap().get(Resource::KernelBytes), 0);
+                }
+                w.jobs.release(job);
+                assert_eq!(
+                    w.jobs.exists(job),
+                    leaks,
+                    "seed {seed}: job {job:?} kept iff it has leaked charges"
+                );
+            }
         }
     }
     for (i, h) in HITS.iter().enumerate() {
@@ -1222,4 +1306,222 @@ fn the_fault_ring_keeps_the_sixteen_oldest_and_counts_the_rest() {
     };
     assert_eq!(w.store.fault(stranger, 5000, 1000).domain, None);
     assert_eq!(w.store.stats().last_fault, Some((40, at(1), 1)));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// the command queue: the invalidation's form, a full queue, a queue error
+
+/// The commands the simulated IOMMU ran since `from`.
+fn ran_since(w: &World, from: usize) -> Vec<iommucore::cmdq::Command> {
+    w.sim.executed()[from..].to_vec()
+}
+
+#[test]
+fn an_unmap_that_empties_a_table_invalidates_the_whole_soft_context() {
+    use iommucore::cmdq::Command;
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let g = w.store.gscid_of(d).unwrap();
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 2, job)
+        .unwrap();
+    let a = map_ok(&mut w, d, v, 0, 1, Access::Read);
+    let b = map_ok(&mut w, d, v, 1, 1, Access::Read);
+    assert_eq!(a >> 21, b >> 21, "the two pages share a leaf table");
+    // the first unmap leaves the table in use: the page alone is invalidated
+    let at = w.sim.executed().len();
+    unmap_ok(&mut w, d, a, 1);
+    let ran = ran_since(&w, at);
+    assert!(ran.contains(&Command::iotinval_gvma(g, Some(a))));
+    assert!(!ran.contains(&Command::iotinval_gvma(g, None)));
+    // the second empties the leaf table and the one above: the non-leaf entries cached for them go with the whole soft context
+    let at = w.sim.executed().len();
+    unmap_ok(&mut w, d, b, 1);
+    let ran = ran_since(&w, at);
+    assert!(
+        ran.contains(&Command::iotinval_gvma(g, None)),
+        "IO3 for table frames: a page-wise invalidation need not drop the page-walk cache ({ran:x?})"
+    );
+    assert_eq!(w.store.usage(d).unwrap().0, 0, "the tables were freed");
+    destroy_ok(&mut w, d);
+    w.close_vmo(v);
+}
+
+/// Fill the stalled queue with maps of `v` until one finds no room: the maps that were queued, and the one that was not.
+fn fill_queue(w: &mut World, d: DomainId, v: u64) -> (Vec<Mapped>, Mapped) {
+    let mut queued = vec![];
+    for _ in 0..1000 {
+        match w.map(d, v, 0, 1, Access::Read, None) {
+            MapStart::Wait(m) => {
+                if w.store.poll(&mut w.sim, m.ticket) == Fence::Unqueued {
+                    return (queued, m);
+                }
+                queued.push(m);
+            }
+            _ => panic!("map refused"),
+        }
+    }
+    panic!("the queue never filled");
+}
+
+#[test]
+fn a_full_queue_is_queued_again_not_failed() {
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 1, job)
+        .unwrap();
+
+    // a map
+    let (queued, mut m) = fill_queue(&mut w, d, v);
+    let stuck = w.store.stats().queue_stuck;
+    assert!(stuck > 0);
+    assert_eq!(
+        w.store.stats().fence_timeouts,
+        0,
+        "a full queue is not a timeout"
+    );
+    assert_eq!(
+        w.store.requeue_map(w.mem, &mut w.sim, d, &mut m),
+        Fence::Unqueued,
+        "still full"
+    );
+    w.sim.process_commands();
+    assert_eq!(
+        w.store.requeue_map(w.mem, &mut w.sim, d, &mut m),
+        Fence::Waiting
+    );
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, m.ticket), Fence::Done);
+    for q in &queued {
+        assert_eq!(w.store.poll(&mut w.sim, q.ticket), Fence::Done);
+    }
+    let mut maps: Vec<u64> = queued.iter().map(|q| q.iova).collect();
+    maps.push(m.iova);
+
+    // an unmap
+    let (more, mut last) = fill_queue(&mut w, d, v);
+    let iova = maps.pop().unwrap();
+    let mut p = w.unmap(d, iova, 1).unwrap();
+    assert_eq!(w.store.poll(&mut w.sim, p.ticket()), Fence::Unqueued);
+    assert_eq!(
+        w.store.complete(&p).unwrap_err(),
+        IoError::NotDone,
+        "an unqueued fence is not done"
+    );
+    w.sim.process_commands();
+    assert_eq!(
+        w.store.requeue_unmap(w.mem, &mut w.sim, &mut p),
+        Fence::Waiting
+    );
+    assert_eq!(
+        w.store.requeue_map(w.mem, &mut w.sim, d, &mut last),
+        Fence::Waiting
+    );
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, p.ticket()), Fence::Done);
+    let rel = w
+        .store
+        .complete(&p)
+        .unwrap()
+        .expect("the requeued record completes");
+    w.settle(rel);
+    maps.extend(more.iter().map(|q| q.iova));
+    maps.push(last.iova);
+    for iova in maps.drain(..) {
+        unmap_ok(&mut w, d, iova, 1);
+    }
+
+    // a destruction, and a create
+    let (rest, _) = fill_queue(&mut w, d, v);
+    let mut x = w.destroy(d).unwrap();
+    assert_eq!(w.store.poll(&mut w.sim, x.ticket()), Fence::Unqueued);
+    let (d2, mut t2) = w.create(2, job).unwrap();
+    assert_eq!(w.store.poll(&mut w.sim, t2), Fence::Unqueued);
+    w.sim.process_commands();
+    assert_eq!(
+        w.store.requeue_destroy(w.mem, &mut w.sim, &mut x),
+        Fence::Waiting
+    );
+    assert_eq!(
+        w.store.requeue_create(w.mem, &mut w.sim, d2, &mut t2),
+        Fence::Waiting
+    );
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, t2), Fence::Done);
+    assert_eq!(w.store.poll(&mut w.sim, x.ticket()), Fence::Done);
+    let mut det = w.store.destroy_complete(w.mem, &x).unwrap().unwrap();
+    let mut n = 0;
+    while let Some(r) = det.next_record() {
+        n += 1;
+        w.settle(r);
+    }
+    w.finish(det);
+    assert_eq!(
+        n,
+        rest.len() + 1,
+        "the destruction returns the mappings, the unqueued one too"
+    );
+    destroy_ok(&mut w, d2);
+    w.close_vmo(v);
+    let s = w.store.stats();
+    assert_eq!((s.fence_timeouts, s.holds_leaked), (0, 0));
+    assert_eq!(kernel_bytes(&w, job), 0);
+}
+
+#[test]
+fn a_queue_error_or_a_head_out_of_range_fails_the_fence() {
+    use iommucore::Regs;
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 1, job)
+        .unwrap();
+    let iova = map_ok(&mut w, d, v, 0, 1, Access::Read);
+
+    // a head out of range (an IOMMU that misbehaves): the fence fails
+    struct BadHead<'a, 'm>(&'a mut iommucore::sim::Sim<'m, IoMem>);
+    impl Regs for BadHead<'_, '_> {
+        fn read32(&mut self, offset: usize) -> u32 {
+            if offset == iommucore::regs::CQH {
+                0xffff
+            } else {
+                self.0.read32(offset)
+            }
+        }
+        fn write32(&mut self, offset: usize, value: u32) {
+            self.0.write32(offset, value)
+        }
+        fn read64(&mut self, offset: usize) -> u64 {
+            self.0.read64(offset)
+        }
+        fn write64(&mut self, offset: usize, value: u64) {
+            self.0.write64(offset, value)
+        }
+    }
+    let p = w.unmap(d, iova, 1).unwrap();
+    assert_eq!(
+        w.store.poll(&mut BadHead(&mut w.sim), p.ticket()),
+        Fence::Failed
+    );
+
+    // a command the IOMMU refuses (the queue's entry overwritten): the queue stops with an error, and the fence fails
+    let cqb = w.sim.read64(iommucore::regs::CQB);
+    let base = ((cqb >> 10) & ((1 << 44) - 1)) << 12;
+    let head = u64::from(w.sim.read32(iommucore::regs::CQH));
+    mem.write(base + head * 16, 0x7f);
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, p.ticket()), Fence::Failed);
+    assert!(w.store.abandon(&p), "the waiter abandons (6.4)");
+    assert_eq!(w.store.stats().fence_timeouts, 1);
+    assert_eq!(w.store.stats().holds_leaked, 1);
 }

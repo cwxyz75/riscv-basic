@@ -149,7 +149,9 @@ fn wait(k: &Kernel, t: Ticket) {
         match f {
             Fence::Done => return,
             Fence::Waiting => thread::yield_now(),
-            Fence::Failed => panic!("the device never stalls here"),
+            Fence::Failed | Fence::Unqueued => {
+                panic!("the device never stalls and the queue never fills here: {f:?}")
+            }
         }
     }
 }
@@ -362,6 +364,43 @@ fn shuttle_unmap_against_a_map_of_the_same_vmo() {
             let mapped = map(&k, d, v, 1, 3).expect("the domain and VMO are alive");
             t.join().unwrap();
             assert!(unmap(&k, d, mapped, 3));
+            finish(s, dev, true);
+        },
+        SCHEDULES,
+    );
+}
+
+/// The supervisor destroys while a driver maps (OD164's rights split: two owners of one domain). The map is refused (the domain is
+/// being destroyed) and gives its hold and charge back, or it lands first and the destruction returns its record. The domain's job
+/// stays alive throughout: the kernel's domain object holds its own use of it (IOMMU-SPEC 4.5), as this test's creator does.
+#[test]
+fn shuttle_destroy_against_a_map() {
+    shuttle::check_random(
+        || {
+            let s = setup();
+            let dev = spawn_device(&s);
+            let (k, d) = (s.k.clone(), s.d);
+            let t = thread::spawn(move || assert!(destroy(&k, d)));
+            let k = s.k.clone();
+            let mapped = map(&k, s.d, s.vmo, 2, 2);
+            t.join().unwrap();
+            assert_eq!(k.iommu.lock().unwrap().store.job_of(s.d), None);
+            if let Some(iova) = mapped {
+                assert!(!unmap(&k, s.d, iova, 2), "the destruction took the mapping");
+            }
+            assert_eq!(
+                k.vmos.lock().unwrap().refs(s.vmo),
+                Some(1),
+                "every device hold is gone: only the handle is left"
+            );
+            assert_eq!(
+                k.jobs
+                    .lock()
+                    .unwrap()
+                    .io_usage(s.job, IoResource::MappedPages),
+                Some(0),
+                "J2"
+            );
             finish(s, dev, true);
         },
         SCHEDULES,

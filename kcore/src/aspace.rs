@@ -257,6 +257,8 @@ struct Vmo {
     committed: PageMap,
     /// Made with the RESIZABLE flag: `set_size` may change `pages` (MM6).
     resizable: bool,
+    /// A DMA VMO of the old call (`create_dma`), whose frames are one contiguous run: the only kind with a physical address (D2).
+    contiguous: bool,
     /// The node this one inherits from (MM8): a page it has not committed itself is found there, window `offset`.
     parent: Option<Link>,
     /// Nodes that have this one as their parent (a hidden node has two or more: with one left it is merged into it).
@@ -692,6 +694,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
+            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -716,6 +719,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
+            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -774,6 +778,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
+            contiguous: true,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -793,11 +798,10 @@ impl Vmos {
     /// The physical address of a DMA VMO (its first byte), for the old call: only for one whose frames are contiguous (`create_dma`'s,
     /// at most `MAX_DMA_PAGES`); a `create_dma_in` VMO's frames are not promised contiguous, so a first address would be a lie.
     pub fn phys_addr(&self, id: u64) -> Option<u64> {
-        let v = self.vmo(id).filter(|v| v.kind == VmoKind::Dma)?;
-        let first = v.committed.get(0)?;
-        let contiguous = v.pages <= abi::limits::MAX_DMA_PAGES
-            && (1..v.pages).all(|i| v.committed.get(i) == first.checked_add(i));
-        contiguous.then_some(first << 12)
+        let v = self
+            .vmo(id)
+            .filter(|v| v.kind == VmoKind::Dma && v.contiguous)?;
+        Some(v.committed.get(0)? << 12)
     }
 
     /// A DMA VMO for `vmo_create_dma_in` (IOMMU-SPEC 4.7; OD162 point 3, OD166 point 9): `pages` zeroed frames from the ordinary allocator
@@ -861,6 +865,7 @@ impl Vmos {
             refs: 1,
             committed,
             resizable: false,
+            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -1366,6 +1371,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
+            contiguous: false,
             parent: None,
             children: stash,
             hidden: false,
@@ -1437,6 +1443,7 @@ impl Vmos {
                         refs: 2,
                         committed,
                         resizable: false,
+                        contiguous: false,
                         parent: old_parent,
                         children: kids,
                         hidden: true,

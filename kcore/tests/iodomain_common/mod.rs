@@ -121,6 +121,11 @@ impl TableFrames for DbFrames<'_> {
 
 impl IoFrames for DbFrames<'_> {
     fn alloc_root(&mut self) -> Option<u64> {
+        match &mut self.fail {
+            Some(0) => return None,
+            Some(n) => *n -= 1,
+            None => {}
+        }
         let pfn = self.db.alloc_contiguous(4)?;
         assert_eq!(pfn % 4, 0, "an order-2 block is aligned to 16 KiB");
         for i in 0..4 * 512 {
@@ -156,6 +161,18 @@ pub struct Boot {
 /// Bring the simulated IOMMU up as the kernel does (IOMMU-SPEC 2.4 steps 3 to 5): command queue (256 entries), optionally the fault
 /// queue (128 records), a one-level extended directory (device ids 0 to 63), `ddtp` written once; and the quarantine table.
 pub fn boot(db: &mut FrameDb, mem: &IoMem, sim: &mut Sim<'_, IoMem>, fault_queue: bool) -> Boot {
+    boot_with(db, mem, sim, fault_queue, Levels::One)
+}
+
+/// `boot` with a directory of `levels` levels (more than one: the directory pages below the root are allocated as devices are
+/// claimed, and a failed claim can unlink one again).
+pub fn boot_with(
+    db: &mut FrameDb,
+    mem: &IoMem,
+    sim: &mut Sim<'_, IoMem>,
+    fault_queue: bool,
+    levels: Levels,
+) -> Boot {
     let before = db.free_count();
     let dir = db.alloc().unwrap() << 12;
     let cq = db.alloc().unwrap() << 12;
@@ -165,7 +182,7 @@ pub fn boot(db: &mut FrameDb, mem: &IoMem, sim: &mut Sim<'_, IoMem>, fault_queue
             mem.write(pa + i * 8, 0);
         }
     }
-    let ddt = Ddt::new(mem, dir, Levels::One, Format::Extended).unwrap();
+    let ddt = Ddt::new(mem, dir, levels, Format::Extended).unwrap();
     let cmdq = CmdQueue::new(cq, 256).unwrap();
     let quarantine = Iopt::new(mem, q, PtMode::Sv39x4).unwrap();
     sim.write64(regs::CQB, cmdq.cqb());
@@ -175,7 +192,7 @@ pub fn boot(db: &mut FrameDb, mem: &IoMem, sim: &mut Sim<'_, IoMem>, fault_queue
         sim.write64(regs::FQB, FaultQueue::new(FQ_PA, 128).unwrap().fqb());
         sim.write32(regs::FQCSR, regs::QCSR_EN);
     }
-    sim.write64(regs::DDTP, Ddtp::directory(Levels::One, dir).bits());
+    sim.write64(regs::DDTP, Ddtp::directory(levels, dir).bits());
     Boot {
         ddt,
         cmdq,
@@ -240,16 +257,27 @@ impl<'m> World<'m> {
         frames: usize,
         prefill: bool,
     ) -> World<'m> {
+        World::with_levels(mem, fault_queue, frames, prefill, Levels::One)
+    }
+
+    /// `with_frames`, with a directory of `levels` levels.
+    pub fn with_levels(
+        mem: &'m IoMem,
+        fault_queue: bool,
+        frames: usize,
+        prefill: bool,
+        levels: Levels,
+    ) -> World<'m> {
         let mut db = FrameDb::new(BASE_PFN, frames);
         if prefill {
             mem.prefill(BASE_PFN, frames as u64);
         }
         let mut sim = Sim::new(mem, sim_config());
-        let b = boot(&mut db, mem, &mut sim, fault_queue);
+        let b = boot_with(&mut db, mem, &mut sim, fault_queue, levels);
         World {
             mem,
             sim,
-            store: IoDomains::new(b.ddt, b.cmdq, &b.quarantine).unwrap(),
+            store: IoDomains::new(b.ddt, b.cmdq, &b.quarantine, 0x5eed_1234_abcd_0042).unwrap(),
             mm: Mm {
                 db,
                 mem: FakeMem::default(),

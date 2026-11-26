@@ -379,6 +379,14 @@ fn a_dma_in_vmo_is_zeroed_charged_fixed_and_not_promised_contiguous() {
         None,
         "D2: no first address for frames that are not contiguous"
     );
+    // the kind decides, not the frames that happened to come: one page is "contiguous" and still has no address
+    let one = vmos.create_dma_in(&mut mm, &mut jobs, 1, job).unwrap();
+    assert_eq!(
+        vmos.phys_addr(one),
+        None,
+        "D2, IO6: no physical address for the new kind"
+    );
+    vmos.release(&mut mm, &mut jobs, one).unwrap();
     let used = |j: &kcore::job::Jobs, r| j.usage(job).unwrap().get(r);
     assert_eq!(used(&jobs, Resource::Pages), 20, "charged to the named job");
     assert_eq!(
