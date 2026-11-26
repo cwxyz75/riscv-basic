@@ -78,6 +78,8 @@ struct Ref {
     touched: BTreeMap<u32, BTreeSet<u64>>,
     jobs: Vec<JobId>,
     abandoned: bool,
+    /// The ids of domains that are gone (destroyed or leaked): no call may find them again.
+    dead: Vec<DomainId>,
 }
 
 impl Ref {
@@ -112,6 +114,7 @@ impl Ref {
         self.pending = keep;
         self.leaked.extend(gone.into_iter().map(|(_, m)| m));
         let dom = self.doms.remove(&d).unwrap();
+        self.dead.push(d);
         self.leaked_doms
             .push((dom.job, tables_for(pages.into_iter())));
     }
@@ -121,6 +124,7 @@ impl Ref {
         self.live.retain(|k, _| k.0 != d);
         self.pending.retain(|(_, m)| m.d != d);
         self.doms.remove(&d);
+        self.dead.push(d);
     }
 }
 
@@ -266,7 +270,39 @@ fn check_counts(w: &World, r: &Ref, seed: u64, step: u64) {
         }
         known_tables += t;
         msi += 1;
-        let _ = dom;
+        // the domain's identity: its device, its job, and the device's domain (attached or detaching)
+        assert_eq!(
+            w.store.device_of(d),
+            Some(dom.device),
+            "{ctx}: device of {d:?}"
+        );
+        assert_eq!(w.store.job_of(d), Some(dom.job), "{ctx}: job of {d:?}");
+        assert_eq!(
+            w.store.domain_of(dom.device),
+            Some(d),
+            "{ctx}: domain of device {}",
+            dom.device
+        );
+    }
+    // each live domain has its own soft context, never GSCID 0 (the quarantine's)
+    let gscids: BTreeSet<u16> = r
+        .doms
+        .keys()
+        .map(|&d| w.store.gscid_of(d).unwrap())
+        .collect();
+    assert_eq!(
+        gscids.len(),
+        r.doms.len(),
+        "{ctx}: one GSCID per live domain"
+    );
+    assert!(!gscids.contains(&0), "{ctx}: GSCID 0 is the quarantine's");
+    // a domain that is gone is never found again, though its slot is reused
+    for &d in &r.dead {
+        assert_eq!(
+            (w.store.device_of(d), w.store.gscid_of(d)),
+            (None, None),
+            "{ctx}: {d:?} is gone"
+        );
     }
     for &(_, t) in &r.leaked_doms {
         known_tables += t;
@@ -1207,7 +1243,11 @@ fn the_fault_ring_keeps_the_sixteen_oldest_and_counts_the_rest() {
     let mut w = World::new(&mem, true);
     let mut fq = FaultQueue::new(FQ_PA, 128).unwrap();
     let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    // a domain made and destroyed first: the next one reuses its slot with a new generation, which each fault must name
+    let old = ready(&mut w, 2, job);
+    destroy_ok(&mut w, old);
     let d = ready(&mut w, 1, job);
+    assert_ne!(d, old);
     let at = |i: u64| IO_BASE + (IO_VECTOR_PAGES + 300 + i) * PAGE;
     for i in 0..20 {
         assert!(w.sim.read(1, at(i)).is_err());
@@ -1524,4 +1564,136 @@ fn a_queue_error_or_a_head_out_of_range_fails_the_fence() {
     assert!(w.store.abandon(&p), "the waiter abandons (6.4)");
     assert_eq!(w.store.stats().fence_timeouts, 1);
     assert_eq!(w.store.stats().holds_leaked, 1);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// identities: soft-context ids and domain ids
+
+/// Eighty domains take eighty distinct GSCIDs (past the first bitmap word), a destroyed domain's GSCID is free again for the next
+/// create, and its slot's next domain has a new id that the old one never finds.
+#[test]
+fn soft_context_ids_are_distinct_and_freed_and_domain_ids_are_not_reused() {
+    let mem = IoMem::new();
+    // (a one-level directory has 64 devices: three levels for 80)
+    let mut w = World::with_levels(&mem, false, FRAMES, true, iommucore::ddt::Levels::Three);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let doms: Vec<DomainId> = (1..=80).map(|did| ready(&mut w, did, job)).collect();
+    let gscids: Vec<u16> = doms.iter().map(|&d| w.store.gscid_of(d).unwrap()).collect();
+    let set: BTreeSet<u16> = gscids.iter().copied().collect();
+    assert_eq!(set.len(), 80, "one GSCID each: {gscids:?}");
+    assert!(!set.contains(&0), "GSCID 0 is the quarantine's");
+    for (i, &d) in doms.iter().enumerate() {
+        assert_eq!(w.store.device_of(d), Some(i as u32 + 1));
+        assert_eq!(w.store.domain_of(i as u32 + 1), Some(d));
+    }
+    // destroy the domain on GSCID 70 (the second bitmap word): the next create takes that GSCID and that slot
+    let i = gscids
+        .iter()
+        .position(|&g| g == 70)
+        .expect("GSCIDs are taken lowest first");
+    let old = doms[i];
+    destroy_ok(&mut w, old);
+    assert_eq!(w.store.device_of(old), None);
+    let new = ready(&mut w, 200, job);
+    assert_eq!(
+        w.store.gscid_of(new),
+        Some(70),
+        "the destroyed domain's GSCID is free again"
+    );
+    assert_ne!(new, old, "the slot's next domain has a new id");
+    assert_eq!(
+        (w.store.device_of(old), w.store.gscid_of(old)),
+        (None, None)
+    );
+    assert_eq!(w.store.domain_of(200), Some(new));
+    assert_eq!(
+        w.store.stats().slots,
+        80,
+        "the destroyed domain's slot was reused"
+    );
+    // a create on a quarantined device also invalidates the quarantine's soft context (GSCID 0); one on a fresh device need not
+    for did in [i as u32 + 1, 300] {
+        let quarantined = w.store.device_state(w.mem, did) == DeviceState::Quarantined;
+        assert_eq!(quarantined, did != 300, "device {did}");
+        let at = w.sim.executed().len();
+        let again = ready(&mut w, did, job);
+        let zero = iommucore::cmdq::Command::iotinval_gvma(0, None);
+        assert_eq!(
+            ran_since(&w, at).contains(&zero),
+            quarantined,
+            "device {did}"
+        );
+        destroy_ok(&mut w, again);
+    }
+    for d in doms.into_iter().filter(|&d| d != old).chain([new]) {
+        destroy_ok(&mut w, d);
+    }
+    assert_eq!(w.store.stats().domains, 0);
+}
+
+/// A map whose table allocation fails part way, after it wrote leaves for the pages before a leaf-table boundary: the roll-back
+/// clears exactly those leaves, the device reaches none of the range, every table frame comes back, and the range is free again once
+/// its fence completes. The command counter counts every command the IOMMU ran.
+#[test]
+fn a_map_rolled_back_after_writing_leaves_clears_them() {
+    let mem = IoMem::new();
+    let mut w = World::new(&mem, false);
+    let job = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let d = ready(&mut w, 1, job);
+    let v = w
+        .vmos
+        .create_dma_in(&mut w.mm, &mut w.jobs, 600, job)
+        .unwrap();
+    // a filler that ends two pages before a leaf table's boundary (a leaf table maps 512 pages)
+    let a = map_ok(&mut w, d, v, 0, 1, Access::Read);
+    let to_edge = 512 - ((a >> 12) % 512);
+    assert!(to_edge > 3, "the window starts away from a boundary");
+    let filler = map_ok(&mut w, d, v, 1, to_edge - 3, Access::Read);
+    assert_eq!(filler, a + PAGE, "ranges are handed out in order");
+    let start = filler + (to_edge - 3) * PAGE;
+    assert_eq!((start >> 12) % 512, 510, "two pages before the boundary");
+    let tables = w.counts.tables;
+    // four pages: two in the filler's leaf table, two needing a new one, whose allocation fails
+    let p = match w.map(d, v, 100, 4, Access::ReadWrite, Some(0)) {
+        MapStart::RolledBack(p) => p,
+        _ => panic!("the map is rolled back"),
+    };
+    assert_eq!(p.range(), (d, start));
+    for i in 0..4 {
+        assert!(
+            w.sim.read(1, start + i * PAGE).is_err(),
+            "page {i} of the rolled-back range"
+        );
+    }
+    w.sim.process_commands();
+    assert_eq!(w.store.poll(&mut w.sim, p.ticket()), Fence::Done);
+    let rel = w
+        .store
+        .complete(&p)
+        .unwrap()
+        .expect("the record comes back");
+    assert_eq!((rel.vmo(), rel.pages()), (v, 4));
+    w.settle(rel);
+    assert_eq!(w.counts.tables, tables, "no table frame kept");
+    // the range is free again: the same four pages map, and the device reaches them
+    let again = map_ok(&mut w, d, v, 100, 4, Access::ReadWrite);
+    assert_eq!(again, start);
+    for i in 0..4 {
+        assert!(w.sim.read(1, start + i * PAGE).is_ok());
+    }
+    for i in 1..=(to_edge - 3) {
+        assert!(
+            w.sim.read(1, a + i * PAGE).is_ok(),
+            "the filler stays mapped"
+        );
+    }
+    assert_eq!(
+        w.store.stats().commands,
+        w.sim.executed().len() as u64,
+        "every command counted"
+    );
+    unmap_ok(&mut w, d, again, 4);
+    unmap_ok(&mut w, d, filler, to_edge - 3);
+    unmap_ok(&mut w, d, a, 1);
+    destroy_ok(&mut w, d);
 }

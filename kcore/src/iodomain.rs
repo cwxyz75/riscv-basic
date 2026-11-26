@@ -525,6 +525,8 @@ pub struct IoStats {
     pub tables_leaked: u64,
     /// Live domains (attached or detaching).
     pub domains: u64,
+    /// Domain slots made (a destroyed domain's slot is reused by a later domain, under a new generation).
+    pub slots: u64,
     /// Pages of live and pending mappings (leaked ones are counted apart, in `pages_leaked`).
     pub io_pages: u64,
 }
@@ -798,6 +800,7 @@ impl IoDomains {
             gen: 0,
             dom: Some(dom),
         });
+        self.stats.slots = self.slots.len() as u64;
         DomainId(self.slots.len() as u64)
     }
 

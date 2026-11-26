@@ -341,6 +341,7 @@ impl<'m> World<'m> {
             }
         };
         let rec = Record::new(vmo, first, pages, access).unwrap();
+        assert_eq!((rec.vmo(), rec.pages()), (vmo, pages));
         let World {
             mem,
             sim,
