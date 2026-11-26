@@ -33,7 +33,7 @@ get filled in as each area is built.
 | M5 | Kernel memory is never reachable from a user mapping; the kernel image is not reachable at all through the direct map (the firmware's reserved range and everything below the image in its RAM bank stay out too; the device tree's own frames are mapped read-only; only RAM the tree describes below 64 GiB is used) | QEMU `direct_map_does_not_alias_the_image`; `usercopy.rs` (a user pointer into the shared kernel half or page zero is refused even with a user-bit region over it); QEMU `user_store_to_kernel_memory_is_fatal`, `user_load_from_kernel_memory_is_fatal` (S3b) |
 | M6 | Every user pointer is validated and copied by a page-table walk, never dereferenced; a bad pointer is INVALID_ARGS and changes nothing | `kcore/tests/usercopy.rs` (every bad-pointer class, no partial writes); `init` tests `debug_write_pointer_rules`, `buffers_are_validated_before_a_read` (S3b) |
 | M7 | A user program is hostile data: the ELF loader accepts only what is safe to map (user half, in the file, no W+X, no executable stack, no overlap) and never panics | `kcore/tests/elf_loader.rs` (every rule, plus a mutation fuzz of 3000 images); QEMU `a_corrupt_program_is_refused_without_leaks` (S3b) |
-| M8 | A VMO lives while any holder does: its creator (the object a handle names, or the kernel for its own) and every region that maps it; the last holder to go frees its pages and credits its job. A VMO closed while mapped is still faulted in from, and is freed at the last unmap or at teardown (L15: no scan for VMOs nothing maps) | `kcore/tests/aspace_model.rs` (the random model with the reference count: `random_faults_regions_and_teardown_agree_with_the_model_*`, `a_mapping_keeps_its_vmo_and_frames_alive_after_the_creator_goes`, `a_vmo_closed_before_a_region_of_it_faults_still_serves_the_fault`); QEMU `vmo_closed_while_mapped_keeps_its_pages` and the leak suites |
+| M8 | A VMO lives while any holder does: its creator (the object a handle names, or the kernel for its own) and every region that maps it; the last holder to go frees its pages and credits its job. A VMO closed while mapped is still faulted in from, and is freed at the last unmap or at teardown (L15: no scan for VMOs nothing maps) | `kcore/tests/aspace_model.rs` (the random model with the reference count: `random_faults_regions_and_teardown_agree_with_the_model_*`, `a_mapping_keeps_its_vmo_and_frames_alive_after_the_creator_goes`, `a_vmo_closed_before_a_region_of_it_faults_still_serves_the_fault`); a device mapping is a third holder (`Vmos::retain_for_io`): `kcore/tests/device_vmo.rs` and `kcore/tests/iodomain_model.rs` (IOMMU3); QEMU `vmo_closed_while_mapped_keeps_its_pages` and the leak suites |
 
 ## Concurrency
 
@@ -76,7 +76,7 @@ get filled in as each area is built.
 | D1 | A physical VMO never names RAM: its range is inside a device window, so the frame database never sees its frames and no path frees or zeroes them; the kernel never reads or writes through one (`vmo_read`/`vmo_write` and every syscall copy refuse it) | `kcore::devwin` (`kcore/tests/devwin.rs`: the real `virt` tree against `dtc`'s listing; an allowlist by compatible, so an unknown device is never a window; RAM, the kernel's own devices and every controller are cut; four mutants caught), QEMU's refusal probes for the finisher, the CLINT, both APLICs, both IMSIC files, fw-cfg, flash and ECAM, `kcore/tests/device_vmo.rs` (mutation-checked), QEMU `device_caps_need_the_resource`, `mmio_reads_the_virtio_magic` |
 | D2 | A physical address is learnable only through a DMA-right handle of a DMA VMO | QEMU `device_caps_need_the_resource` |
 | D3 | Device objects are minted only with the root resource, which only the kernel-started process can obtain | QEMU `device_caps_need_the_resource` |
-| D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count; mutation-checked), QEMU `device_caps_need_the_resource` |
+| D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count, with device mappings as holders and large DMA VMOs given back in batches; mutation-checked), QEMU `device_caps_need_the_resource` |
 | D5 | A fired interrupt source is masked from the moment it is taken until `interrupt_ack` or the object's destruction, and a destroyed object leaves its source masked (nothing enabled with nobody listening); one live object per source | QEMU `interrupt_object_fires_and_masks` (an acknowledgement with the line still high must fire again: the same test, with the `fault-aia-no-unmask` and `fault-aia-no-repend` negative controls; T59) |
 
 ### Interrupt identities (IOMMU4, IOMMU-SPEC 8 and 12)
@@ -88,6 +88,21 @@ get filled in as each area is built.
 The route table (`kernel/src/arch/riscv64/aia.rs`, over `kcore::msiid`) is read on the claim path and written by `interrupt_create`, `interrupt_ack`,
 the object's destruction and `hart_set_online`, all under the object lock `OBJ`: it has no lock class of its own. When `OBJ` is split into
 per-object locks (OD149) the table needs its own rule (a lock of its own, or a per-hart owner), set then.
+
+### Device domains (IOMMU3, IOMMU-SPEC 4 to 7 and 12)
+
+The store is `kcore::iodomain`, the state the lock class `IOMMU` will protect (IOMMU-SPEC 11: between `KSTACK` and `FRAME`; the class
+joins the table above when IOMMU6 builds it in the kernel). Until then it runs on the host against the simulated IOMMU of
+`iommucore::sim`, with its phases under stand-in locks in that order (`iodomain_concurrency.rs`); IOMMU6 adds the QEMU checks the spec
+lists.
+
+| # | Invariant | How checked |
+|---|---|---|
+| IO3 | A frame mapped for a device is freed only after the fence that follows the invalidation of its mapping has completed | `kcore/tests/iodomain_model.rs` (random: after every step the simulated device, through its own walker and translation cache, reaches no free frame), `kcore/tests/iodomain_concurrency.rs` (shuttle, with a negative control that drops a hold before its fence), `kcore/tests/device_vmo.rs` (`a_dma_vmo_closed_while_device_mapped_is_freed_at_unmap_completion_not_before`); mutation-checked |
+| IO4 | A mapping's access is within the rights of the VMO handle it was made with, and only a pinned (DMA) VMO is ever mapped | The DMA half: `Vmos::retain_for_io` refuses any other kind (`device_vmo.rs`); the access the device gets is the access asked for (`iodomain_model.rs`, mutation-checked). The rights half is IOMMU6's |
+| IO5 | At most one live domain per device id; a device context changes only between a deny state and one domain's state, never from one domain to another | `iodomain_model.rs` (random, and `a_second_domain_for_a_live_device_is_refused_and_the_context_follows_the_domain`) |
+| IO7 | I/O-mapped pages, mapping records, table frames, vectors and interrupt files are charged to the domain's job before they exist and credited exactly once, when they are freed | `iodomain_model.rs` (random: every job's I/O-mapped pages and kernel bytes recomputed after every step), `iodomain_noalloc.rs` (a failing map or create charges nothing), `kcore/tests/job_io_limits.rs` (the two hierarchical limits) |
+| IO8 | A fence that does not complete leaks what it guarded (frames, mapping records, I/O ranges, tables, identities, files): counted, reported, never freed, never reused | `iodomain_model.rs` (a stalled device times fences out: the leaked records, ranges and domains are counted and stay out of the free lists to the end) |
 
 ### Futex rules (S7b)
 
