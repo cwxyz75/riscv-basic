@@ -1613,8 +1613,14 @@ fn soft_context_ids_are_distinct_and_freed_and_domain_ids_are_not_reused() {
     );
     // a create on a quarantined device also invalidates the quarantine's soft context (GSCID 0); one on a fresh device need not
     for did in [i as u32 + 1, 300] {
-        let quarantined = w.store.device_state(w.mem, did) == DeviceState::Quarantined;
-        assert_eq!(quarantined, did != 300, "device {did}");
+        let state = w.store.device_state(w.mem, did);
+        let quarantined = state == DeviceState::Quarantined;
+        let want = if did == 300 {
+            DeviceState::Unclaimed
+        } else {
+            DeviceState::Quarantined
+        };
+        assert_eq!(state, want, "device {did}");
         let at = w.sim.executed().len();
         let again = ready(&mut w, did, job);
         let zero = iommucore::cmdq::Command::iotinval_gvma(0, None);
