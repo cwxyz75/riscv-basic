@@ -644,9 +644,9 @@ fn window_trap(frame: &mut TrapFrame, cause: u64) {
         let (ipi, devices) = claim_file();
         let reasons = if ipi { crate::smp::ipi_interrupt() } else { 0 };
         let mut ask = reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::reschedule_fast();
-        if !devices.is_empty() || crate::aia::has_work() {
+        if devices || crate::aia::has_work() {
             crate::bkl::lock();
-            if crate::aia::deliver(&devices, crate::user::irq_fired) {
+            if crate::aia::deliver(crate::user::irq_fired) {
                 crate::user::wake_signal_waiters();
             }
             ask = true;
@@ -691,17 +691,19 @@ fn ipi_trap(frame: &mut TrapFrame) {
     }
 }
 
-/// Take every message in this hart's IMSIC file: whether the inter-hart identity was among them, and the others (looked up under the
-/// lock by `aia::deliver`).
+/// Take every message in this hart's IMSIC file: whether the inter-hart identity was among them, and whether others were (kept in the
+/// hart's own `claimed` set, looked up under the lock by `aia::deliver`; not in this frame, KT13).
 #[inline(always)]
-fn claim_file() -> (bool, kcore::msiid::IdSet) {
+fn claim_file() -> (bool, bool) {
     let mut ipi = false;
-    let mut devices = kcore::msiid::IdSet::new();
+    let mut devices = false;
+    let claimed = &crate::percpu::this().claimed;
     crate::aia::claim(|id| {
         if id == crate::aia::IPI_ID {
             ipi = true;
         } else {
-            devices.insert(id);
+            claimed.insert(id);
+            devices = true;
         }
     });
     (ipi, devices)
@@ -714,7 +716,7 @@ fn external_trap(frame: &mut TrapFrame, from_user: bool) {
     let (ipi, devices) = claim_file();
     let online =
         crate::percpu::this().hart_state.load(Ordering::Acquire) == crate::percpu::HART_ONLINE;
-    if devices.is_empty() && !crate::aia::has_work() {
+    if !devices && !crate::aia::has_work() {
         if ipi {
             ipi_trap(frame);
         }
@@ -726,7 +728,7 @@ fn external_trap(frame: &mut TrapFrame, from_user: bool) {
         // placed on an online hart and poked like any wake; this hart does not schedule or service the heap from it (it is draining or
         // parked, and a switch made here left a runnable thread unserved). The inter-hart part then takes its usual path.
         crate::bkl::lock();
-        if crate::aia::deliver(&devices, crate::user::irq_fired) {
+        if crate::aia::deliver(crate::user::irq_fired) {
             crate::user::wake_signal_waiters();
         }
         crate::bkl::unlock();
@@ -739,7 +741,7 @@ fn external_trap(frame: &mut TrapFrame, from_user: bool) {
     let reasons = if ipi { crate::smp::ipi_interrupt() } else { 0 };
     crate::bkl::lock();
     crate::fp::trap_entry(frame);
-    let any = crate::aia::deliver(&devices, crate::user::irq_fired);
+    let any = crate::aia::deliver(crate::user::irq_fired);
     if (any || reasons & crate::percpu::IPI_RESCHED != 0) && crate::thread::scheduler_ready() {
         if any {
             crate::user::wake_signal_waiters();

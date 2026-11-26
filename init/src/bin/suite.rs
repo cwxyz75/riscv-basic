@@ -8145,46 +8145,17 @@ fn fetch_the_fuzzer_image() -> Outcome {
 /// (a handle to the job goes to it over the bootstrap channel). Whatever the sequence did (the program may even fault: it can close a handle of its own runtime
 /// by chance), killing the job must bring the job's counters and the kernel heap back to where they began, and the kernel must still be running (a panic is
 /// the boot test's `##PANIC`).
+///
+/// Each seed runs twice and only the second run is measured. The kernel's object tables keep the room they grew to (the VMO table is a slab of
+/// 376-byte slots that doubles when it fills: from 256 slots to 512, with its free list, is 97,280 bytes, kept for the next VMOs and held by
+/// nobody), and whether a sequence is the one that pushes a table past its size depends on how many objects the rest of the system has at that
+/// moment. The first run brings the tables to what the sequence needs; the second, the same sequence again, must give back everything it took.
 fn the_guest_fuzzer_leaves_nothing_behind() -> Outcome {
     const SEEDS: u64 = 4;
     let root = root_job()?;
     for seed in 1..=SEEDS {
-        let j = job(root, 4, 12, 2000)?;
-        let heap_before = sys::debug_stat(109);
-        let (p, mine) =
-            launch_image_in(KFUZZ_IMAGE.load(Ordering::Relaxed), seed as usize as u64, j)?;
-        // the job handle the program's job calls act on: a duplicate with every right
-        let dup = ok(
-            sys::handle_duplicate(j, Rights::JOB.0),
-            "duplicate the job handle",
-        )?
-        .a1 as u64;
-        let hs = [dup];
-        ensure_eq!(
-            st(sys::channel_write(
-                mine,
-                [0u8; 1].as_ptr(),
-                1,
-                hs.as_ptr(),
-                1
-            )),
-            Some(S::Ok),
-            "send the job handle"
-        );
-        // it ends by itself (the sequence is finite); if it does not within the budget, that is a hang worth knowing about
-        let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 6000);
-        ensure!(
-            r.status == 0 && r.a1 as u32 & sig::TERMINATED != 0,
-            "seed {seed}: the fuzzer ended within its budget"
-        );
-        sys::job_kill(j, 1);
-        sys::handle_close(p);
-        sys::handle_close(mine);
-        for which in [0, 1, 2, 3, 4, 5, 8] {
-            job_use_settles(j, which, 0, 2000)?;
-        }
-        sys::handle_close(j);
-        let held = heap_before.wrapping_sub(sys::debug_stat(109)) as i64;
+        guest_fuzzer_run(root, seed)?;
+        let held = guest_fuzzer_run(root, seed)?;
         ensure!(
             held <= 64 * 1024,
             "seed {seed}: {held} kernel heap bytes stayed behind"
@@ -8192,6 +8163,46 @@ fn the_guest_fuzzer_leaves_nothing_behind() -> Outcome {
     }
     sys::handle_close(root);
     Ok(())
+}
+
+/// One run of the guest fuzzer with `seed`, in a job of its own below `root`; then the job is killed and its counters come back to zero. Returns
+/// the kernel heap bytes the run kept.
+fn guest_fuzzer_run(root: u64, seed: u64) -> Result<i64, Detail> {
+    let j = job(root, 4, 12, 2000)?;
+    let heap_before = sys::debug_stat(109);
+    let (p, mine) = launch_image_in(KFUZZ_IMAGE.load(Ordering::Relaxed), seed as usize as u64, j)?;
+    // the job handle the program's job calls act on: a duplicate with every right
+    let dup = ok(
+        sys::handle_duplicate(j, Rights::JOB.0),
+        "duplicate the job handle",
+    )?
+    .a1 as u64;
+    let hs = [dup];
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            [0u8; 1].as_ptr(),
+            1,
+            hs.as_ptr(),
+            1
+        )),
+        Some(S::Ok),
+        "send the job handle"
+    );
+    // it ends by itself (the sequence is finite); if it does not within the budget, that is a hang worth knowing about
+    let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 6000);
+    ensure!(
+        r.status == 0 && r.a1 as u32 & sig::TERMINATED != 0,
+        "seed {seed}: the fuzzer ended within its budget"
+    );
+    sys::job_kill(j, 1);
+    sys::handle_close(p);
+    sys::handle_close(mine);
+    for which in [0, 1, 2, 3, 4, 5, 8] {
+        job_use_settles(j, which, 0, 2000)?;
+    }
+    sys::handle_close(j);
+    Ok(heap_before.wrapping_sub(sys::debug_stat(109)) as i64)
 }
 
 /// AB9: the conformance program (built against `libsys` alone) runs to the end with no check failed; each failure it found comes back as a message.
@@ -14738,20 +14749,36 @@ fn iodomain_faults_reach_the_supervisor() -> Outcome {
                 sys::thread_yield();
             }
         }
-        let total = iommu_faults() - before;
+        // The device faults more than once for one request (QEMU 11.1.3's virtio reads the available ring's index three times), and the loop
+        // above waits only for the first fault of each, so the last requests' later faults can still be on their way: a count read at any one
+        // moment can be short of what the domain has stored and dropped by the time it is read. What holds at every moment is the ledger
+        // (IOMMU-SPEC 7.4: the count and the ring change under one lock): every fault is either a record read from the ring or counted as
+        // dropped. So the count is read once it has stayed still, the ring is drained, the count is let settle again and anything stored since
+        // is drained too, and the sum is checked against the final count.
+        let total = iommu_wait_faults(before).unwrap_or(before) - before;
         ensure!(total >= 20, "twenty faults at least ({total})");
         ensure!(
             sys::object_signals(d.sup).a1 as u32 & sig::DEVICE_FAULT != 0,
             "DEVICE_FAULT is up"
         );
         let recs = drain_domain_faults(d.sup);
-        ensure_eq!(recs.len(), 16, "the ring holds sixteen");
-        let dropped: u64 = recs.iter().map(|r| r.3).sum();
-        ensure_eq!(dropped, total - 16, "the rest are counted as dropped");
+        // (a fault that arrives while the ring is being read finds room in it: the drain reads it too, so the ring holds at least sixteen)
+        ensure!(recs.len() >= 16, "the ring holds sixteen ({})", recs.len());
+        // (the first read reports what was dropped before it: at least the faults counted so far beyond the sixteen it kept)
+        ensure!(
+            recs[0].3 >= total - 16,
+            "the dropped count comes with the first read: {} for {total} faults",
+            recs[0].3
+        );
+        let settled = iommu_wait_faults(before).unwrap_or(before) - before;
+        let late = drain_domain_faults(d.sup);
+        let dropped: u64 = recs.iter().chain(late.iter()).map(|r| r.3).sum();
         ensure_eq!(
-            recs[0].3,
-            total - 16,
-            "the dropped count comes with the first read and resets"
+            recs.len() as u64 + late.len() as u64 + dropped,
+            settled,
+            "every fault was read or counted as dropped ({} read, {} late, {dropped} dropped)",
+            recs.len(),
+            late.len()
         );
         ensure!(
             recs.windows(2).all(|w| w[0].1 <= w[1].1),
@@ -17462,7 +17489,12 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     let v = vmo(4)?;
     let base = map_child_stack(p, v)?;
     sys::handle_close(v);
-    // (the child may still be starting up, and every page it touches is charged: read the use again until it has stopped moving, T238)
+    // The child is stopped for the measured window (T238): it may still be starting up, and every page it touches is charged to the job, so a page
+    // it touched between the read of the use below and the thread's creation was counted against the thread's room (seen at two harts: 68 pages
+    // after the refusal, 69 by the second call, NO_MEMORY at a limit of 72). A stopped thread parks at its next return to user mode and touches
+    // nothing more; one already in a fault finishes it first, which the reads below wait out. A thread made in a stopped process is charged when
+    // it is made and runs no user code (SYSCALLS.md, `process_suspend`), which is all this test needs of it.
+    ensure_eq!(st(sys::process_suspend(p)), Some(S::Ok), "stop the child");
     let mut used = job_use(j, 2)?.0;
     for _ in 0..50 {
         nap(5)?;
@@ -17486,14 +17518,10 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::NoMemory),
         "a thread whose stack does not fit the job"
     );
-    // (nothing of the stack is charged; a page-table page that the attempt needed, where the random placement put the stack's end, may stay, so the room below is
-    // counted from what the job has now: T238)
+    // (nothing is charged: with the caller's stack already mapped the only charge is the thread's, all or nothing, and the stopped child
+    // charges nothing more: T238)
     let after = job_use(j, 2)?.0;
-    ensure!(
-        after >= used && after - used <= 1,
-        "a refused thread charged nothing but at most a page-table page: {used} -> {after}"
-    );
-    used = after;
+    ensure_eq!(after, used, "a refused thread charges nothing");
     ensure_eq!(
         job_use(j, 1)?.0,
         1,
