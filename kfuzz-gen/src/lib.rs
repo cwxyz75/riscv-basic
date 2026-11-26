@@ -210,6 +210,7 @@ pub const CALLS: &[usize] = &[
     nr::JOB_CREATE,
     nr::JOB_SET_LIMITS,
     nr::JOB_INFO,
+    nr::JOB_SET_IO_LIMITS,
 ];
 
 /// The kind of handle each call wants first.
@@ -220,7 +221,7 @@ fn wants(n: usize) -> Option<Kind> {
         nr::EVENT_SIGNAL => Kind::Event,
         nr::PORT_BIND | nr::PORT_REARM | nr::PORT_UNBIND => Kind::Port,
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_COMMIT => Kind::Vmo,
-        nr::JOB_CREATE | nr::JOB_SET_LIMITS | nr::JOB_INFO => Kind::Job,
+        nr::JOB_CREATE | nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_SET_IO_LIMITS => Kind::Job,
         _ => return None,
     })
 }
@@ -322,7 +323,11 @@ impl Gen {
     fn valid(&mut self, m: &Model) -> Call {
         let n = self.pick(CALLS).unwrap_or(nr::EVENT_CREATE);
         // set-limits on a job and a permanent shutdown are rarer than the calls that make things happen
-        let n = if matches!(n, nr::SOCKET_SHUTDOWN | nr::JOB_SET_LIMITS) && self.below(4) != 0 {
+        let n = if matches!(
+            n,
+            nr::SOCKET_SHUTDOWN | nr::JOB_SET_LIMITS | nr::JOB_SET_IO_LIMITS
+        ) && self.below(4) != 0
+        {
             nr::SOCKET_WRITE
         } else {
             n
@@ -330,7 +335,7 @@ impl Gen {
         let handle = match wants(n) {
             Some(k) => {
                 let mut hs = m.of(k);
-                if matches!(n, nr::JOB_SET_LIMITS) {
+                if matches!(n, nr::JOB_SET_LIMITS | nr::JOB_SET_IO_LIMITS) {
                     hs.retain(|&h| Some(h) != m.pinned); // never the root's limits
                 }
                 match self.pick(&hs) {
@@ -491,7 +496,12 @@ impl Gen {
                 c.args = [handle, at, 0, 0, 0, 0];
                 c.pokes.push((at, raw));
             }
-            nr::JOB_INFO => c.args[1] = self.below(8),
+            // (12 and 13: the I/O-mapped pages and the vectors, IOMMU6)
+            nr::JOB_INFO => c.args[1] = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13][self.below(10) as usize],
+            nr::JOB_SET_IO_LIMITS => {
+                c.args[1] = self.limit();
+                c.args[2] = self.limit();
+            }
             _ => {}
         }
         c

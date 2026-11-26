@@ -14394,6 +14394,523 @@ fn iommu_denies_messages_by_default() -> Outcome {
     })
 }
 
+// ---- device domains (IOMMU6; IOMMU-SPEC 4, 6, 7.4, 10) -------------------------------------------------------------------------
+//
+// The same virtio-rng function, now with a domain: the test is the supervisor (the handle `iodomain_create` returns) and, through a
+// duplicate with IO_MAP and IO_UNMAP only, the driver. One request is one descriptor the device fetches (a **read** of memory the
+// test wrote: the available ring and the descriptor) and fills with random bytes (a **write** into the buffer), then the used ring
+// it writes back. Its configuration message is masked, so the only transactions are the queue's.
+
+/// Where the device-domain tests map their DMA VMOs into this process: the rings, the buffer (two pages) and the read-only page.
+const IODMA_VA: u64 = 0x7a0_0000;
+const RINGS_VA: u64 = IODMA_VA;
+const BUF_VA: u64 = IODMA_VA + 0x1_0000;
+const RO_VA: u64 = IODMA_VA + 0x2_0000;
+const SCRATCH_VA: u64 = IODMA_VA + 0x10_0000;
+/// The direction field of `iodomain_fault_read` (abi::iodomain).
+const DIR_READ: u64 = 1;
+const DIR_WRITE: u64 = 2;
+
+fn wr16(va: u64, v: u16) {
+    // SAFETY: `va` is inside one of the DMA VMOs this test mapped read-write at DMA_VA.
+    unsafe { core::ptr::write_volatile(va as *mut u16, v) }
+}
+fn rd16(va: u64) -> u16 {
+    // SAFETY: as `wr16`.
+    unsafe { core::ptr::read_volatile(va as *const u16) }
+}
+fn wr64(va: u64, v: u64) {
+    // SAFETY: as `wr16`.
+    unsafe { core::ptr::write_volatile(va as *mut u64, v) }
+}
+fn rd64(va: u64) -> u64 {
+    // SAFETY: as `wr16`.
+    unsafe { core::ptr::read_volatile(va as *const u64) }
+}
+
+/// Map `vmo` (its first `pages` pages) into this process at `va`.
+fn map_here(vmo: u64, va: u64, pages: u64, flags: u64) -> Outcome {
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let m = sys::process_map(me, vmo, va, 0, pages * 4096, flags);
+    sys::handle_close(me);
+    ensure_eq!(st(m), Some(S::Ok), "map a DMA VMO at {va:#x}");
+    Ok(())
+}
+
+fn unmap_here(va: u64) {
+    if let Ok(me) = ok(sys::process_self(), "process_self") {
+        sys::process_unmap(me.a1 as u64, va);
+        sys::handle_close(me.a1 as u64);
+    }
+}
+
+/// One request on queue 0: its rings at I/O address `rings` (descriptors, then the available ring at +0x100, the used ring at
+/// +0x200; the test writes them through RINGS_VA, which maps the same VMO when `rings` is its mapping), one descriptor of `len`
+/// bytes at I/O address `buf` for the device to write. True if the device returned the descriptor within the wait.
+fn rng_request(f: &PciFn, rings: u64, buf: u64, len: u32, wait_ms: u64) -> Result<bool, Detail> {
+    for i in 0..(0x300 / 8) {
+        wr64(RINGS_VA + 8 * i, 0);
+    }
+    wr64(RINGS_VA, buf); // descriptor 0: the address,
+    wr64(RINGS_VA + 8, u64::from(len) | (2 << 32)); // its length, VIRTQ_DESC_F_WRITE, no next
+    wr16(RINGS_VA + 0x100, 1); // VIRTQ_AVAIL_F_NO_INTERRUPT
+    wr16(RINGS_VA + 0x104, 0); // ring[0] = descriptor 0
+    wr16(RINGS_VA + 0x102, 1); // idx 1
+    virtio_up(f, (rings, rings + 0x100, rings + 0x200), (0, 0))?;
+    mmio_wr32(f.msix_table + 12, 1); // the configuration message masked: the queue's transactions are the only ones
+    mmio_wr16(f.notify, 0);
+    let t0 = sys::clock_get();
+    while sys::clock_get() < t0 + wait_ms {
+        if rd16(RINGS_VA + 0x202) == 1 {
+            return Ok(true);
+        }
+        sys::thread_yield();
+    }
+    Ok(false)
+}
+
+/// Every fault record waiting in the domain's ring, oldest first: (cause, I/O address, direction, dropped).
+fn drain_domain_faults(sup: u64) -> Vec<(u64, u64, u64, u64)> {
+    let mut out = Vec::new();
+    loop {
+        let r = sys::iodomain_fault_read(sup);
+        if r.status != 0 {
+            break;
+        }
+        let w = r.a1 as u64;
+        out.push((w & 0xffff, r.a2 as u64, (w >> 16) & 0xffff, w >> 32));
+    }
+    out
+}
+
+/// Wait for DEVICE_FAULT on the control handle, then take every record: one at `iova` in direction `dir` must be among them.
+fn expect_fault(sup: u64, iova: u64, dir: u64, what: &str) -> Outcome {
+    let w = sys::object_wait(sup, sig::DEVICE_FAULT, sys::clock_get() + 2000);
+    ensure_eq!(
+        st(w),
+        Some(S::Ok),
+        "{what}: DEVICE_FAULT rises on the supervisor's handle"
+    );
+    // (a device may fault more than once for one request: let it finish)
+    let mut quiet = sys::clock_get();
+    let mut n = iommu_faults();
+    while sys::clock_get() < quiet + 50 {
+        if iommu_faults() != n {
+            n = iommu_faults();
+            quiet = sys::clock_get();
+        }
+        sys::thread_yield();
+    }
+    let recs = drain_domain_faults(sup);
+    ensure!(
+        recs.iter()
+            .any(|&(_, a, d, _)| a & !0xfff == iova & !0xfff && d == dir),
+        "{what}: no record at {iova:#x} direction {dir} among {recs:x?}"
+    );
+    ensure_eq!(
+        sys::object_signals(sup).a1 as u32 & sig::DEVICE_FAULT,
+        0,
+        "{what}: the read that empties the ring clears DEVICE_FAULT"
+    );
+    Ok(())
+}
+
+/// The test function brought up with a domain: the control handle, the driver's duplicate, and the rings mapped both ways.
+struct Domain {
+    sup: u64,
+    drv: u64,
+    rings_io: u64,
+}
+
+/// `with_test_function` with a domain: `body` gets the root resource, the function, the domain and the pattern frame's physical address.
+fn with_domain(body: impl FnOnce(u64, &PciFn, &Domain, u64) -> Outcome) -> Outcome {
+    with_test_function(|res, f, pa| {
+        let sup = ok(
+            sys::iodomain_create(res, IOMMU_TEST_DID, 0),
+            "iodomain_create for the test function",
+        )?
+        .a1 as u64;
+        let r = (|| {
+            let drv = ok(
+                sys::handle_duplicate(sup, Rights::IO_MAP.0 | Rights::IO_UNMAP.0),
+                "the driver's duplicate",
+            )?
+            .a1 as u64;
+            let rings = ok(sys::vmo_create_dma_in(res, 1, 0), "the rings' DMA VMO")?.a1 as u64;
+            let r = (|| {
+                map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
+                let rings_io = ok(
+                    sys::iodomain_map(drv, rings, 0, 1, 3),
+                    "the driver maps the rings",
+                )?
+                .a1 as u64;
+                let d = Domain { sup, drv, rings_io };
+                let r = body(res, f, &d, pa);
+                unmap_here(RINGS_VA);
+                r
+            })();
+            sys::handle_close(rings);
+            sys::handle_close(drv);
+            r
+        })();
+        sys::handle_close(sup);
+        r
+    })
+}
+
+/// IOMMU-SPEC 4.1 to 4.3, 3.3 and IO3/IO4: through the driver's duplicate (IO_MAP and IO_UNMAP only), the device reaches what was
+/// mapped, at the addresses the kernel chose, with the access granted, and nothing else; a hundred more mappings show that no table of
+/// 64 bounds a domain.
+fn iodomain_maps_exactly_what_was_granted() -> Outcome {
+    with_domain(|res, f, d, pa| {
+        let buf = ok(sys::vmo_create_dma_in(res, 2, 0), "the buffer")?.a1 as u64;
+        let ro = ok(sys::vmo_create_dma_in(res, 1, 0), "the read-only page")?.a1 as u64;
+        let r = (|| {
+            map_here(buf, BUF_VA, 2, PF_R | PF_W)?;
+            map_here(ro, RO_VA, 1, PF_R | PF_W)?;
+            for i in 0..512 {
+                wr64(RO_VA + 8 * i, pattern_word(i));
+            }
+            let ro_handle = ok(
+                sys::handle_duplicate(ro, Rights::READ.0 | Rights::DMA.0),
+                "a read-only DMA handle",
+            )?
+            .a1 as u64;
+            let wide = sys::iodomain_map(d.drv, ro_handle, 0, 1, 3);
+            let ro_io = sys::iodomain_map(d.drv, ro_handle, 0, 1, 1);
+            sys::handle_close(ro_handle);
+            ensure_eq!(
+                st(wide),
+                Some(S::AccessDenied),
+                "IO4: never wider than the handle"
+            );
+            let ro_io = ok(ro_io, "map the page for reading")?.a1 as u64;
+            let buf_io = ok(sys::iodomain_map(d.drv, buf, 0, 2, 3), "map the buffer")?.a1 as u64;
+            // the driver's duplicate does nothing else
+            ensure_eq!(
+                st(sys::iodomain_destroy(d.drv)),
+                Some(S::AccessDenied),
+                "the driver cannot destroy"
+            );
+            ensure_eq!(
+                st(sys::iodomain_fault_read(d.drv)),
+                Some(S::AccessDenied),
+                "the driver cannot read faults"
+            );
+            ensure_eq!(
+                st(sys::object_wait(d.drv, sig::DEVICE_FAULT, 1)),
+                Some(S::AccessDenied),
+                "the driver cannot wait for faults"
+            );
+            // positive DMA: the device reads the descriptor the test wrote and writes random bytes into the buffer's second page
+            for i in 0..512 {
+                wr64(BUF_VA + 4096 + 8 * i, 0);
+            }
+            ensure!(
+                rng_request(f, d.rings_io, buf_io + 4096, 64, 2000)?,
+                "the device did not return the descriptor (used idx {})",
+                rd16(RINGS_VA + 0x202)
+            );
+            ensure!(
+                (0..8).any(|i| rd64(BUF_VA + 4096 + 8 * i) != 0),
+                "the device's write did not reach the buffer"
+            );
+            ensure!(
+                (8..512).all(|i| rd64(BUF_VA + 4096 + 8 * i) == 0),
+                "the device wrote past its 64 bytes"
+            );
+            // what the device must not reach: a write to the read-only page, one page past the buffer, a physical address, address 0
+            // (the pattern frame `with_test_function` made, at PATTERN_VA)
+            {
+                // (QEMU's virtio maps a buffer it may not write through a bounce buffer: the request completes, the write-back
+                // is refused and reported. So a refused transaction shows as memory unchanged and a fault record, not as the
+                // used ring: `rng_request`'s answer is not the check here.)
+                for (at, what) in [
+                    (ro_io, "a write to the read-only mapping"),
+                    (buf_io + 2 * 4096, "a write one page past the buffer"),
+                    (pa, "a write to a frame's physical address"),
+                    (0, "a write to address 0"),
+                ] {
+                    let _ = rng_request(f, d.rings_io, at, 64, 300)?;
+                    expect_fault(d.sup, at, DIR_WRITE, what)?;
+                }
+                // rings at an address nothing maps (the page past the buffer: the lowest-fit allocator put the rings, the
+                // read-only page and the buffer below it): the device's first fetch from them is refused
+                let _ = rng_request(f, buf_io + 2 * 4096, buf_io, 64, 300)?;
+                expect_fault(
+                    d.sup,
+                    buf_io + 2 * 4096,
+                    DIR_READ,
+                    "a read of rings nothing maps",
+                )?;
+                if let Some(i) = pattern_intact() {
+                    ensure!(false, "the pattern frame changed at word {i}");
+                }
+                ensure!(
+                    (0..512).all(|i| rd64(RO_VA + 8 * i) == pattern_word(i)),
+                    "the read-only page changed"
+                );
+            }
+            let mut more = Vec::new();
+            for _ in 0..100 {
+                more.push(
+                    ok(
+                        sys::iodomain_map(d.drv, buf, 0, 1, 1),
+                        "one of a hundred more",
+                    )?
+                    .a1 as u64,
+                );
+            }
+            ensure!(
+                sys::debug_stat(160) >= 104,
+                "the I/O-mapped pages are counted ({})",
+                sys::debug_stat(160)
+            );
+            for io in more {
+                ok(
+                    sys::iodomain_unmap(d.drv, io, 1),
+                    "unmap one of the hundred",
+                )?;
+            }
+            ok(sys::iodomain_unmap(d.drv, buf_io, 2), "unmap the buffer")?;
+            ok(
+                sys::iodomain_unmap(d.drv, ro_io, 1),
+                "unmap the read-only page",
+            )?;
+            Ok(())
+        })();
+        unmap_here(BUF_VA);
+        unmap_here(RO_VA);
+        sys::handle_close(buf);
+        sys::handle_close(ro);
+        r
+    })
+}
+
+/// IOMMU-SPEC 4.4 and 6.1 (IO3): when `iodomain_unmap` returns, the device can no longer reach the frames, even though it used the
+/// translation just before (so the IOMMU's translation cache held it). The negative control `fault-iommu-skip-inval` must fail here.
+fn iodomain_unmap_stops_the_device() -> Outcome {
+    with_domain(|res, f, d, _| {
+        let buf = ok(sys::vmo_create_dma_in(res, 1, 0), "the buffer")?.a1 as u64;
+        let r = (|| {
+            map_here(buf, BUF_VA, 1, PF_R | PF_W)?;
+            let io = ok(sys::iodomain_map(d.drv, buf, 0, 1, 3), "map the buffer")?.a1 as u64;
+            ensure!(
+                rng_request(f, d.rings_io, io, 64, 2000)?,
+                "the first request was not returned"
+            );
+            ensure!(
+                (0..8).any(|i| rd64(BUF_VA + 8 * i) != 0),
+                "the first write did not land"
+            );
+            for i in 0..512 {
+                wr64(BUF_VA + 8 * i, 0);
+            }
+            ok(sys::iodomain_unmap(d.drv, io, 1), "unmap")?;
+            // (the request may complete through QEMU's bounce buffer: what matters is that its write-back is refused)
+            let _ = rng_request(f, d.rings_io, io, 64, 300)?;
+            expect_fault(d.sup, io, DIR_WRITE, "a write after the unmap")?;
+            ensure!(
+                (0..512).all(|i| rd64(BUF_VA + 8 * i) == 0),
+                "the device reached the frame after the unmap returned (a stale translation)"
+            );
+            Ok(())
+        })();
+        unmap_here(BUF_VA);
+        sys::handle_close(buf);
+        r
+    })
+}
+
+/// IOMMU-SPEC 7.4: the ring keeps the sixteen oldest unread records, counts the rest as dropped, and DEVICE_FAULT follows it.
+fn iodomain_faults_reach_the_supervisor() -> Outcome {
+    with_domain(|_, f, d, _| {
+        let before = iommu_faults();
+        // twenty refused reads, each at its own page past the rings (the device fetches its available ring there)
+        for i in 0..20u64 {
+            let at = d.rings_io + (1 + i) * 4096;
+            ensure!(
+                !rng_request(f, at, d.rings_io, 64, 0)?,
+                "read {i} was taken"
+            );
+            let t0 = sys::clock_get();
+            while iommu_faults() == before + i && sys::clock_get() < t0 + 2000 {
+                sys::thread_yield();
+            }
+        }
+        let total = iommu_faults() - before;
+        ensure!(total >= 20, "twenty faults at least ({total})");
+        ensure!(
+            sys::object_signals(d.sup).a1 as u32 & sig::DEVICE_FAULT != 0,
+            "DEVICE_FAULT is up"
+        );
+        let recs = drain_domain_faults(d.sup);
+        ensure_eq!(recs.len(), 16, "the ring holds sixteen");
+        let dropped: u64 = recs.iter().map(|r| r.3).sum();
+        ensure_eq!(dropped, total - 16, "the rest are counted as dropped");
+        ensure_eq!(
+            recs[0].3,
+            total - 16,
+            "the dropped count comes with the first read and resets"
+        );
+        ensure!(
+            recs.windows(2).all(|w| w[0].1 <= w[1].1),
+            "oldest first: {recs:x?}"
+        );
+        ensure_eq!(
+            recs[0].1 & !0xfff,
+            d.rings_io + 4096,
+            "the oldest is the first read"
+        );
+        ensure!(recs.iter().all(|r| r.2 == DIR_READ), "reads: {recs:x?}");
+        ensure_eq!(
+            st(sys::iodomain_fault_read(d.sup)),
+            Some(S::ShouldWait),
+            "empty"
+        );
+        ensure_eq!(
+            sys::object_signals(d.sup).a1 as u32 & sig::DEVICE_FAULT,
+            0,
+            "and the signal is down"
+        );
+        ensure_eq!(
+            st(sys::iodomain_fault_read(d.drv)),
+            Some(S::AccessDenied),
+            "the driver cannot read them"
+        );
+        Ok(())
+    })
+}
+
+/// IOMMU-SPEC 10.2 and 10.3 (the T42 scenario): a killed driver's mappings stay with the domain and hold their VMO, the device's write
+/// still lands; the supervisor's destroy gives everything back. With the supervisor killed too, the last handle destroys the domain,
+/// the device is quarantined: a late write fails, reaches nothing and reports nothing.
+fn iodomain_outlives_its_makers() -> Outcome {
+    let domains = sys::debug_stat(159);
+    let pages = sys::debug_stat(160);
+    with_test_function(|res, f, _| {
+        let rings = ok(sys::vmo_create_dma_in(res, 1, 0), "the rings")?.a1 as u64;
+        map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
+        let r = (|| {
+            for run in 0..2 {
+                let sup = ok(
+                    sys::iodomain_create(res, IOMMU_TEST_DID, 0),
+                    "iodomain_create",
+                )?
+                .a1 as u64;
+                // (TRANSFER as well: the supervisor hands it over a channel)
+                let drv = ok(
+                    sys::handle_duplicate(
+                        sup,
+                        Rights::IO_MAP.0 | Rights::IO_UNMAP.0 | Rights::TRANSFER.0,
+                    ),
+                    "the driver's duplicate",
+                )?
+                .a1 as u64;
+                let buf = ok(sys::vmo_create_dma_in(res, 1, 0), "the driver's buffer")?.a1 as u64;
+                let rings_io =
+                    ok(sys::iodomain_map(drv, rings, 0, 1, 3), "map the rings")?.a1 as u64;
+                let buf_io = ok(sys::iodomain_map(drv, buf, 0, 1, 3), "map the buffer")?.a1 as u64;
+                map_here(buf, BUF_VA, 1, PF_R | PF_W)?;
+                // the driver: a child that holds the duplicate and the buffer, and is killed
+                let (driver, ch) = launch(15)?;
+                let hs = [drv, buf];
+                let w = sys::channel_write(ch, [0u8; 4].as_ptr(), 4, hs.as_ptr(), 2);
+                let mapped = sys::debug_stat(160);
+                let killed = sys::process_kill(driver, 9);
+                let ended = wait_ended(driver, 1000);
+                sys::handle_close(driver);
+                sys::handle_close(ch);
+                ensure_eq!(st(w), Some(S::Ok), "the driver is given its handles");
+                ok(killed, "kill the driver")?;
+                ended?;
+                ensure_eq!(
+                    sys::debug_stat(160),
+                    mapped,
+                    "the mappings stay with the domain"
+                );
+                for i in 0..512 {
+                    wr64(BUF_VA + 8 * i, 0);
+                }
+                ensure!(
+                    rng_request(f, rings_io, buf_io, 64, 2000)?,
+                    "the device's request after the driver died"
+                );
+                ensure!(
+                    (0..8).any(|i| rd64(BUF_VA + 8 * i) != 0),
+                    "the write lands in the buffer the mapping holds"
+                );
+                unmap_here(BUF_VA); // (the buffer's last holder is now the domain's mapping)
+                if run == 0 {
+                    ok(
+                        sys::iodomain_destroy(sup),
+                        "the supervisor destroys the domain",
+                    )?;
+                    sys::handle_close(sup);
+                } else {
+                    // the supervisor dies too: the last handle goes with its teardown
+                    let (supervisor, ch) = launch(15)?;
+                    let w = sys::channel_write(ch, [0u8; 4].as_ptr(), 4, [sup].as_ptr(), 1);
+                    let killed = sys::process_kill(supervisor, 9);
+                    let ended = wait_ended(supervisor, 1000);
+                    sys::handle_close(supervisor);
+                    sys::handle_close(ch);
+                    ensure_eq!(
+                        st(w),
+                        Some(S::Ok),
+                        "the supervisor is given the control handle"
+                    );
+                    ok(killed, "kill the supervisor")?;
+                    ended?;
+                }
+                let t0 = sys::clock_get();
+                while sys::debug_stat(159) != domains && sys::clock_get() < t0 + 2000 {
+                    sys::thread_yield();
+                }
+                ensure_eq!(
+                    sys::debug_stat(159),
+                    domains,
+                    "run {run}: the domain is gone"
+                );
+                ensure_eq!(
+                    sys::debug_stat(160),
+                    pages,
+                    "run {run}: the I/O-mapped pages are back"
+                );
+                // quarantined: allocate and fill memory (the buffer's frames are free again), then the late write at the old address
+                let fill = ok(sys::vmo_create_dma_in(res, 16, 0), "fill memory")?.a1 as u64;
+                map_here(fill, SCRATCH_VA, 16, PF_R | PF_W)?;
+                for i in 0..16 * 512 {
+                    wr64(SCRATCH_VA + 8 * i, pattern_word(i));
+                }
+                let faults = iommu_faults();
+                let late = rng_request(f, rings_io, buf_io, 64, 300)?;
+                let t1 = sys::clock_get();
+                while sys::clock_get() < t1 + 50 {
+                    sys::thread_yield();
+                }
+                let intact = (0..16 * 512).all(|i| rd64(SCRATCH_VA + 8 * i) == pattern_word(i));
+                unmap_here(SCRATCH_VA);
+                sys::handle_close(fill);
+                ensure!(
+                    !late,
+                    "run {run}: the quarantined device's request was served"
+                );
+                ensure!(intact, "run {run}: the late write reached reused memory");
+                ensure_eq!(
+                    iommu_faults(),
+                    faults,
+                    "run {run}: a quarantined device's faults are not reported (A14)"
+                );
+            }
+            Ok(())
+        })();
+        unmap_here(RINGS_VA);
+        sys::handle_close(rings);
+        r
+    })
+}
+
 /// IOMMU4: identities are allocated per hart, next-fit, so an object re-created again and again walks the whole identity space of a
 /// file; an object routed through an identity of 64 or more (every `eie` register, up to `riscv,num-ids`) fires, stays masked until it
 /// is acknowledged and fires again after (D5). Before IOMMU4 the identity was source + 1 and `claim` dropped every identity above 63.
@@ -15550,7 +16067,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 12)),
+        st(sys::job_info(root, 14)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -15569,7 +16086,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     );
     sys::handle_close(child);
     ensure_eq!(
-        st(sys::job_info(root, 12)),
+        st(sys::job_info(root, 14)),
         Some(S::InvalidArgs),
         "the resource after the last"
     );
@@ -17638,6 +18155,22 @@ pub fn app_main() -> i32 {
         (
             "iommu_denies_messages_by_default",
             iommu_denies_messages_by_default,
+        ),
+        (
+            "iodomain_maps_exactly_what_was_granted",
+            iodomain_maps_exactly_what_was_granted,
+        ),
+        (
+            "iodomain_unmap_stops_the_device",
+            iodomain_unmap_stops_the_device,
+        ),
+        (
+            "iodomain_faults_reach_the_supervisor",
+            iodomain_faults_reach_the_supervisor,
+        ),
+        (
+            "iodomain_outlives_its_makers",
+            iodomain_outlives_its_makers,
         ),
         (
             "socket_ends_travel_over_channels",

@@ -45,13 +45,13 @@ pub trait IoEnv {
     type P: PhysMem64;
     /// The IOMMU's registers.
     type R: Regs;
-    /// `OBJ`, then `VMO`, `JOBS` and `FRAME` inside it.
-    fn obj<T>(&mut self, f: impl FnOnce(IoObj<'_, Self::M>) -> T) -> T;
-    /// `OBJ`, then `IOMMU` inside it (no memory lock: the fault signal is changed in the same section as the ring, 7.4).
+    /// `OBJ`, then `VMO`, `JOBS` and `FRAME` inside it. `None` (and `f` not run) if the caller's process is gone (BAD_STATE).
+    fn obj<T>(&mut self, f: impl FnOnce(IoObj<'_, Self::M>) -> T) -> Option<T>;
+    /// `OBJ`, then `IOMMU` inside it (no memory lock: the fault signal is changed in the same section as the ring, 7.4). `None` as `obj`.
     fn obj_iommu<T>(
         &mut self,
         f: impl FnOnce(&mut Kobjs, &HandleTable, &mut IoDomains, &Self::P, &mut Self::R) -> T,
-    ) -> T;
+    ) -> Option<T>;
     /// `VMO`, `JOBS` and `FRAME`.
     fn mem<T>(
         &mut self,
@@ -337,7 +337,7 @@ pub fn iodomain_create<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
         o.jobs.retain(job);
         Ok(job)
     });
-    let job = match job {
+    let job = match job.unwrap_or(Err(Status::BadState)) {
         Ok(j) => j,
         Err(s) => return err(s),
     };
@@ -384,7 +384,7 @@ fn create_in<E: IoEnv>(e: &mut E, a: [u64; 6], job: JobId) -> Reply {
             },
         )
     });
-    match made {
+    match made.unwrap_or(Err(Status::BadState)) {
         Ok((h, obj)) => {
             e.iommu(|s, _, _, _| s.set_tag(d, obj.to_words()));
             Ok((Some(h.0), None))
@@ -464,7 +464,7 @@ pub fn iodomain_map<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
             Ok((DomainId::from_raw(d.domain), d.job, vmo, charge))
         },
     );
-    let (d, job, vmo, charge) = match resolved {
+    let (d, job, vmo, charge) = match resolved.unwrap_or(Err(Status::BadState)) {
         Ok(x) => x,
         Err(s) => return err(s),
     };
@@ -591,7 +591,7 @@ fn settle_pending<E: IoEnv>(e: &mut E, p: Pending) {
 /// `iodomain_unmap(domain, io_address, pages)` (4.4, amendment parts 1 and 3).
 pub fn iodomain_unmap<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let d = e.obj(|o| ipc::iodomain_of(o.objs, o.handles, Handle(a[0]), Rights::IO_UNMAP));
-    let d = match d {
+    let d = match d.unwrap_or(Err(Status::BadState)) {
         Ok(d) => d,
         Err(s) => return err(s),
     };
@@ -637,7 +637,7 @@ pub fn iodomain_destroy<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
             Ok(s.destroy(mem, regs, DomainId::from_raw(d.domain)))
         },
     );
-    match started {
+    match started.unwrap_or(Err(Status::BadState)) {
         Ok(Some(x)) => {
             finish_destroy(e, x);
             Ok((None, None))
@@ -672,6 +672,7 @@ pub fn iodomain_fault_read<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
             | u64::from(r.dropped) << io::DROPPED_SHIFT;
         Ok((Some(word), Some(r.record.iotval)))
     })
+    .unwrap_or(Err((Status::BadState, None, None)))
 }
 
 // ---- vmo_create_dma_in -----------------------------------------------------------------------------------------------------------
@@ -698,7 +699,7 @@ pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
         o.jobs.retain(job);
         Ok((job, b))
     });
-    let (job, mut b) = match begun {
+    let (job, mut b) = match begun.unwrap_or(Err(Status::BadState)) {
         Ok(x) => x,
         Err(s) => return err(s),
     };
@@ -709,7 +710,11 @@ pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
             Err(_) => break false,
         }
     };
+    let mut slot = Some(b);
     let r = e.obj(|o| -> Reply {
+        let Some(b) = slot.take() else {
+            return err(Status::BadState);
+        };
         if !built {
             o.vmos.dma_abort(o.mm, o.jobs, b);
             return err(Status::NoMemory);
@@ -735,6 +740,13 @@ pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
                 err(s)
             }
         }
+    });
+    // (the caller's process went while the frames were taken: what was built is given back)
+    let r = r.unwrap_or_else(|| {
+        if let Some(b) = slot.take() {
+            e.mem(|mm, vmos, jobs, _| vmos.dma_abort(mm, jobs, b));
+        }
+        err(Status::BadState)
     });
     release_job(e, job);
     r

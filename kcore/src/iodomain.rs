@@ -1060,6 +1060,22 @@ impl IoDomains {
         Ticket(self.cmdq.ticket())
     }
 
+    /// Queue the kernel's own commands (the boot invalidation, the self-test's) and a fence through the store's queue, the only
+    /// writer of the command queue: the fence's ticket, for `poll` (`Fence::Unqueued` when the queue had no room).
+    pub fn queue<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        cmds: &[Command],
+    ) -> Ticket {
+        self.submit(mem, regs, cmds)
+    }
+
+    /// The device directory, for the kernel's self-test (a context for a device id beyond every id a device has: no domain names it).
+    pub fn directory(&mut self) -> &mut Ddt {
+        &mut self.ddt
+    }
+
     /// Poll a fence (no lock is held between polls; the kernel stops at `IOMMU_FENCE_BOUND`).
     pub fn poll<R: Regs>(&mut self, regs: &mut R, t: Ticket) -> Fence {
         if t.0 == NO_TICKET {

@@ -104,6 +104,18 @@ pub mod iommu {
     pub fn stat(which: u64) -> u64 {
         unimplemented!()
     }
+    pub fn call(n: usize, a: [u64; 6]) -> Option<ksys::Reply> {
+        unimplemented!()
+    }
+    pub fn closed(domain: u64) {
+        unimplemented!()
+    }
+    pub fn drain() {
+        unimplemented!()
+    }
+    pub fn directory_frames() -> usize {
+        unimplemented!()
+    }
     #[cfg(not(feature = "release"))]
     pub fn selftest() -> Result<(), alloc::string::String> {
         unimplemented!()

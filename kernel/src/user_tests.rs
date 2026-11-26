@@ -14,8 +14,10 @@ use crate::report::Outcome;
 /// `abi::arch::fault`): every page fault is one kind, whatever the access.
 use abi::arch::fault::{exit_code, ILLEGAL, PAGE_FAULT};
 
+/// Free frames, plus the device directory's (IOMMU6): the first domain of a device id grows the directory for good (its device stays
+/// quarantined after the domain goes), which is the kernel's structure, not a leak.
 fn free_frames() -> usize {
-    crate::irq::without(kmem::free_frames_accounted)
+    crate::irq::without(kmem::free_frames_accounted) + crate::iommu::directory_frames()
 }
 
 /// The four terms of `free_frames_accounted`, for a leak report: (database, per-hart caches, kernel stacks, heap).
@@ -269,17 +271,20 @@ pub fn run_all() -> Report {
             && crate::fp::entry_count() == 0
             && crate::irq::without(|| kmem::get().vmos.count()) == vmos_before
             && user::job_ledger() == (1, 0, 0, 0, 0, 0)
+            // (IOMMU6) no device domain, no I/O-mapped page and no leaked mapping record is left
+            && (159..=161).all(|w| crate::iommu::stat(w) == 0)
         {
             Ok(())
         } else {
             Err(format!(
                 "{} processes and {} VMOs left (wanted 0 and {vmos_before}), {} futex sleepers, {} pager waiters or pagers; (jobs, \
-                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0)",
+                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0); device domains, I/O-mapped pages, leaked holds {:?}",
                 user::process_count(),
                 crate::irq::without(|| kmem::get().vmos.count()),
                 user::futex_sleepers(),
                 user::pager_leftovers(),
-                user::job_ledger()
+                user::job_ledger(),
+                [159, 160, 161].map(crate::iommu::stat)
             ))
         },
     );

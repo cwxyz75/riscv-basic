@@ -13,8 +13,13 @@
 //!   triggered as the tree says. The fault handler runs under the object lock with interrupts off (`aia::deliver`), takes `IOMMU`,
 //!   drains at most 64 records, and prints at most 16 lines a second **after** releasing it (7.1, 7.2). The command queue is polled
 //!   (6.4); its interrupt only acknowledges.
-//! * **Lock** `IOMMU` (class 11, between `KSTACK` and `FRAME`): the directory, the queues and the rate limit. Never held across a
-//!   wait: a fence is polled with the lock taken only for each look.
+//! * **Lock** `IOMMU` (class 11, between `KSTACK` and `FRAME`): the device-domain store (`kcore::iodomain`, which owns the directory
+//!   and the command queue), the fault queue and the rate limit. Never held across a wait: a fence is polled with the lock taken only
+//!   for each look.
+//! * **Device domains** (IOMMU6; IOMMU-SPEC 4, 6, 7.4): the calls are `ksys::iodomain`'s, run over this machine (`Kenv`): the caller's
+//!   handles under the object lock, the store under `IOMMU`, the frames under `FRAME`, the waits with no lock held. A destruction begun
+//!   by a handle close or a teardown (`closed`, under the object lock) is completed by `drain` with no lock held, at the tail of the
+//!   call or fault that began it and at the end of a teardown.
 
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -22,10 +27,12 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use iommucore::cmdq::{CmdQueue, Command};
 use iommucore::ddt::{Ddt, Format, Levels};
-use iommucore::driver::{self, FaultLine, Fence, FenceTimeoutLine, Plan, RateLimit};
+use iommucore::driver::{self, FaultLine, FenceTimeoutLine, Plan, RateLimit};
 use iommucore::faultq::{FaultQueue, FaultRecord};
+use iommucore::iopt::{Iopt, PtMode};
 use iommucore::regs::{self, Caps, Required};
 use iommucore::{PhysMem64, Regs};
+use kcore::iodomain::{Fence, IoDomains};
 use kcore::iommutree::{Absent, Cause, Iommu};
 
 /// The bound of every wait on the IOMMU (`IOMMU_FENCE_BOUND`, IOMMU-SPEC 6.4): 100 ms of the `time` counter.
@@ -171,8 +178,8 @@ impl PhysMem64 for Direct {
 
 /// What `IOMMU` protects.
 struct State {
-    ddt: Ddt,
-    cq: CmdQueue,
+    /// The domains, the directory and the command queue (every command is queued through it).
+    store: IoDomains,
     fq: FaultQueue,
     rate: RateLimit,
     /// The fault records the rate limit admitted and nobody has printed yet: printed one at a time with the lock released
@@ -185,6 +192,8 @@ static STATE: klock::Spin<Option<State>, crate::bkl::Machine> =
 
 /// The directory is written and every device is denied (step 5 done): the device windows may be built.
 static ON: AtomicBool = AtomicBool::new(false);
+/// A destruction was begun under another lock (a handle close, a teardown) and may wait for `drain`.
+static DETACHING: AtomicBool = AtomicBool::new(false);
 /// The counters of IOMMU-SPEC 7.3 this slice has (`debug_stat` 150 to 157, SYSCALLS.md).
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -234,6 +243,24 @@ pub fn init() {
     else {
         panic!("no IOMMU: no frames for its directory and queues");
     };
+    // the quarantine table (Q-IOMMU-MODEL 6): one empty second-stage table, 16 KiB aligned, that every device a destroyed domain
+    // leaves behind translates through; never freed
+    let Some(qpa) = crate::kmem::frames()
+        .mm
+        .db
+        .alloc_contiguous(kcore::iodomain::ROOT_FRAMES as usize)
+        .map(|p| p * 4096)
+    else {
+        panic!("no IOMMU: no frames for its quarantine table");
+    };
+    // SAFETY: an order-2 block the database just gave us (nobody else's), direct-mapped RAM, ROOT_FRAMES pages.
+    unsafe {
+        core::ptr::write_bytes(
+            (crate::kmem::direct_base() + qpa) as *mut u8,
+            0,
+            (kcore::iodomain::ROOT_FRAMES * 4096) as usize,
+        )
+    };
     let mem = Direct;
     let ddt = Ddt::new(&mem, root, Levels::Three, Format::Extended)
         .unwrap_or_else(|_| panic!("no IOMMU: the directory root cannot be encoded"));
@@ -241,6 +268,8 @@ pub fn init() {
         .unwrap_or_else(|_| panic!("no IOMMU: the command queue cannot be encoded"));
     let fq = FaultQueue::new(fqf, driver::FQ_RECORDS)
         .unwrap_or_else(|_| panic!("no IOMMU: the fault queue cannot be encoded"));
+    let quarantine = Iopt::new(&mem, qpa, PtMode::Sv39x4)
+        .unwrap_or_else(|_| panic!("no IOMMU: the quarantine table cannot be encoded"));
     let top = crate::kmem::usable_ranges()
         .iter()
         .map(|&(first, count)| (first + count as u64) * 4096)
@@ -267,9 +296,15 @@ pub fn init() {
     };
     #[cfg(feature = "fault-iommu-bare")]
     driver::write_bare(&mut r); // the negative control: pass-through, the state IO2 forbids
+                                // (the mapping index's priorities are seeded from the clock and the entropy pool: its depth stays logarithmic whatever a driver keeps)
+    let mut pool = [0u8; 8];
+    let _ = crate::entropy::fill(&mut pool); // (not yet seeded: the clock alone)
+    let seed = crate::timer::now() ^ u64::from_le_bytes(pool);
+    let Some(store) = IoDomains::new(ddt, cq, &quarantine, seed) else {
+        panic!("no IOMMU: no memory for the domain store");
+    };
     *STATE.lock() = Some(State {
-        ddt,
-        cq,
+        store,
         fq,
         rate: RateLimit::new(),
         lines: [None; driver::LINES_PER_SECOND as usize],
@@ -298,20 +333,18 @@ fn kcore_device_id_bits() -> u32 {
     iommucore::ddt::device_id_bits(Levels::Three, Format::Extended)
 }
 
-/// Submit `cmds` and wait for them with the lock released between looks, bounded by `IOMMU_FENCE_BOUND` (IOMMU-SPEC 6.4). A fence
-/// that does not complete is counted and reported (`device` names the device it was for); the caller leaks what it guarded.
+/// Queue the kernel's own `cmds` (and a fence) through the store and wait for them with the lock released between looks, bounded by
+/// `IOMMU_FENCE_BOUND` (IOMMU-SPEC 6.4); a full queue is queued again within the same bound. A fence that does not complete is counted
+/// and reported (`device` names the device it was for); the caller leaks what it guarded.
 fn fence(cmds: &[Command], device: Option<u32>) -> Result<(), ()> {
-    let ticket = {
+    let queue = || {
         let mut g = STATE.lock();
         match (g.as_mut(), Mmio::new()) {
-            (Some(s), Some(mut r)) => driver::submit(&mut r, &Direct, &mut s.cq, cmds).ok(),
+            (Some(s), Some(mut r)) => Some(s.store.queue(&Direct, &mut r, cmds)),
             _ => None,
         }
     };
-    let Some(ticket) = ticket else {
-        // (a batch the ring cannot take is a fence that did not complete: counted and reported the same way, after the lock)
-        FENCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-        let _ = writeln!(crate::console::Console, "{}", FenceTimeoutLine(device));
+    let Some(mut ticket) = queue() else {
         return Err(());
     };
     COMMANDS.fetch_add(cmds.len() as u64, Ordering::Relaxed);
@@ -326,23 +359,34 @@ fn fence(cmds: &[Command], device: Option<u32>) -> Result<(), ()> {
             let (Some(s), Some(mut r)) = (g.as_mut(), Mmio::new()) else {
                 return Err(());
             };
-            driver::fence_poll(&mut r, &mut s.cq, ticket)
+            s.store.poll(&mut r, ticket)
         };
         match state {
             Fence::Done => return Ok(()),
-            Fence::Pending if !expired => core::hint::spin_loop(),
+            Fence::Unqueued if !expired => {
+                if let Some(t) = queue() {
+                    ticket = t;
+                }
+            }
+            Fence::Waiting if !expired => core::hint::spin_loop(),
             _ => {
-                FENCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                let _ = writeln!(crate::console::Console, "{}", FenceTimeoutLine(device));
+                timed_out(device);
                 return Err(());
             }
         }
     }
 }
 
+/// A fence that did not complete within the bound, or a queue that failed (6.4): counted, and one line.
+fn timed_out(device: Option<u32>) {
+    FENCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    let _ = writeln!(crate::console::Console, "{}", FenceTimeoutLine(device));
+}
+
 /// The fault-queue interrupt (IOMMU-SPEC 7.1, 7.2), under the object lock with interrupts off: drain at most 64 records under
 /// `IOMMU`, count them, and print the lines the rate limit admits once the lock is released. Returns whether records were left.
 fn fault_interrupt(_source: u32) -> bool {
+    let mut raised = false;
     let more = {
         let mut g = STATE.lock();
         let (Some(s), Some(mut r)) = (g.as_mut(), Mmio::new()) else {
@@ -351,10 +395,20 @@ fn fault_interrupt(_source: u32) -> bool {
         let second = crate::timer::cycles_from_ns(1_000_000_000);
         let now = crate::timer::now();
         let State {
-            fq, rate, lines, ..
+            store,
+            fq,
+            rate,
+            lines,
         } = s;
         let d = driver::drain_faults(&mut r, &Direct, fq, driver::DRAIN_PER_INTERRUPT, |rec| {
             FAULTS.fetch_add(1, Ordering::Relaxed);
+            // 7.4: the record goes to the ring of the device's domain, if it has a live one, which raises DEVICE_FAULT on its object
+            // (the object lock is this handler's: the signal and the ring change in one section, as `iodomain_fault_read` reads them)
+            let out = store.fault(rec, now, second);
+            if let Some(obj) = out.tag.and_then(kcore::object::ObjId::from_words) {
+                raised |=
+                    crate::user::with_objs(|objs| kcore::ipc::iodomain_set_fault(objs, obj, true));
+            }
             LAST_DID.store(u64::from(rec.device_id), Ordering::Relaxed);
             LAST_IOVA.store(rec.iotval, Ordering::Relaxed);
             LAST_CAUSE.store(
@@ -383,6 +437,9 @@ fn fault_interrupt(_source: u32) -> bool {
         let Some(rec) = rec else { break };
         let _ = writeln!(crate::console::Console, "{}", FaultLine(&rec));
     }
+    if raised {
+        crate::user::wake_signal_waiters(); // (a waiter for DEVICE_FAULT: the lock is this handler's, as for a wired source's object)
+    }
     more
 }
 
@@ -398,9 +455,18 @@ fn command_interrupt(_source: u32) -> bool {
     false
 }
 
+/// The frames the device directory holds (its root and the pages below). They are the kernel's for good once a device id has had a
+/// domain: a destroyed domain's device keeps its quarantine context (IOMMU-SPEC 6.3), so the leak checks count them as accounted.
+pub fn directory_frames() -> usize {
+    let mut st = STATE.lock();
+    let Some(s) = st.as_mut() else { return 0 };
+    s.store.directory().pages(&Direct) as usize
+}
+
 /// The counters (`debug_stat`, SYSCALLS.md): 150 faults taken, 151 fault lines dropped by the rate limit, 152 fault-queue overflows,
 /// 153 the last fault's device id, 154 its address, 155 its cause (bits 11:0) and transaction type (bits 37:32), 156 commands
-/// issued, 157 fence timeouts.
+/// issued, 157 fence timeouts; IOMMU6: 158 frames leaked by fence timeouts (mapped pages and table frames), 159 live domains, 160
+/// I/O-mapped pages, 161 mapping records leaked with their holds.
 pub fn stat(which: u64) -> u64 {
     let c = match which {
         150 => &FAULTS,
@@ -411,9 +477,166 @@ pub fn stat(which: u64) -> u64 {
         155 => &LAST_CAUSE,
         156 => &COMMANDS,
         157 => &FENCE_TIMEOUTS,
+        158..=161 => {
+            let st = STATE.lock().as_ref().map(|s| s.store.stats());
+            let Some(st) = st else { return 0 };
+            return match which {
+                158 => st.pages_leaked.saturating_add(st.tables_leaked),
+                159 => st.domains,
+                160 => st.io_pages,
+                _ => st.holds_leaked,
+            };
+        }
         _ => return 0,
     };
     c.load(Ordering::Relaxed)
+}
+
+// ---- device domains (IOMMU6) -----------------------------------------------------------------------------------------------
+
+/// This machine under the device-domain calls (`ksys::iodomain::IoEnv`): each lock a closure, the clock, the console.
+struct Kenv;
+
+impl Kenv {
+    /// `IOMMU` and the register page. Present after `init` (no call reaches here before user mode, which starts after it).
+    #[allow(clippy::expect_used)] // INVARIANT: `init` filled the state and the tree names the register page before any process runs
+    fn locked<T>(f: impl FnOnce(&mut IoDomains, &mut Mmio) -> T) -> T {
+        let mut g = STATE.lock();
+        let s = g.as_mut().expect("the IOMMU is up before user mode");
+        let mut r = Mmio::new().expect("the IOMMU's register page");
+        f(&mut s.store, &mut r)
+    }
+}
+
+impl ksys::iodomain::IoEnv for Kenv {
+    type M = crate::kmem::DirectMap;
+    type P = Direct;
+    type R = Mmio;
+    fn obj<T>(&mut self, f: impl FnOnce(ksys::iodomain::IoObj<'_, Self::M>) -> T) -> Option<T> {
+        crate::user::with_caller(|objs, handles, job| {
+            let k = crate::kmem::get();
+            f(ksys::iodomain::IoObj {
+                objs,
+                handles,
+                job,
+                mm: k.mm,
+                vmos: k.vmos,
+                jobs: k.jobs,
+            })
+        })
+    }
+    fn obj_iommu<T>(
+        &mut self,
+        f: impl FnOnce(
+            &mut kcore::ipc::Kobjs,
+            &kcore::handle::HandleTable,
+            &mut IoDomains,
+            &Direct,
+            &mut Mmio,
+        ) -> T,
+    ) -> Option<T> {
+        crate::user::with_caller(|objs, handles, _| {
+            Kenv::locked(|s, r| f(objs, handles, s, &Direct, r))
+        })
+    }
+    fn mem<T>(
+        &mut self,
+        f: impl FnOnce(
+            &mut kcore::Mm<Self::M>,
+            &mut kcore::aspace::Vmos,
+            &mut kcore::job::Jobs,
+            &Direct,
+        ) -> T,
+    ) -> T {
+        let k = crate::kmem::mem();
+        f(k.mm, k.vmos, k.jobs, &Direct)
+    }
+    fn frame<T>(
+        &mut self,
+        f: impl FnOnce(&mut kcore::frame::FrameDb, &mut Self::M, &Direct) -> T,
+    ) -> T {
+        let k = crate::kmem::frames();
+        let kcore::Mm { db, mem } = k.mm;
+        f(db, mem, &Direct)
+    }
+    fn iommu<T>(
+        &mut self,
+        f: impl FnOnce(&mut IoDomains, &Direct, &mut Mmio, &mut kcore::frame::FrameDb) -> T,
+    ) -> T {
+        Kenv::locked(|s, r| {
+            // (`FRAME` inside `IOMMU`: 11.2)
+            let k = crate::kmem::frames();
+            f(s, &Direct, r, &mut k.mm.db)
+        })
+    }
+    fn device_ok(&self, device_id: u64) -> bool {
+        tree().is_some_and(|t| device_id < u64::from(t.device_ids))
+    }
+    fn now(&self) -> u64 {
+        crate::timer::now()
+    }
+    fn fence_bound(&self) -> u64 {
+        crate::timer::cycles_from_ns(FENCE_BOUND_NS)
+    }
+    fn relax(&mut self) {
+        // (no lock is held: interrupts are taken and a switch may happen, as between the slices of any long call)
+        if crate::bkl::holds() {
+            core::hint::spin_loop();
+        } else {
+            crate::irq::window();
+        }
+    }
+    fn fence_timeout(&mut self, device: Option<u32>) {
+        timed_out(device);
+    }
+}
+
+/// The device-domain calls (IOMMU-SPEC 4, 7.4): `iodomain_create`, `iodomain_map`, `iodomain_unmap`, `iodomain_destroy`,
+/// `iodomain_fault_read` and `vmo_create_dma_in`, from the syscall path with no lock held. `None` for any other call.
+pub fn call(n: usize, a: [u64; 6]) -> Option<ksys::Reply> {
+    use abi::syscall as nr;
+    use ksys::iodomain as io;
+    let e = &mut Kenv;
+    let r = match n {
+        nr::IODOMAIN_CREATE => io::iodomain_create(e, a),
+        nr::IODOMAIN_MAP => io::iodomain_map(e, a),
+        nr::IODOMAIN_UNMAP => io::iodomain_unmap(e, a),
+        nr::IODOMAIN_DESTROY => io::iodomain_destroy(e, a),
+        nr::IODOMAIN_FAULT_READ => io::iodomain_fault_read(e, a),
+        nr::VMO_CREATE_DMA_IN => io::vmo_create_dma_in(e, a),
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// The last handle of a device domain went (the object's cleanup, under the object lock): 6.3 step 1, which allocates nothing and does
+/// not wait; `drain` completes it.
+pub fn closed(domain: u64) {
+    let started = {
+        let mut g = STATE.lock();
+        match (g.as_mut(), Mmio::new()) {
+            (Some(s), Some(mut r)) => {
+                ksys::iodomain::iodomain_closed(&mut s.store, &Direct, &mut r, domain);
+                true
+            }
+            _ => false,
+        }
+    };
+    if started {
+        DETACHING.store(true, Ordering::Release);
+    }
+}
+
+/// Complete every destruction begun under another lock (6.3 steps 2 to 4), with no lock held: the tail of every call and fault, and
+/// the end of a teardown. One load when nothing is pending; a caller that holds the object lock leaves it to the next.
+pub fn drain() {
+    if crate::bkl::holds()
+        || !DETACHING.load(Ordering::Acquire)
+        || !DETACHING.swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    ksys::iodomain::drain_destructions(&mut Kenv);
 }
 
 /// Directory and table frames for the self-test: zeroed on the way in; on the way out kept off the free lists until the fence
@@ -497,7 +720,8 @@ pub fn selftest() -> Result<(), alloc::string::String> {
         {
             let mut g = STATE.lock();
             let s = g.as_mut().ok_or("no state")?;
-            s.ddt
+            s.store
+                .directory()
                 .set(&mem, &mut frames, SELFTEST_DID, &ctx)
                 .map_err(|e| format!("ddt set: {e:?}"))?;
         }
@@ -553,7 +777,7 @@ pub fn selftest() -> Result<(), alloc::string::String> {
     {
         let mut g = STATE.lock();
         if let Some(s) = g.as_mut() {
-            s.ddt.clear(&mem, &mut frames, SELFTEST_DID);
+            s.store.directory().clear(&mem, &mut frames, SELFTEST_DID);
         }
     }
     let fenced = fence(

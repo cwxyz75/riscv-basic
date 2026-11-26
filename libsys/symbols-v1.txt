@@ -92,3 +92,10 @@ sys_vmo_phys_addr
 sys_vmo_read
 sys_vmo_set_size
 sys_vmo_write
+sys_iodomain_create
+sys_iodomain_map
+sys_iodomain_unmap
+sys_iodomain_destroy
+sys_iodomain_fault_read
+sys_job_set_io_limits
+sys_vmo_create_dma_in

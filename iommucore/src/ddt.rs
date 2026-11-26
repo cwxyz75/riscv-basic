@@ -219,6 +219,23 @@ impl Ddt {
     pub const fn format(&self) -> Format {
         self.format
     }
+    /// How many pages the directory holds: the root and every non-leaf and leaf page below it. Reads only (IOMMU6: the kernel's
+    /// leak check counts them, since a quarantined device keeps its context, and so its directory pages, for good).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: at most 1 + 512 + 512 * 512 pages
+    pub fn pages<M: PhysMem64>(&self, mem: &M) -> u64 {
+        fn below<M: PhysMem64>(mem: &M, page: u64, depth: u32) -> u64 {
+            if depth == 0 {
+                return 0;
+            }
+            (0..512u64)
+                .map(|i| mem.read(page + i * 8))
+                .filter(|de| de & DDTE_V != 0)
+                .map(|de| 1 + below(mem, ppn_addr(de), depth - 1))
+                .sum()
+        }
+        1 + below(mem, self.root, self.levels.count() - 1)
+    }
+
     /// The value to write to `ddtp` for this directory.
     pub const fn ddtp(&self) -> crate::regs::Ddtp {
         crate::regs::Ddtp::directory(self.levels, self.root)

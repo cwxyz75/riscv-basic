@@ -16,6 +16,8 @@ use kcore::Mm;
 use ksys::{ipc_call, job_call, vmo_call, Ctx, Faults, Reply};
 use std::collections::HashMap;
 
+pub mod iohost;
+
 /// Physical memory as a map from frame number to 512 words, created on demand (the kernel's direct map, on the host).
 #[derive(Default)]
 pub struct FakeMem {
