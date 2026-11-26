@@ -107,7 +107,7 @@ Measure before choosing (`TEST-TOOLS.md`, "Measuring"); do not guess. Raising a 
 "CI's QEMU"), because the distribution's QEMU is too old for the IOMMU. The `qemu` job of `ci.yml` looks the cache entry up and, only
 when it is missing, builds it before the boots start. Its timeout is 20 minutes, not 7: a cold build does not fit the gate's budget,
 and a build must never land inside a job that boots. On a warm cache it is a lookup, and the boots start after it: the gate's wall time grows
-by that job (tens of seconds, mostly the runner's start), and by the build (about 3.5 minutes) only for the first smoke in a cache
+by that job (tens of seconds, mostly the runner's start), and by the build (about 3 minutes) only for the first smoke in a cache
 scope. The exception is for building a tool into the cache and nothing else: the job runs no
 make target, no test and no boot, and every job that boots restores the entry and fails on a miss rather than building it. No rule
 about tests or boots changes.

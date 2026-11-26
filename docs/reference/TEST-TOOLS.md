@@ -241,7 +241,7 @@ pull request also those of its base branch. Two places build into the cache:
 has no entry (an epic cut before `main` had one, or after the entry was evicted: GitHub drops an entry unused for 7 days, and
 evicts the least recently used first when the repository's 10 GB, shared with the Rust caches, is full), run
 `gh workflow run qemu.yml --ref epic/<name>` and start the smoke when it is green. Nothing else needs it; a smoke without it is
-still correct, only longer by the build (about 3.5 minutes cold, measured 2026-11-26).
+still correct, only longer by the build (about 3 minutes cold, measured 2026-11-26).
 
 **Changing the version.** Edit `QEMU_VERSION`, `QEMU_SHA256` (and the key file and `QEMU_KEY_FPR` if the release manager changed)
 in `build-qemu.sh`; the key changes, the next tool-build job builds it, and `check-qemu.sh` then expects the new version.

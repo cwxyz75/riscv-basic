@@ -208,5 +208,5 @@ closed and the epic's IOMMU, MSI and device-capability tests failed. 11.1.0 is t
 writes `iommu-map = <0x0 0x8000 0x0 0x10000>` [observed, on a developer's machine and on CI]. By the owner's decision of 2026-11-26,
 CI now builds 11.1.3, the version of this record, from the release tarball (sha256 and release-key signature checked) and caches it;
 every job that boots asserts the version, and `qemu.yml` checks the `iommu-map` above (`docs/reference/TEST-TOOLS.md`, "CI's QEMU").
-The bundled firmware is OpenSBI 1.8.1. A cold build on a hosted runner took 196 s (`riscv64-softmmu` only); restoring the cached
-install took about 10 s.
+The bundled firmware is OpenSBI 1.8.1. A cold build on a hosted runner took 165 to 196 s (`riscv64-softmmu` only); restoring the cached
+install (29 MB without the UEFI images) took about a second.
