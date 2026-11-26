@@ -537,3 +537,91 @@ fn a_suspend_that_finds_a_thread_still_asleep_in_the_park_raises_suspended() {
         "suspended again while still in the park: SUSPENDED rises again"
     );
 }
+
+/// The rule `thread_stacks_are_charged_to_the_job_and_credited_back` checks in the guest, on the host (T238, rule 8: an accounting rule
+/// belongs on the host): one more thread costs exactly one slot and `KSTACK_PAGES` pages, all or nothing. Over many prior page and thread
+/// uses, in a child job and with a limit on the parent too: with `KSTACK_PAGES - 1` pages of room the charge is refused and nothing moves on
+/// either job; with no thread slot left nothing moves either; with `KSTACK_PAGES` it fits exactly (the job is then full); and the credit
+/// puts every count back.
+#[test]
+fn a_thread_costs_exactly_its_kernel_stack_and_one_slot_all_or_nothing() {
+    use kcore::job::{Jobs, Usage};
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let both = |jobs: &Jobs, a: JobId, b: JobId| (jobs.usage(a).unwrap(), jobs.usage(b).unwrap());
+    let limited = |pages: u64, threads: u64| Limits {
+        pages,
+        threads,
+        ..Limits::UNLIMITED
+    };
+    for round in 0..500 {
+        let mut jobs = Jobs::new();
+        let parent = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+        let j = jobs.create(parent, Limits::UNLIMITED).unwrap();
+        let (pages, threads) = (next(10_000), next(50));
+        jobs.charge(j, Resource::Pages, pages).unwrap();
+        jobs.charge(j, Resource::Threads, threads).unwrap();
+        // (the parent holds some of its own, so its use is not the child's)
+        let own = next(100);
+        jobs.charge(parent, Resource::Pages, own).unwrap();
+        let before = both(&jobs, j, parent);
+        // the child's limit, then the parent's, one page short: refused, nothing charged anywhere
+        for on_parent in [false, true] {
+            let (who, used) = if on_parent {
+                (parent, pages + own)
+            } else {
+                (j, pages)
+            };
+            jobs.set_limits(who, limited(used + ksys::KSTACK_PAGES - 1, u64::MAX))
+                .unwrap();
+            assert!(
+                ksys::charge_thread(&mut jobs, j).is_err(),
+                "round {round}: one page short (parent: {on_parent})"
+            );
+            assert_eq!(
+                both(&jobs, j, parent),
+                before,
+                "round {round}: a refusal moves nothing (parent: {on_parent})"
+            );
+            jobs.set_limits(who, Limits::UNLIMITED).unwrap();
+        }
+        // no thread slot left: the pages are not charged either
+        jobs.set_limits(j, limited(u64::MAX, threads)).unwrap();
+        assert!(ksys::charge_thread(&mut jobs, j).is_err());
+        assert_eq!(
+            both(&jobs, j, parent),
+            before,
+            "round {round}: no slot, no pages"
+        );
+        // exactly the stack's room: it fits, and takes all of it
+        jobs.set_limits(j, limited(pages + ksys::KSTACK_PAGES, threads + 1))
+            .unwrap();
+        ksys::charge_thread(&mut jobs, j).unwrap();
+        let (u, p): (Usage, Usage) = both(&jobs, j, parent);
+        assert_eq!(
+            (u.pages, u.threads),
+            (pages + ksys::KSTACK_PAGES, threads + 1),
+            "round {round}"
+        );
+        assert_eq!(
+            (p.pages, p.threads),
+            (pages + own + ksys::KSTACK_PAGES, threads + 1),
+            "round {round}: the parent too"
+        );
+        assert!(
+            ksys::charge_thread(&mut jobs, j).is_err(),
+            "round {round}: the job is full"
+        );
+        ksys::credit_thread(&mut jobs, j);
+        assert_eq!(
+            both(&jobs, j, parent),
+            before,
+            "round {round}: the credit puts it all back"
+        );
+    }
+}

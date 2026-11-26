@@ -30,7 +30,7 @@ use core::fmt::Write as _;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use kcore::iovec::{Harts, Vectors};
-use kcore::msiid::{IdSet, MsiIds, Place, Route, Slot};
+use kcore::msiid::{MsiIds, Place, Route, Slot};
 
 /// What the device tree says about the interrupt controller (`discover`, called by `kmem::init` once the tree is parsed); `None` on a
 /// machine without a message-signalled APLIC (PL5c).
@@ -940,21 +940,24 @@ fn deliver_one(p: Place, fired: &mut impl FnMut(u32) -> bool) -> bool {
     }
 }
 
-/// Deliver the device messages a `claim` took on this hart, then do this hart's work in its file (open the identities it was asked to
+/// Deliver the device messages a `claim` took on this hart (its `claimed` set, emptied here), then do this hart's work in its file (open the identities it was asked to
 /// open and aim their sources; close, drain and free the ones it was asked to retire). Each device source is masked at the APLIC and
 /// handed to `fired` (whether an interrupt object took it). Under the lock. Returns whether any object was signalled.
-pub fn deliver(ids: &IdSet, mut fired: impl FnMut(u32) -> bool) -> bool {
-    let Some(file) = this_file() else {
-        return false;
-    };
-    let Ok(hart) = u16::try_from(file) else {
+pub fn deliver(mut fired: impl FnMut(u32) -> bool) -> bool {
+    let claimed = &crate::percpu::this().claimed;
+    let Some((file, hart)) = this_file().and_then(|f| Some((f, u16::try_from(f).ok()?))) else {
+        claimed.take(|_| {}); // (no file: nothing could have been claimed; the set is left empty all the same)
         return false;
     };
     let mut any = false;
-    for id in ids.iter().filter(|&id| id != IPI_ID) {
-        let Ok(id) = u16::try_from(id) else { continue };
-        any |= deliver_one(Place { hart, id }, &mut fired);
-    }
+    claimed.take(|id| {
+        if id == IPI_ID {
+            return;
+        }
+        if let Ok(id) = u16::try_from(id) {
+            any |= deliver_one(Place { hart, id }, &mut fired);
+        }
+    });
     if work_flag(file).is_some_and(|f| f.swap(false, Ordering::AcqRel)) {
         let n = with_table(|t| t.ids.num_ids()).unwrap_or(0);
         for id in 2..=n {

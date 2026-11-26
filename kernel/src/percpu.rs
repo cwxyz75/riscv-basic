@@ -75,6 +75,9 @@ pub struct PerHart {
     pub bkl_depth: kcore::ticket::Depth,
     /// What this hart holds (a stack of lock classes), for the lock-order checker.
     pub held: HeldCell,
+    /// The device identities this hart claimed from its interrupt file and has not delivered yet (IOMMU4): here, not on the trap's stack
+    /// (KT13). Only this hart touches it, in its trap path with interrupts off.
+    pub claimed: kcore::msiid::IdSet,
     /// Work for the hart's IPI handler (S5b tests): kind, argument, result and a done flag.
     pub work_kind: AtomicU32,
     pub work_arg: AtomicU64,
@@ -273,6 +276,7 @@ impl PerHart {
             tp_seen: AtomicUsize::new(0),
             bkl_depth: kcore::ticket::Depth::new(),
             held: HeldCell(core::cell::UnsafeCell::new(klock::Held::new())),
+            claimed: kcore::msiid::IdSet::new(),
             work_kind: AtomicU32::new(0),
             work_arg: AtomicU64::new(0),
             work_result: AtomicU64::new(0),

@@ -25,6 +25,7 @@
 //! never allocate (T177). Pure: no hardware, no locks (the kernel keeps it under `OBJ`, IOMMU-SPEC 11.1).
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The inter-hart interrupt's identity on every hart.
 pub const IPI: u16 = 1;
@@ -516,43 +517,45 @@ impl MsiIds {
     }
 }
 
-/// A set of identities of one hart (up to `MAX_IDS`): what one claim of the interrupt file took, before the routes are looked up under
-/// the lock. Fixed size, no allocation (it lives on the trap path's stack).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IdSet([u64; 32]);
+/// The identities one hart has claimed from its interrupt file and not yet delivered (up to `MAX_IDS`): filled by the claim, emptied
+/// by the delivery under the lock. One per hart, kept in the hart's own record and not on the trap path's stack: a 256-byte set in the
+/// frame of every external interrupt deepened each kernel path an interrupt can land on, and that is every one (KT13). Atomics, so
+/// that the set needs no `unsafe` to be shared; only its own hart touches it, with interrupts off, so they are never contended.
+#[derive(Debug, Default)]
+pub struct IdSet([AtomicU64; 32]);
 
 impl IdSet {
     pub const fn new() -> IdSet {
-        IdSet([0; 32])
+        IdSet([const { AtomicU64::new(0) }; 32])
     }
 
     /// Add `id` (an identity above `MAX_IDS` is not one: ignored).
-    pub fn insert(&mut self, id: u32) {
-        if let Some(w) = self.0.get_mut((id / 64) as usize) {
-            *w |= 1u64 << (id % 64);
+    pub fn insert(&self, id: u32) {
+        if let Some(w) = self.0.get((id / 64) as usize) {
+            w.fetch_or(1u64 << (id % 64), Ordering::Relaxed);
         }
     }
 
     pub fn contains(&self, id: u32) -> bool {
         self.0
             .get((id / 64) as usize)
-            .is_some_and(|w| w & (1u64 << (id % 64)) != 0)
+            .is_some_and(|w| w.load(Ordering::Relaxed) & (1u64 << (id % 64)) != 0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|&w| w == 0)
+        self.0.iter().all(|w| w.load(Ordering::Relaxed) == 0)
     }
 
-    /// The identities, ascending.
-    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.iter().enumerate().flat_map(|(k, &w)| {
-            (0..64u32).filter_map(move |b| {
-                if w & (1u64 << b) != 0 {
-                    u32::try_from(k).ok()?.checked_mul(64)?.checked_add(b)
-                } else {
-                    None
-                }
-            })
-        })
+    /// Empty the set, giving each identity to `f`, ascending (a word at a time: an identity added meanwhile is in this call or the next).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: k < 32 and b < 64, so k * 64 + b < 2048
+    pub fn take(&self, mut f: impl FnMut(u32)) {
+        for (k, w) in self.0.iter().enumerate() {
+            let mut bits = w.swap(0, Ordering::Relaxed);
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                bits &= bits - 1;
+                f(k as u32 * 64 + b);
+            }
+        }
     }
 }

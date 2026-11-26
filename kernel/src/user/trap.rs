@@ -970,6 +970,31 @@ pub(super) fn status_ret(frame: &mut crate::trap::TrapFrame, s: Status) {
     frame.set_return(s.code() as i64 as u64, None, None);
 }
 
+/// The device-domain calls (IOMMU6) and a vector's `interrupt_ack` and `interrupt_deliver_here` (IOMMU7), answered by the device-domain
+/// layer: whether this call was one of its (`vector`: only if the handle names a vector; a wired source's are `dispatch`'s). A frame of
+/// its own, never inlined into `syscall`: folded in, it made the syscall path deeper under every call, not only these (KT13).
+#[inline(never)]
+fn device_domain_call(
+    frame: &mut crate::trap::TrapFrame,
+    n: usize,
+    a: [u64; 6],
+    vector: bool,
+) -> bool {
+    let r = match ksys::wide_argument_error(n, &a) {
+        Some(_) if vector => return false,
+        Some(s) => fail(s),
+        None if vector && !crate::iommu::is_on() => return false,
+        None => match crate::iommu::call(n, a) {
+            Some(r) => r,
+            None if vector => return false,
+            None => fail(Status::BadSyscall),
+        },
+    };
+    notify();
+    reply(frame, r);
+    true
+}
+
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
@@ -985,14 +1010,6 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             frame.arg(15),
         ],
     );
-    let vector_reply = if matches!(n, nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE)
-        && ksys::wide_argument_error(n, &a).is_none()
-        && crate::iommu::is_on()
-    {
-        crate::iommu::call(n, a)
-    } else {
-        None
-    };
     match n {
         nr::THREAD_YIELD => {
             status_ret(frame, Status::Ok);
@@ -1017,12 +1034,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::IODOMAIN_FAULT_READ
         | nr::VMO_CREATE_DMA_IN
         | nr::IODOMAIN_GRANT_VECTOR => {
-            let r = match ksys::wide_argument_error(n, &a) {
-                Some(s) => fail(s),
-                None => crate::iommu::call(n, a).unwrap_or_else(|| fail(Status::BadSyscall)),
-            };
-            notify();
-            reply(frame, r);
+            let _ = device_domain_call(frame, n, a, false);
         }
         nr::OBJECT_WAIT => {
             // (IOMMU-SPEC 8.5: the first wait on a vector moves it to this hart, with no lock held)
@@ -1030,11 +1042,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, object_wait(a))
         }
         // (IOMMU7) a vector's acknowledgement and `interrupt_deliver_here` are the device-domain layer's; a wired source's are `dispatch`'s
-        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE if vector_reply.is_some() => {
-            if let Some(r) = vector_reply {
-                notify();
-                reply(frame, r);
-            }
+        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE if device_domain_call(frame, n, a, true) => {
         }
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)

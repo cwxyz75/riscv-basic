@@ -787,15 +787,21 @@ fn an_evacuation_is_all_or_nothing() {
 
 #[test]
 fn the_id_set_holds_every_identity_up_to_the_maximum() {
-    let mut s = IdSet::new();
+    let s = IdSet::new();
     assert!(s.is_empty());
     for id in [1u32, 2, 63, 64, 127, 128, 255, 256, 2047] {
         s.insert(id);
     }
     s.insert(2048); // not an identity
     assert!(s.contains(64) && s.contains(2047) && !s.contains(65) && !s.contains(2048));
-    assert_eq!(
-        s.iter().collect::<Vec<_>>(),
-        vec![1, 2, 63, 64, 127, 128, 255, 256, 2047]
-    );
+    let mut got = Vec::new();
+    s.take(|id| got.push(id));
+    assert_eq!(got, vec![1, 2, 63, 64, 127, 128, 255, 256, 2047]);
+    // the take emptied it: a second one gives nothing, and the set fills again
+    assert!(s.is_empty());
+    s.take(|_| panic!("an identity was given twice"));
+    s.insert(5);
+    let mut again = Vec::new();
+    s.take(|id| again.push(id));
+    assert_eq!(again, vec![5]);
 }
