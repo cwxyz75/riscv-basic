@@ -82,6 +82,10 @@ pub mod aia {
     pub fn handle(fired: impl FnMut(u32) -> bool) -> bool {
         unimplemented!()
     }
+    /// IOMMU7's placement of a wired source (`interrupt_deliver_here`): a stub, as the rest.
+    pub fn move_here(irq: u32) -> Result<(), abi::status::Status> {
+        unimplemented!()
+    }
 }
 
 /// IOMMU5's bring-up (the SMMU would stand here): stubs, as the rest.
@@ -114,6 +118,23 @@ pub mod iommu {
         unimplemented!()
     }
     pub fn directory_frames() -> usize {
+        unimplemented!()
+    }
+    /// IOMMU7's vectors: stubs, as the rest.
+    pub fn vector_closed(v: kcore::ipc::VectorRef) {
+        unimplemented!()
+    }
+    pub fn first_wait(h: u64) {
+        unimplemented!()
+    }
+    pub fn settle_moves() {
+        unimplemented!()
+    }
+    pub fn vector_route(
+        objs: &kcore::ipc::Kobjs,
+        handles: &kcore::handle::HandleTable,
+        h: u64,
+    ) -> Option<u64> {
         unimplemented!()
     }
     #[cfg(not(feature = "release"))]

@@ -184,3 +184,18 @@ testdev (1), but virtio stops at status 0 (the device state is reset by the virt
 6. Direct directory-mode to directory-mode changes of `ddtp` are ignored (15).
 7. Open, **not established**: 3 (spec's stage choice), 7 (DBG usage), 9 (independent walk vectors), 10 to 12 (hardware text), A4
    fault absence, M12, INTx silencing, stopped-hart IMSIC.
+
+## Addendum 2026-11-26 (IOMMU7, observed)
+
+These come from a kernel-only boot (`OS_SHARD=k`, one hart, `-cpu rva23s64`, virtio-rng-pci at 00:04.0 behind MRIF entries) with
+`OS_SHOW='## iommu: fault'`. The fault lines of the four MSI suite tests:
+
+- **Cause 262** (the entry not valid: a message to an ungranted page, and to a revoked vector's page) reports **`iotval` 0**:
+  `cause=262 dev=00:04.0 iova=0x0 write`, twice. So both MSI causes this machine raises, 262 and 263, carry no address. The section 10
+  remark about 263 holds for 262 too.
+- **Cause 263** (data 4096 on a granted page): `iova=0x0`.
+- **An unaligned address on a granted MRIF page** (window page + 2, data 1): **no fault**, nothing delivered, and no notice. This is
+  M12 again, now through an MRIF entry. It is still unexplained against the source's alignment check.
+- **A device write to the S-mode IMSIC page** (0x28000000): an ordinary translation fault (cause 23, `iova` the address). It is not an
+  MSI fault, because the address is outside the window.
+

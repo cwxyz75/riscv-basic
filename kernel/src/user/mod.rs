@@ -159,6 +159,22 @@ pub(crate) fn with_caller<R>(
     })
 }
 
+/// `with_caller` for a step that also runs with no caller (the kernel's drain after a teardown): the objects, and the caller's handles
+/// and job when the calling thread's process is still there. Takes the object lock.
+pub(crate) fn with_caller_opt<R>(
+    f: impl FnOnce(&mut ipc::Kobjs, Option<(&mut HandleTable, JobId)>) -> R,
+) -> R {
+    locked_state(|s| {
+        let pid = s.pid_of(thread::current());
+        let UserState { objs, procs, .. } = s;
+        let caller = pid.and_then(|pid| procs.get_mut(&pid)).map(|p| {
+            let job = p.job;
+            (&mut p.handles, job)
+        });
+        f(objs, caller)
+    })
+}
+
 /// The object registry, under the object lock this hart already holds (the IOMMU's fault interrupt raises DEVICE_FAULT through it).
 pub(crate) fn with_objs<R>(f: impl FnOnce(&mut ipc::Kobjs) -> R) -> R {
     with_state(|s| f(&mut s.objs))

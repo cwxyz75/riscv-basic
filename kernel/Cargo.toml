@@ -58,6 +58,9 @@ fault-iommu-bare = ["iommucore/fault-iommu-bare"]
 # IOMMU6's negative control: an unmap clears the leaves and frees, without the invalidation and the fence (`iodomain_unmap_stops_the_device`
 # must fail on it)
 fault-iommu-skip-inval = ["kcore/fault-iommu-skip-inval"]
+# IOMMU7's negative control: vectors' MSI entries in basic-translate mode, to the target hart's file (IO11 broken): the device's data
+# word reaches the hart, and `msi_forgery_faults` must fail on its "granted page, wrong data" row (`make os-boot-test` with it, by hand)
+fault-iommu-msi-basic = ["kcore/fault-iommu-msi-basic"]
 # MM8: a SNAPSHOT leaves the source's writable translations as they were; a write through them then reaches the child's pages
 fault-skip-cow-protect = []
 # MM6/MM7: a decommit, or a protect that takes a permission away, leaves the other harts' translations alone; the sibling-thread tests must then fail

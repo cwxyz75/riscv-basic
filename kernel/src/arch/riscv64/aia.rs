@@ -29,6 +29,7 @@ use core::arch::asm;
 use core::fmt::Write as _;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use kcore::iovec::{Harts, Vectors};
 use kcore::msiid::{IdSet, MsiIds, Place, Route, Slot};
 
 /// What the device tree says about the interrupt controller (`discover`, called by `kmem::init` once the tree is parsed); `None` on a
@@ -76,6 +77,8 @@ struct Table {
     ids: MsiIds,
     /// Per source (wired or kernel-owned): the identity the APLIC aims it at (its Live identity), if it has a route.
     at: alloc::vec::Vec<Option<Place>>,
+    /// The vector routes (IOMMU7, `kcore::iovec`): a granted MSI vector's identities, its object and its file.
+    vecs: Vectors,
 }
 
 static mut TABLE: Option<Table> = None;
@@ -172,9 +175,14 @@ pub fn discover(
         .filter(|&s| s <= aia.num_sources)
         .max()
         .unwrap_or(0);
+    // (twice the identities: a route whose identities are all free waits for its charge to be given back by a drain)
+    let Some(vecs) = Vectors::new(files * aia.num_ids as usize * 2) else {
+        return;
+    };
     let table = Table {
         ids,
         at: alloc::vec![None; top as usize + 1],
+        vecs,
     };
     // SAFETY: boot code, one hart, before anything reads them.
     unsafe {
@@ -246,6 +254,12 @@ static NO_ROUTE_SAID: AtomicBool = AtomicBool::new(false);
 static TOP_ID: AtomicU64 = AtomicU64::new(0);
 /// Identities retired after their route moved (`debug_stat` 143).
 static MOVES: AtomicU64 = AtomicU64::new(0);
+/// Notices taken on a vector's identity (IOMMU7: `debug_stat` 162), and the ones that fired its object (163).
+static NOTICES: AtomicU64 = AtomicU64::new(0);
+static NOTICES_FIRED: AtomicU64 = AtomicU64::new(0);
+/// A vector route's identities are all free (its charge is due), or a hart's evacuation opened a vector's new identity (its entry is
+/// to be rewritten): work for the next drain with no lock held (`iommu::drain`).
+pub static VECTORS_DUE: AtomicBool = AtomicBool::new(false);
 
 /// The delivery counters: `which` 3 taken, 4 taken off the boot hart, 5 misrouted; 140 messages with no route, 141 the free identities of
 /// every file together (the object lock is held: `debug_stat` reads under it), 142 the highest identity a device message was taken on,
@@ -260,6 +274,21 @@ pub fn stat(which: u64) -> u64 {
         142 => TOP_ID.load(Ordering::Relaxed),
         143 => MOVES.load(Ordering::Relaxed),
         144 => info().map_or(0, |i| u64::from(i.num_ids)),
+        // (IOMMU7) 146 live vectors (granted, being revoked, or with identities still retiring), 147 stray bits taken at
+        // acknowledgement (the store's, at revoke and release, are added by `iommu::stat`), 149 vectors leaked by fence timeouts
+        146 | 147 | 149 => crate::bkl::ensure(|| {
+            with_table(|t| {
+                let c = t.vecs.counts();
+                match which {
+                    146 => c.live,
+                    147 => c.strays,
+                    _ => c.leaked,
+                }
+            })
+        })
+        .unwrap_or(0),
+        162 => NOTICES.load(Ordering::Relaxed),
+        163 => NOTICES_FIRED.load(Ordering::Relaxed),
         _ => 0,
     }
 }
@@ -524,6 +553,48 @@ fn end_route(t: &mut Table, s: u32) {
     }
 }
 
+/// The harts' files as `kcore::iovec` sees them (IOMMU7), under the object lock with interrupts off.
+pub struct KHarts;
+
+impl Harts for KHarts {
+    fn here(&self) -> Option<u16> {
+        this_file().and_then(|f| u16::try_from(f).ok())
+    }
+    fn usable(&self, f: u16) -> bool {
+        usable_file(f)
+    }
+    fn leaving(&self, f: u16) -> bool {
+        leaving(f)
+    }
+    fn open_here(&mut self, id: u16) {
+        open_here(u32::from(id));
+    }
+    fn ask(&mut self, f: u16) {
+        ask(usize::from(f));
+    }
+    fn file_page(&self, f: u16) -> u64 {
+        info().map_or(0, |i| i.imsic_base + u64::from(f) * 0x1000)
+    }
+}
+
+/// Run `f` on the identities and the vector routes (IOMMU7), with this hart's files: under the object lock, interrupts off. `None`
+/// without a controller.
+#[track_caller]
+pub fn with_irq<R>(f: impl FnOnce(&mut MsiIds, &mut Vectors, &mut dyn Harts) -> R) -> Option<R> {
+    with_table(|t| f(&mut t.ids, &mut t.vecs, &mut KHarts))
+}
+
+/// Where vector route `v`'s entry sends its notices: (interrupt file << 16) | identity, or `None` while it is not fenced
+/// (`debug_stat` 148). Under the object lock.
+pub fn vector_route_of(v: kcore::ipc::VectorRef) -> Option<u64> {
+    with_table(|t| {
+        t.vecs
+            .named(v)
+            .map(|p| (u64::from(p.hart) << 16) | u64::from(p.id))
+    })
+    .flatten()
+}
+
 /// Is file `f` one routes may go to: its hart is started and online (not draining, offline or starting, IOMMU-SPEC 8.5)?
 fn usable_file(f: u16) -> bool {
     hart_of_file(usize::from(f)).is_some_and(|h| {
@@ -600,49 +671,61 @@ pub fn enable(irq: u32) {
 /// `interrupt_ack`: move the source's route to the acknowledging hart (if it is elsewhere, and this hart has a free identity: else it
 /// stays where it is) and unmask it; a level that is still asserted fires again.
 pub fn reenable(irq: u32) {
-    if let Some(file) = this_file() {
-        if let Ok(hart) = u16::try_from(file) {
-            with_table(|t| {
-                let Some(&Some(at)) = t.at.get(irq as usize) else {
-                    return;
-                };
-                // (the route stays where it is, and a move under way with it, unless this acknowledgement moves it: not on its own
-                // hart, not onto a hart that is leaving (the evacuation chose where its routes go), not without a free identity here)
-                if at.hart == hart
-                    || leaving(hart)
-                    || t.ids.free_on(hart) == 0
-                    || !matches!(t.ids.slot(at), Some(Slot::Live { .. }))
-                {
-                    return;
-                }
-                // a move under way (a hart going offline asked another to open one) gives way to this one
-                if let Some(Slot::Live { to: Some(next), .. }) = t.ids.slot(at) {
-                    if t.ids.end(next).is_ok() {
-                        ask(usize::from(next.hart));
-                    }
-                }
-                let Some(id) = t.ids.move_to(at, hart) else {
-                    return; // (refused: the source stays where it is)
-                };
-                let p = Place { hart, id };
-                open_here(u32::from(id));
-                let old = t.ids.opened(p).and_then(|o| o.retiring);
-                if let Some(a) = t.at.get_mut(irq as usize) {
-                    *a = Some(p);
-                }
-                aim(irq, p);
-                if let Some(o) = old {
-                    ask(usize::from(o.hart));
-                }
-            });
-        }
-    }
+    let _ = move_here(irq);
     #[cfg(feature = "fault-aia-no-unmask")]
     {
         return; // negative control: an acknowledged source stays masked for good
     }
     #[cfg(not(feature = "fault-aia-no-unmask"))]
     aim_and_unmask(irq);
+}
+
+/// Move wired source `irq`'s route to the calling hart (an acknowledgement, or `interrupt_deliver_here`: IOMMU-SPEC 8.5), and aim
+/// the source there; its mask stays as it is. It stays where it is on its own hart, from a hart that is leaving, or when its
+/// identity is not live; `NoMemory`, staying, when this hart has no free identity.
+pub fn move_here(irq: u32) -> Result<(), abi::status::Status> {
+    let Some(hart) = this_file().and_then(|f| u16::try_from(f).ok()) else {
+        return Ok(());
+    };
+    with_table(|t| {
+        let Some(&Some(at)) = t.at.get(irq as usize) else {
+            return Ok(());
+        };
+        // (the route stays where it is, and a move under way with it, unless this call moves it: not on its own hart, not onto a hart
+        // that is leaving (the evacuation chose where its routes go), not without a free identity here)
+        if at.hart == hart || leaving(hart) || !matches!(t.ids.slot(at), Some(Slot::Live { .. })) {
+            return Ok(());
+        }
+        if t.ids.free_on(hart) == 0 {
+            return Err(abi::status::Status::NoMemory);
+        }
+        move_locked(t, irq, at, hart);
+        Ok(())
+    })
+    .unwrap_or(Ok(()))
+}
+
+/// Move wired source `irq`'s Live identity `at` to a new identity on this hart (`hart`), opened here, and aim the source at it.
+fn move_locked(t: &mut Table, irq: u32, at: Place, hart: u16) {
+    // a move under way (a hart going offline asked another to open one) gives way to this one
+    if let Some(Slot::Live { to: Some(next), .. }) = t.ids.slot(at) {
+        if t.ids.end(next).is_ok() {
+            ask(usize::from(next.hart));
+        }
+    }
+    let Some(id) = t.ids.move_to(at, hart) else {
+        return; // (refused: the source stays where it is)
+    };
+    let p = Place { hart, id };
+    open_here(u32::from(id));
+    let old = t.ids.opened(p).and_then(|o| o.retiring);
+    if let Some(a) = t.at.get_mut(irq as usize) {
+        *a = Some(p);
+    }
+    aim(irq, p);
+    if let Some(o) = old {
+        ask(usize::from(o.hart));
+    }
 }
 
 /// Aim source `irq` at its identity and unmask it.
@@ -709,7 +792,7 @@ pub fn evacuate_locked(v: usize) -> Result<(), abi::status::Status> {
         return Ok(());
     };
     with_table(|t| {
-        let Table { ids, at } = t;
+        let Table { ids, at, vecs: _ } = t;
         ids.evacuate(from, usable_file, |c| match c {
             kcore::msiid::Evacuated::Cancelled { at: p, .. } => ask(usize::from(p.hart)),
             kcore::msiid::Evacuated::Moved { to, .. } => ask(usize::from(to.hart)),
@@ -761,6 +844,8 @@ enum Act {
     Wired(u32, bool),
     /// A source the kernel owns.
     Kernel(u32),
+    /// A vector's identity (IOMMU7): the notice of 8.5 on its file.
+    Vector,
     /// An identity whose route ended: dropped.
     Ended,
     /// Nobody's.
@@ -785,6 +870,20 @@ fn act(t: &Table, p: Place) -> Act {
             route: Route::Kernel(s),
             moved: true,
         }) => Act::Kernel(s),
+        Some(
+            Slot::Live {
+                route: Route::Vector(_),
+                ..
+            }
+            | Slot::Moved {
+                route: Route::Vector(_),
+                ..
+            }
+            | Slot::Retiring {
+                route: Route::Vector(_),
+                moved: true,
+            },
+        ) => Act::Vector,
         Some(Slot::Retiring { moved: false, .. }) => Act::Ended,
         // (vectors have no identity before IOMMU7; a Free or Opening identity takes no message)
         _ => Act::NoRoute,
@@ -819,6 +918,19 @@ fn deliver_one(p: Place, fired: &mut impl FnMut(u32) -> bool) -> bool {
             }
             aim_and_unmask(s);
             false
+        }
+        Act::Vector => {
+            TAKEN.fetch_add(1, Ordering::Relaxed);
+            TOP_ID.fetch_max(u64::from(p.id), Ordering::Relaxed);
+            if crate::percpu::this().index.load(Ordering::Relaxed) != 0 {
+                TAKEN_OFF_BOOT.fetch_add(1, Ordering::Relaxed);
+            }
+            NOTICES.fetch_add(1, Ordering::Relaxed);
+            let f = crate::iommu::vector_notice(p);
+            if f {
+                NOTICES_FIRED.fetch_add(1, Ordering::Relaxed);
+            }
+            f
         }
         Act::Ended => false,
         Act::NoRoute => {
@@ -855,6 +967,10 @@ pub fn deliver(ids: &IdSet, mut fired: impl FnMut(u32) -> bool) -> bool {
                         if let Some(r) = o.retiring {
                             ask(usize::from(r.hart));
                         }
+                        // (a vector a hart's evacuation moved here: its entry is rewritten and its old identity retired by a drain)
+                        if o.held.is_some() {
+                            VECTORS_DUE.store(true, Ordering::Release);
+                        }
                         let (Route::Wired(s) | Route::Kernel(s)) = o.route else {
                             return None;
                         };
@@ -874,7 +990,14 @@ pub fn deliver(ids: &IdSet, mut fired: impl FnMut(u32) -> bool) -> bool {
                     if close_here(u32::from(id)) {
                         any |= deliver_one(p, &mut fired);
                     }
-                    with_table(|t| t.ids.retired(p));
+                    with_table(|t| {
+                        // (a vector route's last identity: its charge is given back by the next drain)
+                        if let Some((Route::Vector(n), _)) = t.ids.retired(p) {
+                            if t.vecs.retired(&t.ids, n) {
+                                VECTORS_DUE.store(true, Ordering::Release);
+                            }
+                        }
+                    });
                     if moved {
                         MOVES.fetch_add(1, Ordering::Relaxed);
                     }

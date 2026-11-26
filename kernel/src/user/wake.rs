@@ -158,6 +158,12 @@ fn cleanup_dead_held() {
                     with_state(|s| ksys::pager::pager_destroyed(s, id));
                     super::waits::wake_pager_waiters();
                 }
+                // (IOMMU7: a vector's revoke begins under the object lock, and `drain` completes it with none; it owns no wired source)
+                ipc::KObj::Interrupt(i) if i.vector.is_some() => with_state(|_| {
+                    if let Some(v) = i.vector {
+                        crate::iommu::vector_closed(v);
+                    }
+                }),
                 ipc::KObj::Interrupt(i) => with_state(|s| {
                     // mask the source and end its route (its identity is retired by its hart) unless a newer object already owns it
                     let owned = matches!(s.irq_objs.get(i.irq as usize), Some(Some(o))

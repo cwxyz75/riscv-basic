@@ -43,7 +43,7 @@ use iommucore::ddt::{device_id_bits, Ddt, DeviceContext, TableRoot};
 use iommucore::faultq::FaultRecord;
 use iommucore::iopt::{Access, Iopt, PtMode};
 use iommucore::iova::Iova;
-use iommucore::msi::{MsiTable, MsiWindow};
+use iommucore::msi::{Mrif, MsiPte, MsiTable, MsiWindow, MRIF_BYTES};
 use iommucore::regs::{self, Cqcsr};
 use iommucore::{PhysMem64, Regs, TableFrames, PAGE_SHIFT, PAGE_SIZE};
 
@@ -56,6 +56,13 @@ pub const IO_WINDOW_PAGES: u64 = 1 << 18;
 pub const IO_VECTOR_PAGES: u64 = 256;
 /// The DMA part of the window.
 pub const IO_DMA_PAGES: u64 = IO_WINDOW_PAGES - IO_VECTOR_PAGES;
+/// Interrupt files to a frame (512 bytes each, IOMMU-SPEC 5.3), and the file frames a domain may hold.
+pub const FILES_PER_FRAME: u64 = PAGE_SIZE / MRIF_BYTES;
+const FILE_FRAMES: usize = (IO_VECTOR_PAGES / FILES_PER_FRAME) as usize;
+/// The kernel bytes a granted vector's interrupt file is charged (IOMMU-SPEC 5.3: "512 bytes, eight to a frame").
+pub const VECTOR_FILE_BYTES: u64 = MRIF_BYTES;
+/// The only identity the kernel ever enables in a vector's file, and so the data word of the vector's MSI-X entry (IOMMU-SPEC 8.2).
+pub const VECTOR_DATA: u16 = 1;
 /// Fault records a domain's ring keeps (IOMMU-SPEC 7.4).
 pub const FAULT_RING: usize = 16;
 /// Console lines for faults, per second, for the whole system (IOMMU-SPEC 7.2).
@@ -485,8 +492,44 @@ struct Domain {
     ring_len: usize,
     dropped: u32,
     destroy_ticket: u64,
+    /// The vector table (IOMMU7, IOMMU-SPEC 8.3): one slot per MSI page-table entry, sized at creation.
+    vectors: Vec<VSlot>,
+    /// The frames of the vectors' interrupt files: file `k` is at `files[k / 8] + (k % 8) * 512` (0: no frame yet).
+    files: [u64; FILE_FRAMES],
     /// The store's list of leaked domains.
     next: Option<FBox<Domain>>,
+}
+
+/// The state of one vector index of a domain (the store's half: its MSI entry and its file; the route is the kernel's, under `OBJ`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VState {
+    Free,
+    /// The grant wrote the entry; its fence (this ticket) is outstanding.
+    Granting(u64),
+    /// A valid MRIF entry names the vector's file and its notice target, and its fence is done.
+    Live,
+    /// The notice target was rewritten; the fence (this ticket) is outstanding.
+    Moving(u64),
+    /// The entry was made invalid; the fence (this ticket) is outstanding. The file is freed after it.
+    Revoking(u64),
+    /// A fence of the vector was abandoned (IO8): the index, its file and its identities are never reused.
+    Leaked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VSlot {
+    state: VState,
+}
+
+/// What a domain's vector index is, for the kernel and the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorState {
+    Free,
+    Granting,
+    Live,
+    Moving,
+    Revoking,
+    Leaked,
 }
 
 /// The kernel bytes a domain is charged at creation (IOMMU-SPEC 5.3): its body with the fault ring, the root table, the MSI page table
@@ -494,7 +537,42 @@ struct Domain {
 pub const DOMAIN_BYTES: u64 = core::mem::size_of::<Domain>() as u64
     + ROOT_FRAMES * PAGE_SIZE
     + PAGE_SIZE
-    + 2 * IO_WINDOW_PAGES.div_ceil(64) * 8;
+    + 2 * IO_WINDOW_PAGES.div_ceil(64) * 8
+    + IO_VECTOR_PAGES * core::mem::size_of::<VSlot>() as u64;
+
+/// The interrupt file of vector `index` of `dom` (its frame must have been taken).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: index < 256, so the offset is below a frame
+fn file_of(dom: &Domain, index: u16) -> Option<u64> {
+    let frame = *dom
+        .files
+        .get(usize::from(index) / FILES_PER_FRAME as usize)?;
+    (frame != 0).then(|| frame + (u64::from(index) % FILES_PER_FRAME) * MRIF_BYTES)
+}
+
+/// Free the frame of vector `index`'s file if no index of its eight is granted any more (free, every one: a leaked one keeps it).
+/// The vectors whose files share a frame with vector `index`'s.
+fn file_group(dom: &Domain, index: u16) -> impl Iterator<Item = &VSlot> {
+    let per = FILES_PER_FRAME as usize;
+    let first = usize::from(index)
+        .checked_div(per)
+        .unwrap_or(0)
+        .saturating_mul(per);
+    dom.vectors.iter().skip(first).take(per)
+}
+
+fn free_file_frame<F: TableFrames>(dom: &mut Domain, index: u16, frames: &mut F) {
+    let per = FILES_PER_FRAME as usize;
+    let group = usize::from(index).checked_div(per).unwrap_or(0);
+    let first = group.saturating_mul(per);
+    let empty = dom
+        .vectors
+        .get(first..first.saturating_add(per))
+        .is_some_and(|g| g.iter().all(|v| v.state == VState::Free));
+    if let Some(f) = dom.files.get_mut(group).filter(|f| **f != 0 && empty) {
+        frames.free(*f);
+        *f = 0;
+    }
+}
 
 impl Domain {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the counts are of the list's records and their chained frames
@@ -571,6 +649,13 @@ pub struct IoStats {
     pub slots: u64,
     /// Pages of live and pending mappings (leaked ones are counted apart, in `pages_leaked`).
     pub io_pages: u64,
+    /// Vector indices granted (reserved, live, moving or revoking) in live domains (IOMMU7).
+    pub vectors: u64,
+    /// Vector indices whose fence was abandoned (IO8), with their files (a frame that holds one is counted in `tables_leaked` when its
+    /// first file leaks).
+    pub vectors_leaked: u64,
+    /// Stray bits taken from vectors' interrupt files at revoke and release (8.4: a data word other than the granted one).
+    pub strays: u64,
 }
 
 /// The domain store (the state the `IOMMU` lock protects).
@@ -590,6 +675,8 @@ pub struct IoDomains {
     /// (`destroy_released`): with the domains still detaching, what `unfinished` waits for (IOMMU-SPEC 6.3: done before the call
     /// that began it returns).
     releasing: u64,
+    /// Vector revokes begun whose fence nobody has completed or abandoned yet (`next_revoking`; part of `unfinished`).
+    revoking: u64,
     stats: IoStats,
     window_start: u64,
     window_lines: u32,
@@ -849,7 +936,12 @@ impl Detached {
     /// job the domain's kernel bytes and its tables', and drop the domain's use of its job, unless a fence of the domain was abandoned
     /// (the leaked charges stay, and so does the use that keeps the job record: J2). Call after every record was taken. Allocates
     /// nothing.
-    pub fn finish<M: PhysMem64, F: IoFrames>(mut self, mem: &M, frames: &mut F, jobs: &mut Jobs) {
+    pub fn finish<M: PhysMem64, F: IoFrames>(
+        mut self,
+        mem: &M,
+        frames: &mut F,
+        jobs: &mut Jobs,
+    ) -> u64 {
         debug_assert!(
             self.dom.pending.is_none() && self.dom.live.is_none(),
             "Detached::finish before every record was taken (their holds would be lost)"
@@ -863,6 +955,27 @@ impl Detached {
             frames.free_root(iopt.root());
         }
         frames.free(self.dom.msi.root());
+        // the vectors' files (the fence covered every entry, and the kernel ended the vectors' routes before the release: IO10): the
+        // stray bits counted, the frames freed; a frame that holds a leaked vector's file stays leaked (IO8)
+        let mut strays = 0u64;
+        for k in 0..IO_VECTOR_PAGES as u16 {
+            let st = self.dom.vectors.get(usize::from(k)).map(|v| v.state);
+            if matches!(st, Some(VState::Free | VState::Leaked) | None) {
+                continue;
+            }
+            if let Some(w) = file_of(&self.dom, k)
+                .and_then(|f| Mrif::new(f).ok())
+                .and_then(|f| f.stray(mem, VECTOR_DATA).ok())
+            {
+                strays = strays.saturating_add(w.iter().map(|x| u64::from(x.count_ones())).sum());
+            }
+            if let Some(v) = self.dom.vectors.get_mut(usize::from(k)) {
+                v.state = VState::Free;
+            }
+        }
+        for k in (0..IO_VECTOR_PAGES as u16).step_by(FILES_PER_FRAME as usize) {
+            free_file_frame(&mut self.dom, k, frames);
+        }
         let job = self.dom.job;
         jobs.credit(
             job,
@@ -872,7 +985,19 @@ impl Detached {
         if !self.dom.leaks {
             jobs.release(job);
         }
+        strays
     }
+}
+
+/// A domain's granted vectors (granting, live, moving or revoking) and, of them, the ones being revoked.
+fn vector_counts(dom: &Domain) -> (u64, u64) {
+    dom.vectors
+        .iter()
+        .fold((0u64, 0u64), |(g, r), v| match v.state {
+            VState::Free | VState::Leaked => (g, r),
+            VState::Revoking(_) => (g.saturating_add(1), r.saturating_add(1)),
+            _ => (g.saturating_add(1), r),
+        })
 }
 
 /// The commands that invalidate what an unmap (or a map's roll-back) of `rec` changed: page by page for a short range that emptied no
@@ -924,6 +1049,7 @@ impl IoDomains {
             leaked_domains: None,
             abandons: 0,
             releasing: 0,
+            revoking: 0,
             stats: IoStats::default(),
             window_start: 0,
             window_lines: 0,
@@ -943,6 +1069,11 @@ impl IoDomains {
         let i = usize::try_from((d.0 & 0xffff_ffff).checked_sub(1)?).ok()?;
         let s = self.slots.get(i)?;
         (s.dom.is_some() && u64::from(s.gen) == d.0 >> 32).then_some(i)
+    }
+
+    /// The physical address of domain `d`'s MSI page table (a test reads the entries the IOMMU walks, IOMMU7).
+    pub fn msi_root(&self, d: DomainId) -> Option<u64> {
+        Some(self.dom(d)?.msi.root())
     }
 
     fn dom(&self, d: DomainId) -> Option<&Domain> {
@@ -1191,6 +1322,17 @@ impl IoDomains {
             undo_frames(frames);
             return Err(IoError::NoMemory);
         };
+        let mut vectors = Vec::new();
+        if vectors.try_reserve_exact(IO_VECTOR_PAGES as usize).is_err() {
+            undo_frames(frames);
+            return Err(IoError::NoMemory);
+        }
+        vectors.resize(
+            IO_VECTOR_PAGES as usize,
+            VSlot {
+                state: VState::Free,
+            },
+        );
         let Some(gscid) = self.alloc_gscid() else {
             undo_frames(frames);
             return Err(IoError::NoMemory);
@@ -1224,6 +1366,8 @@ impl IoDomains {
             ring_len: 0,
             dropped: 0,
             destroy_ticket: NO_TICKET,
+            vectors,
+            files: [0; FILE_FRAMES],
             next: None,
         }) {
             Ok(d) => d,
@@ -1878,6 +2022,23 @@ impl IoDomains {
             self.ddt.clear(mem, &mut na, device);
         }
         debug_assert_eq!(chain.n, 0, "a quarantine write freed no directory page");
+        // 10.6 step 2: every vector's enable bit is cleared (nothing more is noticed); the whole-context invalidation drops its entries
+        if let Some(dom) = self.dom(d) {
+            for (k, v) in dom.vectors.iter().enumerate() {
+                if matches!(
+                    v.state,
+                    VState::Granting(_) | VState::Live | VState::Moving(_)
+                ) {
+                    if let Some(f) = u16::try_from(k)
+                        .ok()
+                        .and_then(|k| file_of(dom, k))
+                        .and_then(|f| Mrif::new(f).ok())
+                    {
+                        let _ = f.disable(mem, VECTOR_DATA);
+                    }
+                }
+            }
+        }
         let cmds = [
             Command::iodir_inval_ddt(Some(device)),
             Command::iotinval_gvma(gscid, None),
@@ -1923,6 +2084,9 @@ impl IoDomains {
         let held = dom.io_pages.saturating_sub(dom.leaked_pages);
         self.stats.io_pages = self.stats.io_pages.saturating_sub(held);
         dom.io_pages = held;
+        let (granted, revoking) = vector_counts(&dom);
+        self.stats.vectors = self.stats.vectors.saturating_sub(granted);
+        self.revoking = self.revoking.saturating_sub(revoking);
         dom.mappings = 0;
         let gscid = dom.gscid;
         self.free_gscid(gscid);
@@ -1933,6 +2097,15 @@ impl IoDomains {
             freed: 0,
             tables_done: false,
         }))
+    }
+
+    /// Would `destroy_complete(x)` take the domain now (its fence done, and the destruction still the domain's)? The kernel ends the
+    /// domain's vector routes first (IOMMU7, 10.6 step 4), in the same section.
+    pub fn destroy_done(&self, x: &Destroying) -> bool {
+        self.done(x.ticket)
+            && self.dom(x.domain).is_some_and(|dom| {
+                dom.state == State::Detaching && dom.destroy_ticket == x.ticket.0
+            })
     }
 
     /// Keep a list of leaked records for good (a list of lists, linked through the heads' `left`: constant work).
@@ -1964,11 +2137,31 @@ impl IoDomains {
         dom.leaks = true;
         let holds = dom.mappings.saturating_add(dom.pending_n);
         let pages = dom.io_pages.saturating_sub(dom.leaked_pages);
+        // (a frame that holds a leaked vector's file was counted when that vector leaked)
+        let files = dom
+            .files
+            .iter()
+            .enumerate()
+            .filter(|&(g, &f)| {
+                f != 0
+                    && !dom
+                        .vectors
+                        .iter()
+                        .skip(g.saturating_mul(FILES_PER_FRAME as usize))
+                        .take(FILES_PER_FRAME as usize)
+                        .any(|v| v.state == VState::Leaked)
+            })
+            .count() as u64;
         let tables = dom
             .tables
             .saturating_add(ROOT_FRAMES + 1)
-            .saturating_add(dom.pending_tables);
+            .saturating_add(dom.pending_tables)
+            .saturating_add(files);
+        let (granted, revoking) = vector_counts(&dom);
+        self.revoking = self.revoking.saturating_sub(revoking);
         let s = &mut self.stats;
+        s.vectors = s.vectors.saturating_sub(granted);
+        s.vectors_leaked = s.vectors_leaked.saturating_add(granted);
         s.io_pages = s.io_pages.saturating_sub(pages);
         s.fence_timeouts = s.fence_timeouts.saturating_add(1);
         s.holds_leaked = s.holds_leaked.saturating_add(holds);
@@ -1977,6 +2170,328 @@ impl IoDomains {
         dom.next = self.leaked_domains.take();
         self.leaked_domains = Some(dom);
         true
+    }
+
+    // ---- vectors (IOMMU7) -----------------------------------------------------------------------------------------------
+
+    /// The device's address of vector `index`: page `index` of the interrupt window (8.2), what MSI-X entry `index` is given.
+    pub const fn vector_address(index: u16) -> u64 {
+        IO_BASE.wrapping_add((index as u64).wrapping_mul(PAGE_SIZE))
+    }
+
+    /// The state of vector `index` of domain `d` (`None`: no such domain or index).
+    pub fn vector_state(&self, d: DomainId, index: u16) -> Option<VectorState> {
+        let v = self.dom(d)?.vectors.get(usize::from(index))?;
+        Some(match v.state {
+            VState::Free => VectorState::Free,
+            VState::Granting(_) => VectorState::Granting,
+            VState::Live => VectorState::Live,
+            VState::Moving(_) => VectorState::Moving,
+            VState::Revoking(_) => VectorState::Revoking,
+            VState::Leaked => VectorState::Leaked,
+        })
+    }
+
+    /// The interrupt file of vector `index` (its physical address), while the index is granted (not free) in a live domain.
+    pub fn vector_file(&self, d: DomainId, index: u16) -> Option<u64> {
+        let dom = self.dom(d)?;
+        if matches!(dom.vectors.get(usize::from(index))?.state, VState::Free) {
+            return None;
+        }
+        file_of(dom, index)
+    }
+
+    /// The commands that invalidate vector `index`'s cached MSI entry (A6: the address form of `IOTINVAL.GVMA` on the vector's page).
+    fn vector_cmds(gscid: u16, index: u16) -> [Command; 1] {
+        [Command::iotinval_gvma(
+            gscid,
+            Some(Self::vector_address(index)),
+        )]
+    }
+
+    /// The entry of a granted vector: MRIF mode, naming its file and the notice target (IO11). The negative control
+    /// `fault-iommu-msi-basic` writes basic-translate mode to the target's file instead (the device's data word then reaches the hart
+    /// unchanged: `msi_forgery_faults` must see it).
+    fn vector_pte(file: u64, notice_page: u64, notice_id: u16) -> Option<MsiPte> {
+        #[cfg(feature = "fault-iommu-msi-basic")]
+        {
+            let _ = (file, notice_id);
+            Some(MsiPte::basic(notice_page))
+        }
+        #[cfg(not(feature = "fault-iommu-msi-basic"))]
+        MsiPte::mrif(file, notice_page, notice_id).ok()
+    }
+
+    /// 8.3, under `IOMMU` (the caller holds `OBJ` and took the vector's identity and charge): grant vector `index` of attached domain
+    /// `d`: its interrupt file (a frame of eight files is taken with `frames` if this is its first), reset with every enable bit clear,
+    /// the MRIF entry naming the file and the notice target (`notice_page`, the target hart's interrupt-file page, and `notice_id`),
+    /// the entry's invalidation and a fence queued. Returns the fence's ticket and the file's address; the vector is `Granting` until
+    /// `vector_fenced`. `InvalidArgs`: `index` is 256 or more. `BadState`: the domain is gone or being destroyed, or the index is not
+    /// free. `NoMemory`: no frame for the file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vector_grant<M: PhysMem64, R: Regs, F: TableFrames>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        frames: &mut F,
+        d: DomainId,
+        index: u16,
+        notice_page: u64,
+        notice_id: u16,
+    ) -> Result<(Ticket, u64), IoError> {
+        if u64::from(index) >= IO_VECTOR_PAGES {
+            return Err(IoError::InvalidArgs);
+        }
+        let dom = self
+            .dom_mut(d)
+            .filter(|x| x.state == State::Attached)
+            .ok_or(IoError::BadState)?;
+        if dom.vectors.get(usize::from(index)).map(|v| v.state) != Some(VState::Free) {
+            return Err(IoError::BadState);
+        }
+        let group = usize::from(index)
+            .checked_div(FILES_PER_FRAME as usize)
+            .unwrap_or(usize::MAX);
+        let frame = dom.files.get(group).copied().ok_or(IoError::InvalidArgs)?;
+        if frame == 0 {
+            let pa = frames.alloc().ok_or(IoError::NoMemory)?;
+            if let Some(f) = dom.files.get_mut(group) {
+                *f = pa;
+            }
+        }
+        let file = file_of(dom, index).ok_or(IoError::NoMemory)?;
+        let mrif = Mrif::new(file).map_err(|_| IoError::NoMemory)?;
+        mrif.reset(mem);
+        let pte = Self::vector_pte(file, notice_page, notice_id).ok_or(IoError::InvalidArgs)?;
+        if dom.msi.set(mem, u64::from(index), pte).is_err() {
+            return Err(IoError::InvalidArgs);
+        }
+        let gscid = dom.gscid;
+        let ticket = self.submit(mem, regs, &Self::vector_cmds(gscid, index));
+        if let Some(v) = self
+            .dom_mut(d)
+            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
+        {
+            v.state = VState::Granting(ticket.0);
+        }
+        self.stats.vectors = self.stats.vectors.saturating_add(1);
+        Ok((ticket, file))
+    }
+
+    /// 8.5, a move, under `IOMMU`: rewrite live vector `index`'s notice target (page and identity) with one store (A16), queue the
+    /// entry's invalidation and a fence. The vector is `Moving` until `vector_fenced`. `BadState`: the domain is gone or being
+    /// destroyed, or the vector is not live (a grant or another move not yet fenced, a revoke).
+    pub fn vector_retarget<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        d: DomainId,
+        index: u16,
+        notice_page: u64,
+        notice_id: u16,
+    ) -> Result<Ticket, IoError> {
+        let dom = self
+            .dom_mut(d)
+            .filter(|x| x.state == State::Attached)
+            .ok_or(IoError::BadState)?;
+        if dom.vectors.get(usize::from(index)).map(|v| v.state) != Some(VState::Live) {
+            return Err(IoError::BadState);
+        }
+        let file = file_of(dom, index).ok_or(IoError::BadState)?;
+        let pte = Self::vector_pte(file, notice_page, notice_id).ok_or(IoError::InvalidArgs)?;
+        // (`MsiTable::set` writes only the notice doubleword when the mode and the file stay: one store, A16)
+        if dom.msi.set(mem, u64::from(index), pte).is_err() {
+            return Err(IoError::InvalidArgs);
+        }
+        let gscid = dom.gscid;
+        let ticket = self.submit(mem, regs, &Self::vector_cmds(gscid, index));
+        if let Some(v) = self
+            .dom_mut(d)
+            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
+        {
+            v.state = VState::Moving(ticket.0);
+        }
+        Ok(ticket)
+    }
+
+    /// The fence a vector waits for (a grant's, a move's or a revoke's: its own ticket, which a waiter polls), `None` when it waits
+    /// for none (live, free, leaked, or its domain is being destroyed or gone: the destruction's fence covers it).
+    pub fn vector_ticket(&self, d: DomainId, index: u16) -> Option<Ticket> {
+        let dom = self.dom(d).filter(|x| x.state == State::Attached)?;
+        match dom.vectors.get(usize::from(index))?.state {
+            VState::Granting(x) | VState::Moving(x) | VState::Revoking(x) => Some(Ticket(x)),
+            _ => None,
+        }
+    }
+
+    /// The fence of a grant or a move (the vector's own ticket) has completed: the vector is `Live`. `Ok(false)`: the write did not
+    /// take effect as a grant or a move (a revoke followed it, or the domain's destruction has begun: theirs end the vector). `NotDone`
+    /// before the fence.
+    pub fn vector_fenced(&mut self, d: DomainId, index: u16) -> Result<bool, IoError> {
+        let done = self.vector_ticket(d, index).map(|t| self.done(t));
+        let Some(v) = self
+            .dom_mut(d)
+            .filter(|x| x.state == State::Attached)
+            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
+        else {
+            return Ok(false);
+        };
+        match (v.state, done) {
+            (VState::Granting(_) | VState::Moving(_), Some(true)) => {
+                v.state = VState::Live;
+                Ok(true)
+            }
+            (VState::Granting(_) | VState::Moving(_), _) => Err(IoError::NotDone),
+            _ => Ok(false),
+        }
+    }
+
+    /// 8.5, revoke, steps 1 to 3 under `IOMMU`: clear the enable bit of the vector's file (nothing more is noticed), make its entry
+    /// invalid, queue the invalidation and a fence. `None` (nothing done): the domain is gone or being destroyed (its destruction
+    /// revokes every vector: 6.3, 10.6), or the index is free or leaked. A vector being granted or moved is revoked all the same: this
+    /// fence comes after theirs. Allocates nothing.
+    pub fn vector_revoke<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        d: DomainId,
+        index: u16,
+    ) -> Option<Ticket> {
+        let dom = self.dom_mut(d).filter(|x| x.state == State::Attached)?;
+        let v = dom.vectors.get(usize::from(index))?;
+        if matches!(v.state, VState::Free | VState::Leaked | VState::Revoking(_)) {
+            return None;
+        }
+        if let Some(f) = file_of(dom, index).and_then(|f| Mrif::new(f).ok()) {
+            let _ = f.disable(mem, VECTOR_DATA);
+        }
+        let _ = dom.msi.clear(mem, u64::from(index));
+        let gscid = dom.gscid;
+        let ticket = self.submit(mem, regs, &Self::vector_cmds(gscid, index));
+        if let Some(v) = self
+            .dom_mut(d)
+            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
+        {
+            v.state = VState::Revoking(ticket.0);
+        }
+        self.revoking = self.revoking.saturating_add(1);
+        Some(ticket)
+    }
+
+    /// Queue a vector's commands again (a grant's, a move's or a revoke's whose queue had no room). `t` is the waiter's ticket: when
+    /// another waiter queued them meanwhile, `t` takes the vector's current ticket. `Done` if the vector waits for no fence any more.
+    pub fn requeue_vector<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        d: DomainId,
+        index: u16,
+        t: &mut Ticket,
+    ) -> Fence {
+        let Some(cur) = self.vector_ticket(d, index) else {
+            return Fence::Done;
+        };
+        if cur.0 != NO_TICKET {
+            *t = cur;
+            return Fence::Waiting;
+        }
+        let Some(gscid) = self.dom(d).map(|dom| dom.gscid) else {
+            return Fence::Done;
+        };
+        let Some(n) = self.requeue(mem, regs, &Self::vector_cmds(gscid, index)) else {
+            return Fence::Unqueued;
+        };
+        if let Some(v) = self
+            .dom_mut(d)
+            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
+        {
+            v.state = match v.state {
+                VState::Granting(_) => VState::Granting(n.0),
+                VState::Moving(_) => VState::Moving(n.0),
+                VState::Revoking(_) => VState::Revoking(n.0),
+                other => other,
+            };
+        }
+        *t = n;
+        Fence::Waiting
+    }
+
+    /// 8.5, revoke, the end, once the vector's fence has completed: the stray bits left in the file are taken and counted (8.4), and
+    /// the file is freed (its frame too, when it was the last of its eight). The index is free for a new grant. Returns the strays
+    /// taken. `Ok(None)`: the domain is gone (its destruction's fence covered the entry and its release freed the file), or the vector
+    /// is not being revoked. `NotDone`: the fence has not completed, or the domain's destruction has begun and its fence has not (the
+    /// destruction ends the vector). Allocates nothing.
+    pub fn vector_revoked<M: PhysMem64, F: TableFrames>(
+        &mut self,
+        mem: &M,
+        frames: &mut F,
+        d: DomainId,
+        index: u16,
+    ) -> Result<Option<u64>, IoError> {
+        let Some(dom) = self.dom(d) else {
+            return Ok(None);
+        };
+        if dom.state != State::Attached {
+            return Err(IoError::NotDone);
+        }
+        let Some(VState::Revoking(x)) = dom.vectors.get(usize::from(index)).map(|v| v.state) else {
+            return Ok(None);
+        };
+        if !self.done(Ticket(x)) {
+            return Err(IoError::NotDone);
+        }
+        let Some(dom) = self.dom_mut(d) else {
+            return Ok(None);
+        };
+        let strays = file_of(dom, index)
+            .and_then(|f| Mrif::new(f).ok())
+            .and_then(|f| f.stray(mem, VECTOR_DATA).ok())
+            .map_or(0, |w| w.iter().map(|x| u64::from(x.count_ones())).sum());
+        if let Some(v) = dom.vectors.get_mut(usize::from(index)) {
+            v.state = VState::Free;
+        }
+        free_file_frame(dom, index, frames);
+        self.revoking = self.revoking.saturating_sub(1);
+        self.stats.vectors = self.stats.vectors.saturating_sub(1);
+        self.stats.strays = self.stats.strays.saturating_add(strays);
+        Ok(Some(strays))
+    }
+
+    /// A grant's, a move's or a revoke's fence will not complete (6.4): the vector is leaked (IO8): its index, its file and its
+    /// identities are never reused, and its charge stays. False if there was nothing to abandon (no fence outstanding, or the
+    /// domain's destruction has begun: its own fence decides).
+    pub fn vector_abandon(&mut self, d: DomainId, index: u16) -> bool {
+        let Some(dom) = self.dom_mut(d).filter(|x| x.state == State::Attached) else {
+            return false;
+        };
+        // (the frame that holds this vector's file is never freed from now on: counted in `tables_leaked` with its first leaked file)
+        let frame_leaks = !file_group(dom, index).any(|v| v.state == VState::Leaked);
+        let Some(v) = dom.vectors.get_mut(usize::from(index)) else {
+            return false;
+        };
+        let revoking = match v.state {
+            VState::Granting(_) | VState::Moving(_) => false,
+            VState::Revoking(_) => true,
+            _ => return false,
+        };
+        v.state = VState::Leaked;
+        dom.leaks = true;
+        if revoking {
+            self.revoking = self.revoking.saturating_sub(1);
+        }
+        let s = &mut self.stats;
+        s.vectors = s.vectors.saturating_sub(1);
+        s.vectors_leaked = s.vectors_leaked.saturating_add(1);
+        s.fence_timeouts = s.fence_timeouts.saturating_add(1);
+        if frame_leaks {
+            s.tables_leaked = s.tables_leaked.saturating_add(1);
+        }
+        true
+    }
+
+    /// Stray bits a release found in interrupt files (`Detached::finish`), added to the count (`IoStats::strays`).
+    pub fn count_strays(&mut self, n: u64) {
+        self.stats.strays = self.stats.strays.saturating_add(n);
     }
 
     // ---- faults ---------------------------------------------------------------------------------------------------------
@@ -2041,7 +2556,7 @@ impl IoDomains {
     /// thread), or a release under way with no lock held? A caller that began one waits until this is false before it returns
     /// (IOMMU-SPEC 6.3, 4.5). Work in the number of slots.
     pub fn unfinished(&self) -> bool {
-        self.releasing > 0 || self.next_detaching().is_some()
+        self.releasing > 0 || self.revoking > 0 || self.next_detaching().is_some()
     }
 
     /// Name the domain for its faults (`FaultOutcome::tag`): the kernel stores its object's id. False if the domain is gone.
@@ -2104,6 +2619,25 @@ pub fn charge_create(jobs: &mut Jobs, job: JobId) -> Result<(), JobError> {
 
 pub fn uncharge_create(jobs: &mut Jobs, job: JobId) {
     jobs.credit(job, Resource::KernelBytes, DOMAIN_BYTES);
+    jobs.release(job);
+}
+
+/// Charge a granted vector to its domain's job (IOMMU-SPEC 5.3): one of the job's interrupt vectors (hierarchical, J1) and its
+/// interrupt file's kernel bytes, and a use of the job that keeps its record until the vector's identities are freed. All or nothing.
+pub fn charge_vector(jobs: &mut Jobs, job: JobId) -> Result<(), JobError> {
+    jobs.charge_io(job, IoResource::Vectors, 1)?;
+    if let Err(e) = jobs.charge(job, Resource::KernelBytes, VECTOR_FILE_BYTES) {
+        jobs.credit_io(job, IoResource::Vectors, 1);
+        return Err(e);
+    }
+    jobs.retain(job);
+    Ok(())
+}
+
+/// Give back what `charge_vector` took: when the vector's last identity is freed (8.5), or when the grant fails before any entry named it.
+pub fn credit_vector(jobs: &mut Jobs, job: JobId) {
+    jobs.credit_io(job, IoResource::Vectors, 1);
+    jobs.credit(job, Resource::KernelBytes, VECTOR_FILE_BYTES);
     jobs.release(job);
 }
 

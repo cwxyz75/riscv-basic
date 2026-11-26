@@ -439,6 +439,11 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
         (self.tlb.len(), self.ctx_cache.len(), self.msi_cache.len())
     }
 
+    /// The MSI page-table entries the IOMMU holds cached (IOMMU7: a test checks that no identity is free while one names it).
+    pub fn msi_cached_entries(&self) -> impl Iterator<Item = [u64; 2]> + '_ {
+        self.msi_cache.values().copied()
+    }
+
     /// Non-leaf entries in the page-walk cache.
     pub fn walk_cached(&self) -> usize {
         self.pwc.borrow().len()

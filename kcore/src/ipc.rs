@@ -118,13 +118,24 @@ pub struct SocketEnd {
     shut: bool,
 }
 
-/// An interrupt object: one PLIC source. When it fires the kernel masks the source and sets
-/// `fired` (the INTERRUPT signal); `interrupt_ack` clears it and unmasks.
+/// An interrupt object (IOMMU-SPEC 8.3): of the kind *wired source* (`irq`, an APLIC source: when it fires the kernel masks the source
+/// and sets `fired`, the INTERRUPT signal; `interrupt_ack` clears it and unmasks), or of the kind *vector* of a device domain (`vector`,
+/// `irq` 0: masked by its interrupt file's enable bit, `kcore::iovec`).
 pub struct IrqObj {
     pub irq: u32,
     pub fired: bool,
     /// How many times the kernel claimed this source (a storm would show here).
     pub claims: u64,
+    /// A vector's route in the kernel's vector table (`kcore::iovec`): its slot and the slot's generation (a stale one names a dead
+    /// vector: it never fires and its acknowledgement is BAD_STATE).
+    pub vector: Option<VectorRef>,
+}
+
+/// A vector object's name for its route: the slot of the kernel's vector table and its generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorRef {
+    pub n: u32,
+    pub gen: u32,
 }
 
 /// A device domain (IOMMU-SPEC 4): the domain's id in the kernel's store (`kcore::iodomain::DomainId::raw`), the job that pays for it
@@ -1517,6 +1528,7 @@ pub fn interrupt_object_create_in(
             irq,
             fired: false,
             claims: 0,
+            vector: None,
         }),
         q.job,
     );
@@ -1524,6 +1536,55 @@ pub fn interrupt_object_create_in(
         .insert(reg, obj, Rights::INTERRUPT)
         .expect("room was checked");
     Ok((h, obj))
+}
+
+/// A new interrupt object of the kind vector (IOMMU-SPEC 8.3), for the vector route `v`, with a handle carrying `Rights::INTERRUPT`
+/// (wait and acknowledge: it names nothing else). The object and the handle are charged to `q`'s job (the caller's).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn vector_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    v: VectorRef,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(
+        KObj::Interrupt(IrqObj {
+            irq: 0,
+            fired: false,
+            claims: 0,
+            vector: Some(v),
+        }),
+        q.job,
+    );
+    let h = table
+        .insert(reg, obj, Rights::INTERRUPT)
+        .expect("room was checked");
+    Ok((h, obj))
+}
+
+/// An interrupt object handle that carries `need`: the object and its vector route (`None` for a wired source).
+pub fn interrupt_kind_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(ObjId, Option<VectorRef>), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Interrupt(i)) => {
+            if entry.rights.contains(need) {
+                Ok((entry.obj, i.vector))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
 }
 
 /// The source of an interrupt object handle that carries `need`.
@@ -1552,7 +1613,7 @@ pub fn interrupt_of(
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 claim counter
 pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
     match reg.get_mut(obj) {
-        Some(KObj::Interrupt(i)) if i.irq == irq => {
+        Some(KObj::Interrupt(i)) if i.irq == irq && i.vector.is_none() => {
             i.claims += 1;
             let first = !i.fired;
             i.fired = true;
@@ -1566,7 +1627,7 @@ pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
 /// of claims so far.
 pub fn interrupt_ack(reg: &mut Kobjs, obj: ObjId) -> Result<(u32, u64), Status> {
     match reg.get_mut(obj) {
-        Some(KObj::Interrupt(i)) if i.fired => {
+        Some(KObj::Interrupt(i)) if i.fired && i.vector.is_none() => {
             i.fired = false;
             Ok((i.irq, i.claims))
         }

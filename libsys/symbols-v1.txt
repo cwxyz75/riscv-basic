@@ -99,3 +99,5 @@ sys_iodomain_destroy
 sys_iodomain_fault_read
 sys_job_set_io_limits
 sys_vmo_create_dma_in
+sys_iodomain_grant_vector
+sys_interrupt_deliver_here

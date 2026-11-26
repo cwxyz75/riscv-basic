@@ -41,6 +41,7 @@ pub mod handle;
 pub mod harts;
 pub mod iodomain;
 pub mod iommutree;
+pub mod iovec;
 pub mod ipc;
 pub mod isa;
 pub mod job;

@@ -15088,6 +15088,11 @@ fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
                     Some(S::BadState),
                     "map: a destroyed domain"
                 );
+                ensure_eq!(
+                    st(sys::iodomain_unmap(drv, 0, 1)),
+                    Some(S::BadState),
+                    "unmap: a destroyed domain (OD171: before INVALID_ARGS)"
+                );
                 for h in [buf, no_map, drv, no_unmap] {
                     sys::handle_close(h);
                 }
@@ -15125,6 +15130,552 @@ fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
         }
         r.and(r2)
     })
+}
+
+// ---- interrupt vectors (IOMMU7; IOMMU-SPEC 8.2 to 8.5) -------------------------------------------------------------------------
+//
+// The same virtio-rng function and domain; its configuration-change message (`virtio_message`) is the device's MSI-X write. The test
+// is the supervisor: it grants a vector and programs MSI-X entry 0 with the pair the kernel returned (or with a forged one). A granted
+// vector's message sets the pending bit in its own interrupt file and, if the file is enabled, the IOMMU sends the kernel's notice.
+
+/// Fault causes of the MSI translation (the IOMMU specification; `iommucore::faultq`): entry not valid, entry misconfigured.
+const CAUSE_MSI_INVALID: u64 = 262;
+const CAUSE_MSI_MISCONFIGURED: u64 = 263;
+
+/// Where vector handle `h` sends its notices (`debug_stat` 148): (interrupt file << 16) | identity, all ones for none.
+fn vector_route(h: u64) -> u64 {
+    let r = rt::syscall(
+        rt::abi::syscall::DEBUG_STAT,
+        [rt::debug::handle() as usize, 148, h as usize, 0, 0, 0],
+    );
+    if r.status == 0 {
+        r.a1 as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// The device's MSI-X entry 0 says `(address, data)`, then the device sends it (the function reset and brought up again first, so
+/// each message is a fresh configuration change).
+fn msi_send(f: &PciFn, d: &Domain, address: u64, data: u32) -> Outcome {
+    virtio_up(
+        f,
+        (d.rings_io, d.rings_io + 0x100, d.rings_io + 0x200),
+        (address, data),
+    )?;
+    virtio_message(f);
+    Ok(())
+}
+
+/// Let the device finish: no new IOMMU fault and no new notice for 50 ms.
+fn msi_settle() {
+    let mut last = (iommu_faults(), sys::debug_stat(162));
+    let mut still = sys::clock_get();
+    let t0 = still;
+    while sys::clock_get() < still + 50 && sys::clock_get() < t0 + 2000 {
+        let now = (iommu_faults(), sys::debug_stat(162));
+        if now != last {
+            last = now;
+            still = sys::clock_get();
+        }
+        sys::thread_yield();
+    }
+}
+
+/// The leak oracle of a vector test: once the handles are closed, no vector is live and every interrupt identity is free again (the
+/// retirements are the harts' work: waited for, briefly).
+fn vectors_at_baseline(live: u64, ids: u64) -> Outcome {
+    let t0 = sys::clock_get();
+    while (sys::debug_stat(146), sys::debug_stat(141)) != (live, ids)
+        && sys::clock_get() < t0 + 1000
+    {
+        sys::thread_yield();
+    }
+    ensure_eq!(
+        sys::debug_stat(146),
+        live,
+        "live vectors (debug_stat 146) back at the baseline"
+    );
+    ensure_eq!(
+        sys::debug_stat(141),
+        ids,
+        "free interrupt identities (debug_stat 141) back at the baseline"
+    );
+    ensure_eq!(
+        sys::debug_stat(140),
+        0,
+        "no message on an identity with no route"
+    );
+    Ok(())
+}
+
+/// `with_domain` with vector 0 granted: `body` gets the function, the domain, the interrupt handle and the MSI-X address. Afterwards
+/// the leak oracle.
+fn with_vector(body: impl FnOnce(&PciFn, &Domain, u64, u64) -> Outcome) -> Outcome {
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let r = with_domain(|_, f, d, _| {
+        let g = ok(sys::iodomain_grant_vector(d.sup, 0), "grant vector 0")?;
+        let (irq, address) = (g.a1 as u64, g.a2 as u64);
+        let r = (|| {
+            ensure_eq!(
+                sys::debug_stat(146),
+                live + 1,
+                "one live vector (debug_stat 146)"
+            );
+            ensure_eq!(
+                address & 0xfff,
+                0,
+                "the MSI-X address is a page of the window"
+            );
+            body(f, d, irq, address)
+        })();
+        sys::handle_close(irq);
+        r
+    });
+    r.and(vectors_at_baseline(live, ids))
+}
+
+/// IOMMU-SPEC 8.3 and 8.5 (D5, IO11): the granted vector's message fires its object; while fired, the device's next message only sets
+/// the file's pending bit (no notice) and the acknowledgement finds it and fires again at once; armed again, nothing more. The vector
+/// can be placed on the calling hart (`interrupt_deliver_here`), moves off a hart that goes offline, and is still delivered. No IOMMU
+/// fault.
+fn msi_granted_vector_is_delivered() -> Outcome {
+    with_vector(|f, d, irq, address| {
+        let faults = iommu_faults();
+        let notices = sys::debug_stat(162);
+        ensure_eq!(
+            st(sys::iodomain_grant_vector(d.drv, 1)),
+            Some(S::AccessDenied),
+            "a driver's handle cannot grant"
+        );
+        ensure_eq!(
+            st(sys::iodomain_grant_vector(d.sup, 0)),
+            Some(S::BadState),
+            "vector 0 is granted and live"
+        );
+        msi_send(f, d, address, 1)?;
+        ensure_eq!(
+            st(sys::object_wait(
+                irq,
+                sig::INTERRUPT,
+                sys::clock_get() + 2000
+            )),
+            Some(S::Ok),
+            "the granted vector fires (notices {} to {})",
+            notices,
+            sys::debug_stat(162)
+        );
+        let route = vector_route(irq);
+        ensure!(route != u64::MAX, "the vector has a route (debug_stat 148)");
+        // masked: the message while fired sends nothing, and the acknowledgement fires it again from the pending bit
+        msi_send(f, d, address, 1)?;
+        msi_settle();
+        ensure_eq!(
+            sys::debug_stat(162),
+            notices + 1,
+            "masked: one notice only (D5)"
+        );
+        ok(sys::interrupt_ack(irq), "acknowledge")?;
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 1)),
+            Some(S::Ok),
+            "the message that came while masked fires again at the acknowledgement"
+        );
+        ok(sys::interrupt_ack(irq), "acknowledge again")?;
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 50)),
+            Some(S::TimedOut),
+            "armed, and nothing pending"
+        );
+        ensure_eq!(
+            st(sys::interrupt_ack(irq)),
+            Some(S::BadState),
+            "an acknowledgement before it fired again"
+        );
+        // the explicit placement, then the hart it is on goes offline (unless it is hart 0, which never does): it moves, and still fires
+        ok(sys::interrupt_deliver_here(irq), "interrupt_deliver_here")?;
+        let here = vector_route(irq);
+        ensure!(here != u64::MAX, "placed (debug_stat 148)");
+        if here >> 16 != 0 {
+            vector_moves_off_an_offline_hart(f, d, irq, address, here)?;
+        }
+        msi_send(f, d, address, 1)?;
+        ensure_eq!(
+            st(sys::object_wait(
+                irq,
+                sig::INTERRUPT,
+                sys::clock_get() + 2000
+            )),
+            Some(S::Ok),
+            "delivered where it was placed"
+        );
+        ok(sys::interrupt_ack(irq), "the last acknowledgement")?;
+        msi_settle();
+        ensure_eq!(iommu_faults(), faults, "no IOMMU fault");
+        Ok(())
+    })
+}
+
+/// The argument and rights errors of `iodomain_grant_vector` and `interrupt_deliver_here` (SYSCALLS.md), on a live domain and vector;
+/// a refused call changes nothing.
+fn vector_calls_check_handles_rights_and_arguments() -> Outcome {
+    with_vector(|_, d, irq, _| {
+        let ev = ok(sys::event_create(), "event")?.a1 as u64;
+        let waiter = ok(
+            sys::handle_duplicate(irq, Rights::WAIT.0),
+            "a WAIT-only duplicate",
+        )?
+        .a1 as u64;
+        let r = (|| {
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(BAD, 1)),
+                Some(S::BadHandle),
+                "grant: no domain"
+            );
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(ev, 1)),
+                Some(S::WrongType),
+                "grant: an event"
+            );
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(irq, 1)),
+                Some(S::WrongType),
+                "grant: an interrupt"
+            );
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(d.sup, 256)),
+                Some(S::InvalidArgs),
+                "grant: index 256"
+            );
+            ensure_eq!(
+                st(sys::interrupt_deliver_here(BAD)),
+                Some(S::BadHandle),
+                "deliver_here: no interrupt"
+            );
+            ensure_eq!(
+                st(sys::interrupt_deliver_here(ev)),
+                Some(S::WrongType),
+                "deliver_here: an event"
+            );
+            ensure_eq!(
+                st(sys::interrupt_deliver_here(d.sup)),
+                Some(S::WrongType),
+                "deliver_here: a domain"
+            );
+            ensure_eq!(
+                st(sys::interrupt_deliver_here(waiter)),
+                Some(S::AccessDenied),
+                "deliver_here: no MANAGE"
+            );
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(d.drv, 1)),
+                Some(S::AccessDenied),
+                "grant: the driver's duplicate"
+            );
+            ensure_eq!(
+                vector_route(waiter),
+                vector_route(irq),
+                "a refused call changed nothing"
+            );
+            Ok(())
+        })();
+        sys::handle_close(waiter);
+        sys::handle_close(ev);
+        r
+    })
+}
+
+/// The hart vector `irq` is placed on (`here`, from debug_stat 148) goes offline: the vector moves to another hart and is still
+/// delivered; the hart comes back.
+fn vector_moves_off_an_offline_hart(
+    f: &PciFn,
+    d: &Domain,
+    irq: u64,
+    address: u64,
+    here: u64,
+) -> Outcome {
+    let hart = here >> 16;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let off = sys::hart_set_online(res, hart, 0);
+    let r = (|| {
+        ensure_eq!(st(off), Some(S::Ok), "hart {hart} offline");
+        let moved = vector_route(irq);
+        ensure!(
+            moved != u64::MAX && moved >> 16 != hart,
+            "the vector moved off hart {hart} ({here:#x} to {moved:#x})"
+        );
+        msi_send(f, d, address, 1)?;
+        ensure_eq!(
+            st(sys::object_wait(
+                irq,
+                sig::INTERRUPT,
+                sys::clock_get() + 2000
+            )),
+            Some(S::Ok),
+            "delivered after the move"
+        );
+        ok(sys::interrupt_ack(irq), "acknowledge after the move")?;
+        Ok(())
+    })();
+    let back = sys::hart_set_online(res, hart, 1);
+    sys::handle_close(res);
+    r?;
+    ensure_eq!(st(back), Some(S::Ok), "hart {hart} online again");
+    Ok(())
+}
+
+/// IOMMU-SPEC 8.4, first row: a message to a page of the window whose vector is not granted is an IOMMU fault (MSI entry not valid)
+/// naming the device; nothing is delivered and the granted vector does not fire.
+fn msi_ungranted_vector_faults() -> Outcome {
+    with_vector(|f, d, irq, address| {
+        let notices = sys::debug_stat(162);
+        let before = iommu_faults();
+        msi_send(f, d, address + 5 * 4096, 1)?;
+        ensure!(
+            iommu_wait_faults(before).is_some(),
+            "the message to vector 5 raised no fault"
+        );
+        let (did, _, cause, ttype) = iommu_last_fault();
+        ensure_eq!(did, IOMMU_TEST_DID, "the fault names the function");
+        ensure_eq!(cause, CAUSE_MSI_INVALID, "the MSI entry is not valid");
+        ensure_eq!(ttype, TTYPE_WRITE, "a message is a write");
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 50)),
+            Some(S::TimedOut),
+            "vector 0 did not fire"
+        );
+        ensure_eq!(sys::debug_stat(162), notices, "no notice");
+        // the record reaches the supervisor
+        ensure_eq!(
+            st(sys::object_wait(
+                d.sup,
+                sig::DEVICE_FAULT,
+                sys::clock_get() + 2000
+            )),
+            Some(S::Ok),
+            "DEVICE_FAULT rises"
+        );
+        let recs = drain_domain_faults(d.sup);
+        ensure!(
+            recs.iter()
+                .any(|&(c, _, dir, _)| c == CAUSE_MSI_INVALID && dir == DIR_WRITE),
+            "the supervisor reads the record: {recs:x?}"
+        );
+        Ok(())
+    })
+}
+
+/// IOMMU-SPEC 8.4 and IO11: what a device can forge. A data word other than 1 on the granted page sets a bit in the vector's own file,
+/// which sends nothing and is found and counted (debug_stat 147) at the acknowledgement; a data word no file holds is an IOMMU fault
+/// (misconfigured); a message aimed at a real interrupt file is a translation fault. Nothing reaches a hart: no notice, no message on
+/// an identity with no route, the object fires only for data 1. The negative control `fault-iommu-msi-basic` (basic-translate
+/// entries, the device's data word passed to the hart) must fail here.
+fn msi_forgery_faults() -> Outcome {
+    with_vector(|f, d, irq, address| {
+        let (notices, no_route, strays) = (
+            sys::debug_stat(162),
+            sys::debug_stat(140),
+            sys::debug_stat(147),
+        );
+        // a stray data word
+        let before = iommu_faults();
+        msi_send(f, d, address, 5)?;
+        msi_settle();
+        ensure_eq!(iommu_faults(), before, "a word the file holds is no fault");
+        ensure_eq!(sys::debug_stat(162), notices, "data 5 sends no notice");
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20)),
+            Some(S::TimedOut),
+            "data 5 does not fire the vector"
+        );
+        // a word no file holds
+        msi_send(f, d, address, 4096)?;
+        ensure!(
+            iommu_wait_faults(before).is_some(),
+            "data 4096 raised no fault"
+        );
+        let (did, _, cause, _) = iommu_last_fault();
+        ensure_eq!(did, IOMMU_TEST_DID, "the fault names the function");
+        ensure_eq!(
+            cause,
+            CAUSE_MSI_MISCONFIGURED,
+            "data 4096: the entry is misconfigured for it"
+        );
+        // a misaligned address on the granted page (8.4: cause 263; QEMU, observed: no fault and nothing delivered, records note
+        // 2026-11-25 section 13): nothing reaches a hart either way, and a fault, if one is recorded, is the misconfiguration
+        let before = iommu_faults();
+        msi_send(f, d, address + 2, 1)?;
+        msi_settle();
+        if iommu_faults() != before {
+            let (did, _, cause, _) = iommu_last_fault();
+            ensure_eq!(
+                (did, cause),
+                (IOMMU_TEST_DID, CAUSE_MSI_MISCONFIGURED),
+                "a misaligned message's fault"
+            );
+        }
+        ensure_eq!(
+            sys::debug_stat(162),
+            notices,
+            "a misaligned message sends no notice"
+        );
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20)),
+            Some(S::TimedOut),
+            "a misaligned message does not fire the vector"
+        );
+        // a real interrupt file, from the device
+        let before = iommu_faults();
+        msi_send(f, d, IMSIC_S, 1)?;
+        ensure!(
+            iommu_wait_faults(before).is_some(),
+            "a message to the interrupt file raised no fault"
+        );
+        let (did, iova, _, ttype) = iommu_last_fault();
+        ensure_eq!(
+            (did, iova, ttype),
+            (IOMMU_TEST_DID, IMSIC_S, TTYPE_WRITE),
+            "the translation fault"
+        );
+        msi_settle();
+        ensure_eq!(sys::debug_stat(162), notices, "no notice from a forgery");
+        ensure_eq!(
+            sys::debug_stat(140),
+            no_route,
+            "no message on an identity with no route"
+        );
+        // data 1 fires; its acknowledgement finds the stray bit of data 5 and counts it
+        msi_send(f, d, address, 1)?;
+        ensure_eq!(
+            st(sys::object_wait(
+                irq,
+                sig::INTERRUPT,
+                sys::clock_get() + 2000
+            )),
+            Some(S::Ok),
+            "data 1 fires the vector"
+        );
+        ok(sys::interrupt_ack(irq), "acknowledge")?;
+        ensure_eq!(
+            sys::debug_stat(147),
+            strays + 1,
+            "the stray bit is found and counted once (debug_stat 147)"
+        );
+        ensure_eq!(
+            st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20)),
+            Some(S::TimedOut),
+            "a stray bit does not fire the vector"
+        );
+        Ok(())
+    })
+}
+
+/// IOMMU-SPEC 8.3 and 8.5, revoke (IO10): when the last handle closes, the entry is invalid before the call returns, so the device's
+/// next message is a fault and nothing is delivered; the identity and the file are given back (the leak oracle), and the index can be
+/// granted again.
+fn msi_revoke_stops_the_vector() -> Outcome {
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let r = with_domain(|_, f, d, _| {
+        let g = ok(sys::iodomain_grant_vector(d.sup, 2), "grant vector 2")?;
+        let (irq, address) = (g.a1 as u64, g.a2 as u64);
+        let dup = sys::handle_duplicate(irq, Rights::WAIT.0);
+        msi_send(f, d, address, 1)?;
+        let fired = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 2000);
+        sys::handle_close(irq);
+        ensure_eq!(st(fired), Some(S::Ok), "the vector fires before the revoke");
+        ensure_eq!(st(dup), Some(S::Ok), "a duplicate");
+        let dup = dup.a1 as u64;
+        ensure_eq!(sys::debug_stat(146), live + 1, "a duplicate keeps it live");
+        sys::handle_close(dup);
+        ensure_eq!(sys::debug_stat(146), live, "the last handle revoked it");
+        let (notices, before) = (sys::debug_stat(162), iommu_faults());
+        msi_send(f, d, address, 1)?;
+        ensure!(
+            iommu_wait_faults(before).is_some(),
+            "the revoked vector's message raised no fault"
+        );
+        let (did, _, cause, _) = iommu_last_fault();
+        ensure_eq!(
+            (did, cause),
+            (IOMMU_TEST_DID, CAUSE_MSI_INVALID),
+            "the entry is invalid"
+        );
+        msi_settle();
+        ensure_eq!(
+            sys::debug_stat(162),
+            notices,
+            "nothing is delivered after the revoke"
+        );
+        vectors_at_baseline(live, ids)?;
+        // granted again, it works again
+        let g = ok(sys::iodomain_grant_vector(d.sup, 2), "grant vector 2 again")?;
+        let irq = g.a1 as u64;
+        msi_send(f, d, g.a2 as u64, 1)?;
+        let fired = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 2000);
+        sys::handle_close(irq);
+        ensure_eq!(st(fired), Some(S::Ok), "the vector granted again fires");
+        Ok(())
+    });
+    r.and(vectors_at_baseline(live, ids))
+}
+
+/// IOMMU-SPEC 6.3 and 10.6: destroying a domain with live vectors (one fired, one armed) revokes them all, and before the call returns
+/// (no waiting afterwards) their identities are free again and no vector is live. The handles stay and name dead objects:
+/// `interrupt_ack` and `interrupt_deliver_here` are BAD_STATE and the objects never fire again.
+fn msi_destroy_revokes_every_vector() -> Outcome {
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let r = with_domain(|_, f, d, _| {
+        let a = ok(sys::iodomain_grant_vector(d.sup, 0), "grant vector 0")?;
+        let b = ok(sys::iodomain_grant_vector(d.sup, 1), "grant vector 1")?;
+        let (x, y) = (a.a1 as u64, b.a1 as u64);
+        let r = (|| {
+            msi_send(f, d, a.a2 as u64, 1)?;
+            ensure_eq!(
+                st(sys::object_wait(x, sig::INTERRUPT, sys::clock_get() + 2000)),
+                Some(S::Ok),
+                "vector 0 fires before the destruction"
+            );
+            ensure_eq!(sys::debug_stat(146), live + 2, "two live vectors");
+            ok(sys::iodomain_destroy(d.sup), "iodomain_destroy")?;
+            ensure_eq!(
+                sys::debug_stat(146),
+                live,
+                "no live vector when the destroy returns"
+            );
+            ensure_eq!(
+                sys::debug_stat(141),
+                ids,
+                "every identity free when the destroy returns"
+            );
+            for (h, what) in [(x, "the fired vector"), (y, "the armed vector")] {
+                ensure_eq!(
+                    st(sys::interrupt_ack(h)),
+                    Some(S::BadState),
+                    "ack on {what} after the destruction"
+                );
+                ensure_eq!(
+                    st(sys::interrupt_deliver_here(h)),
+                    Some(S::BadState),
+                    "deliver_here on {what} after the destruction"
+                );
+            }
+            ensure_eq!(
+                st(sys::object_wait(y, sig::INTERRUPT, sys::clock_get() + 50)),
+                Some(S::TimedOut),
+                "the armed vector never fires again"
+            );
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(d.sup, 2)),
+                Some(S::BadState),
+                "a destroyed domain grants nothing"
+            );
+            Ok(())
+        })();
+        sys::handle_close(x);
+        sys::handle_close(y);
+        r
+    });
+    r.and(vectors_at_baseline(live, ids))
 }
 
 /// IOMMU4: identities are allocated per hart, next-fit, so an object re-created again and again walks the whole identity space of a
@@ -18391,6 +18942,18 @@ pub fn app_main() -> i32 {
         (
             "iodomain_calls_check_handles_rights_and_arguments",
             iodomain_calls_check_handles_rights_and_arguments,
+        ),
+        (
+            "msi_granted_vector_is_delivered",
+            msi_granted_vector_is_delivered,
+        ),
+        ("msi_ungranted_vector_faults", msi_ungranted_vector_faults),
+        ("msi_forgery_faults", msi_forgery_faults),
+        ("msi_revoke_stops_the_vector", msi_revoke_stops_the_vector),
+        ("msi_destroy_revokes_every_vector", msi_destroy_revokes_every_vector),
+        (
+            "vector_calls_check_handles_rights_and_arguments",
+            vector_calls_check_handles_rights_and_arguments,
         ),
         (
             "socket_ends_travel_over_channels",

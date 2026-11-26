@@ -236,6 +236,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | iodomain_unmap | `a0` domain, `a1` I/O address, `a2` pages |  |
 | iodomain_destroy | `a0` domain |  |
 | iodomain_fault_read | `a0` domain | `a1` cause \| direction << 16 \| dropped << 32, `a2` I/O address |
+| iodomain_grant_vector | `a0` domain, `a1` vector index | `a1` interrupt handle, `a2` MSI-X address (the data word is `abi::iodomain::MSI_DATA`, 1) |
+| interrupt_deliver_here | `a0` interrupt |  |
 | job_set_io_limits | `a0` job, `a1` I/O-mapped pages, `a2` vectors |  |
 | vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
 | vmo_decommit | `a0` vmo, `a1` offset, `a2` length |  |
@@ -298,6 +300,13 @@ their bound or could not be submitted (always 0 on a healthy machine: the boot s
 (IOMMU6): 158 the frames leaked by fence timeouts (mapped pages and table frames, IO8), 159 the live device domains (attached or being
 destroyed), 160 the I/O-mapped pages of live and pending mappings, 161 the mapping records leaked with their holds. The end-of-run
 check `no_process_or_vmo_survives_init` wants 159, 160 and 161 at zero.
+
+`which` 146 to 149 and 162, 163 (IOMMU7, IOMMU-SPEC 7.3 and 8): 146 the live vectors (granted and not yet given back: their identities
+not all free), 147 the stray bits found in vector files (a data word other than 1: at acknowledgement, at revoke and when a domain's
+files are freed), 148 takes the caller's interrupt handle in `a2` and returns where its vector sends its notices, as (interrupt file
+<< 16) | identity of the entry's fenced target, or all ones for anything else (read under the object lock), 149 the vectors leaked by
+a fence that did not complete (IO8), 162 the notices taken on vector identities, 163 those that fired their object. The end-of-run
+check wants 146 and 149 at zero.
 
 `which` 110 and 111 (PL7) are the executable pages mapped by faults so far and the times the instruction caches were synchronised for them (once per fault that mapped any: `fence.i` here and SBI `remote_fence_i` on every other online hart); a page that was already mapped adds nothing.
 
@@ -600,10 +609,10 @@ left mapped and nothing freed before its fence.
 ### iodomain_unmap(domain, io_address, pages) -> status
 
 Removes the one mapping `iodomain_map` returned at exactly `io_address` and `pages`. When it returns, the device can no longer reach the
-frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (not
-exactly a live mapping of this domain: `pages` 0, `io_address` not page aligned, no such mapping, or the domain was destroyed, which
-took every mapping); BAD_STATE (the domain was destroyed; as IOMMU-SPEC 4.4 orders it, never reached, since the INVALID_ARGS before it
-covers it: Q-IOMMU-UNMAPORDER).
+frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order (OD171, IOMMU-SPEC amendment 2026-11-26 part 4): BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the domain was destroyed, also by a destruction begun after the handle was resolved and before
+the unmap's first step); INVALID_ARGS (not exactly a live mapping of this domain: `pages` 0, `io_address` not page aligned, no such
+mapping).
 Never NO_MEMORY. A fence that does not complete within its bound still returns OK and leaks the frames (counted, `debug_stat` 158). An
 unmap under way when the domain's destruction begins returns OK: the destruction's fence covers it (OD170).
 
@@ -613,7 +622,32 @@ Detaches the device (it becomes Quarantined: an empty table, fault reporting off
 then the domain's tables, root and record are freed after the fence (IOMMU-SPEC 6.3), and its job credited. Needs IO_DESTROY. Errors:
 BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED. A destroyed domain's destroy is OK and does nothing. **Closing the last handle** destroys the
 domain the same way (and so does the teardown of the last process that held one), completed before the closing call returns to user
-mode. A destroyed domain's other handles stay valid: `iodomain_map` is BAD_STATE and `iodomain_unmap` INVALID_ARGS.
+mode. A destroyed domain's other handles stay valid: `iodomain_map`, `iodomain_unmap` and `iodomain_grant_vector` are BAD_STATE. The
+destruction revokes the domain's vectors (their objects stay, dead: IOMMU-SPEC 10.6); before the call returns their identities are
+retired by their harts and their charges given back.
+
+### iodomain_grant_vector(domain, index) -> status, interrupt, msi_address
+
+Grants vector `index` of the domain's device (IOMMU-SPEC 8.3): an MRIF entry at `index` of the domain's MSI page table, an interrupt
+file of its own (512 bytes, eight to a frame) in which only identity 1 is ever enabled, an identity on the online hart with the
+fewest routes (if that hart does not open it within the fence bound, an identity on the calling hart instead), and an **interrupt object** of the kind vector, armed. Returns a handle to it (rights DUPLICATE, TRANSFER, WAIT,
+INSPECT, MANAGE: the rights of an interrupt object; it names no identity, file or address and cannot grant or revoke) and the address
+to program into MSI-X table entry `index`, `IO_BASE + index * 4096`; the data word is always `abi::iodomain::MSI_DATA` (1), so it
+is a constant of the ABI rather than a returned value. The pair works only for this device through this domain. The call returns once
+the entry's fence has completed. Charged to the domain's job: one vector (`job_set_io_limits`, hierarchical) and the file's 512 bytes
+of kernel memory, given back when the vector's identities are all free again. Needs IO_GRANT (the supervisor's handle; a driver's
+duplicate with IO_MAP and IO_UNMAP cannot). Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`index` 256 or
+more); BAD_STATE (the index is granted, or the domain was destroyed); NO_MEMORY (the job's vector limit or kernel bytes, no free
+identity on any online hart, the handle table, or a fence that did not complete: nothing is granted).
+
+A vector is **revoked** when the last handle to its object closes (completed before the closing call returns: the enable bit cleared,
+the entry made invalid, invalidated and fenced, then its identity retired by its hart, then the identity, the file and the charge
+freed) or when its domain is destroyed (the destruction's fence covers its entries; completed, the same way, before `iodomain_destroy`
+returns); after a destruction the remaining handles name a
+dead object that never fires again (`interrupt_ack` and `interrupt_deliver_here` are BAD_STATE). A message to a page whose vector is
+not granted is an IOMMU fault (cause 262, the MSI entry not valid), a data word other than 1 sets a bit in the vector's own file that
+sends nothing (found and counted at the next acknowledgement, at revoke or when the domain's files are freed: `debug_stat` 147), and a
+data word above 2047 or a misaligned address is cause 263 (IOMMU-SPEC 8.4).
 
 ### iodomain_fault_read(domain) -> status, word, io_address
 
@@ -664,6 +698,22 @@ device fires again. `claims` is how many times the kernel has claimed this sourc
 file (when it has none free, the route stays where it is); the old identity is closed, checked for a message still on its way (delivered, not
 lost) and freed by its own hart (IOMMU-SPEC 8.1). An acknowledgement on a hart that is going offline, or with no free identity there,
 leaves the route where it is. Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
+
+On a **vector** (IOMMU7, IOMMU-SPEC 8.5) the mask is the enable bit of the vector's own interrupt file: the acknowledgement clears
+INTERRUPT, sets the enable bit, then reads and clears the file's pending bit, and if it was set (a message came while the object was
+fired) fires the object again at once; it also takes the file's stray bits (data words other than 1, counted in `debug_stat` 147). It
+issues no IOMMU command. The vector's first `object_wait` or acknowledgement moves it, once, to the calling hart (placement); after
+that only `interrupt_deliver_here` or a hart going offline moves it. BAD_STATE also for a vector whose domain was destroyed.
+
+### interrupt_deliver_here(interrupt) -> status
+
+Moves the interrupt's delivery to the calling hart (IOMMU-SPEC 8.5). On a vector: an identity is taken in this hart's file and opened
+there, the vector's MSI entry is rewritten to name it with one store, invalidated and fenced, and then the old identity is retired by
+its own hart (until then both deliver to the vector); the call returns when the entry names the new identity. An explicit placement
+counts as the vector's placement (no first wait moves it again). On a wired source it moves the route as an acknowledgement does.
+Rights: MANAGE. Errors, in order: BAD_HANDLE; WRONG_TYPE (not an interrupt object); ACCESS_DENIED (no MANAGE); BAD_STATE (a vector
+whose domain was destroyed or that is being revoked, or whose move did not complete: a fence that did not complete leaks the vector,
+IO8, its file disabled so that it sends nothing); NO_MEMORY (the calling hart's file has no free identity: nothing changed).
 
 ### process_create(job) -> status, handle
 
@@ -1154,6 +1204,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
 | vmo_create_dma_in, iodomain_create, iodomain_map, iodomain_unmap, iodomain_destroy, iodomain_fault_read, job_set_io_limits | specified and implemented (IOMMU6) |
+| iodomain_grant_vector, interrupt_deliver_here | specified and implemented (IOMMU7) |
 | resource_dtb | specified and implemented (S6c) |
 | system_set_placement | specified and implemented (PM4) |
 | hart_set_online, hart_info | specified and implemented (PM1) |

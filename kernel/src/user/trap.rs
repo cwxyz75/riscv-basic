@@ -498,6 +498,12 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             let at = u32::try_from(a[2]).ok().and_then(crate::aia::route_of);
             return Ok((Some(at.unwrap_or(u64::MAX)), None));
         }
+        // 148 (IOMMU7): where the vector of the caller's interrupt handle `a2` sends its notices (the fenced entry's target), as
+        // (interrupt file << 16) | identity, or all ones for anything else
+        if a[1] == 148 {
+            let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
+            return Ok((Some(at.unwrap_or(u64::MAX)), None));
+        }
         // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
         if let Some(v) = backstop_stat(s, a[1]) {
             return Ok((Some(v), None));
@@ -979,6 +985,14 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             frame.arg(15),
         ],
     );
+    let vector_reply = if matches!(n, nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE)
+        && ksys::wide_argument_error(n, &a).is_none()
+        && crate::iommu::is_on()
+    {
+        crate::iommu::call(n, a)
+    } else {
+        None
+    };
     match n {
         nr::THREAD_YIELD => {
             status_ret(frame, Status::Ok);
@@ -1001,7 +1015,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::IODOMAIN_UNMAP
         | nr::IODOMAIN_DESTROY
         | nr::IODOMAIN_FAULT_READ
-        | nr::VMO_CREATE_DMA_IN => {
+        | nr::VMO_CREATE_DMA_IN
+        | nr::IODOMAIN_GRANT_VECTOR => {
             let r = match ksys::wide_argument_error(n, &a) {
                 Some(s) => fail(s),
                 None => crate::iommu::call(n, a).unwrap_or_else(|| fail(Status::BadSyscall)),
@@ -1009,7 +1024,18 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             notify();
             reply(frame, r);
         }
-        nr::OBJECT_WAIT => reply(frame, object_wait(a)),
+        nr::OBJECT_WAIT => {
+            // (IOMMU-SPEC 8.5: the first wait on a vector moves it to this hart, with no lock held)
+            crate::iommu::first_wait(a[0]);
+            reply(frame, object_wait(a))
+        }
+        // (IOMMU7) a vector's acknowledgement and `interrupt_deliver_here` are the device-domain layer's; a wired source's are `dispatch`'s
+        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE if vector_reply.is_some() => {
+            if let Some(r) = vector_reply {
+                notify();
+                reply(frame, r);
+            }
+        }
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)
             let r = port_wait(a);
@@ -1417,6 +1443,13 @@ fn dispatch_in(
                     fail(e)
                 }
             }
+        }
+        nr::INTERRUPT_DELIVER_HERE => {
+            // (a wired source: its identity moves to this hart's file, IOMMU-SPEC 8.5; a vector's was the device-domain layer's)
+            let (_, irq) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
+                .map_err(|e| (e, None, None))?;
+            crate::aia::move_here(irq).map_err(|e| (e, None, None))?;
+            Ok((None, None))
         }
         nr::INTERRUPT_ACK => {
             let (obj, _) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)

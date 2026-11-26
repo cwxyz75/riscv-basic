@@ -22,6 +22,9 @@ fault-msiid-free-at-move = []
 # IOMMU6's negative control: an unmap clears its leaves and its record is released without the invalidation and the fence;
 # the suite's `iodomain_unmap_stops_the_device` must fail (the device still reaches the frame through the IOMMU's cache).
 fault-iommu-skip-inval = []
+# IOMMU7's negative control: a granted vector's MSI entry is written in basic-translate mode to the target hart's file (the forbidden
+# mode of IO11), so the device's own data word reaches the hart: the suite's `msi_forgery_faults` must fail (its "wrong data" row).
+fault-iommu-msi-basic = ["iommucore/fault-msi-basic"]
 
 # Concurrency checkers, host only (they are dependencies, not dev-dependencies,
 # because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")

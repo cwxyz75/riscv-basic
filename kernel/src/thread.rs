@@ -567,6 +567,9 @@ fn hart_change(
             st.hart_state.store(HART_ONLINE, Ordering::Release);
             return Err(e);
         }
+        // (IOMMU7: a vector that moved has its entry rewritten to the new identity and fenced, with no lock held; the old identity
+        // keeps taking messages on this hart, which still takes its file's, until the fence)
+        crate::iommu::settle_moves();
     }
     crate::smp::send_ipi(v, crate::percpu::IPI_RESCHED);
     let give_up = now_ns().saturating_add(2_000_000_000);
@@ -1759,9 +1762,10 @@ pub fn wake_stat(which: u64) -> u64 {
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
-        3..=5 | 140..=144 => crate::aia::stat(which),
-        // 150 to 157: the IOMMU's counters (IOMMU5, IOMMU-SPEC 7.3)
-        150..=161 => crate::iommu::stat(which),
+        // (IOMMU7: 146 live vectors, 149 vectors leaked, 162 vector notices, 163 notices that fired their object)
+        3..=5 | 140..=144 | 146 | 149 | 162 | 163 => crate::aia::stat(which),
+        // 150 to 157: the IOMMU's counters (IOMMU5, IOMMU-SPEC 7.3); 147: the stray identities taken (IOMMU7)
+        147 | 150..=161 => crate::iommu::stat(which),
         // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),

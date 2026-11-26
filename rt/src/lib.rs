@@ -550,6 +550,18 @@ pub mod sys {
     pub fn iodomain_fault_read(domain: u64) -> Ret {
         syscall(IODOMAIN_FAULT_READ, [domain as usize, 0, 0, 0, 0, 0])
     }
+    /// Grant vector `index` of the domain's device (IOMMU-SPEC 8.3, needs IO_GRANT): `a1` an interrupt handle, `a2` the MSI-X address;
+    /// the data word is `abi::iodomain::MSI_DATA`.
+    pub fn iodomain_grant_vector(domain: u64, index: u64) -> Ret {
+        syscall(
+            IODOMAIN_GRANT_VECTOR,
+            [domain as usize, index as usize, 0, 0, 0, 0],
+        )
+    }
+    /// Move the interrupt's delivery to the calling hart (8.5; needs MANAGE).
+    pub fn interrupt_deliver_here(interrupt: u64) -> Ret {
+        syscall(INTERRUPT_DELIVER_HERE, [interrupt as usize, 0, 0, 0, 0, 0])
+    }
     /// Set a job's limits on I/O-mapped pages and interrupt vectors (`u64::MAX`: none of its own) (5.3): SET_LIMITS.
     pub fn job_set_io_limits(job: u64, io_pages: u64, vectors: u64) -> Ret {
         syscall(

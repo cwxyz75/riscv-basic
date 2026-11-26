@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -141,6 +141,8 @@ os-models:
 	@if cargo test -p kcore --features fault-offline-skip-blocked --test sched_offline --target-dir target/neg-offline >/dev/null 2>&1; then echo 'fault-offline-skip-blocked was not caught by sched_offline'; exit 1; fi
 	# SC2's negative control: with no hart ever marked overloaded the masks' acceptance test must fail
 	@if cargo test -p kcore --features fault-skip-overloaded --test sched_masks --target-dir target/neg-overloaded >/dev/null 2>&1; then echo 'fault-skip-overloaded was not caught by sched_masks'; exit 1; fi
+	# IOMMU7's negative control on the host: basic-translate MSI entries (the device's data word reaches the hart) must fail the vector model
+	@if cargo test -p kcore --features fault-iommu-msi-basic --test iodomain_vectors_model --target-dir target/neg-msi >/dev/null 2>&1; then echo 'fault-iommu-msi-basic was not caught by iodomain_vectors_model'; exit 1; fi
 	RUSTFLAGS="--cfg loom" cargo test -p klock --release --test spin_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p netring --release --test doorbell_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p klock --release --test spin_concurrency --target-dir target/shuttle
@@ -159,6 +161,7 @@ os-models:
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test pager_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test park_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test iodomain_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test iodomain_vectors_concurrency --target-dir target/shuttle
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
 # nightly --profile minimal --component miri); CI runs it, `make check` does not.
@@ -491,6 +494,13 @@ os-boot-test-iommu-inval: kernel-main
 	cd kernel && cargo build --features fault-iommu-skip-inval --target-dir ../target/os-fault-iommuinval
 	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUINVAL_ELF) iodomain_unmap_stops_the_device
 
+# IOMMU7 negative control (TESTING.md rule 9): a kernel that writes basic-translate MSI entries (the device's own data word reaches the
+# hart's file) must fail `msi_forgery_faults` (IO11). Kernel-only boot.
+OS_IOMMUMSI_ELF := target/os-fault-iommumsi/$(KERNEL_TARGET)/debug/kernel
+os-boot-test-iommu-msi: kernel-main
+	cd kernel && cargo build --features fault-iommu-msi-basic --target-dir ../target/os-fault-iommumsi
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUMSI_ELF) msi_forgery_faults
+
 # Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
 # third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
 fetch-third-party:
@@ -539,7 +549,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
