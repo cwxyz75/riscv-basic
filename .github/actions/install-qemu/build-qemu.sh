@@ -3,12 +3,13 @@
 # The tarball is checked twice before anything in it runs: its sha256 (pinned here; the same value as Homebrew's formula for
 # this release) and its signature by the QEMU release key (the public key is the file beside this one, and its fingerprint is
 # pinned here). The cache key hashes this file, so a change to the version or to the configuration below is a new cache entry.
-# The build needs: ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev gnupg.
 set -euo pipefail
 
 QEMU_VERSION=11.1.3
 QEMU_SHA256=5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22
 QEMU_KEY_FPR=CEACC9E15534EBABB82D3FA03353C9CEF108B584 # Michael Roth, the QEMU release key
+# What the build needs from apt (the install action reads this line; the libraries' run-time halves are in action.yml)
+QEMU_BUILD_DEPS="ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev gnupg"
 
 prefix=${1:?usage: build-qemu.sh <prefix>}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -35,8 +36,9 @@ tar -xJf qemu.tar.xz
 cd "qemu-$QEMU_VERSION"
 # One target, and only what the boots use: TCG (with -icount and record/replay), the virt machine with AIA and the IOMMU, the virtio
 # devices, the slirp network backend (`-netdev user`, hostfwd), pixman (the home computer's ramfb and `screendump`), the system libfdt
-# (`-machine dumpdtb`, `-dtb`), and the bundled firmware blobs (`-bios default` is the OpenSBI that ships with this release, as on a
-# developer's machine). No GUI, no VNC, no docs, no tools, no guest agent, no Rust.
+# (`-machine dumpdtb`, `-dtb`), and the bundled firmware blobs but the UEFI ones (`-bios default` is the OpenSBI that ships with this release, as on a
+# developer's machine). No GUI, no VNC, no docs, no tools, no guest agent, no Rust, and nothing downloaded at configure time (the
+# meson wheel and the subprojects come from the checked tarball).
 ./configure \
   --prefix="$prefix" \
   --target-list=riscv64-softmmu \
@@ -45,11 +47,14 @@ cd "qemu-$QEMU_VERSION"
   --enable-slirp \
   --enable-pixman \
   --enable-fdt=system \
+  --disable-download \
   --disable-docs \
   --disable-debug-info \
   --disable-werror \
   --enable-strip
 make -j"$(nproc)"
 make install
+# the UEFI images of every architecture are most of the install (about 300 MB) and no boot uses one; `-bios default` is OpenSBI
+rm -f "$prefix"/share/qemu/edk2-*
 "$prefix/bin/qemu-system-riscv64" --version | head -1
 rm -rf "$work"

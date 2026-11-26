@@ -78,6 +78,26 @@ def boots(rules, target, seen=None):
     return bool(BOOTS_RE.search(recipe)) or any(boots(rules, d, seen) for d in deps)
 
 
+def check_ci_qemu(wf, text, rules):
+    """CI's QEMU (TEST-TOOLS.md): a job that boots gets QEMU only from the install action (never `qemu: 'false'`, never apt), and a job
+    that uses CI's QEMU needs the tool-build job that fills the cache, so it cannot start before the entry exists."""
+    out = []
+    for job in re.split(r"^  (?=[a-z][\w-]*:\s*$)", text.split("\njobs:\n", 1)[-1], flags=re.M):
+        name = job.split(":", 1)[0].strip()
+        if name == TOOL_BUILD_JOB:
+            continue
+        targets = " ".join(re.findall(r"^\s*(?:- )?run: make (.*)$", job, re.M)).split()
+        targets += re.findall(r"^\s+(?:[A-Z_]+=\S+ )*make ([a-z][\w-]*)", job, re.M)
+        uses = "uses: ./.github/actions/install-qemu" in job and "qemu: 'false'" not in job
+        if (any(boots(rules, t) for t in targets if "$" not in t) or BOOTS_RE.search(job)) and not uses:
+            out.append(f"{wf}: job {name} boots but does not install CI's QEMU (the install action, without `qemu: 'false'`)")
+        if uses:
+            needs = re.search(r"^    needs:\s*(.*)$", job, re.M)
+            if not needs or not re.search(rf"(?<![\w-]){TOOL_BUILD_JOB}(?![\w-])", needs.group(1)):
+                out.append(f"{wf}: job {name} uses CI's QEMU but does not need the job `{TOOL_BUILD_JOB}` that fills the cache")
+    return out
+
+
 def check_tiers():
     """The testing tiers (OD83, OD144, TESTING.md) are enforced mechanically, so they cannot drift back: the feature gate
     starts no emulator; the epic gate (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget;
@@ -124,11 +144,8 @@ def check_tiers():
         for n in re.findall(r"timeout-minutes:\s*(\d+)", job):
             if int(n) > budget:
                 out.append(f"ci.yml: job {name}'s timeout is {n} minutes; its budget is {budget} (TESTING.md, \"Budgets\")")
-        # a job that uses CI's QEMU (the install action without `qemu: 'false'`) must wait for the job that puts it in the cache
-        if not tool and "uses: ./.github/actions/install-qemu" in job and "qemu: 'false'" not in job:
-            needs = re.search(r"^    needs:\s*(.*)$", job, re.M)
-            if not needs or not re.search(rf"(?<![\w-]){TOOL_BUILD_JOB}(?![\w-])", needs.group(1)):
-                out.append(f"ci.yml: job {name} uses CI's QEMU but does not need the job `{TOOL_BUILD_JOB}` that fills the cache")
+    for wf in ("ci.yml", "soak.yml", "overnight.yml"):
+        out += check_ci_qemu(wf, read(f".github/workflows/{wf}"), rules)
     if "matrix:" in ci:
         out.append("ci.yml: the merge gate has a build matrix; that belongs in soak.yml")
     # the commit hook: format, docs check, clippy; never a test or a boot

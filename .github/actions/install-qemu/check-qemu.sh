@@ -17,6 +17,9 @@ if [ "$got" != "QEMU emulator version $want" ]; then
   exit 1
 fi
 # what the boots need of the machine: the AIA, the platform IOMMU, the profile CPU, the user network backend
-qemu-system-riscv64 -machine virt,help | grep -E "^  (aia|iommu-sys)="
+opts=$(qemu-system-riscv64 -machine virt,help)
+for o in aia iommu-sys; do
+  echo "$opts" | grep "^  $o=" || { echo "::error::this QEMU's virt machine has no $o option"; exit 1; }
+done
 qemu-system-riscv64 -cpu help | grep -w rva23s64 >/dev/null || { echo "::error::this QEMU has no rva23s64 CPU"; exit 1; }
 qemu-system-riscv64 -machine none -netdev help | grep -x user >/dev/null || { echo "::error::this QEMU has no user network backend (slirp)"; exit 1; }

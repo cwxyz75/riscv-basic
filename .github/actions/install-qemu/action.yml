@@ -40,7 +40,8 @@ runs:
           PKGS="$PKGS libglib2.0-0t64 libpixman-1-0 libslirp0 libfdt1"
         fi
         echo "apt=$(echo $PKGS)" >> "$GITHUB_OUTPUT"
-        echo "build-apt=ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev gnupg" >> "$GITHUB_OUTPUT"
+        echo "build-apt=$(sed -n 's/^QEMU_BUILD_DEPS="\(.*\)"$/\1/p' "$HERE/build-qemu.sh")" >> "$GITHUB_OUTPUT"
+        echo "distro=$distro" >> "$GITHUB_OUTPUT"
     - id: restore
       if: inputs.qemu == 'true'
       uses: actions/cache/restore@v4
@@ -71,7 +72,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/apt-archives
-        key: apt-${{ runner.os }}-${{ runner.arch }}-${{ steps.need.outputs.apt }}-v1
+        key: apt-${{ steps.plan.outputs.distro }}-${{ runner.arch }}-${{ steps.need.outputs.apt }}-v1
     - name: Install
       if: steps.need.outputs.apt != ''
       shell: bash

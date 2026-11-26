@@ -199,3 +199,14 @@ These come from a kernel-only boot (`OS_SHARD=k`, one hart, `-cpu rva23s64`, vir
 - **A device write to the S-mode IMSIC page** (0x28000000): an ordinary translation fault (cause 23, `iova` the address). It is not an
   MSI fault, because the address is outside the window.
 
+
+## Addendum 2026-11-26 (CI pins QEMU 11.1.3)
+
+CI ran the boots on Ubuntu 26.04's QEMU, `1:10.2.1+ds-1ubuntu3.3`, whose `virt` machine with `iommu-sys=on` writes
+`iommu-map = <0 ph 0 0>, <0 ph 0 0xffff>`: requester id 0xffff is outside the IOMMU, so the kernel (IOMMU-SPEC 2.2) kept the PCI windows
+closed and the epic's IOMMU, MSI and device-capability tests failed. 11.1.0 is the first release with the single full entry; 11.1.3
+writes `iommu-map = <0x0 0x8000 0x0 0x10000>` [observed, on a developer's machine and on CI]. By the owner's decision of 2026-11-26,
+CI now builds 11.1.3, the version of this record, from the release tarball (sha256 and release-key signature checked) and caches it;
+every job that boots asserts the version, and `qemu.yml` checks the `iommu-map` above (`docs/reference/TEST-TOOLS.md`, "CI's QEMU").
+The bundled firmware is OpenSBI 1.8.1. A cold build on a hosted runner took 196 s (`riscv64-softmmu` only); restoring the cached
+install took about 10 s.

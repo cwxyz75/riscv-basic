@@ -106,8 +106,9 @@ Measure before choosing (`TEST-TOOLS.md`, "Measuring"); do not guess. Raising a 
 **The one exception: the tool-build job** (2026-11-26). CI's QEMU is built from its release tarball and cached (`TEST-TOOLS.md`,
 "CI's QEMU"), because the distribution's QEMU is too old for the IOMMU. The `qemu` job of `ci.yml` looks the cache entry up and, only
 when it is missing, builds it before the boots start. Its timeout is 20 minutes, not 7: a cold build does not fit the gate's budget,
-and a build must never land inside a job that boots. It is a lookup of seconds on a warm cache, so the gate's wall time is unchanged
-except for the first smoke in a cache scope. The exception is for building a tool into the cache and nothing else: the job runs no
+and a build must never land inside a job that boots. On a warm cache it is a lookup, and the boots start after it: the gate's wall time grows
+by that job (tens of seconds, mostly the runner's start), and by the build (about 3.5 minutes) only for the first smoke in a cache
+scope. The exception is for building a tool into the cache and nothing else: the job runs no
 make target, no test and no boot, and every job that boots restores the entry and fails on a miss rather than building it. No rule
 about tests or boots changes.
 
@@ -118,8 +119,8 @@ about tests or boots changes.
 - a feature-gate target that starts QEMU, directly or through anything it depends on;
 - a job of `ci.yml` that starts QEMU and is not limited to the epic gate;
 - a `make` target in `ci.yml` that is not a smoke target, a job timeout over the budget, or a build matrix;
-- a tool-build job (`qemu`) that does more than fill the cache, is not limited to the epic gate, or exceeds its own 20 minutes, and a
-  job that uses CI's QEMU without needing it;
+- a tool-build job (`qemu`) that does more than fill the cache, is not limited to the epic gate, or exceeds its own 20 minutes; a
+  job (in `ci.yml`, `soak.yml` or `overnight.yml`) that boots without CI's QEMU, or uses it without needing the `qemu` job;
 - a commit hook that runs a test or a boot;
 - `make check` being anything but `smoke`;
 - a soak or overnight target that its workflow does not run, or that a lower tier does;

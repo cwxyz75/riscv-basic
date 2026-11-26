@@ -209,6 +209,7 @@ jobs:
 
   allocfail:
     name: overnight (allocation failure)
+    needs: qemu
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -218,6 +219,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: overnight-allocfail
+      # (the guest half of the sweep boots a kernel: CI's QEMU, and clang for the boot image's C programs)
+      - name: Install QEMU
+        uses: ./.github/actions/install-qemu
       - run: make os-allocfail
       - name: Summary
         if: always()
