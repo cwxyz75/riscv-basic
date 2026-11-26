@@ -30,7 +30,7 @@ pub struct Aia {
 }
 
 /// The first cell of a property of this node or, failing that, of the nearest ancestor that has it (how `interrupt-parent` is inherited).
-fn inherited(nodes: &[Node], n: &Node, name: &str) -> Option<u32> {
+pub(crate) fn inherited(nodes: &[Node], n: &Node, name: &str) -> Option<u32> {
     if let Some(v) = n.cells(name).first() {
         return Some(*v);
     }
@@ -55,7 +55,7 @@ fn inherited(nodes: &[Node], n: &Node, name: &str) -> Option<u32> {
     None
 }
 
-fn phandle(n: &Node) -> Option<u32> {
+pub(crate) fn phandle(n: &Node) -> Option<u32> {
     // (`linux,phandle` is the older spelling of the same property)
     n.cells("phandle")
         .first()

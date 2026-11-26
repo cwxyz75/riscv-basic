@@ -44,7 +44,10 @@ fn the_real_virt_tree_gives_the_rtc_and_the_virtio_slots_and_nothing_else() {
         (0x1010_0000, "fw-cfg"),
         (0x2000_0000, "flash bank 0"),
         (0x2200_0000, "flash bank 1"),
-        (0x3000_0000, "the PCI ECAM window"),
+        (
+            0x3000_0000,
+            "the PCI ECAM window (this tree has no IOMMU: its host has no iommu-map)",
+        ),
     ] {
         assert!(!in_window(&w, pa, 4096), "{what} at {pa:#x}");
     }

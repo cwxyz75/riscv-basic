@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MACHINE = "virt,aia=aplic-imsic"
+MACHINE = "virt,aia=aplic-imsic,iommu-sys=on"
 RAM = "256M"
 
 

@@ -43,15 +43,18 @@ pub enum Class {
     Tt = 8,
     Rq = 9,
     Kstack = 10,
-    Frame = 11,
-    Heap = 12,
-    Entropy = 13,
-    Uart = 14,
+    /// The IOMMU (IOMMU-SPEC 11.1): the device directory, the command and fault queues, and (from IOMMU6) the domain store. After
+    /// `OBJ` (the fault interrupt arrives holding it) and `VMO`/`JOBS`, before `FRAME` (a map takes table frames under it).
+    Iommu = 11,
+    Frame = 12,
+    Heap = 13,
+    Entropy = 14,
+    Uart = 15,
 }
 
 impl Class {
     /// Every class, in order.
-    pub const ALL: [Class; 14] = [
+    pub const ALL: [Class; 15] = [
         Class::Obj,
         Class::As,
         Class::Procs,
@@ -62,6 +65,7 @@ impl Class {
         Class::Tt,
         Class::Rq,
         Class::Kstack,
+        Class::Iommu,
         Class::Frame,
         Class::Heap,
         Class::Entropy,

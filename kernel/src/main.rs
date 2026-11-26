@@ -13,7 +13,7 @@
 extern crate alloc;
 
 // The architecture's modules keep their short names at the crate root (`crate::trap::...`).
-use arch::{aia, finisher, fp, irq, timer, trap};
+use arch::{aia, finisher, fp, iommu, irq, timer, trap};
 
 mod arch;
 mod bkl;
@@ -156,6 +156,9 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         aia::present(),
         "no usable AIA (APLIC in MSI mode with an IMSIC): this kernel needs `-machine virt,aia=aplic-imsic`"
     );
+    // IOMMU5 (IOMMU-SPEC 2.4): the IOMMU is required, and from here every device is denied; only then the device windows exist
+    iommu::init();
+    kmem::build_windows();
     if !RELEASE {
         let _ = writeln!(out, "interrupt controller: AIA");
         let _ = writeln!(

@@ -7,7 +7,20 @@
 
 pub mod aia {
     pub const PAGE_COUNT: usize = 0;
-    pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+    /// A wired source the kernel itself handles (IOMMU5: the IOMMU's own interrupts).
+    pub struct KernelSource {
+        pub source: u32,
+        pub edge: bool,
+        pub handler: fn(u32) -> bool,
+    }
+    pub fn discover(
+        nodes: &[kcore::fdt::Node],
+        ram: &[(u64, u64)],
+        kernel: alloc::vec::Vec<KernelSource>,
+    ) {
+        unimplemented!()
+    }
+    pub fn route_of(s: u32) -> Option<u64> {
         unimplemented!()
     }
     pub const IPI_BIT: u64 = 0;
@@ -67,6 +80,32 @@ pub mod aia {
         unimplemented!()
     }
     pub fn handle(fired: impl FnMut(u32) -> bool) -> bool {
+        unimplemented!()
+    }
+}
+
+/// IOMMU5's bring-up (the SMMU would stand here): stubs, as the rest.
+pub mod iommu {
+    pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+        unimplemented!()
+    }
+    pub fn kernel_sources() -> alloc::vec::Vec<super::aia::KernelSource> {
+        unimplemented!()
+    }
+    pub fn page() -> Option<u64> {
+        unimplemented!()
+    }
+    pub fn is_on() -> bool {
+        unimplemented!()
+    }
+    pub fn init() {
+        unimplemented!()
+    }
+    pub fn stat(which: u64) -> u64 {
+        unimplemented!()
+    }
+    #[cfg(not(feature = "release"))]
+    pub fn selftest() -> Result<(), alloc::string::String> {
         unimplemented!()
     }
 }

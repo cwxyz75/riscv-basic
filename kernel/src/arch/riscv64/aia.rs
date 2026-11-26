@@ -45,12 +45,31 @@ pub fn info() -> Option<&'static kcore::aiatree::Aia> {
 pub const PAGE_COUNT: usize = 4;
 
 /// The sources the kernel owns (IOMMU-SPEC 8.6: kernel-owned wired sources, never in the set `interrupt_create` admits), each with
-/// its handler. A `Kernel` route is installed for each at boot; `deliver` masks the source, calls the handler and unmasks it again.
-/// None yet: IOMMU5 adds the IOMMU's fault-queue and command-queue sources.
-const KERNEL_SOURCES: &[KernelSource] = &[];
+/// its handler: the IOMMU's fault-queue and command-queue sources (IOMMU5, named by the tree and handed to `discover`). A `Kernel`
+/// route is installed for each at boot; `deliver` masks the source, calls the handler and unmasks it again.
+static mut KERNEL_SOURCES: alloc::vec::Vec<KernelSource> = alloc::vec::Vec::new();
 
-/// A source the kernel owns and its handler (called with the source masked; it is unmasked after).
-type KernelSource = (u32, fn(u32));
+/// A source the kernel owns: its number, whether the device signals it with an edge (the tree's trigger type; the IOMMU's lines are
+/// pulsed: QEMU `qemu_irq_pulse`), and its handler, called with the source masked under the object lock. The handler returns
+/// whether it left work behind (records it did not take): then the source is set pending again as it is unmasked. An edge source
+/// is otherwise never set pending by the kernel (an edge latched while it was masked is kept by the APLIC; a `setipnum` would
+/// always latch, and the handler would run once more for every time it ran).
+#[derive(Clone, Copy)]
+pub struct KernelSource {
+    pub source: u32,
+    pub edge: bool,
+    pub handler: fn(u32) -> bool,
+}
+
+fn kernel_sources() -> &'static [KernelSource] {
+    // SAFETY: written once by `discover` at boot, before any other hart or thread runs; read-only afterwards.
+    unsafe { &*core::ptr::addr_of!(KERNEL_SOURCES) }
+}
+
+/// Is `s` a source the kernel owns that is edge-triggered?
+fn kernel_edge(s: u32) -> bool {
+    kernel_sources().iter().any(|k| k.source == s && k.edge)
+}
 
 /// The route table and what it needs, under the object lock.
 struct Table {
@@ -116,9 +135,13 @@ fn this_file() -> Option<usize> {
 
 /// Read the interrupt controller out of the parsed tree and size the per-source state and the route table (needs the heap). `ram` is
 /// every range that is RAM or reserved: a controller whose registers lie in it, or beyond the direct map, is not used (it would alias
-/// memory the kernel owns).
+/// memory the kernel owns). `kernel` are the sources the kernel itself owns (IOMMU-SPEC 8.6).
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; boot only, once, on the boot stack (the boot-time high-water budget check bounds the sum)
-pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+pub fn discover(
+    nodes: &[kcore::fdt::Node],
+    ram: &[(u64, u64)],
+    kernel: alloc::vec::Vec<KernelSource>,
+) {
     let Some(aia) = kcore::aiatree::discover(nodes) else {
         return;
     };
@@ -145,7 +168,7 @@ pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
         .sources
         .iter()
         .copied()
-        .chain(KERNEL_SOURCES.iter().map(|k| k.0))
+        .chain(kernel.iter().map(|k| k.source))
         .filter(|&s| s <= aia.num_sources)
         .max()
         .unwrap_or(0);
@@ -160,6 +183,7 @@ pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
         *core::ptr::addr_of_mut!(HART_OF_FILE) =
             (0..files).map(|_| AtomicUsize::new(usize::MAX)).collect();
         *core::ptr::addr_of_mut!(INFO) = Some(aia);
+        *core::ptr::addr_of_mut!(KERNEL_SOURCES) = kernel;
     }
 }
 
@@ -240,6 +264,18 @@ pub fn stat(which: u64) -> u64 {
     }
 }
 
+/// Where source `s` is delivered: its Live identity as (interrupt file << 16) | identity (`debug_stat` 145). Under the object lock.
+pub fn route_of(s: u32) -> Option<u64> {
+    with_table(|t| {
+        t.at.get(s as usize)
+            .copied()
+            .flatten()
+            .filter(|&p| matches!(t.ids.slot(p), Some(Slot::Live { .. })))
+            .map(|p| (u64::from(p.hart) << 16) | u64::from(p.id))
+    })
+    .flatten()
+}
+
 const DOMAINCFG: u64 = 0x0000;
 const SOURCECFG: u64 = 0x0004; // + 4 * (source - 1)
 const SETIPNUM: u64 = 0x1cdc;
@@ -251,6 +287,8 @@ const TARGET: u64 = 0x3004; // + 4 * (source - 1)
 const DOMAINCFG_IE_MSI: u32 = (1 << 8) | (1 << 2);
 /// sourcecfg: level-sensitive, active high (what virtio-mmio asserts).
 const SM_LEVEL_HIGH: u32 = 6;
+/// sourcecfg: edge-sensitive, rising edge (the IOMMU's wired interrupts on `virt`: the tree's trigger type 1).
+const SM_EDGE_RISE: u32 = 4;
 
 fn reg(off: u64) -> *mut u32 {
     let base = info().map_or(0, |i| i.aplic_base);
@@ -276,24 +314,28 @@ pub fn init() {
         );
     }
     let kernel = || {
-        KERNEL_SOURCES.iter().filter(|k| {
-            let ok = (1..=aia.num_sources).contains(&k.0) && !irq_allowed(k.0);
+        kernel_sources().iter().filter(|k| {
+            let ok = (1..=aia.num_sources).contains(&k.source) && !irq_allowed(k.source);
             if !ok {
                 let _ = writeln!(
                     crate::console::Console,
                     "aia: kernel source {} is not a source of the APLIC or is one a process may take: not used",
-                    k.0
+                    k.source
                 );
             }
             ok
         })
     };
     // SAFETY: the APLIC pages are direct-mapped device memory (`kmem::init`); these are its
-    // documented registers: per-source configuration (level high), the enable-clear number register
-    // (masked until a route owns the source), then the domain config.
+    // documented registers: per-source configuration (level high, or rising edge for a kernel source the tree says is edge-triggered),
+    // the enable-clear number register (masked until a route owns the source), then the domain config.
     unsafe {
-        for s in aia.sources.iter().copied().chain(kernel().map(|k| k.0)) {
-            write_volatile(reg(SOURCECFG + 4 * (u64::from(s) - 1)), SM_LEVEL_HIGH);
+        for (s, mode) in
+            aia.sources.iter().map(|&s| (s, SM_LEVEL_HIGH)).chain(
+                kernel().map(|k| (k.source, if k.edge { SM_EDGE_RISE } else { SM_LEVEL_HIGH })),
+            )
+        {
+            write_volatile(reg(SOURCECFG + 4 * (u64::from(s) - 1)), mode);
             write_volatile(reg(CLRIENUM), s);
         }
         write_volatile(reg(DOMAINCFG), DOMAINCFG_IE_MSI);
@@ -309,7 +351,7 @@ pub fn init() {
     PRESENT.store(true, Ordering::SeqCst);
     // the kernel's own sources, on the boot hart (the only one running): moved when it goes offline, like any route
     crate::irq::without(|| {
-        for &(s, _) in kernel() {
+        for s in kernel().map(|k| k.source) {
             if install_here(s, Route::Kernel(s)).is_ok() {
                 aim_and_unmask(s);
             } else {
@@ -615,15 +657,30 @@ fn aim_and_unmask(irq: u32) {
         return;
     };
     aim(irq, p);
+    // (an edge-triggered kernel source is not re-pended: `setipnum` latches an edge source whatever its line, so it would fire once
+    // more for every time it was unmasked; an edge that came while it was masked is already pending)
+    let repend = !kernel_edge(irq);
     // SAFETY: the controller exists (the caller found it in the tree) and `irq` is one of its sources (checked by the caller against the
     // allow list in user/trap.rs, or a kernel source), so the two registers are inside its mapped window. The set-pending and enable-set
     // number registers of the supervisor APLIC. Pending goes first: set while masked it is forwarded exactly once when the enable
     // follows (the reverse order could forward twice). Setting pending on a level source whose line is low is ignored by the hardware.
     unsafe {
         #[cfg(not(feature = "fault-aia-no-repend"))]
-        write_volatile(reg(SETIPNUM), irq);
+        if repend {
+            write_volatile(reg(SETIPNUM), irq);
+        }
+        #[cfg(feature = "fault-aia-no-repend")]
+        let _ = repend;
         write_volatile(reg(SETIENUM), irq);
     }
+}
+
+/// A kernel source's handler left work behind: set it pending, so it is taken again once it is unmasked (an edge source's line
+/// only pulses on a new event).
+fn repend(irq: u32) {
+    // SAFETY: `irq` is a kernel source of the controller the tree described (`kernel_sources`), so the set-pending number register
+    // is inside its mapped window; writing a source number only sets that source pending.
+    unsafe { write_volatile(reg(SETIPNUM), irq) };
 }
 
 /// The source `irq`'s object is gone (and no newer one owns it): mask it and end its route; the identity is retired by its hart.
@@ -753,8 +810,12 @@ fn deliver_one(p: Place, fired: &mut impl FnMut(u32) -> bool) -> bool {
         }
         Act::Kernel(s) => {
             disable(s);
-            if let Some(&(_, handler)) = KERNEL_SOURCES.iter().find(|k| k.0 == s) {
-                handler(s);
+            let more = kernel_sources()
+                .iter()
+                .find(|k| k.source == s)
+                .is_some_and(|k| (k.handler)(s));
+            if more {
+                repend(s);
             }
             aim_and_unmask(s);
             false

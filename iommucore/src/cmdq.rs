@@ -60,6 +60,23 @@ impl Command {
         }
     }
 
+    /// `IOTINVAL.GVMA` of every soft-context (`GV` clear): drop every second-stage translation and cached MSI entry. Issued once,
+    /// at bring-up (IOMMU5), so nothing a previous owner left cached survives.
+    pub const fn iotinval_gvma_all() -> Command {
+        Command {
+            dword0: OP_IOTINVAL | (FUNC_GVMA << FUNC_SHIFT),
+            dword1: 0,
+        }
+    }
+
+    /// `IOFENCE.C` with PR and PW and no completion write (the kernel polls the head).
+    pub const fn fence() -> Command {
+        Command {
+            dword0: OP_IOFENCE | (FUNC_FENCE_C << FUNC_SHIFT) | IOFENCE_PR | IOFENCE_PW,
+            dword1: 0,
+        }
+    }
+
     /// `IOTINVAL.VMA` for a first-stage-only context: drop the translations of process soft-context `pscid` (or of every one),
     /// all of them or only those of the page at `addr`.
     pub const fn iotinval_vma(pscid: Option<u32>, addr: Option<u64>) -> Command {

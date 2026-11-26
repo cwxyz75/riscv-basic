@@ -492,6 +492,12 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
             _ => {}
         }
+        // 145: where wired source `a2` is delivered, as (interrupt file << 16) | identity, or all ones without a Live route (IOMMU5: the
+        // suite aims a device's message at an identity the kernel gave an object, to see that it is refused). Read under this lock.
+        if a[1] == 145 {
+            let at = u32::try_from(a[2]).ok().and_then(crate::aia::route_of);
+            return Ok((Some(at.unwrap_or(u64::MAX)), None));
+        }
         // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
         if let Some(v) = backstop_stat(s, a[1]) {
             return Ok((Some(v), None));

@@ -15,6 +15,8 @@ exits with pass or fail. Its switches are environment variables:
 | `OS_DTB` | boot with this device tree (`-dtb`); `scripts/entropy_boot_test.py` (`make os-boot-test-entropy`, soak) uses a copy of QEMU's own with `/chosen/rng-seed` removed |
 | `OS_LOAD` | the physical address the image was built for (`make os-boot-test-loadaddr` sets it): the kernel line carries `load=<address>` and the test `the_image_is_where_the_loader_put_it` compares it with where the early boot code found the image |
 | `OS_RAM` | the RAM QEMU is given (`-m`; default `256M`); the harness also puts `ram=<size>` on the kernel line, and the kernel test `ram_matches_the_machine` checks the frame count against it |
+| `OS_MACHINE` | the machine; default `virt,aia=aplic-imsic,iommu-sys=on` (the AIA and the platform IOMMU, both required by the kernel); only `os-boot-test-iommu-neg` sets it, to the machine without the IOMMU |
+| `OS_PCI_TEST` | `0` leaves off the virtio-pci function behind the IOMMU (`virtio-rng-pci` at `00:04.0`, `iommu_platform=on`) that the suite's `iommu_*` tests drive by hand |
 | `OS_CPU` | the CPU model; always `rva23s64` (the kernel refuses to boot below the profile); only `os-boot-test-cpu-neg` sets it, to `rv64` |
 | `OS_BOOT_STALL` | seconds without output before a boot is called stalled (default 180) |
 | `OS_BOOT_TIMEOUT` | the runaway ceiling in seconds (default 1800) |
@@ -165,8 +167,8 @@ overflow checks on.
 
 **The matrix and the negative controls** (soak): `os-boot-test` (the normal, fail-demo, round-robin and release
 kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`,
-`os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
-mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`.
+`os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-iommu-neg` (a machine without the platform IOMMU ends in `##PANIC ... no IOMMU`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
+mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`, `os-boot-test-iommu-bare` (`ddtp` Bare: `iommu_is_on_and_denies_by_default` must fail).
 
 **The network checks by tier.**
 

@@ -12,6 +12,7 @@ kcore = { path = "../kcore" }
 rngcore = { path = "../rngcore" }
 ksys = { path = "../ksys" }
 klock = { path = "../klock" }
+iommucore = { path = "../iommucore" }
 # Free-list heap for the kernel (OD29). Small utility crate, as the home computer's
 # kernel uses (decision D10 there).
 linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
@@ -51,6 +52,9 @@ chaos = []
 # Negative controls for the SMP tests (S5d): each disables one safety mechanism, and the test
 # that guards it must then fail (the harness runs these builds and requires that).
 fault-skip-shootdown = []
+# IOMMU5 (IOMMU-SPEC 13): the IOMMU is brought up and then `ddtp` is written Bare (pass-through, no isolation): the forbidden state of IO2.
+# `iommu_is_on_and_denies_by_default` must then fail (`make os-boot-test-iommu-bare`).
+fault-iommu-bare = ["iommucore/fault-iommu-bare"]
 # MM8: a SNAPSHOT leaves the source's writable translations as they were; a write through them then reaches the child's pages
 fault-skip-cow-protect = []
 # MM6/MM7: a decommit, or a protect that takes a permission away, leaves the other harts' translations alone; the sibling-thread tests must then fail
