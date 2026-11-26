@@ -21,6 +21,7 @@
 extern crate alloc;
 
 mod create;
+pub mod iodomain;
 mod job;
 mod lifecycle;
 pub mod pager;

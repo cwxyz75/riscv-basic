@@ -146,7 +146,10 @@ fn check_reach(w: &mut World, r: &Ref, seed: u64, step: u64) {
                 let pfn = m.pfns[(page - m.page) as usize];
                 allowed.push((pfn, m.write));
                 let dom = &r.doms[&m.d];
-                if dom.ready && !dom.detaching {
+                // (a mapping must be reached once its fence has completed: before, an earlier unmap's whole-context invalidation may
+                // still be queued, and the page-walk cache may still name the table frames it detached, A18; such a walk faults and
+                // reaches no freed frame, which the checks below keep asserting)
+                if dom.ready && !dom.detaching && m.visible {
                     required = Some((pfn, m.write));
                 }
             }

@@ -225,6 +225,10 @@ impl FrameDb {
         match m.refs {
             0 => Err(FrameError::NotAllocated),
             1 => {
+                debug_assert_eq!(
+                    m.io, 0,
+                    "IO3: frame {pfn:#x} is freed while a device mapping names it"
+                );
                 m.refs = 0;
                 range.buddy.free_block(window, pfn, 0);
                 Ok(true)
@@ -232,6 +236,30 @@ impl FrameDb {
             n => {
                 m.refs = n - 1;
                 Ok(false)
+            }
+        }
+    }
+
+    /// A device mapping names the frame (IOMMU6, debug builds: the mark is checked by `dec`, which must never free a marked frame).
+    /// Taken after the mapping's hold on the frame's VMO and before any leaf names the frame; dropped by `io_unmark` after the
+    /// mapping's fence and before its hold is dropped.
+    #[cfg(debug_assertions)]
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the index was checked by `locate`
+    pub fn io_mark(&mut self, pfn: Pfn) {
+        if let Ok((_, i)) = self.locate(pfn) {
+            let m = &mut self.storage.get_mut()[i];
+            m.io = m.io.saturating_add(1);
+        }
+    }
+
+    /// Drop one `io_mark` (a saturated count stays: it can only under-count, never stop a free that is allowed).
+    #[cfg(debug_assertions)]
+    #[allow(clippy::indexing_slicing)] // INVARIANT: as io_mark
+    pub fn io_unmark(&mut self, pfn: Pfn) {
+        if let Ok((_, i)) = self.locate(pfn) {
+            let m = &mut self.storage.get_mut()[i];
+            if m.io != u16::MAX {
+                m.io = m.io.saturating_sub(1);
             }
         }
     }

@@ -998,3 +998,72 @@ fn the_debug_interface_and_other_registers() {
         ((QEMU_CAPS & !(1 << 31)) >> 32) as u32
     );
 }
+
+/// A18 (IOMMU-SPEC amendment 2026-11-26 part 2, OD169): the page-walk cache keeps non-leaf entries, which the address form of
+/// `IOTINVAL.GVMA` leaves and the whole-context form drops. A leaf table emptied and replaced behind the IOMMU's back is still
+/// walked through the cached pointer after a page-wise invalidation, and no longer after a whole-context one.
+#[test]
+fn the_page_walk_cache_is_dropped_only_by_a_whole_context_invalidation() {
+    let m = Machine::new();
+    let mut sim = m.sim(SimConfig::qemu());
+    assert_eq!(sim.read(1, 0x1008), Ok(0x2000_1008));
+    assert_eq!(
+        sim.walk_cached(),
+        2,
+        "the level-1 and the leaf table of device 1's walk"
+    );
+    // another soft context has entries of its own
+    assert_eq!(sim.read(2, 0x2000), Ok(0x2000_2000));
+    assert_eq!(sim.walk_cached(), 4);
+    // the leaf table is replaced: the level-1 entry now names a fresh table that maps page 1 elsewhere
+    let l1 = (m.mem.read(G_ROOT) >> 10) << 12;
+    let old_leaf_table = (m.mem.read(l1) >> 10) << 12;
+    let fresh = 0x8300_0000u64;
+    m.mem.write(
+        fresh + 8,
+        iommucore::iopt::leaf(0x2000_9000, Access::ReadWrite),
+    );
+    m.mem
+        .write(l1, (m.mem.read(l1) & 0x3ff) | ((fresh >> 12) << 10));
+    // the old table is reused for something else: a leaf for page 1 that reaches a frame nobody mapped
+    m.mem.write(
+        old_leaf_table + 8,
+        iommucore::iopt::leaf(0x2000_8000, Access::ReadWrite),
+    );
+    assert!(run(
+        &mut sim,
+        &m.mem,
+        Command::iotinval_gvma(1, Some(0x1000))
+    ));
+    assert_eq!(
+        sim.read(1, 0x1010),
+        Ok(0x2000_8010),
+        "the address form dropped the leaf but not the cached table pointer: the walk reached the old table"
+    );
+    assert!(run(
+        &mut sim,
+        &m.mem,
+        Command::iotinval_gvma(1, Some(0x1000))
+    ));
+    assert!(run(&mut sim, &m.mem, Command::iotinval_gvma(1, None)));
+    assert_eq!(sim.walk_cached(), 2, "only soft context 2's entries remain");
+    assert_eq!(
+        sim.read(1, 0x1010),
+        Ok(0x2000_9010),
+        "after the whole-context form the walk starts at the root"
+    );
+    // GVMA without GV drops every second-stage context's entries
+    assert!(run(
+        &mut sim,
+        &m.mem,
+        Command {
+            dword0: 1 | 1 << 7,
+            dword1: 0
+        }
+    ));
+    assert_eq!(sim.walk_cached(), 0);
+    // the debug interface walks the tables and caches nothing
+    sim.write64(regs::TR_REQ_IOVA, 0x2000);
+    sim.write64(regs::TR_REQ_CTL, regs::tr_req_ctl(1, false));
+    assert_eq!(sim.walk_cached(), 0);
+}

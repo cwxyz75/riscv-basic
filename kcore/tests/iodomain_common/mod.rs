@@ -368,10 +368,13 @@ impl<'m> World<'m> {
                     .unwrap();
                 MapStart::Refused(e)
             }
-            Err(MapFailed::RolledBack { pending, tables }) => {
+            Err(MapFailed::RolledBack {
+                pending, tables, ..
+            }) => {
                 charge.settle(&mut self.jobs, tables);
                 MapStart::RolledBack(pending)
             }
+            Err(e) => panic!("a map in one call meets no destruction: {e:?}"),
         }
     }
 

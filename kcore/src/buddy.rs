@@ -28,6 +28,9 @@ pub struct Meta {
     prev: u32,
     /// 0: not a free head; `k + 1`: the head of a free block of order `k`.
     head: u8,
+    /// Device mappings that name the frame (IOMMU6: kept in debug builds only, by `FrameDb::io_mark`; saturating), so that freeing a
+    /// frame a device can still reach is caught at the free.
+    pub io: u16,
 }
 
 /// Bytes of metadata per frame (the size of [`Meta`]).

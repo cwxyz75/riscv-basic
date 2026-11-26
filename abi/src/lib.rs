@@ -111,13 +111,21 @@ pub mod rights {
         /// given the power to make things inside a job without the power to lift the job's limits.
         pub const SET_LIMITS: Rights = Rights(1 << 11);
         /// Every assigned right bit.
-        pub const ALL: Rights = Rights(0x3fff);
+        pub const ALL: Rights = Rights(0x3_ffff);
         /// Learn a DMA VMO's physical address (a DMA VMO handle only).
         pub const DMA: Rights = Rights(1 << 12);
         /// Commit a VMO's pages now (`vmo_commit`): the pages are charged to the VMO's creating job, so a
         /// holder with this right spends the creator's quota (slice V). A creator narrows it away before
         /// handing a VMO to someone else.
         pub const COMMIT: Rights = Rights(1 << 13);
+        /// Map a DMA VMO into a device domain (`iodomain_map`; a domain handle only, IOMMU-SPEC 4.1).
+        pub const IO_MAP: Rights = Rights(1 << 14);
+        /// Remove a mapping of a device domain (`iodomain_unmap`).
+        pub const IO_UNMAP: Rights = Rights(1 << 15);
+        /// Grant an interrupt vector of a device domain (`iodomain_grant_vector`, IOMMU7).
+        pub const IO_GRANT: Rights = Rights(1 << 16);
+        /// Destroy a device domain (`iodomain_destroy`).
+        pub const IO_DESTROY: Rights = Rights(1 << 17);
         /// Not a right: "the same rights as the source", for duplicate and replace.
         pub const SAME: Rights = Rights(1 << 31);
 
@@ -181,6 +189,20 @@ pub mod rights {
         );
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
+        /// A device domain, as `iodomain_create` returns it (the supervisor's control handle, IOMMU-SPEC 4.1): map, unmap, grant,
+        /// destroy, and wait for and read its faults.
+        pub const IODOMAIN: Rights = Rights(
+            Self::IO_MAP.0
+                | Self::IO_UNMAP.0
+                | Self::IO_GRANT.0
+                | Self::IO_DESTROY.0
+                | Self::DUPLICATE.0
+                | Self::TRANSFER.0
+                | Self::WAIT.0
+                | Self::INSPECT.0,
+        );
+        /// What a driver is given (a duplicate of the control handle): map and unmap its own buffers, nothing else.
+        pub const IODOMAIN_DRIVER: Rights = Rights(Self::IO_MAP.0 | Self::IO_UNMAP.0);
 
         pub const fn union(self, other: Rights) -> Rights {
             Rights(self.0 | other.0)
@@ -256,6 +278,23 @@ pub mod port_flags {
     pub const ONESHOT: u64 = 1;
 }
 
+/// Device domains (IOMMU-SPEC 4, 7.4): the `access` word of `iodomain_map` and the words `iodomain_fault_read` returns.
+pub mod iodomain {
+    /// The device may read the memory (`access`: READ, or READ | WRITE; there is no write-only access).
+    pub const READ: u64 = 1;
+    /// The device may also write it.
+    pub const WRITE: u64 = 2;
+    /// `iodomain_fault_read`'s `a1`: the cause in bits 15:0, the direction in bits 23:16, the faults dropped since the previous read in
+    /// bits 63:32 (`a2` is the I/O address).
+    pub const DIRECTION_SHIFT: u32 = 16;
+    pub const DROPPED_SHIFT: u32 = 32;
+    /// The directions: not a transaction, a read, a write (a message is a write), an instruction fetch.
+    pub const DIR_NONE: u64 = 0;
+    pub const DIR_READ: u64 = 1;
+    pub const DIR_WRITE: u64 = 2;
+    pub const DIR_EXEC: u64 = 3;
+}
+
 pub mod signals {
     pub const READABLE: u32 = 1 << 0;
     pub const WRITABLE: u32 = 1 << 1;
@@ -268,6 +307,9 @@ pub mod signals {
     pub const INTERRUPT: u32 = 1 << 5;
     /// A process is stopped by `process_suspend` (level: cleared by `process_resume`; never set with TERMINATED).
     pub const STOPPED: u32 = 1 << 6;
+    /// A device domain has a fault record waiting (IOMMU-SPEC 7.4: level, cleared by the `iodomain_fault_read` that empties its ring).
+    /// The same bit as STOPPED: signal bits are per object kind.
+    pub const DEVICE_FAULT: u32 = 1 << 6;
     /// A thread has stopped because of `thread_suspend` (level: cleared when its suspend count falls to 0; never set with TERMINATED; EX1). A
     /// thread blocked in a call has stopped where it is.
     pub const SUSPENDED: u32 = 1 << 7;
@@ -499,6 +541,20 @@ pub mod syscall {
         SYSTEM_SUSPEND = 118,
         INTERRUPT_CREATE = 100,
         INTERRUPT_ACK = 101,
+        /// `iodomain_create(resource, device_id, job) -> domain` (IOMMU-SPEC 4.2).
+        IODOMAIN_CREATE = 119,
+        /// `iodomain_map(domain, vmo, vmo_offset, pages, access) -> io_address` (4.3).
+        IODOMAIN_MAP = 120,
+        /// `iodomain_unmap(domain, io_address, pages)` (4.4).
+        IODOMAIN_UNMAP = 121,
+        /// `iodomain_destroy(domain)` (4.5).
+        IODOMAIN_DESTROY = 122,
+        /// `iodomain_fault_read(domain) -> (cause | direction << 16 | dropped << 32, io_address)` (7.4; the packing is SYSCALLS.md's).
+        IODOMAIN_FAULT_READ = 123,
+        /// `job_set_io_limits(job, io_pages, vectors)` (5.3).
+        JOB_SET_IO_LIMITS = 124,
+        /// `vmo_create_dma_in(resource, pages, job) -> vmo` (4.7).
+        VMO_CREATE_DMA_IN = 125,
     }
     /// One more than the largest number in the table.
     pub const LIMIT: usize = 128;
