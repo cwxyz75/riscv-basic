@@ -13,8 +13,13 @@
 //! * `alloc` never returns an identity that is taken (a Retiring one included), and only a retirement frees one;
 //! * at the end, with everything destroyed and retired, every identity is Free again and every message sent was taken.
 //!
+//! * a message is delivered only to the object it was sent for, never to the next object of the same source;
+//! * a hart that is offline holds no route: nothing Opening, and every Live identity on it is moving away (IOMMU-SPEC 8.5).
+//!
 //! The mutations it was seen to catch: `fault-msiid-free-at-move` (the old identity freed at the move instead of at its retirement),
-//! `alloc` handing out identity 1, and the `num_ids` bound off by one (identity `num_ids + 1` handed out, or `num_ids` never).
+//! `alloc` handing out identity 1, the `num_ids` bound off by one (identity `num_ids + 1` handed out, or `num_ids` never), `evacuate`
+//! dropping a new route that its hart had not opened yet, `end` keeping the moved-from identities of an ended route for the source's
+//! next object, and an acknowledgement on a departing hart cancelling the move its evacuation started.
 use kcore::msiid::{Evacuated, IdSet, MsiIds, Opened, Place, Route, Slot, IPI};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,6 +41,13 @@ impl Lcg {
 struct Obj {
     at: Place,
     armed: bool,
+    /// which object of its source this is (a source's objects are destroyed and created again)
+    generation: u64,
+}
+
+/// A message: its source in the low 32 bits, the generation of the object it was sent for above.
+fn src(m: u64) -> u32 {
+    m as u32
 }
 
 struct Sim {
@@ -44,10 +56,11 @@ struct Sim {
     n: u16,
     eie: Vec<BTreeSet<u16>>,
     /// pending bits: the sources whose messages set it (several messages of one source merge into one bit)
-    eip: Vec<BTreeMap<u16, Vec<u32>>>,
+    eip: Vec<BTreeMap<u16, Vec<u64>>>,
+    generations: u64,
     objs: BTreeMap<u32, Obj>,
     target: BTreeMap<u32, Place>,
-    inflight: Vec<(u32, Place)>,
+    inflight: Vec<(u64, Place)>,
     work: BTreeSet<u16>,
     online: Vec<bool>,
     /// the reference: which identities are taken (independent of the allocator's own state)
@@ -68,6 +81,7 @@ impl Sim {
             objs: BTreeMap::new(),
             target: BTreeMap::new(),
             inflight: Vec::new(),
+            generations: 0,
             work: BTreeSet::new(),
             online: vec![true; harts as usize],
             taken: BTreeSet::new(),
@@ -113,7 +127,30 @@ impl Sim {
     }
 
     fn create(&mut self, s: u32, hart: u16) {
-        if self.objs.contains_key(&s) || !self.online[hart as usize] {
+        if self.objs.contains_key(&s) {
+            return;
+        }
+        if !self.online[hart as usize] {
+            // (a thread still on a hart that is leaving: the identity goes to an online hart, which opens it and aims the source later)
+            let online = self.online.clone();
+            let Some(p) = self.ids.alloc_any(Route::Wired(s), |h| online[h as usize]) else {
+                return;
+            };
+            assert!(
+                online[p.hart as usize],
+                "a new route placed on an offline hart"
+            );
+            self.note_taken(p);
+            self.generations += 1;
+            self.objs.insert(
+                s,
+                Obj {
+                    at: p,
+                    armed: true,
+                    generation: self.generations,
+                },
+            );
+            self.work.insert(p.hart);
             return;
         }
         let Some(id) = self.ids.alloc(hart, Route::Wired(s)) else {
@@ -126,7 +163,15 @@ impl Sim {
         };
         let p = Place { hart, id };
         self.note_taken(p);
-        self.objs.insert(s, Obj { at: p, armed: true });
+        self.generations += 1;
+        self.objs.insert(
+            s,
+            Obj {
+                at: p,
+                armed: true,
+                generation: self.generations,
+            },
+        );
         self.open(p);
         self.aim(s, p);
     }
@@ -152,11 +197,13 @@ impl Sim {
         if o.armed {
             return;
         }
-        if let Some(Slot::Live { to: Some(t), .. }) = self.ids.slot(o.at) {
-            self.ids.end(t).unwrap();
-            self.work.insert(t.hart);
-        }
-        if o.at.hart != hart && self.online[hart as usize] {
+        // (as the kernel's `reenable`: only an acknowledgement that will move the route cancels a move under way; one on a hart that is
+        // leaving, or with no free identity, leaves the route and its move as they are)
+        if o.at.hart != hart && self.online[hart as usize] && self.ids.free_on(hart) > 0 {
+            if let Some(Slot::Live { to: Some(t), .. }) = self.ids.slot(o.at) {
+                self.ids.end(t).unwrap();
+                self.work.insert(t.hart);
+            }
             if let Some(id) = self.ids.move_to(o.at, hart) {
                 let p = Place { hart, id };
                 self.note_taken(p);
@@ -184,22 +231,24 @@ impl Sim {
     fn fire(&mut self, s: u32) {
         if let (Some(o), Some(&t)) = (self.objs.get(&s), self.target.get(&s)) {
             if o.armed {
-                self.inflight.push((s, t));
+                self.inflight.push((o.generation << 32 | u64::from(s), t));
                 self.sent += 1;
             }
         }
     }
 
     fn land(&mut self, k: usize) {
-        let (s, p) = self.inflight.swap_remove(k);
+        let (m, p) = self.inflight.swap_remove(k);
+        let s = src(m);
         let pend = self.eip[p.hart as usize].entry(p.id).or_default();
         if let Some(&other) = pend.first() {
+            let other = src(other);
             assert_eq!(
                 other, s,
                 "{p:?} has messages of sources {other} and {s} pending: one identity, two routes"
             );
         }
-        pend.push(s);
+        pend.push(m);
     }
 
     fn land_all_to(&mut self, p: Place) {
@@ -209,8 +258,8 @@ impl Sim {
     }
 
     /// A message (or several merged) of source `s` taken on `p`: to its route, or discarded where the route ended.
-    fn take(&mut self, p: Place, srcs: Vec<u32>) {
-        let s = srcs[0];
+    fn take(&mut self, p: Place, srcs: Vec<u64>) {
+        let s = src(srcs[0]);
         self.took += srcs.len() as u64;
         match self.ids.slot(p) {
             Some(Slot::Live {
@@ -226,6 +275,15 @@ impl Sim {
                     "a message of source {s} delivered to source {r} on {p:?}"
                 );
                 *self.delivered.entry(s).or_default() += 1;
+                if let Some(o) = self.objs.get(&s) {
+                    for &m in &srcs {
+                        assert_eq!(
+                            m >> 32,
+                            o.generation,
+                            "a message sent for an earlier object of source {s} delivered to the object that replaced it, on {p:?}"
+                        );
+                    }
+                }
                 if let Some(o) = self.objs.get_mut(&s) {
                     o.armed = false; // masked: the object fired
                 }
@@ -303,6 +361,17 @@ impl Sim {
                     match c {
                         Evacuated::Cancelled { at, .. } => {
                             self.work.insert(at.hart);
+                        }
+                        Evacuated::Replaced { from, to, route } => {
+                            assert!(online[to.hart as usize], "placed again on an offline hart");
+                            assert_eq!(from.hart, hart);
+                            let Route::Wired(s) = route else {
+                                panic!("{route:?} replaced")
+                            };
+                            self.note_taken(to);
+                            self.objs.get_mut(&s).expect("an object's new route").at = to;
+                            self.work.insert(to.hart);
+                            self.work.insert(from.hart);
                         }
                         Evacuated::Moved { to, from, .. } => {
                             assert_ne!(to.hart, hart, "evacuated onto the departing hart");
@@ -388,6 +457,21 @@ impl Sim {
                     "identity {id} is open on hart {hart} with no route (IO12)"
                 );
                 assert!(!matches!(s, Slot::Opening { .. }));
+            }
+        }
+        // a hart that is offline holds no route: nothing Opening, and every Live identity is moving away (IOMMU-SPEC 8.5)
+        for hart in 0..self.harts {
+            if self.online[hart as usize] {
+                continue;
+            }
+            for id in 2..=self.n {
+                let p = Place { hart, id };
+                match self.ids.slot(p).unwrap() {
+                    Slot::Opening { .. } | Slot::Live { to: None, .. } => {
+                        panic!("{p:?} is {:?} on an offline hart", self.ids.slot(p))
+                    }
+                    _ => {}
+                }
             }
         }
         for (&src, &k) in &live {

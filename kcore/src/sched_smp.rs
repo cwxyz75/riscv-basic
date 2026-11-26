@@ -363,6 +363,21 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.marks.load(Ordering::Relaxed)
     }
 
+    /// Would `begin_offline(v)` refuse now (no such hart, the last one online, or a thread pinned to it)? For a caller that must change
+    /// something else first, and only if the hart may go (the kernel moves the hart's interrupt routes): it makes one offline call at a
+    /// time, and a thread's affinity is given when the thread is made, so the answer holds until its `begin_offline` unless a pinned
+    /// thread is made on `v` in between (then `begin_offline` still refuses, and the caller says so).
+    pub fn offline_refused(&self, v: usize) -> bool {
+        if v >= self.harts() {
+            return true;
+        }
+        let m = self.masks.online.load(Ordering::SeqCst);
+        if m & (1u64 << v) == 0 {
+            return false; // (already offline: `begin_offline` says OK)
+        }
+        m & !(1u64 << v) == 0 || self.lq(v).has_pinned(v)
+    }
+
     pub fn harts(&self) -> usize {
         self.rqs.len()
     }

@@ -72,6 +72,14 @@ pub enum Evacuated {
         from: Place,
         to: Place,
     },
+    /// A new route (Opening with no origin: placed there by a hart that was leaving, and not opened yet) was placed again: `from` is
+    /// Retiring (`moved` false: nothing was ever aimed at it), and `to` is Opening on another hart. Whoever records the route's
+    /// identity must record `to`.
+    Replaced {
+        route: Route,
+        from: Place,
+        to: Place,
+    },
 }
 
 /// What `opened` did.
@@ -296,6 +304,9 @@ impl MsiIds {
                 Ok(None)
             }
             Some(Slot::Live { route, to }) if route != Route::Ipi => {
+                // (the route ends: a message still waiting on an identity it moved away from is nobody's now, not the next owner's of
+                // the same source)
+                self.forget_moves(route);
                 self.set(
                     p,
                     Slot::Retiring {
@@ -324,6 +335,24 @@ impl MsiIds {
                 Ok(cancelled)
             }
             _ => Err(()),
+        }
+    }
+
+    /// Every identity `route` moved away from and not yet retired becomes one whose route ended (`moved` false).
+    fn forget_moves(&mut self, route: Route) {
+        for hart in 0..self.harts {
+            for id in 2..=self.num_ids {
+                let p = Place { hart, id };
+                if self.slot(p) == Some(Slot::Retiring { route, moved: true }) {
+                    self.set(
+                        p,
+                        Slot::Retiring {
+                            route,
+                            moved: false,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -356,7 +385,9 @@ impl MsiIds {
         let mut need: u64 = 0;
         for id in 2..=self.num_ids {
             match self.slot(Place { hart: from, id }) {
-                Some(Slot::Live { to: None, .. }) => need = need.saturating_add(1),
+                Some(Slot::Live { to: None, .. }) | Some(Slot::Opening { from: None, .. }) => {
+                    need = need.saturating_add(1)
+                }
                 Some(Slot::Opening { from: Some(f), .. }) if !ok(f.hart) => {
                     need = need.saturating_add(1)
                 }
@@ -373,6 +404,16 @@ impl MsiIds {
         for id in 2..=self.num_ids {
             let at = Place { hart: from, id };
             match self.slot(at) {
+                Some(Slot::Opening { route, from: None }) => {
+                    let hart = self.best_hart(ok).ok_or(())?;
+                    let _ = self.end(at);
+                    let id = self.alloc(hart, route).ok_or(())?;
+                    changed(Evacuated::Replaced {
+                        route,
+                        from: at,
+                        to: Place { hart, id },
+                    });
+                }
                 Some(Slot::Opening {
                     route,
                     from: origin,

@@ -511,8 +511,9 @@ was running is displaced and every thread and timer homed on it moves to online 
 it move to another online hart (IOMMU-SPEC 8.5: each gets an identity in that hart's file first, and the old one is retired by the hart
 that had it). Coming back: its clock is reset, its TLB flushed, and placement may choose it again. Idempotent when the hart is already in the requested
 state. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such hart, `online` above 1); BAD_STATE (it is the last online hart, a thread is pinned to it,
-or another call is changing it); NO_MEMORY (going offline: the other online harts have no free interrupt identity for a route the hart holds; nothing
-changed, the hart stays online); TIMED_OUT (the hart did not get there within two seconds: a kernel bug; the hart goes on towards the requested state, so the call can be repeated and answers OK once it is there). Hart 0 never goes offline today: the boot thread and the default affinity of kernel threads are pinned to it (BAD_STATE).
+or another `hart_set_online` call is under way, for any hart); NO_MEMORY (going offline: the other online harts have no free interrupt identity for a route the hart holds; nothing
+changed, the hart stays online; the refusals of BAD_STATE change nothing either). OK means the hart is offline: its routes are on other
+harts, and the identities they left may still be retiring on it (it keeps taking its file's messages until then); TIMED_OUT (the hart did not get there within two seconds: a kernel bug; the hart goes on towards the requested state, so the call can be repeated and answers OK once it is there). Hart 0 never goes offline today: the boot thread and the default affinity of kernel threads are pinned to it (BAD_STATE).
 
 ### hart_info(resource, index) -> state
 
@@ -551,11 +552,12 @@ QEMU `virt` the virtio-mmio slots, sources 1 to 8, and the RTC, 11; slot *n* is 
 other source, the console's included, is refused (the kernel never keeps for itself a source an admitted device names). The kernel delivers the source to an interrupt
 identity it chooses in the calling hart's IMSIC file (IOMMU-SPEC 8.1: identities are per hart, 0 is invalid and 1 the inter-hart interrupt; any
 other identity up to `riscv,num-ids` may be used). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
-INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`**, and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` moves the source to the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
+INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`** (or, when that hart is going offline,
+to the online hart with the fewest routes), and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` moves the source to the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
 existed (a device that raised its line while nobody listened): **drivers must tolerate a spurious
 interrupt** right after `interrupt_create` and check their device's own status. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
 INVALID_ARGS (source 0, not a source of an admitted device, or past 32 bits); BAD_STATE (a live object already owns the source); NO_MEMORY (also when
-the calling hart's file has no free interrupt identity: nothing changed).
+the calling hart's file has no free interrupt identity, or the IMSIC does not list the calling hart: nothing changed).
 
 ### interrupt_ack(interrupt) -> status, claims
 
@@ -563,7 +565,8 @@ Clear INTERRUPT and unmask the source (a level still asserted fires again at onc
 device fires again. `claims` is how many times the kernel has claimed this source for the object
 (a storm shows here). When the acknowledging hart is not the one the source is delivered to, the route moves to a new identity in this hart's
 file (when it has none free, the route stays where it is); the old identity is closed, checked for a message still on its way (delivered, not
-lost) and freed by its own hart (IOMMU-SPEC 8.4). Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
+lost) and freed by its own hart (IOMMU-SPEC 8.1). An acknowledgement on a hart that is going offline, or with no free identity there,
+leaves the route where it is. Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
 
 ### process_create(job) -> status, handle
 

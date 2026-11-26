@@ -511,7 +511,7 @@ fn install_here(s: u32, route: Route) -> Result<(), abi::status::Status> {
     let file = this_file().ok_or(abi::status::Status::NoMemory)?;
     let hart = u16::try_from(file).map_err(|_| abi::status::Status::NoMemory)?;
     with_table(|t| {
-        end_route(t, s);
+        // (the identity first: when there is none, nothing has changed, the old route included)
         let p = if !leaving(hart) {
             let id = t
                 .ids
@@ -529,6 +529,12 @@ fn install_here(s: u32, route: Route) -> Result<(), abi::status::Status> {
             ask(usize::from(p.hart));
             p
         };
+        // a route the source still has (a destroyed object whose cleanup has not run yet) ends: masked first, so the source cannot
+        // fire into its old identity once that is retired and given to someone else
+        if matches!(t.at.get(s as usize), Some(Some(_))) {
+            disable(s);
+            end_route(t, s);
+        }
         if let Some(a) = t.at.get_mut(s as usize) {
             *a = Some(p);
         }
@@ -558,18 +564,23 @@ pub fn reenable(irq: u32) {
                 let Some(&Some(at)) = t.at.get(irq as usize) else {
                     return;
                 };
+                // (the route stays where it is, and a move under way with it, unless this acknowledgement moves it: not on its own
+                // hart, not onto a hart that is leaving (the evacuation chose where its routes go), not without a free identity here)
+                if at.hart == hart
+                    || leaving(hart)
+                    || t.ids.free_on(hart) == 0
+                    || !matches!(t.ids.slot(at), Some(Slot::Live { .. }))
+                {
+                    return;
+                }
                 // a move under way (a hart going offline asked another to open one) gives way to this one
                 if let Some(Slot::Live { to: Some(next), .. }) = t.ids.slot(at) {
                     if t.ids.end(next).is_ok() {
                         ask(usize::from(next.hart));
                     }
                 }
-                // (a hart going offline takes no route: it stays where it is, on a hart the evacuation chose)
-                if at.hart == hart || leaving(hart) {
-                    return;
-                }
                 let Some(id) = t.ids.move_to(at, hart) else {
-                    return; // (no free identity here: the source stays where it is)
+                    return; // (refused: the source stays where it is)
                 };
                 let p = Place { hart, id };
                 open_here(u32::from(id));
@@ -618,13 +629,18 @@ fn aim_and_unmask(irq: u32) {
 /// The source `irq`'s object is gone (and no newer one owns it): mask it and end its route; the identity is retired by its hart.
 pub fn release(irq: u32) {
     disable(irq);
+    // (the mask reaches the APLIC before the identity's hart is told to retire it, as `aim` makes sure of a new target)
+    // SAFETY: a fence orders this hart's device writes; it touches no memory.
+    unsafe { asm!("fence iorw, iorw") };
     with_table(|t| end_route(t, irq));
 }
 
 /// Hart `v` (`percpu` index) goes offline (IOMMU-SPEC 8.5): move every route on its file to the online hart with the fewest routes.
-/// All or nothing: `NoMemory`, with nothing changed, when the other harts have too few free identities. The harts the routes move to
-/// open them and aim the sources; `v` retires the old identities (an offline hart still takes its file's messages). Takes the lock.
-pub fn evacuate(v: usize) -> Result<(), abi::status::Status> {
+/// All or nothing: `NoMemory`, with nothing changed, when the other harts have too few free identities (or there is no other online
+/// hart and `v` has routes). The harts the routes move to open them and aim the sources; `v` retires the old identities (an offline
+/// hart still takes its file's messages). The caller holds the object lock with interrupts off (`hart_set_online`, which also checks
+/// first that the hart may go).
+pub fn evacuate_locked(v: usize) -> Result<(), abi::status::Status> {
     let Some(file) = FILE_OF_HART
         .get(v)
         .map(|a| a.load(Ordering::Acquire))
@@ -635,21 +651,25 @@ pub fn evacuate(v: usize) -> Result<(), abi::status::Status> {
     let Ok(from) = u16::try_from(file) else {
         return Ok(());
     };
-    let usable = usable_file;
-    crate::irq::without(|| {
-        with_table(|t| {
-            // (no other hart to move to: it is the last one online, which `hart_set_online` refuses on its own, BAD_STATE)
-            if !(0..t.ids.harts()).any(|f| f != from && usable(f)) {
-                return Ok(());
+    with_table(|t| {
+        let Table { ids, at } = t;
+        ids.evacuate(from, usable_file, |c| match c {
+            kcore::msiid::Evacuated::Cancelled { at: p, .. } => ask(usize::from(p.hart)),
+            kcore::msiid::Evacuated::Moved { to, .. } => ask(usize::from(to.hart)),
+            // (a new route not opened yet is placed again: the source's record follows it, and both harts have work)
+            kcore::msiid::Evacuated::Replaced { route, from, to } => {
+                if let Route::Wired(s) | Route::Kernel(s) = route {
+                    if let Some(a) = at.get_mut(s as usize).filter(|a| **a == Some(from)) {
+                        *a = Some(to);
+                    }
+                }
+                ask(usize::from(from.hart));
+                ask(usize::from(to.hart));
             }
-            t.ids.evacuate(from, usable, |c| match c {
-                kcore::msiid::Evacuated::Cancelled { at, .. } => ask(usize::from(at.hart)),
-                kcore::msiid::Evacuated::Moved { to, .. } => ask(usize::from(to.hart)),
-            })
         })
-        .unwrap_or(Ok(()))
-        .map_err(|()| abi::status::Status::NoMemory)
     })
+    .unwrap_or(Ok(()))
+    .map_err(|()| abi::status::Status::NoMemory)
 }
 
 /// Mask source `irq`.

@@ -712,17 +712,24 @@ fn claim_file() -> (bool, kcore::msiid::IdSet) {
 #[inline(never)] // (as `ipi_trap`)
 fn external_trap(frame: &mut TrapFrame, from_user: bool) {
     let (ipi, devices) = claim_file();
-    if devices.is_empty() {
-        // (identities to open or retire in this hart's file: work under the lock, which may deliver a message a retired identity still
-        // held (IOMMU4). It is not a reason to switch here: a thread it wakes is placed and poked like any wake, and the inter-hart
-        // part then takes its usual quiet path. A hart that is going offline does this too, and must not schedule from it.)
-        if crate::aia::has_work() {
-            crate::bkl::lock();
-            if crate::aia::deliver(&devices, crate::user::irq_fired) {
-                crate::user::wake_signal_waiters();
-            }
-            crate::bkl::unlock();
+    let online =
+        crate::percpu::this().hart_state.load(Ordering::Acquire) == crate::percpu::HART_ONLINE;
+    if devices.is_empty() && !crate::aia::has_work() {
+        if ipi {
+            ipi_trap(frame);
         }
+        return;
+    }
+    if !online {
+        // A hart that is going offline, or is offline, still takes its file's messages: the identities it retires after its routes
+        // moved, and a message that reached one first (IOMMU4, IOMMU-SPEC 8.5). That is work under the lock, and a thread it wakes is
+        // placed on an online hart and poked like any wake; this hart does not schedule or service the heap from it (it is draining or
+        // parked, and a switch made here left a runnable thread unserved). The inter-hart part then takes its usual path.
+        crate::bkl::lock();
+        if crate::aia::deliver(&devices, crate::user::irq_fired) {
+            crate::user::wake_signal_waiters();
+        }
+        crate::bkl::unlock();
         if ipi {
             ipi_trap(frame);
         }
