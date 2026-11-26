@@ -572,7 +572,7 @@ impl ksys::iodomain::IoEnv for Kenv {
         })
     }
     fn device_ok(&self, device_id: u64) -> bool {
-        tree().is_some_and(|t| device_id < u64::from(t.device_ids))
+        tree().is_some_and(|t| t.covers(device_id))
     }
     fn now(&self) -> u64 {
         crate::timer::now()

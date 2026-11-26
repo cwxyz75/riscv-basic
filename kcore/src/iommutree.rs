@@ -74,6 +74,15 @@ impl Iommu {
     pub fn source(&self, cause: Cause) -> Option<Source> {
         self.sources.get(cause as usize).copied()
     }
+
+    /// Is `device_id` one that some host's `iommu-map` names for this IOMMU? (A map may leave holes: one past the highest,
+    /// `device_ids`, is not enough.)
+    pub fn covers(&self, device_id: u64) -> bool {
+        self.pci.iter().flat_map(|h| &h.map).any(|e| {
+            let base = u64::from(e.did_base);
+            device_id >= base && device_id < base.saturating_add(u64::from(e.len))
+        })
+    }
 }
 
 /// Why there is no usable IOMMU. Its `Display` contains `no IOMMU`, the refusal line of IOMMU-SPEC 2.5.
@@ -142,6 +151,39 @@ fn pci_memory_windows(host: &Node) -> Option<Vec<(u64, u64)>> {
     Some(out)
 }
 
+/// One entry of an `iommu-map` as the binding writes it (`pci-iommu.yaml`): requester ids `rid_base ..` (`len` of them) are, on
+/// the IOMMU whose phandle is `iommu`, the specifiers `did_base ..`.
+struct RawEntry {
+    rid_base: u32,
+    iommu: u32,
+    did_base: u32,
+    len: u32,
+}
+
+/// The entries of `host`'s `iommu-map`: tuples of (rid-base, iommu phandle, iommu-base, length), one cell each (the binding's
+/// specifier is one cell, as `riscv,iommu`'s `#iommu-cells = <1>` makes it). An entry of length 0 maps nothing and is dropped
+/// (QEMU 10.2 and 11.0 write one ahead of their real entry). `None` if the property is empty or does not divide into whole
+/// entries.
+fn map_entries(host: &Node) -> Option<Vec<RawEntry>> {
+    let cells = host.cells("iommu-map");
+    let (quads, rest) = cells.as_chunks::<4>();
+    if quads.is_empty() || !rest.is_empty() {
+        return None;
+    }
+    Some(
+        quads
+            .iter()
+            .filter(|q| q[3] != 0)
+            .map(|&[rid_base, iommu, did_base, len]| RawEntry {
+                rid_base,
+                iommu,
+                did_base,
+                len,
+            })
+            .collect(),
+    )
+}
+
 /// Find the one platform IOMMU, its sources (each on the supervisor-domain APLIC, with that controller's two-cell interrupt
 /// specifiers) and the PCI hosts whose `iommu-map` names it.
 pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
@@ -195,38 +237,39 @@ pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
             "names an interrupt source that cannot be used",
         ));
     }
+    if node.cells("#iommu-cells") != [1] {
+        return Err(Absent::Malformed(
+            "does not have #iommu-cells = <1> (one cell of device id)",
+        ));
+    }
     let mut pci = Vec::new();
     let mut device_ids = 0u32;
     for host in nodes.iter().filter(|n| n.is_compatible(PCI_HOST)) {
-        let map = host.cells("iommu-map");
-        if map.is_empty() {
+        if host.prop("iommu-map").is_none() {
             continue; // not behind this IOMMU: its windows are not opened (devwin)
         }
-        let (quads, rest) = map.as_chunks::<4>();
-        if !rest.is_empty() {
-            return Err(Absent::Malformed(
-                "has a PCI host whose iommu-map cannot be read",
-            ));
-        }
+        let map = map_entries(host).ok_or(Absent::Malformed(
+            "has a PCI host whose iommu-map cannot be read",
+        ))?;
+        // (an entry naming another IOMMU is that IOMMU's business: it puts the host only partly behind this one, which
+        // `fully_behind_the_iommu` refuses windows for; it does not make this IOMMU unusable)
         let mut entries = Vec::new();
-        for &[rid_base, iommu, did_base, len] in quads {
-            if iommu != me {
-                return Err(Absent::Malformed(
-                    "has a PCI host whose iommu-map names another IOMMU",
-                ));
-            }
-            let end = u64::from(did_base).saturating_add(u64::from(len));
-            if len == 0 || end > 1 << 24 {
+        for e in map.into_iter().filter(|e| e.iommu == me) {
+            let end = u64::from(e.did_base).saturating_add(u64::from(e.len));
+            if end > 1 << 24 {
                 return Err(Absent::Malformed(
                     "has a PCI host whose iommu-map names device ids past 24 bits",
                 ));
             }
             device_ids = device_ids.max(end as u32);
             entries.push(MapEntry {
-                rid_base,
-                did_base,
-                len,
+                rid_base: e.rid_base,
+                did_base: e.did_base,
+                len: e.len,
             });
+        }
+        if entries.is_empty() {
+            continue; // no requester id of this host is behind this IOMMU
         }
         let ecam = *host
             .regs()
@@ -251,7 +294,8 @@ pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
 }
 
 /// Is every function of PCI host `host` behind the one platform IOMMU? Its `iommu-map` must name only that IOMMU, have no
-/// `iommu-map-mask` (which would fold requester ids together), and cover every requester id the host can issue (0 to 0xffff:
+/// `iommu-map-mask` that folds requester ids together (one that keeps all 16 bits is the identity), and cover every requester
+/// id the host can issue (0 to 0xffff:
 /// bus, device and function). A host with no map, a partial map or a map naming anything else is not behind it (IOMMU-SPEC 2.6:
 /// fail closed; a function outside the map would reach memory untranslated).
 pub fn fully_behind_the_iommu(host: &Node, nodes: &[Node]) -> bool {
@@ -261,20 +305,26 @@ pub fn fully_behind_the_iommu(host: &Node, nodes: &[Node]) -> bool {
     let (Some(me), None) = (iommus.next().and_then(phandle), iommus.next()) else {
         return false;
     };
+    // the mask is applied to a requester id before the lookup: one that keeps all 16 bits folds nothing, and any other makes
+    // several functions one device id, which one domain per function cannot express
     if host.prop("iommu-map-mask").is_some() {
+        match host.cells("iommu-map-mask").as_slice() {
+            [m] if m & 0xffff == 0xffff => {}
+            _ => return false,
+        }
+    }
+    let Some(map) = map_entries(host) else {
+        return false;
+    };
+    if map.is_empty() || map.iter().any(|e| e.iommu != me) {
         return false;
     }
-    let map = host.cells("iommu-map");
-    let (quads, rest) = map.as_chunks::<4>();
-    if quads.is_empty() || !rest.is_empty() || quads.iter().any(|q| q[1] != me) {
-        return false;
-    }
-    let mut spans: Vec<(u64, u64)> = quads
+    let mut spans: Vec<(u64, u64)> = map
         .iter()
-        .map(|q| {
+        .map(|e| {
             (
-                u64::from(q[0]),
-                u64::from(q[0]).saturating_add(u64::from(q[3])),
+                u64::from(e.rid_base),
+                u64::from(e.rid_base).saturating_add(u64::from(e.len)),
             )
         })
         .collect();
