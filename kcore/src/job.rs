@@ -50,6 +50,29 @@ pub enum Resource {
     KernelBytes,
 }
 
+/// The two device resources of IOMMU-SPEC 5.3 (OD166 point 4), kept apart from `Resource` and `Limits` because they are set by a call of
+/// their own (`job_set_io_limits`) and have no default: a job on which none is set, and none of whose ancestors has one, is unlimited (as
+/// the region limit). Usage is counted on the job and every ancestor (J1), and the smallest limit along the ancestors applies, so a child
+/// inherits its parent's cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoResource {
+    /// Pages mapped into device domains whose job this is (one per page per mapping).
+    MappedPages,
+    /// Live interrupt vectors of device domains whose job this is (charged by IOMMU7).
+    Vectors,
+}
+
+const IO_RESOURCES: usize = 2;
+
+impl IoResource {
+    const fn index(self) -> usize {
+        match self {
+            IoResource::MappedPages => 0,
+            IoResource::Vectors => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub processes: u64,
@@ -182,6 +205,11 @@ struct Rec {
     /// Most regions one address space of this job's processes may hold (PL8: the per-job quota that replaces a constant; the effective value is the
     /// smallest along the ancestors; `UNLIMITED` is the hard backstop only).
     regions: u64,
+    /// The job's own limits on the two device resources (IOMMU-SPEC 5.3), by `IoResource`: `UNLIMITED` unless set. Hierarchical like `regions`: the smallest
+    /// along the ancestors applies, and a charge is checked against every one of them.
+    io_limit: [u64; IO_RESOURCES],
+    /// Usage of the two device resources by this job and everything below it (J1: counted on every ancestor).
+    io_used: [u64; IO_RESOURCES],
     usage: Usage,
     /// Holders of this id (see the module comment).
     uses: u32,
@@ -208,6 +236,8 @@ impl Jobs {
             limits: Limits::UNLIMITED,
             sched: SchedLimits::ROOT,
             regions: UNLIMITED,
+            io_limit: [UNLIMITED; IO_RESOURCES],
+            io_used: [0; IO_RESOURCES],
             usage: Usage::default(),
             uses: 1,
         }));
@@ -275,6 +305,8 @@ impl Jobs {
             limits,
             sched: inherited,
             regions: UNLIMITED,
+            io_limit: [UNLIMITED; IO_RESOURCES],
+            io_used: [0; IO_RESOURCES],
             usage: Usage::default(),
             uses: 1,
         };
@@ -315,6 +347,10 @@ impl Jobs {
             r.uses -= 1;
             if r.uses == 0 {
                 debug_assert_eq!(r.usage, Usage::default(), "a freed job still has usage");
+                debug_assert_eq!(
+                    r.io_used, [0; IO_RESOURCES],
+                    "a freed job still has device usage"
+                );
                 cur = r.parent;
                 self.recs[id.0 as usize] = None;
                 self.free.push(id.0);
@@ -446,6 +482,83 @@ impl Jobs {
             cur = rec.parent;
         }
         room
+    }
+
+    /// Set the job's own limits on I/O-mapped pages and on interrupt vectors (`job_set_io_limits`, IOMMU-SPEC 5.3; `UNLIMITED` for none).
+    /// Usage above a new limit is not an error: later charges fail until usage is back under it.
+    pub fn set_io_limits(
+        &mut self,
+        id: JobId,
+        io_pages: u64,
+        vectors: u64,
+    ) -> Result<(), JobError> {
+        self.rec_mut(id).ok_or(JobError::NoSuchJob)?.io_limit = [io_pages, vectors];
+        Ok(())
+    }
+
+    /// The limit on `r` that applies to `id`: the smallest set on the job and its ancestors (`UNLIMITED` if none).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: IoResource::index() < IO_RESOURCES
+    pub fn io_limit(&self, id: JobId, r: IoResource) -> u64 {
+        let mut cur = Some(id);
+        let mut lim = UNLIMITED;
+        while let Some(c) = cur {
+            let Some(rec) = self.rec(c) else { break };
+            lim = lim.min(rec.io_limit[r.index()]);
+            cur = rec.parent;
+        }
+        lim
+    }
+
+    /// The job's own limit on `r` as set (not inherited).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: IoResource::index() < IO_RESOURCES
+    pub fn io_own_limit(&self, id: JobId, r: IoResource) -> Option<u64> {
+        Some(self.rec(id)?.io_limit[r.index()])
+    }
+
+    /// What the job and everything below it use of `r`.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: IoResource::index() < IO_RESOURCES
+    pub fn io_usage(&self, id: JobId, r: IoResource) -> Option<u64> {
+        Some(self.rec(id)?.io_used[r.index()])
+    }
+
+    /// Charge `n` of `r` to `id` and every ancestor, all or nothing (J1): refused if the job or any ancestor would pass its own limit, which
+    /// is the same as passing the smallest limit along the chain for the job's own usage.
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::expect_used
+    )] // INVARIANT: IoResource::index() < IO_RESOURCES; the record was checked to exist in the first pass; the first pass checked each sum against a limit below u64::MAX, or it is the unlimited case where usage is bounded by the window
+    pub fn charge_io(&mut self, id: JobId, r: IoResource, n: u64) -> Result<(), JobError> {
+        let i = r.index();
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            let rec = self.rec(c).ok_or(JobError::NoSuchJob)?;
+            let limit = rec.io_limit[i];
+            if limit != UNLIMITED && rec.io_used[i].saturating_add(n) > limit {
+                return Err(JobError::Exceeded);
+            }
+            cur = rec.parent;
+        }
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            let rec = self.rec_mut(c).expect("checked above");
+            rec.io_used[i] = rec.io_used[i].saturating_add(n);
+            cur = rec.parent;
+        }
+        Ok(())
+    }
+
+    /// Give back what `charge_io` took (J2: exactly once, by the caller's bookkeeping).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: IoResource::index() < IO_RESOURCES
+    pub fn credit_io(&mut self, id: JobId, r: IoResource, n: u64) {
+        let i = r.index();
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            let Some(rec) = self.rec_mut(c) else { return };
+            debug_assert!(rec.io_used[i] >= n, "credit of more than was charged");
+            rec.io_used[i] = rec.io_used[i].saturating_sub(n);
+            cur = rec.parent;
+        }
     }
 
     /// Give back what `charge` took.
