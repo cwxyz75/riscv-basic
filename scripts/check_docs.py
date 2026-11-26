@@ -28,6 +28,9 @@ STALE = [
 
 
 GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of ci.yml may take at most this long (the jobs run side by side)
+# TESTING.md, "Budgets": the one exception, the tool-build job (CI's QEMU into the cache: seconds when warm, a build when cold). It runs no
+# make target, starts nothing, and only calls the install action in `mode: fill`; every job that uses CI's QEMU needs it.
+TOOL_BUILD_JOB, TOOL_BUILD_BUDGET_MINUTES = "qemu", 20
 # Soak targets that CI runs split into smaller jobs: the soak workflow may name the parts instead.
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
 # Targets besides the smoke ones that ci.yml may run: parts of a smoke target that CI runs as their own jobs.
@@ -75,6 +78,26 @@ def boots(rules, target, seen=None):
     return bool(BOOTS_RE.search(recipe)) or any(boots(rules, d, seen) for d in deps)
 
 
+def check_ci_qemu(wf, text, rules):
+    """CI's QEMU (TEST-TOOLS.md): a job that boots gets QEMU only from the install action (never `qemu: 'false'`, never apt), and a job
+    that uses CI's QEMU needs the tool-build job that fills the cache, so it cannot start before the entry exists."""
+    out = []
+    for job in re.split(r"^  (?=[a-z][\w-]*:\s*$)", text.split("\njobs:\n", 1)[-1], flags=re.M):
+        name = job.split(":", 1)[0].strip()
+        if name == TOOL_BUILD_JOB:
+            continue
+        targets = " ".join(re.findall(r"^\s*(?:- )?run: make (.*)$", job, re.M)).split()
+        targets += re.findall(r"^\s+(?:[A-Z_]+=\S+ )*make ([a-z][\w-]*)", job, re.M)
+        uses = "uses: ./.github/actions/install-qemu" in job and "qemu: 'false'" not in job
+        if (any(boots(rules, t) for t in targets if "$" not in t) or BOOTS_RE.search(job)) and not uses:
+            out.append(f"{wf}: job {name} boots but does not install CI's QEMU (the install action, without `qemu: 'false'`)")
+        if uses:
+            needs = re.search(r"^    needs:\s*(.*)$", job, re.M)
+            if not needs or not re.search(rf"(?<![\w-]){TOOL_BUILD_JOB}(?![\w-])", needs.group(1)):
+                out.append(f"{wf}: job {name} uses CI's QEMU but does not need the job `{TOOL_BUILD_JOB}` that fills the cache")
+    return out
+
+
 def check_tiers():
     """The testing tiers (OD83, OD144, TESTING.md) are enforced mechanically, so they cannot drift back: the feature gate
     starts no emulator; the epic gate (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget;
@@ -112,9 +135,17 @@ def check_tiers():
         cond = re.search(r"^    if:\s*(.*)$", job, re.M)
         if starts and not (cond and SMOKE_IF in cond.group(1)):
             out.append(f"ci.yml: job {name} starts QEMU but is not limited to the epic gate (its `if:` needs `{SMOKE_IF}`)")
-    for n in re.findall(r"timeout-minutes:\s*(\d+)", ci):
-        if int(n) > GATE_BUDGET_MINUTES:
-            out.append(f"ci.yml: a gate job's timeout is {n} minutes; the budget is {GATE_BUDGET_MINUTES} (TESTING.md)")
+        tool = name == TOOL_BUILD_JOB
+        if tool and (targets or starts or "mode: fill" not in job or re.search(r"^\s*(?:- )?run:", job, re.M)):
+            out.append(f"ci.yml: job {name} is the tool-build job: it may only call the install action in `mode: fill` (no run step, no make, no boot)")
+        if tool and not (cond and SMOKE_IF in cond.group(1)):
+            out.append(f"ci.yml: the tool-build job {name} runs only for the epic gate (its `if:` needs `{SMOKE_IF}`)")
+        budget = TOOL_BUILD_BUDGET_MINUTES if tool else GATE_BUDGET_MINUTES
+        for n in re.findall(r"timeout-minutes:\s*(\d+)", job):
+            if int(n) > budget:
+                out.append(f"ci.yml: job {name}'s timeout is {n} minutes; its budget is {budget} (TESTING.md, \"Budgets\")")
+    for wf in ("ci.yml", "soak.yml", "overnight.yml"):
+        out += check_ci_qemu(wf, read(f".github/workflows/{wf}"), rules)
     if "matrix:" in ci:
         out.append("ci.yml: the merge gate has a build matrix; that belongs in soak.yml")
     # the commit hook: format, docs check, clippy; never a test or a boot
