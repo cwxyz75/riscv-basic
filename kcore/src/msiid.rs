@@ -489,6 +489,24 @@ impl MsiIds {
         Ok(())
     }
 
+    /// Every identity of every hart that `route` has (Opening, Live, Moved or Retiring), with its state. Linear in the identities.
+    pub fn places_of(&self, route: Route) -> impl Iterator<Item = (Place, Slot)> + '_ {
+        (0..self.harts).flat_map(move |hart| {
+            (2..=self.num_ids).filter_map(move |id| {
+                let p = Place { hart, id };
+                let s = self.slot(p)?;
+                let r = match s {
+                    Slot::Free => return None,
+                    Slot::Opening { route, .. }
+                    | Slot::Live { route, .. }
+                    | Slot::Moved { route, .. }
+                    | Slot::Retiring { route, .. } => route,
+                };
+                (r == route).then_some((p, s))
+            })
+        })
+    }
+
     /// Every identity of `hart` (2 to `num_ids`) whose hart has work to do: Opening (open it) or Retiring (close and retire it).
     pub fn work_on(&self, hart: u16) -> impl Iterator<Item = (u16, Slot)> + '_ {
         (2..=self.num_ids).filter_map(move |id| match self.slot(Place { hart, id }) {
