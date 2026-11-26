@@ -208,6 +208,8 @@ pub struct Handover {
     pub cq: Option<u64>,
     /// The fault queue left enabled, with this `fqb`.
     pub fq: Option<u64>,
+    /// `ipsr` as left: interrupts pending that a previous owner never acknowledged (write-1-to-clear, not reset by the queues).
+    pub ipsr: u32,
 }
 
 /// How a message reached a simulated interrupt file.
@@ -402,6 +404,7 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
             s.enable_fq();
             s.fqcsr |= regs::QCSR_EN;
         }
+        s.ipsr = h.ipsr & (regs::IPSR_CIP | regs::IPSR_FIP | regs::IPSR_PMIP | regs::IPSR_PIP);
         s
     }
 
@@ -512,6 +515,20 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
             self.enable_fq();
         } else if v & regs::QCSR_EN == 0 && on {
             self.fqcsr &= !regs::QCSR_ON;
+        }
+    }
+
+    /// Write-1-to-clear, except that a queue's bit cannot be cleared while its interrupt is enabled and an error that raises it
+    /// still stands (the IOMMU specification's `ipsr`: `cip` while `cqcsr.cie` and `cqmf`, `cmd_to`, `cmd_ill` or `fence_w_ip`;
+    /// `fip` while `fqcsr.fie` and `fqmf` or `fqof`): such a bit stays set, and no new edge is raised for it.
+    fn write_ipsr(&mut self, v: u32) {
+        let before = self.ipsr;
+        self.ipsr &= !v;
+        if self.cqcsr & regs::QCSR_IE != 0 && self.cqcsr & QCSR_RW1C_CQ != 0 {
+            self.ipsr |= before & regs::IPSR_CIP;
+        }
+        if self.fqcsr & regs::QCSR_IE != 0 && self.fqcsr & QCSR_RW1C_FQ != 0 {
+            self.ipsr |= before & regs::IPSR_FIP;
         }
     }
 
@@ -1108,7 +1125,7 @@ impl<M: PhysMem64> Regs for Sim<'_, M> {
             regs::FQH => self.fqh = value & self.fq_mask,
             regs::CQCSR => self.write_cqcsr(value),
             regs::FQCSR => self.write_fqcsr(value),
-            regs::IPSR => self.ipsr &= !value,
+            regs::IPSR => self.write_ipsr(value),
             _ => {} // read-only or not modelled
         }
     }

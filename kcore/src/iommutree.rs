@@ -30,7 +30,8 @@ pub enum Cause {
 pub struct Source {
     /// The APLIC source number.
     pub number: u32,
-    /// The trigger type of the tree's second cell (1 rising edge, 2 falling edge, 4 level high, 8 level low).
+    /// The trigger type of the tree's second cell: 1 rising edge or 4 level high (the two the kernel programs; a falling-edge or
+    /// level-low source is a refusal, not a guess).
     pub trigger: u32,
 }
 
@@ -184,7 +185,7 @@ pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
         .collect();
     if sources
         .iter()
-        .any(|s| s.number == 0 || s.number > 1023 || ![1, 2, 4, 8].contains(&s.trigger))
+        .any(|s| s.number == 0 || s.number > 1023 || ![1, 4].contains(&s.trigger))
         || sources
             .iter()
             .enumerate()
@@ -249,13 +250,52 @@ pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
     })
 }
 
-/// The PCI hosts behind the IOMMU (an `iommu-map`), not disabled, on a bus that passes addresses through: their ECAM and memory
-/// windows are device windows (IOMMU-SPEC 2.6; `kcore::devwin`). A host with no `iommu-map` is not behind it and gets none.
+/// Is every function of PCI host `host` behind the one platform IOMMU? Its `iommu-map` must name only that IOMMU, have no
+/// `iommu-map-mask` (which would fold requester ids together), and cover every requester id the host can issue (0 to 0xffff:
+/// bus, device and function). A host with no map, a partial map or a map naming anything else is not behind it (IOMMU-SPEC 2.6:
+/// fail closed; a function outside the map would reach memory untranslated).
+pub fn fully_behind_the_iommu(host: &Node, nodes: &[Node]) -> bool {
+    let mut iommus = nodes
+        .iter()
+        .filter(|n| n.is_compatible(COMPATIBLE) && !disabled(n));
+    let (Some(me), None) = (iommus.next().and_then(phandle), iommus.next()) else {
+        return false;
+    };
+    if host.prop("iommu-map-mask").is_some() {
+        return false;
+    }
+    let map = host.cells("iommu-map");
+    let (quads, rest) = map.as_chunks::<4>();
+    if quads.is_empty() || !rest.is_empty() || quads.iter().any(|q| q[1] != me) {
+        return false;
+    }
+    let mut spans: Vec<(u64, u64)> = quads
+        .iter()
+        .map(|q| {
+            (
+                u64::from(q[0]),
+                u64::from(q[0]).saturating_add(u64::from(q[3])),
+            )
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut covered = 0u64;
+    for (start, end) in spans {
+        if start > covered {
+            return false; // a hole
+        }
+        covered = covered.max(end);
+    }
+    covered >= 0x1_0000
+}
+
+/// The PCI hosts fully behind the IOMMU (`fully_behind_the_iommu`), not disabled, on a bus that passes addresses through: their
+/// ECAM and memory windows are device windows (IOMMU-SPEC 2.6; `kcore::devwin`). Any other host gets none.
 pub fn pci_windows(nodes: &[Node]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for host in nodes.iter().filter(|n| {
         n.is_compatible(PCI_HOST)
-            && !n.cells("iommu-map").is_empty()
+            && fully_behind_the_iommu(n, nodes)
             && !disabled(n)
             && physical(n, nodes)
     }) {

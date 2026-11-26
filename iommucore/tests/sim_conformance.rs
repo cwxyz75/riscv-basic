@@ -289,6 +289,7 @@ fn handed_over_queues_are_on() {
             ddtp: (1 << 63) | (0x20_0000 << 10) | (1 << 4) | 1,
             cq: Some(0x2004_0407),
             fq: Some(0x2004_0806),
+            ipsr: 0,
         },
     );
     assert_eq!(sim.read64(regs::DDTP), (0x20_0000 << 10) | 1);

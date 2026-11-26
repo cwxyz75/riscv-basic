@@ -178,6 +178,15 @@ pub fn bring_up<R: Regs>(
     r.write32(regs::FQH, 0);
     queue_on(r, regs::CQCSR, now, bound)?;
     queue_on(r, regs::FQCSR, now, bound)?;
+    // whatever a previous owner left pending is acknowledged (write 1 to clear; switching the queues does not reset it): the
+    // kernel's sources are edge-triggered, and a bit left set would mean no edge, and no fault reported, ever again
+    r.write32(
+        regs::IPSR,
+        regs::IPSR_CIP | regs::IPSR_FIP | regs::IPSR_PMIP | regs::IPSR_PIP,
+    );
+    if r.read32(regs::IPSR) != 0 {
+        return Err(Refusal::Refused("ipsr"));
+    }
     // step 5: the empty directory, once
     regs::write_ddtp(r, plan.ddt.ddtp());
     let v = settled(r, now, bound).ok_or(Refusal::Refused("ddtp"))?;
@@ -299,6 +308,9 @@ pub fn drain_faults<R: Regs, M: PhysMem64>(
         d.overflow = csr.overflow();
         d.mem_fault = csr.mem_fault();
         r.write32(regs::FQCSR, csr.acknowledge());
+        // `fip` could not be cleared while the error stood (the write above ended it): clear it now, so that the next record is
+        // a new edge
+        r.write32(regs::IPSR, regs::IPSR_FIP);
     }
     let tail = r.read32(regs::FQT);
     d.more = tail < fq.entries() && tail != fq.head();

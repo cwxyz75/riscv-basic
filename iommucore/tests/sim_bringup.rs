@@ -61,6 +61,8 @@ fn bring_up_from_every_handover_state() {
                     ddtp: handed,
                     cq: (queues & 1 != 0).then_some(0x2004_0407),
                     fq: (queues & 2 != 0).then_some(0x2004_0806),
+                    // a previous owner's unacknowledged interrupts: an edge source would never fire again
+                    ipsr: if queues == 3 { 0xf } else { 0 },
                 };
                 let mut sim = Sim::handed_over(
                     &mem,
@@ -80,6 +82,8 @@ fn bring_up_from_every_handover_state() {
                 let found =
                     bring_up(&mut sim, &d, &cq, &fq).unwrap_or_else(|e| panic!("{ctx}: {e}"));
                 assert_eq!(found, decode_ddtp(handed).mode, "{ctx}");
+                // the next fault is a new edge: nothing is left pending from before (IOMMU-SPEC 7.1)
+                assert_eq!(sim.read32(regs::IPSR), 0, "{ctx}: ipsr left pending");
                 let writes = sim.ddtp_writes();
                 if handed == 0 {
                     assert_eq!(writes, [d.ddtp().bits()], "{ctx}");
@@ -367,6 +371,21 @@ fn the_drain_is_bounded_and_clears_an_overflow() {
     let _ = sim.read(0x28, 0x9100_0000);
     let d = driver::drain_faults(&mut sim, &mem, &mut fq, 4, |_| n += 1);
     assert_eq!(d.taken, 1);
+}
+
+#[test]
+fn an_overflow_drained_in_one_go_leaves_nothing_pending() {
+    // `fip` cannot be cleared while the overflow stands: a drain that empties the ring (no `more`, so nothing re-pends the
+    // source) must clear it again after the overflow is acknowledged, or the edge-triggered source never fires again
+    let mem = FakeMem::new();
+    let (mut sim, mut fq) = up_with_faults(&mem, 8);
+    for i in 0..20u64 {
+        let _ = sim.read(0x28, 0x9000_0000 + i * 0x1000);
+    }
+    assert_ne!(sim.read32(regs::IPSR) & regs::IPSR_FIP, 0);
+    let d = driver::drain_faults(&mut sim, &mem, &mut fq, 64, |_| {});
+    assert_eq!((d.taken, d.overflow, d.more), (7, true, false));
+    assert_eq!(sim.read32(regs::IPSR) & regs::IPSR_FIP, 0, "fip left set");
 }
 
 #[test]

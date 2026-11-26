@@ -48,13 +48,15 @@ pub fn admitted(nodes: &[Node]) -> impl Iterator<Item = &Node> {
             && ALLOWED.iter().any(|c| n.is_compatible(c))
             && !disabled(n)
             && physical(n, nodes)
-            && behind_the_iommu_if_pci(n)
+            && behind_the_iommu_if_pci(n, nodes)
     })
 }
 
-/// A PCI host is admitted only behind the IOMMU (its `iommu-map`); every other admitted kind has no such condition.
-fn behind_the_iommu_if_pci(n: &Node) -> bool {
-    !n.is_compatible(crate::iommutree::PCI_HOST) || !n.cells("iommu-map").is_empty()
+/// A PCI host is admitted only with every function behind the IOMMU (`iommutree::fully_behind_the_iommu`); every other admitted
+/// kind has no such condition.
+fn behind_the_iommu_if_pci(n: &Node, nodes: &[Node]) -> bool {
+    !n.is_compatible(crate::iommutree::PCI_HOST)
+        || crate::iommutree::fully_behind_the_iommu(n, nodes)
 }
 
 /// A node that is disabled (`status` other than `okay`) is not in use: firmware marks the devices it owns that way.

@@ -279,7 +279,7 @@ a device's message at an identity the kernel gave an interrupt object, to see th
 `which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
 (over the console limit of 16 a second), 152 the fault-queue overflows, 153 the device id of the last fault record, 154 its I/O address,
 155 its cause | (transaction type << 32), 156 the commands submitted to the command queue, 157 the fences that did not complete within
-their bound (always 0 on a healthy machine: the boot script fails a run that prints one).
+their bound or could not be submitted (always 0 on a healthy machine: the boot script fails a run that prints one).
 
 `which` 110 and 111 (PL7) are the executable pages mapped by faults so far and the times the instruction caches were synchronised for them (once per fault that mapped any: `fence.i` here and SBI `remote_fence_i` on every other online hart); a page that was already mapped adds nothing.
 

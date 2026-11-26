@@ -222,6 +222,13 @@ pub fn init() {
     if t.device_ids > 1 << kcore_device_id_bits() {
         panic!("no IOMMU: the tree names device ids the directory cannot cover");
     }
+    // step 4's registration (IOMMU-SPEC 2.4, 8.6): `aia::init` installed both kernel sources, or fault reporting would be dead
+    for cause in [Cause::FaultQueue, Cause::CommandQueue] {
+        let s = t.source(cause).map(|s| s.number);
+        if s.and_then(crate::aia::route_of).is_none() {
+            panic!("no IOMMU: its {cause:?} interrupt (source {s:?}) could not be registered with the interrupt controller");
+        }
+    }
     let (Some(root), Some(cqf), Some(fqf)) = (zeroed_frame(), zeroed_frame(), zeroed_frame())
     else {
         panic!("no IOMMU: no frames for its directory and queues");
@@ -295,17 +302,24 @@ fn kcore_device_id_bits() -> u32 {
 fn fence(cmds: &[Command], device: Option<u32>) -> Result<(), ()> {
     let ticket = {
         let mut g = STATE.lock();
-        let Some(s) = g.as_mut() else {
-            return Err(());
-        };
-        let mut r = Mmio::new().ok_or(())?;
-        let t = driver::submit(&mut r, &Direct, &mut s.cq, cmds).map_err(|_| ())?;
-        COMMANDS.fetch_add(cmds.len() as u64, Ordering::Relaxed);
-        t
+        match (g.as_mut(), Mmio::new()) {
+            (Some(s), Some(mut r)) => driver::submit(&mut r, &Direct, &mut s.cq, cmds).ok(),
+            _ => None,
+        }
     };
+    let Some(ticket) = ticket else {
+        // (a batch the ring cannot take is a fence that did not complete: counted and reported the same way, after the lock)
+        FENCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        let _ = writeln!(crate::console::Console, "{}", FenceTimeoutLine(device));
+        return Err(());
+    };
+    COMMANDS.fetch_add(cmds.len() as u64, Ordering::Relaxed);
     let t0 = crate::timer::now();
     let bound = crate::timer::cycles_from_ns(FENCE_BOUND_NS);
     loop {
+        // (the clock is read before the look, so the last look is taken after the bound passed: a thread held off between a look
+        // and the clock does not time out a fence that completed meanwhile)
+        let expired = crate::timer::now().wrapping_sub(t0) > bound;
         let state = {
             let mut g = STATE.lock();
             let (Some(s), Some(mut r)) = (g.as_mut(), Mmio::new()) else {
@@ -315,9 +329,7 @@ fn fence(cmds: &[Command], device: Option<u32>) -> Result<(), ()> {
         };
         match state {
             Fence::Done => return Ok(()),
-            Fence::Pending if crate::timer::now().wrapping_sub(t0) <= bound => {
-                core::hint::spin_loop()
-            }
+            Fence::Pending if !expired => core::hint::spin_loop(),
             _ => {
                 FENCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 let _ = writeln!(crate::console::Console, "{}", FenceTimeoutLine(device));
@@ -420,7 +432,8 @@ impl iommucore::TableFrames for TestFrames {
     }
 }
 
-/// The device id the self-test borrows: one past the PCI host's map (no device can issue it), inside the directory's 24 bits.
+/// The device id the self-test borrows: beyond every id the PCI host's map gives (0 to 0xffff), so no device can issue it, and
+/// inside the directory's 24 bits. (Its fault lines print as `dev=00:00.0`: the line's bus:device.function shows 16 bits.)
 #[cfg(not(feature = "release"))]
 const SELFTEST_DID: u32 = 0x10_0000;
 
@@ -445,18 +458,33 @@ pub fn selftest() -> Result<(), alloc::string::String> {
     let mut frames = TestFrames {
         deferred: Vec::new(),
     };
-    // the table's root (16 KiB, aligned) and two data frames
-    let root_pfn = crate::kmem::frames()
-        .mm
-        .db
-        .alloc_contiguous(4)
-        .ok_or("frames for the table root")?;
-    let root = root_pfn * 4096;
-    let (Some(rw), Some(ro)) = (zeroed_frame(), zeroed_frame()) else {
+    // two data frames and the table's root (16 KiB, aligned); on a failure here, what was taken goes back (nothing has seen it)
+    let rw = zeroed_frame().ok_or("data frames")?;
+    let Some(ro) = zeroed_frame() else {
+        crate::kmem::frame_free_sole(rw / 4096);
         return Err("data frames".into());
     };
-    let mut iopt =
-        Iopt::new(&mem, root, PtMode::Sv39x4).map_err(|e| format!("Iopt::new: {e:?}"))?;
+    let give_back_root = |root: u64| {
+        let k = crate::kmem::frames();
+        for i in 0..4 {
+            let _ = k.mm.db.dec(root / 4096 + i);
+        }
+    };
+    let Some(root_pfn) = crate::kmem::frames().mm.db.alloc_contiguous(4) else {
+        crate::kmem::frame_free_sole(rw / 4096);
+        crate::kmem::frame_free_sole(ro / 4096);
+        return Err("frames for the table root".into());
+    };
+    let root = root_pfn * 4096;
+    let mut iopt = match Iopt::new(&mem, root, PtMode::Sv39x4) {
+        Ok(t) => t,
+        Err(e) => {
+            give_back_root(root);
+            crate::kmem::frame_free_sole(rw / 4096);
+            crate::kmem::frame_free_sole(ro / 4096);
+            return Err(format!("Iopt::new: {e:?}"));
+        }
+    };
     let base = kcore::iodomain::IO_BASE + (1 << 30);
     let soft_id = 0xfffe; // (no domain exists yet; this id is the self-test's, and every cached entry of it is dropped at the end)
     let mut result = (|| -> Result<(), alloc::string::String> {
@@ -492,12 +520,16 @@ pub fn selftest() -> Result<(), alloc::string::String> {
         let bound = crate::timer::cycles_from_ns(FENCE_BOUND_NS);
         for (iova, op) in probes {
             let want = iopt.translate(&mem, iova, op).ok().map(|pa| pa & !0xfff);
-            let _g = STATE.lock(); // (one request at a time: the interface is the IOMMU's, under its lock)
-            r.write64(regs::TR_REQ_IOVA, iova & !0xfff);
-            r.write64(
-                regs::TR_REQ_CTL,
-                regs::tr_req_ctl(SELFTEST_DID, op == Op::Write),
-            );
+            // (the request is written under the IOMMU's lock and waited for without it: nothing else uses the debug interface,
+            // so its response is this request's)
+            {
+                let _g = STATE.lock();
+                r.write64(regs::TR_REQ_IOVA, iova & !0xfff);
+                r.write64(
+                    regs::TR_REQ_CTL,
+                    regs::tr_req_ctl(SELFTEST_DID, op == Op::Write),
+                );
+            }
             let t0 = crate::timer::now();
             while regs::tr_busy(r.read64(regs::TR_REQ_CTL)) {
                 if crate::timer::now().wrapping_sub(t0) > bound {
@@ -537,13 +569,7 @@ pub fn selftest() -> Result<(), alloc::string::String> {
             "the fence after the clear did not complete: the self-test's frames are leaked".into(),
         );
     }
-    let root = iopt.destroy(&mem, &mut frames);
-    {
-        let k = crate::kmem::frames();
-        for i in 0..4 {
-            let _ = k.mm.db.dec(root / 4096 + i);
-        }
-    }
+    give_back_root(iopt.destroy(&mem, &mut frames));
     for pa in frames.deferred.drain(..).chain([rw, ro]) {
         crate::kmem::frame_free_sole(pa / 4096);
     }

@@ -158,6 +158,63 @@ fn a_pci_host_without_a_map_is_not_behind_the_iommu_and_opens_no_window() {
     assert_eq!(w, vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)]);
 }
 
+/// A map that leaves some requester ids out, folds them with a mask, or names another IOMMU does not put the whole host behind
+/// the IOMMU: no PCI window opens (a function outside the map would reach memory untranslated).
+#[test]
+fn a_pci_host_only_partly_behind_the_iommu_opens_no_window() {
+    let only = |n: &[Node]| device_windows(n, &[CONSOLE], &fdt::memory_ranges(n));
+    let closed = vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
+    for (what, n) in [
+        (
+            "half the ids",
+            with(PCI, "iommu-map", Some(be(&[0, 0x8000, 0, 0x8000]))),
+        ),
+        (
+            "a hole",
+            with(
+                PCI,
+                "iommu-map",
+                Some(be(&[0, 0x8000, 0, 0x100, 0x200, 0x8000, 0x200, 0xfe00])),
+            ),
+        ),
+        (
+            "another IOMMU",
+            with(PCI, "iommu-map", Some(be(&[0, 0x7777, 0, 0x10000]))),
+        ),
+        ("a mask", with(PCI, "iommu-map-mask", Some(be(&[0xff00])))),
+        (
+            "a malformed map",
+            with(PCI, "iommu-map", Some(be(&[0, 0x8000, 0]))),
+        ),
+    ] {
+        assert!(iommutree::pci_windows(&n).is_empty(), "{what}");
+        assert_eq!(only(&n), closed, "{what}");
+    }
+    // two entries that together cover every id are a whole map
+    let n = with(
+        PCI,
+        "iommu-map",
+        Some(be(&[0, 0x8000, 0, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000])),
+    );
+    assert_eq!(iommutree::pci_windows(&n), iommutree::pci_windows(&nodes()));
+}
+
+/// The kernel programs rising-edge and level-high sources only: a falling-edge or level-low source is a refusal.
+#[test]
+fn a_source_the_kernel_cannot_program_is_the_refusal() {
+    for trigger in [2u32, 8] {
+        let n = with(
+            IOMMU,
+            "interrupts",
+            Some(be(&[0x24, trigger, 0x25, 1, 0x26, 1, 0x27, 1])),
+        );
+        assert!(
+            matches!(discover(&n), Err(Absent::Malformed(_))),
+            "trigger {trigger}"
+        );
+    }
+}
+
 /// IOMMU-SPEC 2.6: behind the IOMMU, the ECAM window and the two memory windows join the RTC and the virtio slots; the I/O-port
 /// window, the IOMMU's register page and the interrupt controllers stay out.
 #[test]
