@@ -12,6 +12,10 @@
 //! * A route that moves (`move_to`) keeps its old identity **Live** until the new one is opened: both route to it meanwhile. `opened`
 //!   then makes the old one **Retiring**.
 //! * A route that ends (`end`) makes its identity **Retiring** at once.
+//! * A **vector** (IOMMU7) is different at the move: its old identity is named by the device's MSI page-table entry until the entry has
+//!   been rewritten and the rewrite fenced (IOMMU-SPEC 6.2), so `opened` makes it **Moved**, not Retiring: still routed to the vector,
+//!   not counted as a route of its hart, and retired only once the kernel says the fence is done (`drained`). Ending a vector's route
+//!   (`end`) ends a Moved identity too, one call each.
 //! * A Retiring identity is closed by its hart, which reads and clears its pending bit (delivering a moved route's event if it was
 //!   set: the message was sent before the move) and then calls `retired`: only then is the identity **Free**. So an identity is never
 //!   given to another route while a message for its old owner can still arrive (IO10's half that is about the hart, IO12).
@@ -56,6 +60,9 @@ pub enum Slot {
     Opening { route: Route, from: Option<Place> },
     /// Open and routed. `to`: an Opening identity the route is moving to.
     Live { route: Route, to: Option<Place> },
+    /// A vector's identity its route moved away from (`to` is Live now), still named by the device's MSI entry until the entry's
+    /// rewrite is fenced: still routed to the vector, not retired until `drained` (IOMMU-SPEC 6.2, IO10).
+    Moved { route: Route, to: Place },
     /// No longer routed: its hart must close it, read and clear its pending bit, and then report `retired`. `moved`: the route went on
     /// elsewhere (a pending event is still the route's); otherwise the route ended (a pending event belongs to nobody).
     Retiring { route: Route, moved: bool },
@@ -88,6 +95,8 @@ pub struct Opened {
     pub route: Route,
     /// The identity the route moved away from, now Retiring: its hart must retire it.
     pub retiring: Option<Place>,
+    /// A vector's identity the route moved away from, now Moved: the kernel rewrites the entry, fences, then calls `drained`.
+    pub held: Option<Place>,
 }
 
 /// The identities of every hart's interrupt file and their routes.
@@ -272,21 +281,51 @@ impl MsiIds {
             return None;
         };
         self.set(p, Slot::Live { route, to: None });
-        let retiring = from.filter(|&f| self.slot(f) == Some(Slot::Live { route, to: Some(p) }));
-        if let Some(f) = retiring {
-            self.set(f, Slot::Retiring { route, moved: true });
+        let from = from.filter(|&f| self.slot(f) == Some(Slot::Live { route, to: Some(p) }));
+        if let Some(f) = from {
+            if matches!(route, Route::Vector(_)) {
+                self.set(f, Slot::Moved { route, to: p });
+            } else {
+                self.set(f, Slot::Retiring { route, moved: true });
+            }
             Self::count(&mut self.routes, f.hart, false);
         }
-        Some(Opened { route, retiring })
+        let held = from.filter(|_| matches!(route, Route::Vector(_)));
+        let retiring = from.filter(|_| !matches!(route, Route::Vector(_)));
+        Some(Opened {
+            route,
+            retiring,
+            held,
+        })
+    }
+
+    /// The fence after the rewrite of the MSI entry that named Moved identity `p` has completed: `p` is Retiring (its route moved on),
+    /// and its hart must retire it. `None`, with nothing changed: `p` was not Moved.
+    pub fn drained(&mut self, p: Place) -> Option<Route> {
+        let Some(Slot::Moved { route, .. }) = self.slot(p) else {
+            return None;
+        };
+        self.set(p, Slot::Retiring { route, moved: true });
+        Some(route)
     }
 
     /// The route of identity `p` ends (an object destroyed, a source given up): `p` is Retiring. A move under way ends with it: the
     /// Opening identity it was moving to is Retiring too, and is returned (its hart must retire it as well). Ending an Opening identity
-    /// cancels that move only: the identity it was leaving stays Live. `Err`, with nothing changed: `p` is Free, Retiring or the
-    /// inter-hart interrupt.
+    /// cancels that move only: the identity it was leaving stays Live. Ending a Moved identity makes it Retiring (its route ended).
+    /// `Err`, with nothing changed: `p` is Free, Retiring or the inter-hart interrupt.
     #[allow(clippy::result_unit_err)]
     pub fn end(&mut self, p: Place) -> Result<Option<Place>, ()> {
         match self.slot(p) {
+            Some(Slot::Moved { route, .. }) => {
+                self.set(
+                    p,
+                    Slot::Retiring {
+                        route,
+                        moved: false,
+                    },
+                );
+                Ok(None)
+            }
             Some(Slot::Opening { route, from }) => {
                 if let Some(f) = from {
                     if self.slot(f) == Some(Slot::Live { route, to: Some(p) }) {

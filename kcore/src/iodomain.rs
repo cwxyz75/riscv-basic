@@ -43,7 +43,7 @@ use iommucore::ddt::{device_id_bits, Ddt, DeviceContext, TableRoot};
 use iommucore::faultq::FaultRecord;
 use iommucore::iopt::{Access, Iopt, PtMode};
 use iommucore::iova::Iova;
-use iommucore::msi::{MsiTable, MsiWindow};
+use iommucore::msi::{Mrif, MsiPte, MsiTable, MsiWindow, MRIF_BYTES};
 use iommucore::regs::{self, Cqcsr};
 use iommucore::{PhysMem64, Regs, TableFrames, PAGE_SHIFT, PAGE_SIZE};
 
@@ -56,6 +56,13 @@ pub const IO_WINDOW_PAGES: u64 = 1 << 18;
 pub const IO_VECTOR_PAGES: u64 = 256;
 /// The DMA part of the window.
 pub const IO_DMA_PAGES: u64 = IO_WINDOW_PAGES - IO_VECTOR_PAGES;
+/// Interrupt files to a frame (512 bytes each, IOMMU-SPEC 5.3), and the file frames a domain may hold.
+pub const FILES_PER_FRAME: u64 = PAGE_SIZE / MRIF_BYTES;
+const FILE_FRAMES: usize = (IO_VECTOR_PAGES / FILES_PER_FRAME) as usize;
+/// The kernel bytes a granted vector's interrupt file is charged (IOMMU-SPEC 5.3: "512 bytes, eight to a frame").
+pub const VECTOR_FILE_BYTES: u64 = MRIF_BYTES;
+/// The only identity the kernel ever enables in a vector's file, and so the data word of the vector's MSI-X entry (IOMMU-SPEC 8.2).
+pub const VECTOR_DATA: u16 = 1;
 /// Fault records a domain's ring keeps (IOMMU-SPEC 7.4).
 pub const FAULT_RING: usize = 16;
 /// Console lines for faults, per second, for the whole system (IOMMU-SPEC 7.2).
@@ -485,8 +492,44 @@ struct Domain {
     ring_len: usize,
     dropped: u32,
     destroy_ticket: u64,
+    /// The vector table (IOMMU7, IOMMU-SPEC 8.3): one slot per MSI page-table entry, sized at creation.
+    vectors: Vec<VSlot>,
+    /// The frames of the vectors' interrupt files: file `k` is at `files[k / 8] + (k % 8) * 512` (0: no frame yet).
+    files: [u64; FILE_FRAMES],
     /// The store's list of leaked domains.
     next: Option<FBox<Domain>>,
+}
+
+/// The state of one vector index of a domain (the store's half: its MSI entry and its file; the route is the kernel's, under `OBJ`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VState {
+    Free,
+    /// A grant has claimed the index and not yet written the entry.
+    Reserved,
+    /// A valid MRIF entry names the vector's file and its notice target.
+    Live,
+    /// The notice target was rewritten; the fence (this ticket) is outstanding.
+    Moving(u64),
+    /// The entry was made invalid; the fence (this ticket) is outstanding. The file is freed after it.
+    Revoking(u64),
+    /// A fence of the vector was abandoned (IO8): the index, its file and its identities are never reused.
+    Leaked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VSlot {
+    state: VState,
+}
+
+/// What a domain's vector index is, for the kernel and the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorState {
+    Free,
+    Reserved,
+    Live,
+    Moving,
+    Revoking,
+    Leaked,
 }
 
 /// The kernel bytes a domain is charged at creation (IOMMU-SPEC 5.3): its body with the fault ring, the root table, the MSI page table
@@ -494,7 +537,8 @@ struct Domain {
 pub const DOMAIN_BYTES: u64 = core::mem::size_of::<Domain>() as u64
     + ROOT_FRAMES * PAGE_SIZE
     + PAGE_SIZE
-    + 2 * IO_WINDOW_PAGES.div_ceil(64) * 8;
+    + 2 * IO_WINDOW_PAGES.div_ceil(64) * 8
+    + IO_VECTOR_PAGES * core::mem::size_of::<VSlot>() as u64;
 
 impl Domain {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the counts are of the list's records and their chained frames
@@ -571,6 +615,10 @@ pub struct IoStats {
     pub slots: u64,
     /// Pages of live and pending mappings (leaked ones are counted apart, in `pages_leaked`).
     pub io_pages: u64,
+    /// Vector indices granted (reserved, live, moving or revoking) in live domains (IOMMU7).
+    pub vectors: u64,
+    /// Vector indices whose fence was abandoned (IO8), with their files; and interrupt-file frames leaked.
+    pub vectors_leaked: u64,
 }
 
 /// The domain store (the state the `IOMMU` lock protects).
@@ -590,6 +638,8 @@ pub struct IoDomains {
     /// (`destroy_released`): with the domains still detaching, what `unfinished` waits for (IOMMU-SPEC 6.3: done before the call
     /// that began it returns).
     releasing: u64,
+    /// Vector revokes begun whose fence nobody has completed or abandoned yet (`next_revoking`; part of `unfinished`).
+    revoking: u64,
     stats: IoStats,
     window_start: u64,
     window_lines: u32,
@@ -924,6 +974,7 @@ impl IoDomains {
             leaked_domains: None,
             abandons: 0,
             releasing: 0,
+            revoking: 0,
             stats: IoStats::default(),
             window_start: 0,
             window_lines: 0,
@@ -1191,6 +1242,20 @@ impl IoDomains {
             undo_frames(frames);
             return Err(IoError::NoMemory);
         };
+        let mut vectors = Vec::new();
+        if vectors
+            .try_reserve_exact(IO_VECTOR_PAGES as usize)
+            .is_err()
+        {
+            undo_frames(frames);
+            return Err(IoError::NoMemory);
+        }
+        vectors.resize(
+            IO_VECTOR_PAGES as usize,
+            VSlot {
+                state: VState::Free,
+            },
+        );
         let Some(gscid) = self.alloc_gscid() else {
             undo_frames(frames);
             return Err(IoError::NoMemory);
@@ -1224,6 +1289,8 @@ impl IoDomains {
             ring_len: 0,
             dropped: 0,
             destroy_ticket: NO_TICKET,
+            vectors,
+            files: [0; FILE_FRAMES],
             next: None,
         }) {
             Ok(d) => d,
