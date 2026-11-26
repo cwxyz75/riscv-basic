@@ -1117,3 +1117,14 @@ in progress**, as part 1 point 3 says for a map.
 
 Why OK and not BAD_STATE: what the caller asked for (the device no longer reaches those pages) is guaranteed by the destruction,
 and no frame is freed before a fence that covers it. A map is different: its effect does not happen, so it fails (part 1 point 3).
+
+### 4. `iodomain_unmap`'s error order (OD171)
+
+Amendment authorized by the owner, 2026-11-26 (answers Q-IOMMU-UNMAPORDER).
+
+In 4.4 the destroyed-domain check comes **before** the mapping check. The errors of `iodomain_unmap`, in order: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; **BAD_STATE** (the domain was destroyed: its mappings went with it); INVALID_ARGS (not exactly a live
+mapping of this domain). As 4.4 read before, a destroyed domain has no live mapping, so INVALID_ARGS always applied first and
+BAD_STATE could not be returned. With this order a driver can tell "my domain was destroyed" from "a wrong address", and
+`iodomain_unmap` agrees with `iodomain_map`, which already gives BAD_STATE for a destroyed domain. An unmap that finds its domain
+destroyed **between its steps** is part 3's case and still returns OK.
