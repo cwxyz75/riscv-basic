@@ -15088,6 +15088,11 @@ fn iodomain_calls_check_handles_rights_and_arguments() -> Outcome {
                     Some(S::BadState),
                     "map: a destroyed domain"
                 );
+                ensure_eq!(
+                    st(sys::iodomain_unmap(drv, 0, 1)),
+                    Some(S::BadState),
+                    "unmap: a destroyed domain (OD171: before INVALID_ARGS)"
+                );
                 for h in [buf, no_map, drv, no_unmap] {
                     sys::handle_close(h);
                 }

@@ -628,15 +628,17 @@ pub fn iodomain_unmap<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
         Err(s) => return err(s),
     };
     let (io_address, pages) = (a[1], a[2]);
-    // (4.4's order: INVALID_ARGS, "not exactly a live mapping", comes before BAD_STATE; a destroyed domain has no live mapping, its
-    // mappings went with it, so its unmap is INVALID_ARGS and BAD_STATE is not reached: the owner's question is decision Q-IOMMU-UNMAPORDER)
-    if pages == 0 || io_address % 4096 != 0 || d.destroyed {
+    // (the order of OD171, IOMMU-SPEC amendment 2026-11-26 part 4: a destroyed domain is BAD_STATE, before the mapping is looked at)
+    if d.destroyed {
+        return err(Status::BadState);
+    }
+    if pages == 0 || io_address % 4096 != 0 {
         return err(Status::InvalidArgs);
     }
     match unmap_in(e, DomainId::from_raw(d.domain), io_address, pages) {
         Ok(()) => Ok((None, None)),
-        // (a destruction begun since the handle was resolved took the mapping: not a live mapping, as above)
-        Err(IoError::BadState) => err(Status::InvalidArgs),
+        // (a destruction begun since the handle was resolved: the domain is destroyed, OD171; one begun between the unmap's own steps
+        // is OD170's OK, which `unmap_in` returns)
         Err(x) => err(io_status(x)),
     }
 }

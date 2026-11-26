@@ -600,10 +600,10 @@ left mapped and nothing freed before its fence.
 ### iodomain_unmap(domain, io_address, pages) -> status
 
 Removes the one mapping `iodomain_map` returned at exactly `io_address` and `pages`. When it returns, the device can no longer reach the
-frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (not
-exactly a live mapping of this domain: `pages` 0, `io_address` not page aligned, no such mapping, or the domain was destroyed, which
-took every mapping); BAD_STATE (the domain was destroyed; as IOMMU-SPEC 4.4 orders it, never reached, since the INVALID_ARGS before it
-covers it: Q-IOMMU-UNMAPORDER).
+frames and the mapping's hold is gone. Needs IO_UNMAP. Errors, in order (OD171, IOMMU-SPEC amendment 2026-11-26 part 4): BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the domain was destroyed, also by a destruction begun after the handle was resolved and before
+the unmap's first step); INVALID_ARGS (not exactly a live mapping of this domain: `pages` 0, `io_address` not page aligned, no such
+mapping).
 Never NO_MEMORY. A fence that does not complete within its bound still returns OK and leaks the frames (counted, `debug_stat` 158). An
 unmap under way when the domain's destruction begins returns OK: the destruction's fence covers it (OD170).
 
@@ -613,7 +613,7 @@ Detaches the device (it becomes Quarantined: an empty table, fault reporting off
 then the domain's tables, root and record are freed after the fence (IOMMU-SPEC 6.3), and its job credited. Needs IO_DESTROY. Errors:
 BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED. A destroyed domain's destroy is OK and does nothing. **Closing the last handle** destroys the
 domain the same way (and so does the teardown of the last process that held one), completed before the closing call returns to user
-mode. A destroyed domain's other handles stay valid: `iodomain_map` is BAD_STATE and `iodomain_unmap` INVALID_ARGS.
+mode. A destroyed domain's other handles stay valid: `iodomain_map` and `iodomain_unmap` are BAD_STATE.
 
 ### iodomain_fault_read(domain) -> status, word, io_address
 

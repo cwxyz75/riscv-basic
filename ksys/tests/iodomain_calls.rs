@@ -276,9 +276,15 @@ fn iodomain_unmap_rows() {
     );
     let again = h.map(d, v, 0, 4, RW);
     h.ok(nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
-    // (4.4's order: a destroyed domain has no live mapping, INVALID_ARGS comes first and BAD_STATE is not reached; Q-IOMMU-UNMAPORDER)
-    assert_eq!(h.err(u, [d, again, 4, 0, 0, 0]), Status::InvalidArgs);
-    assert_eq!(h.err(u, [d, again, 0, 0, 0, 0]), Status::InvalidArgs);
+    // (OD171: a destroyed domain is BAD_STATE, before the mapping and the arguments are looked at)
+    assert_eq!(h.err(u, [d, again, 4, 0, 0, 0]), Status::BadState);
+    assert_eq!(h.err(u, [d, again, 0, 0, 0, 0]), Status::BadState);
+    assert_eq!(h.err(u, [d, 1, 4, 0, 0, 0]), Status::BadState);
+    assert_eq!(
+        h.err(u, [no_unmap, again, 4, 0, 0, 0]),
+        Status::AccessDenied,
+        "ACCESS_DENIED before BAD_STATE"
+    );
 }
 
 #[test]
