@@ -1,71 +1,46 @@
 //! The simulated IOMMU handed over in every state (IOMMU2 for IOMMU5; IOMMU-SPEC 2.4 step 1, A17, OD166 point 11; IOMMU0 item 15).
-//! A bring-up sequence written here from IOMMU-SPEC 2.4 (IOMMU5 writes the kernel's own over the same traits) runs against the
-//! simulator handed over Off, Bare and in each directory mode, with its queues on or off and with a busy bit that takes a few
-//! reads to clear. The simulator's record of every `ddtp` write shows the rules: handed over Off, `ddtp` is written once, with the
-//! directory mode; otherwise the first write is Off; Bare is never written; and an IOMMU that will not go Off ends in the refusal.
+//! The kernel's bring-up sequence (`iommucore::driver::bring_up`, IOMMU5) runs against the simulator handed over Off, Bare and in
+//! each directory mode, with its queues on or off and with a busy bit that takes a few reads to clear. The simulator's record of
+//! every `ddtp` write shows the rules: handed over Off, `ddtp` is written once, with the directory mode; otherwise the first write
+//! is Off; Bare is never written; and an IOMMU that will not go Off ends in the refusal. Then the driver's other sequences: the
+//! boot invalidation and its fence, the fault drain (bounded, acknowledged, overflow cleared) and the console's rate limit.
 
-use iommucore::cmdq::CmdQueue;
+use iommucore::cmdq::{CmdQueue, Command};
 use iommucore::ddt::{Ddt, Format, Levels};
-use iommucore::faultq::{self, FaultQueue};
-use iommucore::regs::{self, decode_ddtp, Caps, Ddtp, DdtpMode, Required};
+use iommucore::driver::{self, Drained, Fence, Plan, RateLimit, Refusal};
+use iommucore::faultq::{self, FaultQueue, FaultRecord, TransactionType};
+use iommucore::regs::{self, decode_ddtp, Ddtp, DdtpMode, Required};
 use iommucore::sim::{FakeMem, Handover, Sim, SimConfig};
 use iommucore::Regs;
 
-const BOUND: u32 = 100;
+const BOUND: u64 = 100;
+const ICVEC: u64 = 0x3210;
 
-/// IOMMU-SPEC 2.4 steps 1, 2, 4 and 5 (step 3, the allocations, is the caller's).
+/// The driver's bring-up with a clock that counts its own reads, so a busy bit that never clears ends the wait.
 fn bring_up<R: Regs>(
     r: &mut R,
     d: &Ddt,
     cq: &CmdQueue,
     fq: &FaultQueue,
 ) -> Result<DdtpMode, String> {
-    let wait_ddtp = |r: &mut R| {
-        for _ in 0..BOUND {
-            let v = decode_ddtp(r.read64(regs::DDTP));
-            if !v.busy {
-                return Some(v);
-            }
-        }
-        None
+    let mut t = 0u64;
+    let mut now = || {
+        t += 1;
+        t
     };
-    let found = wait_ddtp(r).ok_or("IOMMU: will not go off")?;
-    if found.mode != DdtpMode::Off {
-        regs::write_ddtp(r, Ddtp::off());
-        match wait_ddtp(r) {
-            Some(v) if v.mode == DdtpMode::Off => {}
-            _ => return Err("IOMMU: will not go off".into()),
-        }
-    }
-    for csr in [regs::CQCSR, regs::FQCSR] {
-        if r.read32(csr) & (regs::QCSR_EN | regs::QCSR_ON) != 0 {
-            r.write32(csr, 0);
-            if (0..BOUND).all(|_| r.read32(csr) & (regs::QCSR_ON | regs::QCSR_BUSY) != 0) {
-                return Err(format!("IOMMU: refused {csr:#x}"));
-            }
-        }
-    }
-    Caps(r.read64(regs::CAPABILITIES))
-        .check(&Required { pas_bits: 40 })
-        .map_err(|m| m.to_string())?;
-    r.write32(regs::FCTL, regs::fctl_wired());
-    if r.read32(regs::FCTL) != regs::fctl_wired() {
-        return Err("IOMMU: refused fctl".into());
-    }
-    r.write64(regs::CQB, cq.cqb());
-    r.write64(regs::FQB, fq.fqb());
-    for csr in [regs::CQCSR, regs::FQCSR] {
-        r.write32(csr, regs::QCSR_EN | regs::QCSR_IE);
-        if r.read32(csr) & regs::QCSR_ON == 0 {
-            return Err(format!("IOMMU: refused {csr:#x}"));
-        }
-    }
-    regs::write_ddtp(r, d.ddtp());
-    let v = wait_ddtp(r).ok_or("IOMMU: refused ddtp")?;
-    if v.mode != DdtpMode::Directory(d.levels()) || v.root_pa != d.root() {
-        return Err("IOMMU: refused ddtp".into());
-    }
-    Ok(found.mode)
+    let plan = Plan {
+        ddt: d,
+        cq,
+        fq,
+        required: Required { pas_bits: 40 },
+        icvec: ICVEC,
+    };
+    driver::bring_up(r, &plan, &mut now, BOUND)
+        .map(|up| {
+            assert_eq!(up.mode, DdtpMode::Directory(d.levels()));
+            up.handover
+        })
+        .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -86,6 +61,8 @@ fn bring_up_from_every_handover_state() {
                     ddtp: handed,
                     cq: (queues & 1 != 0).then_some(0x2004_0407),
                     fq: (queues & 2 != 0).then_some(0x2004_0806),
+                    // a previous owner's unacknowledged interrupts: an edge source would never fire again
+                    ipsr: if queues == 3 { 0xf } else { 0 },
                 };
                 let mut sim = Sim::handed_over(
                     &mem,
@@ -105,6 +82,8 @@ fn bring_up_from_every_handover_state() {
                 let found =
                     bring_up(&mut sim, &d, &cq, &fq).unwrap_or_else(|e| panic!("{ctx}: {e}"));
                 assert_eq!(found, decode_ddtp(handed).mode, "{ctx}");
+                // the next fault is a new edge: nothing is left pending from before (IOMMU-SPEC 7.1)
+                assert_eq!(sim.read32(regs::IPSR), 0, "{ctx}: ipsr left pending");
                 let writes = sim.ddtp_writes();
                 if handed == 0 {
                     assert_eq!(writes, [d.ddtp().bits()], "{ctx}");
@@ -224,4 +203,206 @@ fn ddtp_transitions_are_qemus() {
     assert_eq!(sim.read64(regs::DDTP), 0x10);
     assert_eq!(sim.read64(regs::DDTP), one);
     assert_eq!(sim.ddtp_writes(), [one, two]);
+}
+
+#[test]
+fn refusals_have_the_fixed_lines() {
+    assert_eq!(Refusal::WillNotGoOff.to_string(), "IOMMU: will not go off");
+    assert_eq!(Refusal::Refused("fctl").to_string(), "IOMMU: refused fctl");
+    assert_eq!(
+        Refusal::Missing(regs::Missing::MsiMrif).to_string(),
+        "IOMMU: no MRIF"
+    );
+    assert_eq!(
+        Refusal::Missing(regs::Missing::Sv39x4).to_string(),
+        "IOMMU: missing Sv39x4"
+    );
+}
+
+#[test]
+fn bring_up_programs_the_vectors_and_wired_interrupts() {
+    let mem = FakeMem::new();
+    let mut sim = Sim::new(&mem, SimConfig::qemu());
+    let d = Ddt::new(&mem, 0x8000_0000, Levels::Three, Format::Extended).unwrap();
+    let cq = CmdQueue::new(0x8010_0000, driver::CQ_ENTRIES).unwrap();
+    let fq = FaultQueue::new(0x8010_1000, driver::FQ_RECORDS).unwrap();
+    assert_eq!(bring_up(&mut sim, &d, &cq, &fq), Ok(DdtpMode::Off));
+    assert_eq!(sim.read32(regs::FCTL), regs::FCTL_WSI);
+    assert_eq!(sim.read64(regs::ICVEC), ICVEC);
+    assert_eq!(sim.read64(regs::CQB), cq.cqb());
+    assert_eq!(sim.read64(regs::FQB), fq.fqb());
+    assert_eq!(
+        driver::mode_name(decode_ddtp(sim.read64(regs::DDTP)).mode),
+        "3LVL"
+    );
+}
+
+/// The boot's invalidation and fence: executed in order, and the poll sees the ticket done.
+#[test]
+fn the_boot_invalidation_is_fenced() {
+    let mem = FakeMem::new();
+    let mut sim = Sim::new(&mem, SimConfig::qemu());
+    let d = Ddt::new(&mem, 0x8000_0000, Levels::Three, Format::Extended).unwrap();
+    let mut cq = CmdQueue::new(0x8010_0000, driver::CQ_ENTRIES).unwrap();
+    let fq = FaultQueue::new(0x8010_1000, driver::FQ_RECORDS).unwrap();
+    bring_up(&mut sim, &d, &cq, &fq).unwrap();
+    let cmds = driver::invalidate_everything();
+    let ticket = driver::submit(&mut sim, &mem, &mut cq, &cmds).unwrap();
+    assert_eq!(driver::fence_poll(&mut sim, &mut cq, ticket), Fence::Done);
+    assert_eq!(sim.executed(), cmds);
+}
+
+/// A fence the IOMMU has not yet run is pending; an illegal command fails the wait.
+#[test]
+fn a_fence_waits_and_a_queue_error_fails_it() {
+    let mem = FakeMem::new();
+    let cfg = SimConfig {
+        auto_process: false,
+        ..SimConfig::qemu()
+    };
+    let mut sim = Sim::new(&mem, cfg);
+    let d = Ddt::new(&mem, 0x8000_0000, Levels::Three, Format::Extended).unwrap();
+    let mut cq = CmdQueue::new(0x8010_0000, driver::CQ_ENTRIES).unwrap();
+    let fq = FaultQueue::new(0x8010_1000, driver::FQ_RECORDS).unwrap();
+    bring_up(&mut sim, &d, &cq, &fq).unwrap();
+    let ticket = driver::submit(&mut sim, &mem, &mut cq, &driver::invalidate_everything()).unwrap();
+    assert_eq!(
+        driver::fence_poll(&mut sim, &mut cq, ticket),
+        Fence::Pending
+    );
+    sim.process_commands();
+    assert_eq!(driver::fence_poll(&mut sim, &mut cq, ticket), Fence::Done);
+    let bad = Command {
+        dword0: 0x7f,
+        dword1: 0,
+    };
+    let ticket = driver::submit(&mut sim, &mem, &mut cq, &[bad, Command::fence()]).unwrap();
+    sim.process_commands();
+    assert_eq!(driver::fence_poll(&mut sim, &mut cq, ticket), Fence::Failed);
+}
+
+/// A ring without room refuses a submission whole, and writes nothing to `cqt`.
+#[test]
+fn a_submission_that_does_not_fit_is_refused_whole() {
+    let mem = FakeMem::new();
+    let cfg = SimConfig {
+        auto_process: false,
+        ..SimConfig::qemu()
+    };
+    let mut sim = Sim::new(&mem, cfg);
+    let d = Ddt::new(&mem, 0x8000_0000, Levels::Three, Format::Extended).unwrap();
+    let mut cq = CmdQueue::new(0x8010_0000, 4).unwrap();
+    let fq = FaultQueue::new(0x8010_1000, driver::FQ_RECORDS).unwrap();
+    bring_up(&mut sim, &d, &cq, &fq).unwrap();
+    let cmds = driver::invalidate_everything();
+    assert!(driver::submit(&mut sim, &mem, &mut cq, &cmds).is_err());
+    assert_eq!(sim.read32(regs::CQT), 0);
+    assert!(driver::submit(&mut sim, &mem, &mut cq, &cmds[..3]).is_ok());
+}
+
+fn up_with_faults(mem: &FakeMem, records: u32) -> (Sim<'_, FakeMem>, FaultQueue) {
+    let mut sim = Sim::new(mem, SimConfig::qemu());
+    let d = Ddt::new(mem, 0x8000_0000, Levels::Three, Format::Extended).unwrap();
+    let cq = CmdQueue::new(0x8010_0000, driver::CQ_ENTRIES).unwrap();
+    let fq = FaultQueue::new(0x8010_1000, records).unwrap();
+    bring_up(&mut sim, &d, &cq, &fq).unwrap();
+    (sim, fq)
+}
+
+/// IOMMU-SPEC 7.1: a device with no directory entry is a fault record naming it, its address and its direction; the drain
+/// acknowledges `ipsr.fip` and moves the head.
+#[test]
+fn a_denied_device_is_drained_with_its_address_and_direction() {
+    let mem = FakeMem::new();
+    let (mut sim, mut fq) = up_with_faults(&mem, driver::FQ_RECORDS);
+    assert_eq!(sim.read(0x20, 0x8123_4000), Err(faultq::CAUSE_DDT_INVALID));
+    assert!(sim.write(0x20, 0x8123_4800, 0xdead_beef).is_err());
+    assert_ne!(sim.read32(regs::IPSR) & regs::IPSR_FIP, 0);
+    let mut got: Vec<FaultRecord> = Vec::new();
+    let d = driver::drain_faults(&mut sim, &mem, &mut fq, driver::DRAIN_PER_INTERRUPT, |r| {
+        got.push(r)
+    });
+    assert_eq!(
+        d,
+        Drained {
+            taken: 2,
+            ..Drained::default()
+        }
+    );
+    assert_eq!(sim.read32(regs::IPSR) & regs::IPSR_FIP, 0);
+    assert_eq!(sim.read32(regs::FQH), sim.read32(regs::FQT));
+    assert_eq!(got[0].device_id, 0x20);
+    assert_eq!(got[0].iotval, 0x8123_4000);
+    assert_eq!(got[0].ttype, TransactionType::UntranslatedRead);
+    assert_eq!(got[1].iotval, 0x8123_4800);
+    assert_eq!(got[1].ttype.direction(), "write");
+    assert_eq!(
+        driver::FaultLine(&got[1]).to_string(),
+        "## iommu: fault cause=258 dev=00:04.0 iova=0x81234800 write"
+    );
+    assert_eq!(
+        driver::FenceTimeoutLine(Some(0x20)).to_string(),
+        "## iommu: fence timeout dev=00:04.0"
+    );
+    assert_eq!(
+        driver::FenceTimeoutLine(None).to_string(),
+        "## iommu: fence timeout dev=none"
+    );
+}
+
+/// At most the bound per drain, with the rest left for the next (`more`); an overflow is reported once and cleared.
+#[test]
+fn the_drain_is_bounded_and_clears_an_overflow() {
+    let mem = FakeMem::new();
+    let (mut sim, mut fq) = up_with_faults(&mem, 8);
+    for i in 0..20u64 {
+        let _ = sim.read(0x28, 0x9000_0000 + i * 0x1000);
+    }
+    // seven records fit in a ring of eight; the eighth overflowed it
+    assert!(regs::Fqcsr(sim.read32(regs::FQCSR)).overflow());
+    let mut n = 0;
+    let d = driver::drain_faults(&mut sim, &mem, &mut fq, 4, |_| n += 1);
+    assert_eq!((d.taken, d.overflow, d.more), (4, true, true));
+    assert!(!regs::Fqcsr(sim.read32(regs::FQCSR)).overflow());
+    let d = driver::drain_faults(&mut sim, &mem, &mut fq, 4, |_| n += 1);
+    assert_eq!((d.taken, d.overflow, d.more), (3, false, false));
+    assert_eq!(n, 7);
+    // after the overflow is cleared, new records arrive again
+    let _ = sim.read(0x28, 0x9100_0000);
+    let d = driver::drain_faults(&mut sim, &mem, &mut fq, 4, |_| n += 1);
+    assert_eq!(d.taken, 1);
+}
+
+#[test]
+fn an_overflow_drained_in_one_go_leaves_nothing_pending() {
+    // a drain that empties the ring after an overflow (no `more`, so nothing re-pends the source) leaves `fip` clear, or the
+    // edge-triggered source never fires again (an implementation may hold `fip` while the overflow stands: the driver clears it
+    // again after the acknowledge; the simulator is QEMU's, which clears it at the first write)
+    let mem = FakeMem::new();
+    let (mut sim, mut fq) = up_with_faults(&mem, 8);
+    for i in 0..20u64 {
+        let _ = sim.read(0x28, 0x9000_0000 + i * 0x1000);
+    }
+    assert_ne!(sim.read32(regs::IPSR) & regs::IPSR_FIP, 0);
+    let d = driver::drain_faults(&mut sim, &mem, &mut fq, 64, |_| {});
+    assert_eq!((d.taken, d.overflow, d.more), (7, true, false));
+    assert_eq!(sim.read32(regs::IPSR) & regs::IPSR_FIP, 0, "fip left set");
+}
+
+#[test]
+fn the_console_is_rate_limited_per_second() {
+    let mut rl = RateLimit::new();
+    let admitted = (0..40).filter(|_| rl.admit(5_000, 1_000)).count();
+    assert_eq!(admitted, driver::LINES_PER_SECOND as usize);
+    assert!(!rl.admit(5_999, 1_000));
+    assert!(rl.admit(6_000, 1_000));
+}
+
+#[cfg(feature = "fault-iommu-bare")]
+#[test]
+fn the_negative_control_is_pass_through() {
+    let mem = FakeMem::new();
+    let (mut sim, _) = up_with_faults(&mem, 8);
+    driver::write_bare(&mut sim);
+    assert_eq!(sim.read(0x20, 0x8123_4000), Ok(0x8123_4000));
 }

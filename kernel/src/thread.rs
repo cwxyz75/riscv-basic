@@ -1760,6 +1760,8 @@ pub fn wake_stat(which: u64) -> u64 {
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
         3..=5 | 140..=144 => crate::aia::stat(which),
+        // 150 to 157: the IOMMU's counters (IOMMU5, IOMMU-SPEC 7.3)
+        150..=157 => crate::iommu::stat(which),
         // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),
@@ -1796,11 +1798,7 @@ pub fn wake_stat(which: u64) -> u64 {
         // 109: the kernel heap's leak oracle (`heap::leak_oracle`, wrapping): taken before and after something, `before - after` is the heap
         // bytes it kept (MM5's acceptance test: what a confined program holds against what its job was charged)
         109 => heap_free() as u64,
-        100 => crate::kmem::stats().ram_first << 12,
-        101 => crate::kmem::stats().ram_end << 12,
-        102 => crate::kmem::stats().memory_frames,
-        103 => crate::kmem::stats().managed_frames,
-        104 => crate::kmem::stats().image_first << 12,
+        100..=104 => memory_stat(which),
         // 105: the frequency of the `time` counter (selector 6), in hertz, from the device tree
         105 => crate::timer::timebase(),
         // 107: the first eight bytes the entropy pool produced after it was keyed (test builds; 0 in release), different at every boot; 108: 1 if
@@ -1816,6 +1814,18 @@ pub fn wake_stat(which: u64) -> u64 {
             .bkl_takes
             .load(Relaxed),
         _ => 0,
+    }
+}
+
+/// `wake_stat`'s 100 to 104 (PL4), apart so that its frame does not hold five copies of the memory statistics.
+fn memory_stat(which: u64) -> u64 {
+    let m = crate::kmem::stats();
+    match which {
+        100 => m.ram_first << 12,
+        101 => m.ram_end << 12,
+        102 => m.memory_frames,
+        103 => m.managed_frames,
+        _ => m.image_first << 12,
     }
 }
 

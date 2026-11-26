@@ -1448,6 +1448,11 @@ fn kernel_ends_survive_a_sweep() -> Outcome {
 fn wait_is_woken_by_the_peer_closing() -> Outcome {
     // Last of the helper tests: op 'T' makes the helper close its end after 3 ticks.
     let (m, n) = request(9, b'T', b"");
+    // (the clock is read before the request: the helper's three ticks start when it reads it, so the close can never come
+    // earlier than that, however long this thread is held off after the send. Read after the send, a stall of this thread
+    // longer than three ticks between the send and the read made the close look instant: T267, seen at two harts on the
+    // IOMMU machine, where `channel_write` was seen to return 80 to 120 ms late)
+    let t0 = sys::clock_get();
     ensure_eq!(
         st(sys::channel_write(
             BOOTSTRAP,
@@ -1459,8 +1464,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
         Some(S::Ok),
         "send"
     );
-    let t0 = sys::clock_get();
-    let r = sys::object_wait(BOOTSTRAP, sig::PEER_CLOSED, t0 + 200);
+    let r = sys::object_wait(BOOTSTRAP, sig::PEER_CLOSED, sys::clock_get() + 200);
     ensure_eq!(
         (r.status, r.a1 as u32 & sig::PEER_CLOSED),
         (0, sig::PEER_CLOSED),
@@ -1468,10 +1472,10 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     );
     let waited = sys::clock_get() - t0;
     ensure!(
-        // (the lower bound is the check, with a tick of slack for the helper's clock starting at its read of the
-        // request; the upper one only catches a lost wake-up and is loose because a loaded CI runner can delay
-        // the helper by many ticks)
-        within(waited, 1, 60),
+        // (the lower bound is the check: three ticks from the helper's read of the request, which follows `t0`, less one for
+        // the millisecond clock's rounding; the upper one only catches a lost wake-up and is loose because a loaded CI runner
+        // can delay the helper, or this thread, by many ticks)
+        within(waited, 2, 60),
         "the close came after about 3 ticks (waited {waited})"
     );
     let mut reply = [0u8; 32];
@@ -13347,7 +13351,8 @@ fn device_caps_need_the_resource() -> Outcome {
         (u64::MAX - 4095, 4096, "wrapping"),
         // PL5a: the windows come from the device tree and fail closed. What the kernel or the firmware drives, and what nobody decided
         // a process may touch, on the live tree, are refused: the test finisher, the CLINT, the M-level APLIC, the S-level APLIC and its
-        // upper half, both IMSIC files, fw-cfg (its DMA interface writes guest RAM), both flash banks, the PCI ECAM window
+        // upper half, both IMSIC files, fw-cfg (its DMA interface writes guest RAM), both flash banks, the IOMMU's registers (IOMMU5:
+        // the kernel drives them), the PCI host's I/O-port window (IOMMU-SPEC 2.6: only its ECAM and memory windows are windows)
         (0x10_0000, 4096, "the test finisher"),
         (0x200_0000, 4096, "the CLINT"),
         (0xc00_0000, 4096, "the M-level APLIC"),
@@ -13358,10 +13363,24 @@ fn device_caps_need_the_resource() -> Outcome {
         (0x1010_0000, 4096, "fw-cfg"),
         (0x2000_0000, 4096, "flash bank 0"),
         (0x2200_0000, 4096, "flash bank 1"),
-        (0x3000_0000, 4096, "the PCI ECAM window"),
+        (0x301_0000, 4096, "the IOMMU's registers"),
+        (0x300_0000, 4096, "the PCI I/O-port window"),
+        (0x8000_0000, 4096, "just above the PCI 32-bit window (RAM)"),
     ] {
         let r = sys::vmo_create_physical(res, pa, len);
         ensure!(st(r) == Some(S::InvalidArgs), "{what}: {:?}", st(r));
+    }
+    // IOMMU5 (IOMMU-SPEC 2.6): the PCI host is behind the IOMMU, so its configuration window (ECAM) and its memory windows are the root
+    // resource's; the IOMMU denies every function until a domain exists (`iommu_is_on_and_denies_by_default`)
+    for (pa, what) in [
+        (0x3000_0000u64, "the PCI ECAM window"),
+        (0x3fff_f000, "the end of the ECAM window"),
+        (0x4000_0000, "the PCI 32-bit memory window"),
+        (0x7fff_f000, "the end of the 32-bit window"),
+        (0x4_0000_0000, "the PCI 64-bit memory window"),
+    ] {
+        let r = ok(sys::vmo_create_physical(res, pa, 4096), what)?;
+        sys::handle_close(r.a1 as u64);
     }
     // the RTC page is a window too (the first entry of the table the kernel built from the tree)
     let rtc = ok(
@@ -13880,6 +13899,499 @@ fn hart_count(res: u64) -> u64 {
         n += 1;
     }
     n
+}
+
+// ---- IOMMU5: the IOMMU is on and every device is denied by default (IOMMU-SPEC 2.4, 3.1, 7; IO1) ----------------------------
+//
+// The independent device is a virtio-pci function the harness puts on the command line (`scripts/os_boot_test.py`: `virtio-rng-pci`
+// at slot `IOMMU_TEST_SLOT`, with `iommu_platform=on`). `iommu-testdev` cannot read and cannot choose its data word (IOMMU0 items 1
+// and 14), so the virtio function does both directions here, driven by hand through its registers: a **read** is the device fetching
+// its available ring from an address the test chose (a queue notification), and a **write** is its MSI-X message, whose address and
+// data word the test writes into the MSI-X table and which QEMU's virtio transport sends when the driver writes a value other than 1
+// to `queue_enable` (its configuration-change interrupt, `virtio_error`). No domain exists, so the directory holds no entry for the
+// function: every transaction must be refused and reported (cause 258), and nothing must reach memory or an interrupt file.
+
+/// The slot of the harness's test function on bus 0 (`addr=0x4`): device id `0x20`, `00:04.0`.
+const IOMMU_TEST_SLOT: u64 = 4;
+const IOMMU_TEST_DID: u64 = IOMMU_TEST_SLOT << 3;
+/// The PCI host of QEMU `virt`: its configuration window (ECAM) and its 32-bit memory window (from the device tree; the suite names
+/// the same machine's addresses elsewhere, as `device_caps_need_the_resource` does).
+const PCI_ECAM: u64 = 0x3000_0000;
+const PCI_MEM32: u64 = 0x4000_0000;
+/// The supervisor IMSIC's first interrupt file on QEMU `virt` (one page per hart file).
+const IMSIC_S: u64 = 0x2800_0000;
+/// Where this test maps the function's configuration page, its BARs and the pattern frame.
+const PCI_CFG_VA: u64 = 0x780_0000;
+const PCI_BAR_VA: u64 = 0x781_0000;
+const PATTERN_VA: u64 = 0x790_0000;
+/// Cause 258, "device-directory entry not valid" (the IOMMU specification's fault causes; `iommucore::faultq`).
+const CAUSE_DDT_INVALID: u64 = 258;
+/// Transaction types of a fault record: an untranslated read and an untranslated write.
+const TTYPE_READ: u64 = 2;
+const TTYPE_WRITE: u64 = 3;
+
+/// The IOMMU's counters (`debug_stat`, SYSCALLS.md): faults taken, then the last fault's device id, address and cause.
+fn iommu_faults() -> u64 {
+    sys::debug_stat(150)
+}
+/// The last fault record: (device id, address, cause, transaction type).
+fn iommu_last_fault() -> (u64, u64, u64, u64) {
+    let c = sys::debug_stat(155);
+    (
+        sys::debug_stat(153),
+        sys::debug_stat(154),
+        c & 0xfff,
+        (c >> 32) & 0x3f,
+    )
+}
+
+/// Wait until the fault count has moved past `before` and then stayed still for a while (a device may fault more than once for one
+/// request); the count reached, or None if it never moved.
+fn iommu_wait_faults(before: u64) -> Option<u64> {
+    let t0 = sys::clock_get();
+    while iommu_faults() == before {
+        if sys::clock_get() > t0 + 2000 {
+            return None;
+        }
+        sys::thread_yield();
+    }
+    let mut last = iommu_faults();
+    let mut still = sys::clock_get();
+    while sys::clock_get() < still + 50 {
+        let now = iommu_faults();
+        if now != last {
+            last = now;
+            still = sys::clock_get();
+        }
+        sys::thread_yield();
+    }
+    Some(last)
+}
+
+/// One virtio-pci function, mapped: its configuration page and the virtio structures and MSI-X table inside its BARs.
+struct PciFn {
+    common: u64,
+    notify: u64,
+    msix_cap: u64,
+    msix_table: u64,
+}
+
+fn cfg_rd32(off: u64) -> u32 {
+    // SAFETY: PCI_CFG_VA maps the function's 4 KiB configuration page (`pci_fn_up`); `off` is an aligned register inside it.
+    unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u32) }
+}
+fn cfg_wr32(off: u64, v: u32) {
+    // SAFETY: as `cfg_rd32`.
+    unsafe { core::ptr::write_volatile((PCI_CFG_VA + off) as *mut u32, v) }
+}
+fn cfg_rd16(off: u64) -> u16 {
+    // SAFETY: as `cfg_rd32`, a 16-bit register.
+    unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u16) }
+}
+fn cfg_wr16(off: u64, v: u16) {
+    // SAFETY: as `cfg_rd16`.
+    unsafe { core::ptr::write_volatile((PCI_CFG_VA + off) as *mut u16, v) }
+}
+fn cfg_rd8(off: u64) -> u8 {
+    // SAFETY: as `cfg_rd32`, one byte.
+    unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u8) }
+}
+fn mmio_wr16(va: u64, v: u16) {
+    // SAFETY: `va` is inside the BAR window mapped at PCI_BAR_VA (`pci_fn_up`), at a register the virtio structure there defines.
+    unsafe { core::ptr::write_volatile(va as *mut u16, v) }
+}
+fn mmio_rd16(va: u64) -> u16 {
+    // SAFETY: as `mmio_wr16`.
+    unsafe { core::ptr::read_volatile(va as *const u16) }
+}
+fn mmio_wr32(va: u64, v: u32) {
+    // SAFETY: as `mmio_wr16`.
+    unsafe { core::ptr::write_volatile(va as *mut u32, v) }
+}
+fn mmio_rd32(va: u64) -> u32 {
+    // SAFETY: as `mmio_wr16`.
+    unsafe { core::ptr::read_volatile(va as *const u32) }
+}
+fn mmio_wr8(va: u64, v: u8) {
+    // SAFETY: as `mmio_wr16`.
+    unsafe { core::ptr::write_volatile(va as *mut u8, v) }
+}
+fn mmio_rd8(va: u64) -> u8 {
+    // SAFETY: as `mmio_wr16`.
+    unsafe { core::ptr::read_volatile(va as *const u8) }
+}
+
+/// Map the test function's configuration page, assign its memory BARs in the host's 32-bit window, map them, and find its virtio
+/// structures and MSI-X table. The function is left with memory decoding and bus mastering on and INTx off.
+fn pci_fn_up(res: u64) -> Result<PciFn, Detail> {
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let cfg = sys::vmo_create_physical(res, PCI_ECAM + (IOMMU_TEST_SLOT << 15), 4096);
+    ensure_eq!(
+        st(cfg),
+        Some(S::Ok),
+        "the test function's configuration page is a device window (the ECAM window is the root resource's)"
+    );
+    let cfg = cfg.a1 as u64;
+    let m = sys::process_map(me, cfg, PCI_CFG_VA, 0, 4096, PF_R | PF_W);
+    sys::handle_close(cfg);
+    ensure_eq!(st(m), Some(S::Ok), "map the configuration page");
+    ensure_eq!(
+        cfg_rd32(0),
+        0x1044_1af4,
+        "the harness's virtio-rng-pci (modern) at slot {IOMMU_TEST_SLOT}"
+    );
+    cfg_wr16(4, 0); // decoding off while the BARs move
+                    // size and place every memory BAR, each at its natural alignment, upwards from the window's base
+    let mut next = PCI_MEM32;
+    let mut bars = [0u64; 6];
+    let mut i = 0;
+    while i < 6 {
+        let off = 0x10 + 4 * i as u64;
+        let orig = cfg_rd32(off);
+        if orig & 1 != 0 {
+            i += 1;
+            continue; // an I/O BAR: never used
+        }
+        let wide = (orig >> 1) & 3 == 2;
+        cfg_wr32(off, 0xffff_ffff);
+        let lo = cfg_rd32(off) & !0xf;
+        let hi = if wide {
+            cfg_wr32(off + 4, 0xffff_ffff);
+            cfg_rd32(off + 4)
+        } else {
+            0xffff_ffff
+        };
+        let mask = (u64::from(hi) << 32) | u64::from(lo);
+        if lo != 0 || hi != 0xffff_ffff {
+            let size = (!mask).wrapping_add(1);
+            ensure!(
+                size.is_power_of_two() && size <= 1 << 20,
+                "BAR {i} size {size:#x}"
+            );
+            next = next.div_ceil(size) * size;
+            bars[i] = next;
+            cfg_wr32(off, next as u32);
+            if wide {
+                cfg_wr32(off + 4, (next >> 32) as u32);
+            }
+            next += size;
+        } else {
+            cfg_wr32(off, 0);
+        }
+        i += if wide { 2 } else { 1 };
+    }
+    let span = (next - PCI_MEM32).div_ceil(4096) * 4096;
+    let w = sys::vmo_create_physical(res, PCI_MEM32, span);
+    ensure_eq!(
+        st(w),
+        Some(S::Ok),
+        "the host's 32-bit memory window is a device window"
+    );
+    let w = w.a1 as u64;
+    let m = sys::process_map(me, w, PCI_BAR_VA, 0, span, PF_R | PF_W);
+    sys::handle_close(w);
+    sys::handle_close(me);
+    ensure_eq!(st(m), Some(S::Ok), "map the BARs");
+    let va = |bar: u8, off: u32| -> u64 {
+        bars.get(bar as usize)
+            .map_or(0, |&b| PCI_BAR_VA + (b - PCI_MEM32) + u64::from(off))
+    };
+    // the capability list: the virtio structures (vendor capability 9) and MSI-X (17)
+    ensure!(cfg_rd16(6) & (1 << 4) != 0, "a capability list");
+    let (mut common, mut notify, mut msix_cap, mut msix_table) = (0, 0, 0, 0);
+    let mut p = u64::from(cfg_rd8(0x34) & !3);
+    let mut hops = 0;
+    while p != 0 && hops < 48 {
+        match cfg_rd8(p) {
+            9 => {
+                let (kind, bar, off) = (cfg_rd8(p + 3), cfg_rd8(p + 4), cfg_rd32(p + 8));
+                match kind {
+                    1 => common = va(bar, off),
+                    2 => {
+                        ensure_eq!(cfg_rd32(p + 16), 4, "the notify multiplier QEMU uses");
+                        notify = va(bar, off);
+                    }
+                    _ => {}
+                }
+            }
+            0x11 => {
+                msix_cap = p;
+                let t = cfg_rd32(p + 4);
+                msix_table = va((t & 7) as u8, t & !7);
+            }
+            _ => {}
+        }
+        p = u64::from(cfg_rd8(p + 1) & !3);
+        hops += 1;
+    }
+    ensure!(
+        common != 0 && notify != 0 && msix_cap != 0 && msix_table != 0,
+        "virtio common {common:#x}, notify {notify:#x}, MSI-X {msix_cap:#x} table {msix_table:#x}"
+    );
+    cfg_wr16(4, (1 << 1) | (1 << 2) | (1 << 10)); // memory decoding, bus mastering, INTx disabled
+    Ok(PciFn {
+        common,
+        notify,
+        msix_cap,
+        msix_table,
+    })
+}
+
+fn pci_fn_down(f: &PciFn) {
+    mmio_wr8(f.common + 0x14, 0); // virtio reset
+    cfg_wr16(f.msix_cap + 2, 0); // MSI-X off
+    cfg_wr16(4, 1 << 10); // no decoding, no bus mastering
+    pci_unmap();
+}
+
+/// Unmap the configuration page and the BARs, whichever are mapped (the way out of a `pci_fn_up` that failed part way: its device
+/// registers are not touched, since they may not be mapped; the command register is still 0, as `pci_fn_up` wrote it first).
+fn pci_unmap() {
+    let me = sys::process_self();
+    if st(me) == Some(S::Ok) {
+        let me = me.a1 as u64;
+        sys::process_unmap(me, PCI_BAR_VA);
+        sys::process_unmap(me, PCI_CFG_VA);
+        sys::handle_close(me);
+    }
+}
+
+/// Reset the function and bring it to DRIVER_OK with queue 0 at `rings` (descriptors, available ring, used ring) and the
+/// configuration-change interrupt on MSI-X vector 0, whose table entry says `(address, data)`.
+fn virtio_up(f: &PciFn, rings: (u64, u64, u64), msg: (u64, u32)) -> Outcome {
+    let c = f.common;
+    mmio_wr8(c + 0x14, 0);
+    let t0 = sys::clock_get();
+    while mmio_rd8(c + 0x14) != 0 {
+        ensure!(sys::clock_get() < t0 + 1000, "the reset did not complete");
+    }
+    mmio_wr8(c + 0x14, 1); // ACKNOWLEDGE
+    mmio_wr8(c + 0x14, 1 | 2); // DRIVER
+    mmio_wr32(c, 1); // device features, high word
+    let offered = mmio_rd32(c + 4);
+    ensure!(
+        offered & 3 == 3,
+        "VERSION_1 and ACCESS_PLATFORM offered (high word {offered:#x}): the harness's iommu_platform=on"
+    );
+    mmio_wr32(c + 8, 1);
+    mmio_wr32(c + 12, 3); // we take VERSION_1 and ACCESS_PLATFORM
+    mmio_wr32(c + 8, 0);
+    mmio_wr32(c + 12, 0);
+    mmio_wr8(c + 0x14, 1 | 2 | 8); // FEATURES_OK
+    ensure!(mmio_rd8(c + 0x14) & 8 != 0, "FEATURES_OK accepted");
+    // the MSI-X table entry first, then the vector for configuration changes, then MSI-X on with the function unmasked
+    mmio_wr32(f.msix_table, msg.0 as u32);
+    mmio_wr32(f.msix_table + 4, (msg.0 >> 32) as u32);
+    mmio_wr32(f.msix_table + 8, msg.1);
+    mmio_wr32(f.msix_table + 12, 0);
+    cfg_wr16(f.msix_cap + 2, 1 << 15);
+    mmio_wr16(c + 0x10, 0);
+    ensure_eq!(
+        mmio_rd16(c + 0x10),
+        0,
+        "the configuration vector took MSI-X entry 0"
+    );
+    mmio_wr16(c + 0x16, 0); // queue 0
+    let max = mmio_rd16(c + 0x18);
+    ensure!(max >= 4, "queue size {max}");
+    mmio_wr16(c + 0x18, 4);
+    for (at, v) in [(0x20u64, rings.0), (0x28, rings.1), (0x30, rings.2)] {
+        mmio_wr32(c + at, v as u32);
+        mmio_wr32(c + at + 4, (v >> 32) as u32);
+    }
+    mmio_wr16(c + 0x1a, 0xffff); // no vector for the queue
+    mmio_wr16(c + 0x1c, 1);
+    mmio_wr8(c + 0x14, 1 | 2 | 8 | 4); // DRIVER_OK
+    Ok(())
+}
+
+/// Make the function send its configuration-change message: a `queue_enable` value other than 1 is a driver error, which a modern
+/// virtio device reports by setting NEEDS_RESET and interrupting.
+fn virtio_message(f: &PciFn) {
+    mmio_wr16(f.common + 0x16, 0);
+    mmio_wr16(f.common + 0x1c, 2);
+}
+
+/// A frame the test owns, filled with a pattern, mapped at PATTERN_VA: (its VMO, its physical address).
+fn pattern_frame(res: u64) -> Result<(u64, u64), Detail> {
+    let dma = ok(sys::vmo_create_dma(res, 1), "a DMA frame")?.a1 as u64;
+    let pa = ok(sys::vmo_phys_addr(dma), "its physical address")?.a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let m = sys::process_map(me, dma, PATTERN_VA, 0, 4096, PF_R | PF_W);
+    sys::handle_close(me);
+    ensure_eq!(st(m), Some(S::Ok), "map the pattern frame");
+    for i in 0..512u64 {
+        // SAFETY: PATTERN_VA maps the frame read-write for 4096 bytes.
+        unsafe { core::ptr::write_volatile((PATTERN_VA + 8 * i) as *mut u64, pattern_word(i)) };
+    }
+    Ok((dma, pa))
+}
+
+fn pattern_word(i: u64) -> u64 {
+    0x5a5a_0000_0000_0000 | (i * 0x9e37_79b9)
+}
+
+fn pattern_intact() -> Option<u64> {
+    (0..512u64).find(|&i| {
+        // SAFETY: as in `pattern_frame`.
+        unsafe { core::ptr::read_volatile((PATTERN_VA + 8 * i) as *const u64) != pattern_word(i) }
+    })
+}
+
+fn pattern_drop(dma: u64) {
+    let me = sys::process_self();
+    if st(me) == Some(S::Ok) {
+        sys::process_unmap(me.a1 as u64, PATTERN_VA);
+        sys::handle_close(me.a1 as u64);
+    }
+    sys::handle_close(dma);
+}
+
+/// The root resource, the test function brought up, and a pattern frame; everything undone after `body`, however it ends.
+fn with_test_function(body: impl FnOnce(u64, &PciFn, u64) -> Outcome) -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let r = (|| {
+        let (dma, pa) = pattern_frame(res)?;
+        let r = match pci_fn_up(res) {
+            Ok(f) => {
+                let r = body(res, &f, pa);
+                pci_fn_down(&f);
+                r
+            }
+            Err(e) => {
+                pci_unmap();
+                Err(e)
+            }
+        };
+        pattern_drop(dma);
+        r
+    })();
+    sys::handle_close(res);
+    r
+}
+
+/// IOMMU-SPEC 2.4 step 5 and 3.1 (IO1): the directory is empty, so a function with no domain can neither read nor write memory, and
+/// each refused transaction is a fault record naming the function, the address and the direction.
+fn iommu_is_on_and_denies_by_default() -> Outcome {
+    with_test_function(|_, f, pa| {
+        let before = iommu_faults();
+        // a read: the device fetches its available ring, which the test put in the pattern frame
+        virtio_up(f, (pa, pa + 0x100, pa + 0x200), (pa + 0x800, 0xdead_beef))?;
+        mmio_wr16(f.notify, 0); // queue 0's notification (its notify offset is 0: the only queue)
+        let Some(after_read) = iommu_wait_faults(before) else {
+            ensure!(
+                false,
+                "the device's read of {pa:#x} raised no fault (faults {before})"
+            );
+            return Ok(());
+        };
+        let (did, iova, cause, ttype) = iommu_last_fault();
+        ensure_eq!(did, IOMMU_TEST_DID, "the read's fault names the function");
+        ensure_eq!(cause, CAUSE_DDT_INVALID, "no directory entry");
+        ensure_eq!(ttype, TTYPE_READ, "a read");
+        ensure!(
+            iova & !0xfff == pa,
+            "the read's address {iova:#x} is in the frame at {pa:#x}"
+        );
+        // a write: the message the test put in the MSI-X table, aimed at the pattern frame
+        virtio_message(f);
+        let Some(after_write) = iommu_wait_faults(after_read) else {
+            ensure!(
+                false,
+                "the device's write to {:#x} raised no fault",
+                pa + 0x800
+            );
+            return Ok(());
+        };
+        let (did, iova, cause, ttype) = iommu_last_fault();
+        ensure_eq!(did, IOMMU_TEST_DID, "the write's fault names the function");
+        ensure_eq!(cause, CAUSE_DDT_INVALID, "no directory entry");
+        ensure_eq!(ttype, TTYPE_WRITE, "a write");
+        ensure_eq!(iova, pa + 0x800, "the write's address");
+        ensure!(after_write >= before + 2, "two faults at least");
+        if let Some(i) = pattern_intact() {
+            ensure!(
+                false,
+                "the pattern changed at word {i}: the device reached memory"
+            );
+        }
+        Ok(())
+    })
+}
+
+/// IOMMU-SPEC 3.1 and 8 (IO1, IO9): a function with no domain cannot interrupt a hart. Its MSI-X entry is programmed with a real
+/// interrupt file and identity, first the inter-hart identity of hart file 0, then the identity the kernel gave an RTC interrupt object
+/// of this test (`debug_stat` 145 names it): each message is a refused write with a fault record, and the object never fires.
+fn iommu_denies_messages_by_default() -> Outcome {
+    with_test_function(|res, f, pa| {
+        let no_route = sys::debug_stat(140);
+        let before = iommu_faults();
+        virtio_up(f, (pa, pa + 0x100, pa + 0x200), (IMSIC_S, 1))?;
+        virtio_message(f);
+        let Some(after) = iommu_wait_faults(before) else {
+            ensure!(
+                false,
+                "the message to the inter-hart identity raised no fault"
+            );
+            return Ok(());
+        };
+        let (did, iova, cause, ttype) = iommu_last_fault();
+        ensure_eq!(
+            did,
+            IOMMU_TEST_DID,
+            "the message's fault names the function"
+        );
+        ensure_eq!(cause, CAUSE_DDT_INVALID, "no directory entry");
+        ensure_eq!(ttype, TTYPE_WRITE, "a message is a write");
+        ensure_eq!(iova, IMSIC_S, "the interrupt file's address");
+        // an identity that is open and routed: the RTC object's
+        let Some(obj) = rtc_object(res)? else {
+            ensure!(false, "no RTC interrupt object on this machine");
+            return Ok(());
+        };
+        let route = rt::syscall(
+            rt::abi::syscall::DEBUG_STAT,
+            [rt::debug::handle() as usize, 145, RTC_IRQ as usize, 0, 0, 0],
+        );
+        let r = (|| {
+            ensure!(
+                route.status == 0 && route.a1 as u64 != u64::MAX,
+                "the RTC object's route (debug_stat 145): {:?}",
+                st(route)
+            );
+            let (file, id) = ((route.a1 as u64) >> 16, (route.a1 as u64) & 0xffff);
+            virtio_up(
+                f,
+                (pa, pa + 0x100, pa + 0x200),
+                (IMSIC_S + file * 0x1000, id as u32),
+            )?;
+            virtio_message(f);
+            ensure!(
+                iommu_wait_faults(after).is_some(),
+                "the message to identity {id} of file {file} raised no fault"
+            );
+            let (did, iova, _, ttype) = iommu_last_fault();
+            ensure_eq!(did, IOMMU_TEST_DID, "the second message's fault");
+            ensure_eq!(ttype, TTYPE_WRITE, "a write");
+            ensure_eq!(iova, IMSIC_S + file * 0x1000, "file {file}'s address");
+            ensure_eq!(
+                st(sys::object_wait(
+                    obj,
+                    sig::INTERRUPT,
+                    sys::clock_get() + 100
+                )),
+                Some(S::TimedOut),
+                "the RTC object fired: the message reached identity {id} of file {file}"
+            );
+            ensure_eq!(sys::debug_stat(140), no_route, "messages with no route");
+            if let Some(i) = pattern_intact() {
+                ensure!(false, "the pattern changed at word {i}");
+            }
+            Ok(())
+        })();
+        sys::handle_close(obj);
+        r
+    })
 }
 
 /// IOMMU4: identities are allocated per hart, next-fit, so an object re-created again and again walks the whole identity space of a
@@ -17118,6 +17630,14 @@ pub fn app_main() -> i32 {
         (
             "interrupt_moves_do_not_lose_or_leak",
             interrupt_moves_do_not_lose_or_leak,
+        ),
+        (
+            "iommu_is_on_and_denies_by_default",
+            iommu_is_on_and_denies_by_default,
+        ),
+        (
+            "iommu_denies_messages_by_default",
+            iommu_denies_messages_by_default,
         ),
         (
             "socket_ends_travel_over_channels",

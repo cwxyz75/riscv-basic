@@ -32,6 +32,7 @@ extern crate alloc;
 
 pub mod cmdq;
 pub mod ddt;
+pub mod driver;
 pub mod faultq;
 pub mod iopt;
 pub mod iova;

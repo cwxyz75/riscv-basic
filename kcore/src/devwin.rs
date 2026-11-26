@@ -11,11 +11,20 @@ use alloc::vec::Vec;
 
 /// The devices a physical VMO may name, by `compatible` (exact match of one string of the property): what the device manager drives.
 /// Adding a device here is a deliberate decision about what a holder of the resource handle may touch.
-pub const ALLOWED: &[&str] = &["virtio,mmio", "google,goldfish-rtc"];
+///
+/// The PCI host (`pci-host-ecam-generic`, IOMMU-SPEC 2.6) is admitted only when it is behind the IOMMU (an `iommu-map`): its windows
+/// are its `reg` (the configuration window, ECAM) and the memory windows of its `ranges`, never its I/O-port window. That is safe
+/// only because the IOMMU denies every device id before any window exists (IO1; the kernel asserts the boot order).
+pub const ALLOWED: &[&str] = &[
+    "virtio,mmio",
+    "google,goldfish-rtc",
+    crate::iommutree::PCI_HOST,
+];
 
 /// Compatible strings of nodes the kernel (or the firmware) drives or that are not memory-mapped devices at all: interrupt controllers
 /// and timers, the test finisher, the power and reset syscons. Their `reg` ranges are cut from every window.
 const NEVER: &[&str] = &[
+    "riscv,iommu",
     "riscv,aplic",
     "riscv,imsics",
     "riscv,plic0",
@@ -39,11 +48,19 @@ pub fn admitted(nodes: &[Node]) -> impl Iterator<Item = &Node> {
             && ALLOWED.iter().any(|c| n.is_compatible(c))
             && !disabled(n)
             && physical(n, nodes)
+            && behind_the_iommu_if_pci(n, nodes)
     })
 }
 
+/// A PCI host is admitted only with every function behind the IOMMU (`iommutree::fully_behind_the_iommu`); every other admitted
+/// kind has no such condition.
+fn behind_the_iommu_if_pci(n: &Node, nodes: &[Node]) -> bool {
+    !n.is_compatible(crate::iommutree::PCI_HOST)
+        || crate::iommutree::fully_behind_the_iommu(n, nodes)
+}
+
 /// A node that is disabled (`status` other than `okay`) is not in use: firmware marks the devices it owns that way.
-fn disabled(n: &Node) -> bool {
+pub(crate) fn disabled(n: &Node) -> bool {
     n.prop("status").is_some_and(|v| {
         let s = v.split(|&b| b == 0).next().unwrap_or(&[]);
         s != b"okay" && s != b"ok"
@@ -52,7 +69,7 @@ fn disabled(n: &Node) -> bool {
 
 /// Does every ancestor of `n` pass addresses through unchanged (a `ranges` property that is empty)? A bus with translating `ranges`, or
 /// none, makes the child's `reg` a bus-local address, not a physical one: such a node is refused rather than translated.
-fn physical(n: &Node, nodes: &[Node]) -> bool {
+pub(crate) fn physical(n: &Node, nodes: &[Node]) -> bool {
     let mut path = n.path.as_str();
     while let Some(slash) = path.rfind('/') {
         path = &path[..slash];
@@ -103,9 +120,17 @@ pub fn device_windows(
             continue;
         }
         if ALLOWED.iter().any(|c| n.is_compatible(c)) && !disabled(n) && physical(n, nodes) {
+            if n.is_compatible(crate::iommutree::PCI_HOST) {
+                continue; // (below: only behind the IOMMU, and with its ranges)
+            }
             want.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
         }
     }
+    want.extend(
+        crate::iommutree::pci_windows(nodes)
+            .into_iter()
+            .filter_map(|(a, s)| pages(a, s)),
+    );
     cut.sort_unstable();
     want.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::new();

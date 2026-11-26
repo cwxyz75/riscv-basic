@@ -222,7 +222,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
     ensure(leaves < 3000, "the direct map has few leaves")?;
     ensure_eq(
         devices,
-        2 + crate::aia::pages().count(),
+        2 + crate::aia::pages().count() + crate::iommu::page().iter().count(),
         "device pages in the direct map",
     )?;
     ensure_eq(
@@ -799,7 +799,17 @@ fn irq_service() {
     crate::irq::without(crate::heap::service);
 }
 
+/// IOMMU5 (A11): QEMU's own walker, through the IOMMU's debug translation interface, agrees with `iommucore`'s tables; every frame
+/// comes back (`iommu::selftest`).
+fn iommu_translation_matches_the_tables() -> Outcome {
+    balanced(crate::iommu::selftest)
+}
+
 pub const TESTS: &[Test] = &[
+    (
+        "iommu_translation_matches_the_tables",
+        iommu_translation_matches_the_tables,
+    ),
     ("heap_grows_at_a_safe_point", heap_grows_at_a_safe_point),
     (
         "frame_cache_serves_and_accounts",

@@ -583,6 +583,12 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
         (Class::Jobs, Class::Frame, false),
         (Class::Procs, Class::Futex, false),
         (Class::Futex, Class::Procs, true),
+        // the IOMMU (IOMMU-SPEC 11.1): after OBJ and the memory locks, before FRAME
+        (Class::Obj, Class::Iommu, false),
+        (Class::Iommu, Class::Frame, false),
+        (Class::Frame, Class::Iommu, true),
+        (Class::Iommu, Class::Vmo, true),
+        (Class::Iommu, Class::Obj, true),
     ] {
         if order_check(held, probe) != bad {
             return Err(format!(

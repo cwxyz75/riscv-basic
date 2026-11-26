@@ -272,6 +272,15 @@ prints the first one), 141 the free identities of every hart's IMSIC file togeth
 143 the identities retired after their route moved (an `interrupt_ack` on another hart, or a hart going offline), 144 the identities of one file
 (the device tree's `riscv,num-ids`; 0 on a machine without an IMSIC).
 
+`which` 145 (IOMMU5) takes the wired source number in `a2` and returns where that source is delivered: its live identity as
+(interrupt file << 16) | identity, or all ones when the source has no live route (read under the object lock). The suite uses it to aim
+a device's message at an identity the kernel gave an interrupt object, to see that the IOMMU refuses it.
+
+`which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
+(over the console limit of 16 a second), 152 the fault-queue overflows, 153 the device id of the last fault record, 154 its I/O address,
+155 its cause | (transaction type << 32), 156 the commands submitted to the command queue, 157 the fences that did not complete within
+their bound or could not be submitted (always 0 on a healthy machine: the boot script fails a run that prints one).
+
 `which` 110 and 111 (PL7) are the executable pages mapped by faults so far and the times the instruction caches were synchronised for them (once per fault that mapped any: `fence.i` here and SBI `remote_fence_i` on every other online hart); a page that was already mapped adds nothing.
 
 `which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
@@ -465,10 +474,13 @@ it on deliberately. A process without it cannot reach device memory.
 A VMO over device memory (MMIO). `resource` needs MANAGE. The range must be page aligned,
 non-empty, a whole number of pages and inside one *device window*: the kernel builds the windows at boot from the device tree (`kcore::devwin`) and the rule fails closed. A node
 contributes its `reg` ranges, widened to whole pages, only if its `compatible` is on the list of devices the system drives (`virtio,mmio`
-and `google,goldfish-rtc`), its `status` is not disabled and every bus above it passes addresses through unchanged (`ranges;`); from the
-windows are cut RAM and everything reserved, the console, and the ranges of every interrupt controller, timer, test finisher and power or
-reset node. On QEMU `virt` that is the eight virtio-mmio slots and the RTC page. Anything else, RAM and every other device included (fw-cfg,
-the flash banks, the PCI ECAM window), is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
+and `google,goldfish-rtc`), its `status` is not disabled and every bus above it passes addresses through unchanged (`ranges;`). A PCI host
+(`pci-host-ecam-generic`, IOMMU5, IOMMU-SPEC 2.6) is admitted only when its `iommu-map` puts its functions behind the IOMMU: it contributes
+its configuration window (ECAM, its `reg`) and its memory windows (the 32- and 64-bit memory spaces of its `ranges`), never its I/O-port
+window, and the windows are built only after the IOMMU denies every device. From the windows are cut RAM and everything reserved, the
+console, the IOMMU's registers, and the ranges of every interrupt controller, timer, test finisher and power or reset node. On QEMU `virt`
+with `iommu-sys=on` that is the eight virtio-mmio slots, the RTC page, the PCI ECAM window and the two PCI memory windows. Anything else,
+RAM and every other device included (fw-cfg, the flash banks, the IOMMU, the PCI I/O-port window), is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
 DMA). The frames are not in the frame database: they are never freed, zeroed or charged as pages,
 and `vmo_read`/`vmo_write` on it are NOT_SUPPORTED. **The kernel never copies through device
 memory**: a syscall buffer pointer that lands in an MMIO mapping is INVALID_ARGS. Errors, in

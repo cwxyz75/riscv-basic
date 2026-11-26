@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -415,7 +415,7 @@ os-interactive: os-user
 
 # Boot the OS to its shell in this terminal (type `basic`; Ctrl-A then X leaves QEMU).
 os-run: os-interactive
-	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
 
 # The system as it is meant to be used (T48): optimised kernel and programs, no boot self-tests, no
 # test banners. `make os-release-run` boots it in this terminal; `os-release-smoke` boots it
@@ -427,7 +427,7 @@ os-release:
 	cd kernel && OS_USER_PROFILE=release CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --features release --target-dir ../target/os-release-run
 
 os-release-run: os-release
-	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
 
 os-release-smoke: os-release
 	python3 scripts/release_symbols.py --self-test
@@ -472,6 +472,17 @@ os-boot-test-entropy: kernel
 # PL1 (OD47, OD127): a CPU without the profile must end the boot in `##PANIC missing extension` (QEMU's plain rv64 has no V, Zicond or Svade).
 os-boot-test-cpu-neg: kernel
 	OS_CPU=rv64 OS_BOOT_TIMEOUT=60 python3 scripts/os_boot_test.py --expect-panic "missing extension" $(OS_ELF)
+
+# IOMMU5 (IOMMU-SPEC 2.5): the machine without its platform IOMMU (no `iommu-sys=on`) must end in `##PANIC ... no IOMMU`.
+os-boot-test-iommu-neg: kernel-main
+	OS_MACHINE=virt,aia=aplic-imsic OS_PCI_TEST=0 OS_BOOT_TIMEOUT=60 python3 scripts/os_boot_test.py --expect-panic "no IOMMU" $(OS_ELF)
+
+# IOMMU5 negative control (TESTING.md rule 9): a kernel that writes `ddtp` Bare (no translation, no isolation) must fail
+# `iommu_is_on_and_denies_by_default`. Kernel-only boot.
+OS_IOMMUBARE_ELF := target/os-fault-iommubare/$(KERNEL_TARGET)/debug/kernel
+os-boot-test-iommu-bare: kernel-main
+	cd kernel && cargo build --features fault-iommu-bare --target-dir ../target/os-fault-iommubare
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUBARE_ELF) iommu_is_on_and_denies_by_default
 
 # Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
 # third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
@@ -521,7 +532,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
