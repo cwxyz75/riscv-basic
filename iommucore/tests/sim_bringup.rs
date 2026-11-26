@@ -375,8 +375,9 @@ fn the_drain_is_bounded_and_clears_an_overflow() {
 
 #[test]
 fn an_overflow_drained_in_one_go_leaves_nothing_pending() {
-    // `fip` cannot be cleared while the overflow stands: a drain that empties the ring (no `more`, so nothing re-pends the
-    // source) must clear it again after the overflow is acknowledged, or the edge-triggered source never fires again
+    // a drain that empties the ring after an overflow (no `more`, so nothing re-pends the source) leaves `fip` clear, or the
+    // edge-triggered source never fires again (an implementation may hold `fip` while the overflow stands: the driver clears it
+    // again after the acknowledge; the simulator is QEMU's, which clears it at the first write)
     let mem = FakeMem::new();
     let (mut sim, mut fq) = up_with_faults(&mem, 8);
     for i in 0..20u64 {

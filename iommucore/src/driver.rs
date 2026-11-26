@@ -308,8 +308,9 @@ pub fn drain_faults<R: Regs, M: PhysMem64>(
         d.overflow = csr.overflow();
         d.mem_fault = csr.mem_fault();
         r.write32(regs::FQCSR, csr.acknowledge());
-        // `fip` could not be cleared while the error stood (the write above ended it): clear it now, so that the next record is
-        // a new edge
+        // (the IOMMU specification lets `fip` stay set while the error stands, and the write at the top may not have cleared it
+        // then: clear it again now the error is gone, so that the next record is a new edge. QEMU clears it at the first write,
+        // and this second write is harmless there)
         r.write32(regs::IPSR, regs::IPSR_FIP);
     }
     let tail = r.read32(regs::FQT);

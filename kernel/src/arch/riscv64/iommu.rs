@@ -225,7 +225,8 @@ pub fn init() {
     // step 4's registration (IOMMU-SPEC 2.4, 8.6): `aia::init` installed both kernel sources, or fault reporting would be dead
     for cause in [Cause::FaultQueue, Cause::CommandQueue] {
         let s = t.source(cause).map(|s| s.number);
-        if s.and_then(crate::aia::route_of).is_none() {
+        // (the route table is under the object lock with interrupts off, as `aia::init` reaches it at the same point of boot)
+        if crate::irq::without(|| s.and_then(crate::aia::route_of)).is_none() {
             panic!("no IOMMU: its {cause:?} interrupt (source {s:?}) could not be registered with the interrupt controller");
         }
     }

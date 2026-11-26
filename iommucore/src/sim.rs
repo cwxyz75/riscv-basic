@@ -518,18 +518,22 @@ impl<'m, M: PhysMem64> Sim<'m, M> {
         }
     }
 
-    /// Write-1-to-clear, except that a queue's bit cannot be cleared while its interrupt is enabled and an error that raises it
-    /// still stands (the IOMMU specification's `ipsr`: `cip` while `cqcsr.cie` and `cqmf`, `cmd_to`, `cmd_ill` or `fence_w_ip`;
-    /// `fip` while `fqcsr.fie` and `fqmf` or `fqof`): such a bit stays set, and no new edge is raised for it.
+    /// QEMU's `riscv_iommu_update_ipsr`: the value is first taken write-1-to-clear (`old & !v`), then each queue's bit survives
+    /// only while its interrupt is enabled and an error that raises it still stands (`cip`: `cqcsr.cie` and `cqmf`, `cmd_to`,
+    /// `cmd_ill` or `fence_w_ip`; `fip`: `fqcsr.fie` and `fqmf` or `fqof`; `pip`: the page-request queue, not modelled, so never).
+    /// So a 1 always clears its bit, and a bit not written is cleared too once its condition has gone. `pmip` is plain RW1C.
     fn write_ipsr(&mut self, v: u32) {
-        let before = self.ipsr;
-        self.ipsr &= !v;
-        if self.cqcsr & regs::QCSR_IE != 0 && self.cqcsr & QCSR_RW1C_CQ != 0 {
-            self.ipsr |= before & regs::IPSR_CIP;
+        let val = self.ipsr & !v;
+        let cq_holds = self.cqcsr & regs::QCSR_IE != 0 && self.cqcsr & QCSR_RW1C_CQ != 0;
+        let fq_holds = self.fqcsr & regs::QCSR_IE != 0 && self.fqcsr & QCSR_RW1C_FQ != 0;
+        let mut ipsr = val & regs::IPSR_PMIP;
+        if val & regs::IPSR_CIP != 0 && cq_holds {
+            ipsr |= regs::IPSR_CIP;
         }
-        if self.fqcsr & regs::QCSR_IE != 0 && self.fqcsr & QCSR_RW1C_FQ != 0 {
-            self.ipsr |= before & regs::IPSR_FIP;
+        if val & regs::IPSR_FIP != 0 && fq_holds {
+            ipsr |= regs::IPSR_FIP;
         }
+        self.ipsr = ipsr;
     }
 
     fn write_fctl(&mut self, v: u32) {
