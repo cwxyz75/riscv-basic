@@ -1448,6 +1448,11 @@ fn kernel_ends_survive_a_sweep() -> Outcome {
 fn wait_is_woken_by_the_peer_closing() -> Outcome {
     // Last of the helper tests: op 'T' makes the helper close its end after 3 ticks.
     let (m, n) = request(9, b'T', b"");
+    // (the clock is read before the request: the helper's three ticks start when it reads it, so the close can never come
+    // earlier than that, however long this thread is held off after the send. Read after the send, a stall of this thread
+    // longer than three ticks between the send and the read made the close look instant: T267, seen at two harts on the
+    // IOMMU machine, where `channel_write` was seen to return 80 to 120 ms late)
+    let t0 = sys::clock_get();
     ensure_eq!(
         st(sys::channel_write(
             BOOTSTRAP,
@@ -1459,8 +1464,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
         Some(S::Ok),
         "send"
     );
-    let t0 = sys::clock_get();
-    let r = sys::object_wait(BOOTSTRAP, sig::PEER_CLOSED, t0 + 200);
+    let r = sys::object_wait(BOOTSTRAP, sig::PEER_CLOSED, sys::clock_get() + 200);
     ensure_eq!(
         (r.status, r.a1 as u32 & sig::PEER_CLOSED),
         (0, sig::PEER_CLOSED),
@@ -1468,10 +1472,10 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     );
     let waited = sys::clock_get() - t0;
     ensure!(
-        // (the lower bound is the check, with a tick of slack for the helper's clock starting at its read of the
-        // request; the upper one only catches a lost wake-up and is loose because a loaded CI runner can delay
-        // the helper by many ticks)
-        within(waited, 1, 60),
+        // (the lower bound is the check: three ticks from the helper's read of the request, which follows `t0`, less one for
+        // the millisecond clock's rounding; the upper one only catches a lost wake-up and is loose because a loaded CI runner
+        // can delay the helper, or this thread, by many ticks)
+        within(waited, 2, 60),
         "the close came after about 3 ticks (waited {waited})"
     );
     let mut reply = [0u8; 32];
