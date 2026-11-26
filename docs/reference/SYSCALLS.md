@@ -267,11 +267,16 @@ were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart 
 (roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
 nearly every syscall.
 
+`which` 140 to 144 (IOMMU4, IOMMU-SPEC 8): 140 the device messages taken on an interrupt identity with no route (always 0: IO12; the kernel
+prints the first one), 141 the free identities of every hart's IMSIC file together, 142 the highest identity a device message has been taken on,
+143 the identities retired after their route moved (an `interrupt_ack` on another hart, or a hart going offline), 144 the identities of one file
+(the device tree's `riscv,num-ids`; 0 on a machine without an IMSIC).
+
 `which` 110 and 111 (PL7) are the executable pages mapped by faults so far and the times the instruction caches were synchronised for them (once per fault that mapped any: `fence.i` here and SBI `remote_fence_i` on every other online hart); a page that was already mapped adds nothing.
 
 `which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
 
-`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
+`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; the identities of device sources are the kernel's choice, per hart, IOMMU-SPEC 8.1).
 
 ### debug_write(debug, ptr, len) -> status
 
@@ -316,7 +321,8 @@ Effects: none (waiting changes no signal).
 Errors, in order: BAD_HANDLE (also if the handle stops naming anything while waiting);
 ACCESS_DENIED (no WAIT right); INVALID_ARGS (`mask` is 0 or has
 a bit that is not a signal); TIMED_OUT (the deadline arrived first, or `deadline` was 0 and
-nothing in `mask` was set). A condition that already holds returns OK at once, even with
+nothing in `mask` was set). A wait that a signal ended is OK, with the word that ended it as `observed`, even if another thread cleared the
+signal before this one returned (an `interrupt_ack` by a second waiter, say). A condition that already holds returns OK at once, even with
 `deadline` 0. Only the signals in `mask` end a wait: to stop waiting for a message when the
 peer dies, include PEER_CLOSED (`READABLE | PEER_CLOSED`).
 Invariants: C3 (no lost wakeup: the check and the sleep are one atomic step).
@@ -502,9 +508,12 @@ ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 r
 Takes hart `index` out of the scheduler (`online` 0) or brings it back (1) and returns when it has got there (PM1, KERNEL-V1-SPEC 5.3). Going offline is logical: the hart stays
 powered and parks in its idle loop (the firmware's hart-stop is not used; see tidy item T228). It leaves the placement, pull and mark sets and the shootdown and poke sets; the thread it
 was running is displaced and every thread and timer homed on it moves to online harts; its per-hart frame cache and heap magazines go back to the shared pools; device sources aimed at
-it are re-aimed at another online hart. Coming back: its clock is reset, its TLB flushed, and placement may choose it again. Idempotent when the hart is already in the requested
+it move to another online hart (IOMMU-SPEC 8.5: each gets an identity in that hart's file first, and the old one is retired by the hart
+that had it). Coming back: its clock is reset, its TLB flushed, and placement may choose it again. Idempotent when the hart is already in the requested
 state. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such hart, `online` above 1); BAD_STATE (it is the last online hart, a thread is pinned to it,
-or another call is changing it); TIMED_OUT (the hart did not get there within two seconds: a kernel bug; the hart goes on towards the requested state, so the call can be repeated and answers OK once it is there). Hart 0 never goes offline today: the boot thread and the default affinity of kernel threads are pinned to it (BAD_STATE).
+or another `hart_set_online` call is under way, for any hart); NO_MEMORY (going offline: the other online harts have no free interrupt identity for a route the hart holds; nothing
+changed, the hart stays online; the refusals of BAD_STATE change nothing either). OK means the hart is offline: its routes are on other
+harts, and the identities they left may still be retiring on it (it keeps taking its file's messages until then); TIMED_OUT (the hart did not get there within two seconds: a kernel bug; the hart goes on towards the requested state, so the call can be repeated and answers OK once it is there). Hart 0 never goes offline today: the boot thread and the default affinity of kernel threads are pinned to it (BAD_STATE).
 
 ### hart_info(resource, index) -> state
 
@@ -539,18 +548,25 @@ mapped: nobody can be sleeping on an address the sleeper could not read.)
 ### interrupt_create(resource, source) -> status, handle
 
 An interrupt object for AIA source `source`: one of the sources the admitted devices of the device tree name in `interrupts` (`kcore::aiatree`: on
-QEMU `virt` the virtio-mmio slots, sources 1 to 8, and the RTC, 11; slot *n* is source *n*+1), and at most 62 (a source is delivered as IMSIC message id source + 1; message 1 is the inter-hart interrupt); every other source, the console's
-included, is refused. `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
-INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`**, and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` re-aims the source at the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
+QEMU `virt` the virtio-mmio slots, sources 1 to 8, and the RTC, 11; slot *n* is source *n*+1), up to the APLIC's `riscv,num-sources`; every
+other source, the console's included, is refused (the kernel never keeps for itself a source an admitted device names). The kernel delivers the source to an interrupt
+identity it chooses in the calling hart's IMSIC file (IOMMU-SPEC 8.1: identities are per hart, 0 is invalid and 1 the inter-hart interrupt; any
+other identity up to `riscv,num-ids` may be used). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
+INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`** (or, when that hart is going offline,
+to the online hart with the fewest routes), and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` moves the source to the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
 existed (a device that raised its line while nobody listened): **drivers must tolerate a spurious
 interrupt** right after `interrupt_create` and check their device's own status. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
-INVALID_ARGS (source 0, not a source of an admitted device, or past 32 bits); BAD_STATE (a live object already owns the source); NO_MEMORY.
+INVALID_ARGS (source 0, not a source of an admitted device, or past 32 bits); BAD_STATE (a live object already owns the source); NO_MEMORY (also when
+the calling hart's file has no free interrupt identity, or the IMSIC does not list the calling hart: nothing changed).
 
 ### interrupt_ack(interrupt) -> status, claims
 
 Clear INTERRUPT and unmask the source (a level still asserted fires again at once); the device condition must be cleared first or a level-triggered
 device fires again. `claims` is how many times the kernel has claimed this source for the object
-(a storm shows here). Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
+(a storm shows here). When the acknowledging hart is not the one the source is delivered to, the route moves to a new identity in this hart's
+file (when it has none free, the route stays where it is); the old identity is closed, checked for a message still on its way (delivered, not
+lost) and freed by its own hart (IOMMU-SPEC 8.1). An acknowledgement on a hart that is going offline, or with no free identity there,
+leaves the route where it is. Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
 
 ### process_create(job) -> status, handle
 

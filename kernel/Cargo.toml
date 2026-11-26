@@ -81,3 +81,5 @@ fault-alloc = []
 fault-aia-no-unmask = []
 # Negative control for the AIA: an acknowledged source whose line is still high is not re-pended.
 fault-aia-no-repend = []
+# IOMMU4's negative control: an interrupt identity is freed at the move, not when its old hart retired it (IO10, IO12).
+fault-msiid-free-at-move = ["kcore/fault-msiid-free-at-move"]

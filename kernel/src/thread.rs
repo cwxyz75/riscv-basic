@@ -522,6 +522,28 @@ pub fn hart_set_online(v: u64, online: bool) -> Result<(), abi::status::Status> 
     if st.hart_state.load(Ordering::Acquire) == to {
         return Ok(());
     }
+    // One change of a hart at a time (IOMMU4): an offline call reads the other harts' states to choose where the interrupt routes go,
+    // and a second call making one of them Draining in the meantime would leave none to choose. A call while another runs: BAD_STATE.
+    static CHANGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if CHANGING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Status::BadState);
+    }
+    let r = hart_change(st, v, online, (from, through, to));
+    CHANGING.store(false, Ordering::Release);
+    r
+}
+
+fn hart_change(
+    st: &crate::percpu::PerHart,
+    v: usize,
+    online: bool,
+    (from, through, to): (u8, u8, u8),
+) -> Result<(), abi::status::Status> {
+    use crate::percpu::HART_ONLINE;
+    use abi::status::Status;
     if st
         .hart_state
         .compare_exchange(from, through, Ordering::AcqRel, Ordering::Acquire)
@@ -530,19 +552,20 @@ pub fn hart_set_online(v: u64, online: bool) -> Result<(), abi::status::Status> 
         return Err(Status::BadState);
     }
     if !online {
-        let refused = irq::off(|| sched().begin_offline(v).is_err());
-        if refused {
+        // IOMMU-SPEC 8.5: every interrupt route on it moves first, to the online hart with the fewest routes, and only if the hart may
+        // go at all; under the object lock, so nothing places a route or pins a thread in between. A refusal changes nothing:
+        // BAD_STATE (the last hart, a pinned thread), NO_MEMORY (the others have too few free identities). A hart that is Draining is
+        // no target, so nothing moves back to it.
+        let r = irq::without(|| {
+            if sched().offline_refused(v) {
+                return Err(Status::BadState);
+            }
+            crate::aia::evacuate_locked(v)?;
+            sched().begin_offline(v).map_err(|_| Status::BadState)
+        });
+        if let Err(e) = r {
             st.hart_state.store(HART_ONLINE, Ordering::Release);
-            return Err(Status::BadState);
-        }
-        // (device interrupts aimed at it go to the lowest other online hart)
-        if let Some(t) = (0..crate::smp::started()).find(|&i| {
-            i != v && crate::percpu::hart(i).hart_state.load(Ordering::Acquire) == HART_ONLINE
-        }) {
-            crate::aia::retarget_from(
-                st.hart_id.load(Ordering::Relaxed),
-                crate::percpu::hart(t).hart_id.load(Ordering::Relaxed),
-            );
+            return Err(e);
         }
     }
     crate::smp::send_ipi(v, crate::percpu::IPI_RESCHED);
@@ -1736,7 +1759,7 @@ pub fn wake_stat(which: u64) -> u64 {
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
-        3..=5 => crate::aia::stat(which),
+        3..=5 | 140..=144 => crate::aia::stat(which),
         // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),

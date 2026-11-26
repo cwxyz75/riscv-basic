@@ -13,6 +13,8 @@ pub const MAX_HARTS: usize = 64;
 pub const IPI_RESCHED: u32 = 1;
 /// Run the hart's `work_kind` job in its IPI handler (tests of the lock).
 pub const IPI_WORK: u32 = 2;
+/// Open or retire interrupt identities in this hart's IMSIC file (IOMMU4, IOMMU-SPEC 8.1): the flag `aia::has_work` reads says what.
+pub const IPI_IRQ: u32 = 4;
 
 /// The lock-order checker's record of what a hart holds. Touched only by its own hart with interrupts off (X6).
 pub struct HeldCell(core::cell::UnsafeCell<klock::Held>);

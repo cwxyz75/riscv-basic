@@ -56,6 +56,16 @@ pub mod aia {
     pub fn disable(irq: u32) {
         unimplemented!()
     }
+    /// IOMMU4's routes (`interrupt_create`, an object's destruction, a hart going offline): stubs, as the rest.
+    pub fn take(irq: u32) -> Result<(), abi::status::Status> {
+        unimplemented!()
+    }
+    pub fn release(irq: u32) {
+        unimplemented!()
+    }
+    pub fn evacuate_locked(v: usize) -> Result<(), abi::status::Status> {
+        unimplemented!()
+    }
     pub fn handle(fired: impl FnMut(u32) -> bool) -> bool {
         unimplemented!()
     }

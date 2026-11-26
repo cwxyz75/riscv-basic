@@ -79,6 +79,16 @@ get filled in as each area is built.
 | D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count; mutation-checked), QEMU `device_caps_need_the_resource` |
 | D5 | A fired interrupt source is masked from the moment it is taken until `interrupt_ack` or the object's destruction, and a destroyed object leaves its source masked (nothing enabled with nobody listening); one live object per source | QEMU `interrupt_object_fires_and_masks` (an acknowledgement with the line still high must fire again: the same test, with the `fault-aia-no-unmask` and `fault-aia-no-repend` negative controls; T59) |
 
+### Interrupt identities (IOMMU4, IOMMU-SPEC 8 and 12)
+
+| # | Invariant | How checked |
+|---|---|---|
+| IO12 | An interrupt identity has at most one live route, and every identity open in a hart's file has a route (Live, or Retiring until its own hart retires it: a message taken there is delivered to the route if it moved, and dropped if the route ended, never given to the source's next object). A hart that is offline holds no route (nothing Opening, every Live identity moving away). An identity whose route moved (an `interrupt_ack` on another hart, a hart going offline) is closed, its pending bit read and cleared and a message found there delivered, by its own hart, before it is free again: it is never handed to another route while a message for its old owner can still arrive (the identity half of IO10). Identities 0 and 1 are never given to a route | host `kcore/tests/msiid_model.rs` (random alloc, move, retire, free and hart offline against a reference map, with in-flight messages; mutations seen to fail: free at the move, `alloc` handing out 1, the `num-ids` bound off by one either way, a new route not placed again when its hart is evacuated, a moved-from identity kept for the next object of the source, an acknowledgement on a departing hart cancelling its evacuation); QEMU `interrupt_identities_above_63_work` (every `eie` register up to `riscv,num-ids`) and `interrupt_moves_do_not_lose_or_leak` (no-route counter `debug_stat` 140 stays 0, the free count `debug_stat` 141 comes back), with the `fault-msiid-free-at-move` negative control; `device_interrupts_arrive_where_asked` also checks the no-route counter |
+
+The route table (`kernel/src/arch/riscv64/aia.rs`, over `kcore::msiid`) is read on the claim path and written by `interrupt_create`, `interrupt_ack`,
+the object's destruction and `hart_set_online`, all under the object lock `OBJ`: it has no lock class of its own. When `OBJ` is split into
+per-object locks (OD149) the table needs its own rule (a lock of its own, or a per-hart owner), set then.
+
 ### Futex rules (S7b)
 
 | # | Invariant | How checked |

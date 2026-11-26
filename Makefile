@@ -105,6 +105,7 @@ OS_NOCBZE_ELF := target/os-fault-cbze/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
+OS_NOMSIRETIRE_ELF := target/os-fault-msiid/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
 OS_NOPULL_ELF  := target/os-fault-pull/$(KERNEL_TARGET)/debug/kernel
@@ -398,6 +399,9 @@ os-boot-test-aia: kernel
 	python3 scripts/os_boot_test.py --neg $(OS_NOUNMASK_ELF) interrupt_object_fires_and_masks
 	cd kernel && cargo build --features fault-aia-no-repend --target-dir ../target/os-fault-repend
 	python3 scripts/os_boot_test.py --neg $(OS_NOREPEND_ELF) interrupt_object_fires_and_masks
+	# (IOMMU4, IO12: an interrupt identity freed at the move instead of after its hart retired it)
+	cd kernel && cargo build --features fault-msiid-free-at-move --target-dir ../target/os-fault-msiid
+	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOMSIRETIRE_ELF) interrupt_moves_do_not_lose_or_leak
 
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.
