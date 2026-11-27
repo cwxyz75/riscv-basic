@@ -20504,15 +20504,20 @@ fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
     CPU_SLEEP_NS.store(u64::MAX, Ordering::SeqCst);
     let me_p = ok(sys::process_self(), "process_self")?.a1 as u64;
     let before = ok(sys::process_cpu_ns(me_p), "process cpu")?.a1 as u64;
+    // One after the other: the spinner's 100 ms are of the clock, so at one hart anything else that runs in them (the sleeper's
+    // start-up and its end, a few milliseconds under emulation: T250) is time the spinner is not charged. The suite's thread waits.
     let spin = new_thread(cpu_spinner, 0)?;
+    ensure_eq!(
+        sys::object_wait(spin, sig::TERMINATED, sys::clock_get() + 20_000).status,
+        0,
+        "the spinner ended"
+    );
     let sleep = new_thread(cpu_sleeper, 0)?;
-    for t in [spin, sleep] {
-        ensure_eq!(
-            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000).status,
-            0,
-            "a thread ended"
-        );
-    }
+    ensure_eq!(
+        sys::object_wait(sleep, sig::TERMINATED, sys::clock_get() + 20_000).status,
+        0,
+        "the sleeper ended"
+    );
     let spun = CPU_SPIN_NS.load(Ordering::SeqCst);
     let slept = CPU_SLEEP_NS.load(Ordering::SeqCst);
     // (the thread's own figure at its end: 5 percent either way; the spec's 2 percent needs a quieter machine than a shared CI runner)

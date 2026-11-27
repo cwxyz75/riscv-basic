@@ -365,14 +365,16 @@ os-bench: kernel-main
 # KT5: the guest's retired-instruction counts of the main syscall paths (`##BENCH count_<name> <n> instr` lines of the suite's
 # `instruction_counts_report`), booted at one hart under `-icount shift=0`, where they are deterministic. bench/counts.tsv holds the recorded
 # values; a rise of more than 25 % fails (slack for runners and for unrelated changes that move the counts, T223), a fall of more than 5 % is printed (record it: `make os-count-record`).
+# No disks (OS_DISK=0): under `sleep=off` guest time does not bound the host's disk I/O, so the block tests cannot be judged there (the
+# harness refuses the combination); the disk path through the IOMMU is the other Kernel boots' (os-ktest-small, os-ktest-4).
 os-count: kernel-main
 	rm -f target/count.tsv
-	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_DISK=0 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/count.tsv bench/counts.tsv --prefix count_ --max-ratio 1.25
 
 os-count-record: kernel-main
 	rm -f target/count.tsv
-	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_DISK=0 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	awk -F'\t' '$$2 ~ /^count_/' target/count.tsv > bench/counts.tsv
 
 # S9 Q30 (soak tier): the bulk TCP tests (fetch, httpd, echo) with the guest's network behind the lossy relay

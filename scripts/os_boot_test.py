@@ -986,6 +986,15 @@ if os.environ.get("OS_NET") == "0" and SHARD in ("", "b"):
     # IOMMU11: the network function is always on the bus (the suite's PCI tests list and claim it), so a boot without the network
     # has no way to make the network tests skip: they would run against a function with no backend and fail. Run shard a or k.
     sys.exit("OS_NET=0 needs OS_SHARD=a or k (the network tests run in shard b and the whole suite)")
+if (any(o.strip() in ("sleep=off", "sleep=no", "sleep=false") for o in os.environ.get("OS_ICOUNT", "").split(","))
+        and not (os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"))  # (record and replay use their own -icount)
+        and os.environ.get("OS_DISK") != "0" and os.environ.get("OS_PCI_TEST") != "0"):
+    # Under `-icount sleep=off` the guest's clock jumps to its next timer deadline as soon as the guest idles (QEMU's
+    # `icount_start_warp_timer`), so a disk request the host completes asynchronously (its block layer's thread pool: a flush is
+    # an fsync) can take any amount of guest time: `blkd`'s two-second TIMEOUT and the suite's waits for a disk's interrupt expire
+    # before the host has finished. Guest time bounds no host I/O there, so no test of a disk can pass or fail on its merits: such a
+    # boot leaves the disks off (the instruction counts, `make os-count`; the disk path is the other Kernel boots' to prove).
+    sys.exit("OS_ICOUNT with sleep=off needs OS_DISK=0: guest time does not bound the host's disk I/O in that mode")
 
 
 def _read_lines(path):
@@ -1278,7 +1287,7 @@ def run(kernel: str, extra=()):
         # `iommu-testdev` at 00:08.0. `devmgr` enumerates them all.
         *pci_args(),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
-        # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off
+        # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off OS_DISK=0
         *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") and not rr_args() else []),
         # Record and replay (KT2, TESTING.md): `OS_RECORD=<dir>` boots under QEMU's record mode and the harness keeps the recording only
         # when the boot fails; `OS_REPLAY=<file>` replays one (add OS_GDB=1 to wait for gdb on :1234 first)
