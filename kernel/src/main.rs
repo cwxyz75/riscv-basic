@@ -286,35 +286,44 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     finisher::exit(tally.fail == 0)
 }
 
-/// The words on the panicking thread's kernel stack that point into the kernel's code, innermost first: the return addresses of the calls that led here, among a few
-/// stale ones (T233: a panic whose location is the standard library's says nothing of its caller; resolve these with `llvm-addr2line -e <kernel ELF>`). Only a thread
-/// that entered from user mode has a known stack top (`PerHart.kstack_top`); on any other the list is empty. Reads nothing outside `[sp, kstack_top)`.
+/// The words on the panicking code's stack that point into the kernel's code, innermost first: the return addresses of the calls that led here, among a few
+/// stale ones (T233: a panic whose location is the standard library's says nothing of its caller; resolve these with `scripts/resolve_trace.py`). The stack is
+/// found from `sp` (T266, `kcore::stackwalk`): a thread's kernel stack (a user thread's or a kernel thread's) by the slot arithmetic of the stack window, else
+/// this hart's boot stack (its idle loop) or its emergency stack. Reads nothing outside `[sp, top)` of that one stack; on any other `sp` the list is empty.
+/// The addresses are **link** addresses (the image's KASLR slide taken off, as the fatal-trap report and the `leak:` lines print them, HD3), so the tools
+/// resolve them against the ELF directly; the shipped release build prints none (it prints no address at all).
 struct Trace;
 
 impl core::fmt::Display for Trace {
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: addresses below 2^56; the loop stays inside [sp, top) and counts to at most 32
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: addresses below 2^64 - 8; the loop stays inside [sp, top) and counts to at most 32
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let sp = arch::stack_pointer() & !7;
-        let top = percpu::this()
-            .kstack_top
-            .load(core::sync::atomic::Ordering::Relaxed) as usize;
-        let text = kmem::sections().text;
-        // (a kernel stack is one slot: `sp` and `top` must be in the same one, or `top` is another thread's and the walk would cross a guard page, T240)
-        let slot = abi::layout::KSTACK_SLOT_BYTES as usize;
-        if top == 0
-            || top <= sp
-            || top - sp > abi::layout::KSTACK_BYTES as usize
-            || (top - 1) / slot != sp / slot
-        {
+        if cfg!(all(feature = "release", not(feature = "release-suite"))) {
             return Ok(());
         }
+        let here = percpu::this();
+        let index = here.index.load(core::sync::atomic::Ordering::Relaxed);
+        let emergency_top = here
+            .emergency_top
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let emergency = (
+            emergency_top.saturating_sub(percpu::EMERGENCY_BYTES as u64),
+            emergency_top,
+        );
+        let boot = smp::boot_stack(index).unwrap_or((0, 0));
+        let Some((sp, top)) =
+            kcore::stackwalk::live_stack(arch::stack_pointer() as u64, &[boot, emergency])
+        else {
+            return Ok(());
+        };
+        let text = kmem::sections().text;
         write!(f, " [stack")?;
         let (mut at, mut shown) = (sp, 0);
         while at + 8 <= top && shown < 32 {
-            // SAFETY: `at` is 8-aligned and in `[sp, top)`, the live part of this hart's kernel stack, which is mapped and 8-byte readable.
+            // SAFETY: `at` is 8-aligned and in `[sp, top)`, the live part of the stack this code runs on (`kcore::stackwalk::live_stack`: the mapped upper half of
+            // a kernel-stack slot, or this hart's boot or emergency stack, statics of the image), so it is mapped and 8-byte readable.
             let w = unsafe { core::ptr::read_volatile(at as *const u64) };
             if w >= text.0 && w < text.1 {
-                write!(f, " {w:#x}")?;
+                write!(f, " {:#x}", w.wrapping_sub(arch::slide()))?;
                 shown += 1;
             }
             at += 8;

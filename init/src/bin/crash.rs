@@ -4,6 +4,9 @@
 #![no_main]
 
 use core::arch::asm;
+#[path = "../storm_pattern.rs"]
+mod storm_pattern;
+use storm_pattern::{msg_byte, msg_len, stream_byte};
 
 #[no_mangle]
 pub fn app_main() -> i32 {
@@ -1879,6 +1882,7 @@ fn vec_threads() -> i32 {
     901
 }
 
+#[inline(never)] // (T266: its buffers stay out of the frame of `main`, where child threads start on 16 KiB stacks)
 fn socket_hand() -> i32 {
     use rt::abi::signals as sig;
     let reply = |tag: u8, a: u32, b: i32, c: u32, h: Option<u64>| {
@@ -1897,6 +1901,7 @@ fn socket_hand() -> i32 {
         );
     };
     let mut kept = 0u64;
+    let mut sent = 0u64; // (the stream offset of the next 'P' byte)
     loop {
         let w = rt::sys::object_wait(rt::BOOTSTRAP, sig::READABLE | sig::PEER_CLOSED, u64::MAX);
         let mut m = [0u8; 8];
@@ -1963,8 +1968,110 @@ fn socket_hand() -> i32 {
                 }
                 reply(b'R', total, 0, 0, None);
             }
+            b'P' => {
+                // (T266) like 'W', but the bytes are the stream pattern at their offset (`stream_byte`), so the reader can check every byte
+                let mut block = [0u8; 1024];
+                let (mut done, mut last) = (0u32, 0i32);
+                let want = u64::from(m[1]) * 4096;
+                while u64::from(done) < want {
+                    let n = 1024.min((want - u64::from(done)) as usize);
+                    for (i, b) in block[..n].iter_mut().enumerate() {
+                        *b = stream_byte(sent + i as u64);
+                    }
+                    let w = rt::sys::socket_write(kept, block.as_ptr(), n);
+                    last = w.status as i32;
+                    if w.status != 0 {
+                        break;
+                    }
+                    done += w.a1 as u32;
+                    sent += w.a1 as u64;
+                }
+                reply(b'P', done, last, 0, None);
+            }
+            b'K' => {
+                // (T266) a channel pair: this hand keeps one end, the other goes back
+                let p = rt::sys::channel_create();
+                if p.status != 0 {
+                    reply(b'K', 0, p.status as i32, 0, None);
+                    continue;
+                }
+                kept = p.a1 as u64;
+                reply(b'K', 0, 0, 0, Some(p.a2 as u64));
+            }
+            b'M' => hand_send_messages(kept, m[1]),
+            b'S' => hand_serve_calls(kept),
             b'X' => return 0,
             _ => {}
         }
+    }
+}
+
+/// T266, the socket hand's 'M': write `n` messages on `ch`: message i is `msg_len(i)` bytes of `msg_byte(i, offset)` with two fresh events; a
+/// full queue or a job at its IPC limit is waited out, and a closed peer ends it. (Not inlined: its 64 KiB buffer must not be in the frame of
+/// `main`, which every child thread of this image starts in, on a stack of 16 KiB.)
+#[inline(never)]
+fn hand_send_messages(ch: u64, n: u8) {
+    let mut buf = [0u8; 64 * 1024];
+    for i in 0..u32::from(n) {
+        let len = msg_len(i);
+        for (o, b) in buf[..len].iter_mut().enumerate() {
+            *b = msg_byte(i, o);
+        }
+        if !send_with_two_events(ch, &buf[..len]) {
+            break;
+        }
+    }
+}
+
+/// T266, the socket hand's 'S': serve `channel_call`s on `ch` until the peer closes: a request is (txid, i); the reply is message i with the
+/// txid in its first four bytes, and two fresh events. (Not inlined, as `hand_send_messages`.)
+#[inline(never)]
+fn hand_serve_calls(ch: u64) {
+    use rt::abi::signals as sig;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let w = rt::sys::object_wait(ch, sig::READABLE | sig::PEER_CLOSED, u64::MAX);
+        let mut req = [0u8; 8];
+        let r = rt::sys::channel_read(ch, req.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
+        if r.status != 0 {
+            if w.a1 as u32 & sig::PEER_CLOSED != 0 {
+                return;
+            }
+            continue;
+        }
+        let i = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
+        let len = msg_len(i);
+        for (o, b) in buf[..len].iter_mut().enumerate() {
+            *b = msg_byte(i, o);
+        }
+        buf[..4].copy_from_slice(&req[..4]);
+        if !send_with_two_events(ch, &buf[..len]) {
+            return;
+        }
+    }
+}
+
+/// Write `bytes` with two fresh events on `ch`, waiting out a full queue or a job at its limit. False when the peer has closed (or
+/// the events cannot be made).
+fn send_with_two_events(ch: u64, bytes: &[u8]) -> bool {
+    use rt::abi::signals as sig;
+    let (a, b) = (rt::sys::event_create(), rt::sys::event_create());
+    if a.status != 0 || b.status != 0 {
+        return false;
+    }
+    let hs = [a.a1 as u64, b.a1 as u64];
+    loop {
+        let w = rt::sys::channel_write(ch, bytes.as_ptr(), bytes.len(), hs.as_ptr(), 2);
+        if w.status == 0 {
+            return true;
+        }
+        use rt::abi::status::Status as St;
+        let waitable = w.status == St::ShouldWait as i32 || w.status == St::NoMemory as i32;
+        if !waitable || rt::sys::object_signals(ch).a1 as u32 & sig::PEER_CLOSED != 0 {
+            rt::sys::handle_close(hs[0]);
+            rt::sys::handle_close(hs[1]);
+            return false;
+        }
+        rt::io::nap(1);
     }
 }

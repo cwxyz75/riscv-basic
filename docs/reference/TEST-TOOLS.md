@@ -120,10 +120,16 @@ serial log of every failing run in `target/repeat/`. Over a soak target this is 
 `overnight-repeat-smp` is `os-repeat` of `os-ktest-4`, the kernel-only boot at four harts that the epic gate runs (OD161), `N` times
 (20 by default, about two hours on a hosted runner).
 
-**Where a panic came from.** A kernel `##PANIC` line from a thread that entered from user mode ends with `[stack 0x... 0x...]`: the words on its
-kernel stack that point into the kernel's code, innermost first (the panic handler's own frames, then the return addresses of the calls that led
+**Where a panic came from.** A kernel `##PANIC` line ends with `[stack 0x... 0x...]` (T266: whatever stack the panic ran on, found from `sp` by
+`kcore::stackwalk`: a user or kernel thread's kernel stack, the hart's boot stack, which its idle loop runs on, or its emergency stack): the words on
+that stack that point into the kernel's code, innermost first (the panic handler's own frames, then the return addresses of the calls that led
 here, among a few stale ones). `python3 scripts/resolve_trace.py <kernel ELF> <log file>` names the symbol nearest each address (it needs only
-`nm`); `llvm-addr2line -e <ELF> <addr>` gives the line. It is how a panic whose location is the standard library's (T233) is traced to its caller.
+`nm`); `llvm-addr2line -e <ELF> <addr>` gives the line. It is how a panic whose location is the standard library's (T233) is traced to its caller. Two debug detectors say more than where they fired
+(T266): the big-lock spin panic (`has spun for ... 30 million iterations`) ends with `owner at the start: ..., owner takes since: <n>, waited <ms> ms` and a
+reading (the lock is FIFO: the same owner with no take since held it the whole wait, at the site named, unless the host did not run its hart;
+another owner means it passed through the harts queued ahead; takes since mean FIFO order broke), and the starvation watchdog counts a sample only
+when the hart the thread waits on took an interrupt since the last one (`kcore::watchdog`), so `starved thread` means that hart ran and left the
+thread, and `stalled hart` means it took no interrupt for 10 s.
 
 **What outlived init.** When `no_process_or_vmo_survives_init` or `no_kernel_thread_survives_init` fails, the kernel prints `leak:` lines
 first (T278): the live kernel objects by kind, every process left (its state, threads, handles by kind, job), and every thread that was not

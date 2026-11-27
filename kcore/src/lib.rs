@@ -64,6 +64,7 @@ pub mod sched;
 pub mod sched2;
 pub mod sched_smp;
 pub mod slab;
+pub mod stackwalk;
 pub mod suspend;
 pub mod sync;
 pub mod testlog;
@@ -71,6 +72,7 @@ pub mod ticket;
 pub mod timebase;
 pub mod usercopy;
 pub mod wait;
+pub mod watchdog;
 
 use frame::FrameDb;
 use pagetable::PhysMem;

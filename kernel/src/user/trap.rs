@@ -1207,6 +1207,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             let staged = stage_in(n, a);
             let mut deferred = None;
             let result = irq::without(|| dispatch(n, a, staged, &mut deferred));
+            if deferred.is_some() {
+                // (KT7, T266: under `chaos`, a delay and a yield here switch the reader out with its message taken; nothing without the feature)
+                crate::chaos::point(crate::chaos::Point::CopyOut);
+            }
             let result = finish_out(result, deferred);
             if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
                 // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
