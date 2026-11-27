@@ -33,8 +33,8 @@ now and then when a phase's boots fail; "When an epic's smoke is red" keeps that
 | | the commit hook | every commit, locally | format, the docs check, clippy (which does the whole of `cargo check`); **no tests** | seconds when warm | `make hooks` installs it; it runs `fmt-check`, `docs-check`, `lint` | none |
 | 0 | the feature gate | every pull request (into an epic, and as part of tier 1) | format, the docs check, clippy on the host crates and on everything built for the target, the host tests of every crate, the loom and shuttle model checkers, the kernel against the AArch64 stub, a build of the OS kernel with its user programs, the home kernel and the optimised system image; **no QEMU** | 7 minutes per job | `make feature` | `ci.yml`: `host`, `models`, `build`, `build (release)` |
 | 1 | the epic gate (smoke) | a pull request into `main`; a push to `main`; by hand on any branch | tier 0, then the boots: the whole suite on the default machine at four harts (two shards), the kernel-only boot at one, two and four harts and in the optimised build, the instruction counts, the release smoke, the shell test, the home computer's boot | 7 minutes per job, the jobs side by side: **10 minutes for the whole gate** | `make smoke` (`make check`) | `ci.yml`: the `kernel (...)` jobs |
-| 2 | soak | **only when the owner asks** (OD142) | the full matrix (hart counts, round-robin, release, RVA23, no disk, the serial sessions), every negative control, the benchmarks, Miri | none | `make soak` | `soak.yml`, manual start only |
-| 3 | overnight | **only when the owner asks** (OD142) | the long runs: repeat boots, the checked release kernel, schedule perturbation, mutation testing, coverage, the host fuzzer at length, the persistent allocation-failure sweep | 300 minutes per job | `OVERNIGHT_TARGETS` | `overnight.yml`, manual start only |
+| 2 | soak | **only when the owner asks** (OD142) | the full matrix (hart counts, round-robin, release, RVA23, no disk, the serial sessions), every negative control, the benchmarks, Miri | none; a piece, 120 minutes | `make soak` (one target at a time, `SOAK_JOBS=1`), `make soak-piece` | `soak.yml`, manual start only (inputs: one target as a piece) |
+| 3 | overnight | **only when the owner asks** (OD142) | the long runs: repeat boots, the checked release kernel, schedule perturbation, mutation testing, coverage, the host fuzzer at length, the persistent allocation-failure sweep | 300 minutes per job; a piece, 120 minutes | `OVERNIGHT_TARGETS`, `make overnight-piece` | `overnight.yml`, manual start only (inputs: one target with its seeds, count or shard) |
 
 ## Rules
 
@@ -56,6 +56,10 @@ now and then when a phase's boots fail; "When an epic's smoke is red" keeps that
    targets locally, not `soak.yml` or `overnight.yml`, not a schedule, not a label. Running `os-repeat` over a soak
    target is a soak run. Changes do not each record a run as owed: nothing is recorded per change, and one
    run of a tier covers everything merged before it. A red soak or overnight run means "fix next", not "revert".
+   `make soak` runs its targets **one at a time** (`SOAK_JOBS=1`, T195): the tests follow the host's clock, so boots
+   side by side on one machine fail timing bounds for no fault of the kernel, and a red run must mean a defect. The
+   owner may start either tier as pieces of at most two hours (the workflows' dispatch inputs, `make soak-piece`,
+   `make overnight-piece`; `TEST-TOOLS.md`, "Running several boots at once").
 7. **A work item closes when its epic's gate is green.** An item's acceptance check is written first, as before. `scripts/work.py done` runs in the epic's closing commit,
    so the record reaches `main` only with a green boot behind it. The kernel-only boots of tier 1 are the verification
    at one, two and four harts.
@@ -124,4 +128,7 @@ about tests or boots changes.
 - a commit hook that runs a test or a boot;
 - `make check` being anything but `smoke`;
 - a soak or overnight target that its workflow does not run, or that a lower tier does;
-- a schedule, push or pull-request trigger on `soak.yml` or `overnight.yml`.
+- a schedule, push or pull-request trigger on `soak.yml` or `overnight.yml`, or any trigger there but a manual dispatch; a dispatch
+  input that is not a piece input; a piece job without its 120-minute limit, its guard or `make soak-piece` / `make
+  overnight-piece` (which refuse a target outside the tier), and a whole-tier job that would also run in a piece
+  (`check_docs.py --self-test` plants each of these).

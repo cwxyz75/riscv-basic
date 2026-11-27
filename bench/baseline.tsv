@@ -1,5 +1,6 @@
 # Benchmark baseline (slice B, SCHED-SMP-SPEC 6.1): label, name, ns per operation. QEMU, debug build, the machine of the
 # first measurement (2026-11-14); regenerate with `make os-bench` and copy target/bench.tsv here on purpose.
+# (The machine and its QEMU were not recorded then: bench_compare.py says so. A baseline recorded from a run file keeps its `#@` lines, T195.)
 smp1	thread_create_join	154921	ns
 smp1	wake_latency_event	142052	ns
 smp1	channel_call_rt	164974	ns

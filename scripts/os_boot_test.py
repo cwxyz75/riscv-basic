@@ -33,6 +33,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import refused_devices  # noqa: E402  (IOMMU-SPEC amendment 2026-11-27 part 2, L7: the devices no test machine carries)
+import host_fixtures  # noqa: E402  (T195: the servers the guest connects to, on ports of their own per boot)
+from host_fixtures import file21, tcp_pattern  # noqa: E402
 
 # The machine the OS track runs on (OD75): AIA (APLIC + IMSIC), required since PL6 (inter-hart interrupts are IMSIC messages).
 DEFAULT_MACHINE = "virt,aia=aplic-imsic,iommu-sys=on"
@@ -491,12 +493,9 @@ def run_profiled(cmd, kernel):
     start = time.monotonic()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     stamped = []
-    HOST_NET.clear()
     client = []
     tcp_client = []
     http_client = []
-    tcp_server = HostTcpServer(HOST_NET.append)
-    web = HostWeb()
 
     def pump():
         for raw in proc.stdout:
@@ -529,8 +528,6 @@ def run_profiled(cmd, kernel):
     t.join(timeout=5)
     for c in client + tcp_client + http_client:
         c.join(timeout=60)
-    tcp_server.close()
-    web.close()
     total = time.monotonic() - start
     out = b"".join(raw for _, raw in stamped)
     prev, ticks, rows = start, {}, []
@@ -550,14 +547,6 @@ def run_profiled(cmd, kernel):
 
 
 HOST_NET = []  # lines the host-side network client produced during the last run
-
-TCP_SERVER_PORT = 47802   # the host TCP server the guest connects to (10.0.2.2:47802 through slirp)
-
-
-def tcp_pattern(seed, n, start=0):
-    """The byte pattern the guest's `pattern(seed, i)` makes: ((i * 2654435761) + seed) >> 24, 32-bit arithmetic."""
-    return bytes(((((i * 2654435761) & 0xffffffff) + seed) & 0xffffffff) >> 24 for i in range(start, start + n))
-
 
 def host_tcp_client(tcp_port, emit):
     """S9 step 4c: the host's own TCP as an independent client of the guest's echo listener, through `hostfwd=tcp`. 200,000
@@ -602,108 +591,6 @@ def host_tcp_client(tcp_port, emit):
     if bytes(got) != want:
         bad.append("echoed %d of %d bytes%s" % (len(got), len(want), "" if bytes(got) == want[:len(got)] else " (and wrong)"))
     emit("##HOSTNET tcp_echo " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
-
-
-HTTP_SERVER_PORT = 47804   # the host HTTP server `fetch` talks to (10.0.2.2:47804)
-DNS_SERVER_PORT = 47803    # the scripted DNS server (10.0.2.2:47803, UDP)
-FILE21 = None
-
-
-def file21():
-    """The 256 KiB file the host HTTP server serves (and whose digest the guest's `fetch` must reproduce)."""
-    global FILE21
-    if FILE21 is None:
-        FILE21 = tcp_pattern(21, 262144)
-    return FILE21
-
-
-class HostWeb:
-    """The host side of the fetch tests (S9 step 7b): an HTTP/1.0 server on HTTP_SERVER_PORT and a scripted DNS server on
-    DNS_SERVER_PORT (UDP). `files.test` is 10.0.2.2, `alias.test` is a CNAME to it, `slow.test` drops its first query (the
-    resolver must retry), `nosuch.test` is NXDOMAIN."""
-
-    def __init__(self):
-        import socket, socketserver, threading, http.server
-        self.stop = threading.Event()
-        data = file21()
-
-        class H(http.server.BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.0"
-
-            def do_GET(self):
-                if self.path == "/file.bin":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                else:
-                    self.send_error(404)
-
-            def log_message(self, *a):
-                pass
-
-        class S(socketserver.ThreadingTCPServer):
-            allow_reuse_address = True
-            daemon_threads = True
-
-        self.http = None
-        self.dns = None
-        try:
-            self.http = S(("127.0.0.1", HTTP_SERVER_PORT), H)
-            threading.Thread(target=self.http.serve_forever, daemon=True).start()
-        except OSError:
-            self.http = None
-        try:
-            self.dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.dns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.dns.bind(("127.0.0.1", DNS_SERVER_PORT))
-            self.dns.settimeout(0.3)
-            self.seen = {}
-            threading.Thread(target=self.dns_loop, daemon=True).start()
-        except OSError:
-            self.dns = None
-
-    def dns_loop(self):
-        import socket, struct
-        while not self.stop.is_set():
-            try:
-                q, who = self.dns.recvfrom(512)
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            if len(q) < 17:
-                continue
-            ident = q[:2]
-            i, labels = 12, []
-            while i < len(q) and q[i]:
-                labels.append(q[i + 1:i + 1 + q[i]])
-                i += 1 + q[i]
-            name = b".".join(labels).decode().lower()
-            question = q[12:i + 5]
-            self.seen[name] = self.seen.get(name, 0) + 1
-            if name == "slow.test" and self.seen[name] == 1:
-                continue  # drop the first query: the resolver retries after a second
-            def a_rr(owner_ptr=b"\xc0\x0c"):
-                return owner_ptr + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([10, 0, 2, 2])
-            if name in ("files.test", "slow.test"):
-                resp = ident + b"\x81\x80" + struct.pack("!HHHH", 1, 1, 0, 0) + question + a_rr()
-            elif name == "alias.test":
-                target = b"\x05files\x04test\x00"
-                cn = b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 60, len(target)) + target
-                resp = ident + b"\x81\x80" + struct.pack("!HHHH", 1, 2, 0, 0) + question + cn + target + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([10, 0, 2, 2])
-            else:
-                resp = ident + b"\x81\x83" + struct.pack("!HHHH", 1, 0, 0, 0) + question
-            self.dns.sendto(resp, who)
-
-    def close(self):
-        self.stop.set()
-        if self.http:
-            self.http.shutdown()
-            self.http.server_close()
-        if self.dns:
-            self.dns.close()
 
 
 def host_httpd_client(tcp_port, emit):
@@ -794,59 +681,6 @@ def host_httpd_client(tcp_port, emit):
     emit("##HOSTNET httpd " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
 
 
-class HostTcpServer:
-    """The host TCP server a guest test connects to (10.0.2.2:TCP_SERVER_PORT through slirp): it sends a greeting and 300,000
-    bytes, shuts down its write side, and checks the 100,000 bytes the guest sends back. Reports once, if the guest came."""
-
-    def __init__(self, emit):
-        import socket, threading
-        self.emit = emit
-        self.stop = threading.Event()
-        self.srv = socket.socket()
-        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.srv.bind(("127.0.0.1", TCP_SERVER_PORT))
-            self.srv.listen(4)
-            self.th = threading.Thread(target=self.run, daemon=True)
-            self.th.start()
-        except OSError as e:
-            self.th = None
-            emit("##HOSTNET tcp_server NOTRUN cannot bind %d: %s" % (TCP_SERVER_PORT, e))
-
-    def run(self):
-        import socket
-        self.srv.settimeout(0.5)
-        while not self.stop.is_set():
-            try:
-                c, _ = self.srv.accept()
-            except OSError:
-                continue
-            bad = []
-            try:
-                c.settimeout(30)
-                c.sendall(b"HELLO-FROM-HOST\n" + tcp_pattern(3, 300_000))
-                got = bytearray()
-                c.shutdown(socket.SHUT_WR)
-                while True:
-                    d = c.recv(65536)
-                    if not d:
-                        break
-                    got.extend(d)
-                if bytes(got) != tcp_pattern(4, 100_000):
-                    bad.append("received %d of 100000 bytes%s" % (len(got), "" if bytes(got) == tcp_pattern(4, len(got)) else " (and wrong)"))
-            except OSError as e:
-                bad.append(str(e))
-            c.close()
-            self.emit("##HOSTNET tcp_server " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
-            return
-
-    def close(self):
-        self.stop.set()
-        if self.th:
-            self.th.join(timeout=3)
-        self.srv.close()
-
-
 def host_udp_client(hostport, emit):
     """Q4 (NET-SPEC 12.2): the host's own UDP stack as the independent client of the guest's echo program, through the
     hostfwd. Datagrams of 1, 100, 512 and 1472 bytes come back byte for byte from the same address and port; 200 in a row all
@@ -914,15 +748,12 @@ def run_streaming(cmd):
     """Run QEMU, collect its output, and (when the guest announces its UDP echo program) run the host client against it."""
     import threading
     import time
-    HOST_NET.clear()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     chunks = []
     last_out = [time.monotonic()]
     client = []
     tcp_client = []
     http_client = []
-    tcp_server = HostTcpServer(HOST_NET.append)
-    web = HostWeb()
 
     def pump():
         for raw in proc.stdout:
@@ -967,8 +798,6 @@ def run_streaming(cmd):
     t.join(timeout=5)
     for c in client + tcp_client + http_client:
         c.join(timeout=60)
-    tcp_server.close()
-    web.close()
     return b"".join(chunks), status, timed_out
 
 
@@ -1106,6 +935,12 @@ def net_problems(text):
                     found.append("fetch %s: %r (wanted the host's digest %s)" % (tag, line, want[:12]))
             if "s9: fetch tests done" not in text:
                 found.append("the fetch tests did not finish")
+        # T195: the harness started the host fixtures and named their ports on the kernel line, so the tests that use them must have
+        # reached them (a skip here would hide a fixture that was never reached; lossy mode runs only the fetch tests of the two)
+        if "s9: fetch tests done" not in text and "s9: fetch|" not in text:
+            found.append("the fetch tests did not reach the host's HTTP server ('s9: fetch tests done' missing)")
+        if not lossy and "s9: host-tcp-server done" not in text:
+            found.append("the guest did not reach the host's TCP server ('s9: host-tcp-server done' missing)")
         if "s9: host-tcp-server done" in text:
             r = [l for l in HOST_NET if l.startswith("##HOSTNET tcp_server")]
             if not r:
@@ -1271,6 +1106,18 @@ def run(kernel: str, extra=()):
     refused_devices.refuse([os.environ.get("OS_MACHINE", ""), os.environ.get("OS_BOOT_ARGS", ""), *extra])
     if os.environ.get("OS_LOAD") and int(os.environ["OS_LOAD"], 16) != elf_load_address(kernel):
         raise SystemExit(f"{kernel} is linked to load at {elf_load_address(kernel):#x}, not at OS_LOAD={os.environ['OS_LOAD']}: the load-address build did not take")
+    HOST_NET.clear()
+    # T195: the servers the guest connects to, on ports the host chose for this boot (two boots on one host no longer collide); the
+    # kernel line tells the guest where (`hostports=`)
+    fixtures = host_fixtures.Fixtures(HOST_NET.append) if net_on() else None
+    try:
+        return run_with(kernel, extra, fixtures)
+    finally:
+        if fixtures:
+            fixtures.close()
+
+
+def run_with(kernel, extra, fixtures):
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", DEFAULT_MACHINE), "-bios", "default",
         "-m", os.environ.get("OS_RAM", "256M"), "-display", "none", "-serial", "stdio", "-monitor", "none",
@@ -1303,6 +1150,7 @@ def run(kernel: str, extra=()):
                                            f"ram={os.environ.get('OS_RAM', '256M')}",
                                            f"load={elf_load_address(kernel):#x}",
                                            os.environ.get("OS_BOOT_ARGS", ""),
+                                           fixtures.boot_arg() if fixtures else "",
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           ),
@@ -1461,7 +1309,9 @@ def negative_control(kernel, test):
                   f"{order[:1]}), so the control never reached it", file=sys.stderr)
             return 1
     how = "failed" if test in failed else "crashed or hung the kernel"
-    print(f"negative control passed: {test} {how} without its mechanism ({kernel})")
+    # (the guarded test's own words, so a run by hand records how the control was caught: the round of a race, say; T283)
+    said = next((d for n, ok, d in tests if n == test and not ok), "")
+    print(f"negative control passed: {test} {how} without its mechanism ({kernel})" + (f": {said}" if said else ""))
     return 0
 
 

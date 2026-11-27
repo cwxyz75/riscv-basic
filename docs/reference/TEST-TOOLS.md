@@ -80,7 +80,9 @@ device, so use `OS_SHARD=k` (the PCI disks go through QEMU's `blkreplay` filter)
 harts may not reproduce under it, and its instruction-counted time changes what timing-dependent tests see.
 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the
-serial log of every failing run in `target/repeat/`. Over a soak target this is a soak run (`TESTING.md` rule 6).
+serial log of every failing run in `target/repeat/`. Over a soak target this is a soak run (`TESTING.md` rule 6). The overnight
+`overnight-repeat-smp` is `os-repeat` of `os-ktest-4`, the kernel-only boot at four harts that the epic gate runs (OD161), `N` times
+(20 by default, about two hours on a hosted runner).
 
 **Where a panic came from.** A kernel `##PANIC` line from a thread that entered from user mode ends with `[stack 0x... 0x...]`: the words on its
 kernel stack that point into the kernel's code, innermost first (the panic handler's own frames, then the return addresses of the calls that led
@@ -158,7 +160,11 @@ with `bench/counts.tsv`. A rise of more than 25 % fails (the slack absorbs the r
 **Benchmarks.** The suite prints `##BENCH <name> <ns> ns` lines (a malformed one fails the boot). Every boot runs the
 benchmarks at a tenth of the iterations with sanity assertions only, so they cannot rot. `make os-bench` (soak) runs
 them in full at one and four harts and compares with `bench/baseline.tsv` through `scripts/bench_compare.py`: a
-threefold slowdown fails. The numbers are costs of the emulated machine and move with the host: read the ratios.
+threefold slowdown fails. The numbers are costs of the emulated machine and move with the host: read the ratios. Every run file
+and baseline names where it was measured in `#@ machine:` and `#@ qemu:` lines (`bench_compare.py --provenance`; the make targets start
+each run file with them, `make os-count-record` keeps them), and `bench_compare.py` says so when the run's machine or QEMU differs
+from the baseline's, or when the baseline names neither (T195): a laptop's wall times against another machine's baseline were 1.2 to 3
+times off, and one build's instruction counts under another QEMU 70% above `bench/counts.tsv`.
 `pair_scaling_<kind>_n<N>` (futex and `channel_call` pairs, one, two and four) is the cost per round trip over all pairs;
 `bench_compare.py` prints the scaling, the cost at one pair over the cost at N, and `--scaling-floor bench/scaling.tsv` (on in `make os-bench`; `make os-latency` uses `bench/scaling-latency.tsv`, channel_call only, because the traced futex pair is not comparable) fails if a ratio falls below its recorded floor. The floors are tripwires for a collapse (about 60% of the lowest of three full runs), not the design's goals of 3.0 and 2.5, which are not gates (SCHED-SMP-SPEC amendment of 2026-11-24, T252); the measured figures at four harts are futex 0.5 to 1.3 (it swings with the pair's placement) and `channel_call` 0.8. `rt_latency_p99` and `rt_latency_max` are the
 real-time probe's lateness, printed by the kernel's scheduler test.
@@ -197,9 +203,26 @@ the hostile-driver matrix's `hostile_dma_after_its_own_unmap` must fail),
 
 ## Running several boots at once
 
-`make soak` runs `SOAK_JOBS` boots at once (default 3). The tests follow the host's clock, so on a machine that is
-doing anything else the network tests and the benchmark comparison fail from load. Use `SOAK_JOBS=1` for a result to
-trust, and never run two network boots at once by hand: their host ports are fixed and collide.
+**Host ports.** The host side of the network tests the guest connects to (a TCP server, a scripted DNS server and an HTTP server:
+`scripts/host_fixtures.py`) binds ports the host chooses, one set per boot, and the kernel line tells the guest where they are
+(`hostports=<tcp>,<dns>,<http>`, read as `debug_stat` 15). The ports the host forwards into the guest were already chosen per boot. So two
+network boots at once on one machine no longer collide (they did, at fixed ports 47802 to 47804, until T195); `host_fixtures.py
+--self-test` (in the docs check) starts two sets at once and checks that their ports differ and that each answers on its own. A boot whose
+guest ran the network tests must also have reached the fixtures: the harness fails it if the fetch or the host-server test skipped.
+
+**Timing.** `make soak` runs its targets one at a time (`SOAK_JOBS`, default 1) and ends with one line per target: PASS or FAIL, its
+wall time, and the log of a failing one under `target/tier/` (`scripts/tier.py run`). The tests follow the host's clock, so several
+boots at once on one machine, or a machine doing anything else, report timing failures that are not bugs (the realtime and latency
+bounds, the benchmark comparison): a larger `SOAK_JOBS` is a quick look, not a result to trust.
+
+**Pieces of two hours** (STAB0). `make soak-piece PIECE=<soak target>` and `make overnight-piece PIECE=<overnight target>` run one
+target of the tier, with its size where it has one: `CHAOS_SEEDS=A..B` for `os-chaos`, `N=<boots>` for `overnight-repeat-smp`,
+`PKG=<crate> SHARD=k/n` for `os-mutants`. They refuse a target of another tier and a malformed size (`scripts/tier.py piece`). The
+workflows run them in their `piece` job when the owner dispatches with inputs, each piece within 120 minutes:
+`gh workflow run soak.yml --ref <branch> -f target=os-boot-test-smp`, `gh workflow run overnight.yml --ref <branch> -f
+target=os-chaos -f chaos_seeds=1..40`, `-f target=overnight-repeat-smp -f n=20`, `-f target=os-mutants -f pkg=kcore -f shard=3/8`.
+With no input a dispatch runs the whole tier as before. The docs check refuses any other trigger, any other input, a piece job without
+its 120-minute limit or its guard, and a whole-tier job that would also run in a piece (`check_docs.py --self-test` plants each).
 
 ## CI's QEMU
 

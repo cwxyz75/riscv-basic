@@ -22383,6 +22383,8 @@ fn bench_channel_call(name: &str, n: u32, bystanders: u32) -> Result<u64, Detail
 // to the last exit, over the operations of all pairs, is the reported cost (`pair_scaling_<kind>_n<N>`, ns per round trip). The scaling
 // of 5.2 is the cost at N = 1 over the cost at N: how many times more round trips a second N pairs get through (`bench_compare.py`
 // prints it). On a boot with fewer harts than N it shows how little the pairs share, which is the point of running it at both counts.
+// The reported cost is the median of PS_REPS releases of a fifth of the round trips each (T232): one release swung by 30 times with
+// whether the two threads of a pair happened to share a hart (T231), so a single figure compared with a baseline was noise.
 
 const PS_MAX: usize = 32;
 static PS_GO: AtomicU32 = AtomicU32::new(0);
@@ -22446,8 +22448,47 @@ extern "C" fn ps_call_client(arg: usize) -> ! {
     sys::thread_exit(0)
 }
 
-/// Run `pairs` pairs of the given kind for `rounds` round trips each; report and return ns per round trip over all pairs.
+/// How many times each `pair_scaling` measurement is released; the median of them is reported.
+const PS_REPS: u32 = 5;
+
+/// Run `pairs` pairs of the given kind for `rounds` round trips in all, as [`PS_REPS`] releases of a fifth each, and report and return the
+/// median cost in ns per round trip over all pairs (`ps:` gives the fastest and slowest release beside it, so a swing shows).
 fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
+    let each = (rounds / PS_REPS).max(1);
+    let mut cycles_of = Vec::new();
+    let mut stats = [0u64; 4];
+    for _ in 0..PS_REPS {
+        let (c, d) = pairs_once(kind, pairs, each)?;
+        cycles_of.push(c);
+        for (s, x) in stats.iter_mut().zip(d) {
+            *s += x;
+        }
+    }
+    cycles_of.sort_unstable();
+    let median = cycles_of[cycles_of.len() / 2];
+    let name = alloc::format!("pair_scaling_{kind}_n{pairs}");
+    let trips = u64::from(each) * pairs as u64;
+    let ns = bench_line(&name, median, trips);
+    let per = |c: u64| c * 1_000_000_000 / sys::debug_stat(105).max(1) / trips.max(1);
+    println!(
+        "ps: {name} median of {PS_REPS} releases of {each} round trips: {ns} ns (fastest {} ns, slowest {} ns)",
+        per(cycles_of[0]),
+        per(cycles_of[cycles_of.len() - 1])
+    );
+    // (per thousand round trips, so that a rate below one is not rounded away; over every release)
+    let all = trips * u64::from(PS_REPS);
+    for (i, what) in ["ipis", "suspends", "wfis", "idle_ns"].iter().enumerate() {
+        println!(
+            "##BENCH ps_{kind}_n{pairs}_{what} {} per_1000_rt",
+            stats[i] * 1000 / all.max(1)
+        );
+    }
+    Ok(ns)
+}
+
+/// One release of `pairs` pairs doing `rounds` round trips each: the cycles from the release to the last exit, and what the harts did
+/// meanwhile (IPIs received, retentive suspends, `wfi` idles, idle time: `debug_stat` 209 to 212, T213 M2).
+fn pairs_once(kind: &str, pairs: usize, rounds: u32) -> Result<(u64, [u64; 4]), Detail> {
     PS_GO.store(0, Ordering::SeqCst);
     PS_ROUNDS.store(rounds, Ordering::SeqCst);
     let mut threads = Vec::new(); // (handle to wait for, handles to close afterwards)
@@ -22478,32 +22519,14 @@ fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
     }
     let c = cycles() - t0;
     let stat1 = [209, 210, 211, 212].map(sys::debug_stat);
-    let name = alloc::format!("pair_scaling_{kind}_n{pairs}");
-    let trips = u64::from(rounds) * pairs as u64;
-    let ns = bench_line(&name, c, trips);
-    // (per thousand round trips, so that a rate below one is not rounded away)
-    for (i, (what, unit)) in [
-        ("ipis", "per_1000_rt"),
-        ("suspends", "per_1000_rt"),
-        ("wfis", "per_1000_rt"),
-        ("idle_ns", "per_1000_rt"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let d = stat1[i].saturating_sub(stat0[i]);
-        println!(
-            "##BENCH ps_{kind}_n{pairs}_{what} {} {unit}",
-            d * 1000 / trips.max(1)
-        );
-    }
+    let d: [u64; 4] = core::array::from_fn(|i| stat1[i].saturating_sub(stat0[i]));
     for t in threads {
         sys::handle_close(t);
     }
     for h in closing {
         sys::handle_close(h); // the channel ends make the servers exit; the server handles are closed with them
     }
-    Ok(ns)
+    Ok((c, d))
 }
 
 fn bench_pair_scaling(k: u32) -> Result<u64, Detail> {

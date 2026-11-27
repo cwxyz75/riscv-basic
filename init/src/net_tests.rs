@@ -2433,6 +2433,13 @@ fn drain_ms(clean: u64) -> u64 {
     }
 }
 
+/// The host port of one of the harness's fixtures for this boot (`debug_stat` 15, T195: `which` 0 the TCP server, 1 the DNS server, 2 the
+/// HTTP server). The harness binds them where the host has room and says where on the kernel line, so two boots on one host do not
+/// collide. `None`: this boot has no harness fixtures, and the tests that need them skip, saying so.
+fn host_fixture(which: u32) -> Option<u16> {
+    kcore::testlog::host_port(sys::debug_stat(15), which)
+}
+
 /// The other direction: the guest connects to a TCP server on the host (10.0.2.2 through slirp), reads a greeting and 300,000
 /// bytes, sends 100,000 bytes back and shuts its side down. The harness checks what the server received.
 pub fn net_tcp_to_the_host_server() -> Outcome {
@@ -2445,11 +2452,15 @@ pub fn net_tcp_to_the_host_server() -> Outcome {
         let mut cfg = f.connect(b"net-config")?;
         configure_static(&mut cfg)?;
         let mut net = f.connect(b"net")?;
-        let mut s = match net.connect_stream([10, 0, 2, 2], 47802, 0, 0, 0, t(8000)) {
+        let Some(port) = host_fixture(0) else {
+            sys::debug_write(b"s9: no host TCP server (the kernel line names none): skipped\n");
+            return Ok(());
+        };
+        let mut s = match net.connect_stream([10, 0, 2, 2], port, 0, 0, 0, t(8000)) {
             Ok(s) => s,
             Err(Stack(10)) | Err(NetError::TimedOut) => {
                 sys::debug_write(
-                    b"s9: no host TCP server on 47802 (the harness did not start one): skipped\n",
+                    b"s9: no host TCP server on its port (the harness did not start one): skipped\n",
                 );
                 return Ok(());
             }
@@ -2918,7 +2929,12 @@ pub fn c_sockets_over_the_stack() -> Outcome {
             args: vec![b"ctest".to_vec(), b"sockets".to_vec()],
             namespace: vec![(b"/svc".to_vec(), 1)],
             roles: vec![(Role::Stdout, 0)],
-            env: vec![b"RESOLVER=10.0.2.2:47803".to_vec()],
+            // (the harness's scripted DNS server, when this boot has one: T195; without it `getaddrinfo` asks the configured server and the
+            // test takes its EAI_AGAIN branch)
+            env: host_fixture(1)
+                .map(|p| alloc::format!("RESOLVER=10.0.2.2:{p}").into_bytes())
+                .into_iter()
+                .collect(),
         };
         let bytes = s.encode().map_err(|_| msg_at(line!()))?;
         let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, svc_view.ch]).map_err(|e| {
@@ -3059,7 +3075,7 @@ fn relay(tag: &str, out: &[u8]) {
     }
 }
 
-/// `fetch` against the host's own HTTP server (10.0.2.2:47804, started by the harness): the digest of a 256 KiB file comes out
+/// `fetch` against the host's own HTTP server (10.0.2.2, at the port the kernel line names: T195; started by the harness): the digest of a 256 KiB file comes out
 /// the same as the host computed, by address, by name through the harness's DNS server (A, CNAME, a dropped first query that
 /// the resolver retries), and the failure exits: 404, no such name, connection refused.
 pub fn net_fetch_from_a_host_server() -> Outcome {
@@ -3072,25 +3088,33 @@ pub fn net_fetch_from_a_host_server() -> Outcome {
         configure_static(&mut cfg)?;
         let _warm = f.connect(b"net")?;
         // is there a host server? (a harness without one skips this test, saying so)
+        let (Some(http), Some(dns)) = (host_fixture(2), host_fixture(1)) else {
+            sys::debug_write(b"s9: no host HTTP or DNS server (the kernel line names none): fetch tests skipped\n");
+            return Ok(());
+        };
+        let by_addr = alloc::format!("http://10.0.2.2:{http}/file.bin");
         let probe = run_with_svc(
             &mut f,
             b"bin/fetch",
-            &[b"fetch", b"-m", b"4", b"http://10.0.2.2:47804/file.bin"],
+            &[b"fetch", b"-m", b"4", by_addr.as_bytes()],
             vec![],
             12_000,
         )?;
         if probe.0 == 4 || probe.0 == 7 {
-            sys::debug_write(b"s9: no host HTTP server on 47804 (the harness did not start one): fetch tests skipped\n");
+            sys::debug_write(b"s9: no host HTTP server on its port (the harness did not start one): fetch tests skipped\n");
             return Ok(());
         }
         ensure_eq!(probe.0, 0, "a plain fetch by address");
         relay("addr", &probe.1);
-        let dns: &[u8] = b"10.0.2.2:47803";
-        for (tag, url) in [
-            ("name", &b"http://files.test:47804/file.bin"[..]),
-            ("cname", b"http://alias.test:47804/file.bin"),
-            ("retry", b"http://slow.test:47804/file.bin"),
+        let dns = alloc::format!("10.0.2.2:{dns}");
+        let dns = dns.as_bytes();
+        for (tag, host) in [
+            ("name", "files.test"),
+            ("cname", "alias.test"),
+            ("retry", "slow.test"),
         ] {
+            let url = alloc::format!("http://{host}:{http}/file.bin");
+            let url = url.as_bytes();
             let (code, out) = run_with_svc(
                 &mut f,
                 b"bin/fetch",
@@ -3104,7 +3128,7 @@ pub fn net_fetch_from_a_host_server() -> Outcome {
         let (code, out) = run_with_svc(
             &mut f,
             b"bin/fetch",
-            &[b"fetch", b"--sha256", b"http://10.0.2.2:47804/file.bin"],
+            &[b"fetch", b"--sha256", by_addr.as_bytes()],
             vec![],
             30_000,
         )?;
@@ -3113,7 +3137,10 @@ pub fn net_fetch_from_a_host_server() -> Outcome {
         let (code, _) = run_with_svc(
             &mut f,
             b"bin/fetch",
-            &[b"fetch", b"http://10.0.2.2:47804/nosuch"],
+            &[
+                b"fetch",
+                alloc::format!("http://10.0.2.2:{http}/nosuch").as_bytes(),
+            ],
             vec![],
             15_000,
         )?;

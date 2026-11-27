@@ -899,7 +899,9 @@ const SPINS_PER_YIELD: u64 = 4096;
 /// The tests' power at several harts rests on this: a yield with nothing else queued on the hart (`yield_fast`) leaves the caller where it
 /// is, with no `satp` write, no `sfence` and no migration, so its cached translations survive it. A change to what a yield does must rerun
 /// the three negative controls of `os-boot-test-smp-neg` at four harts (`fault-skip-shootdown`, `fault-decommit-no-shootdown`,
-/// `fault-protect-no-shootdown`): they are in the soak tier, so no gate would notice the tests going blind.
+/// `fault-protect-no-shootdown`): they are in the soak tier, so no gate would notice the tests going blind. (What does not depend on the
+/// emulator is on the host: `ksys/tests/shootdown_model.rs` checks in the feature gate that every unmap, protect and decommit asks for the
+/// remote flush, against harts that keep every translation until flushed, T193; these tests check that the machine then honours it.)
 fn relax(spins: u64) {
     if spins.is_multiple_of(SPINS_PER_YIELD) {
         rt::sys::thread_yield();
