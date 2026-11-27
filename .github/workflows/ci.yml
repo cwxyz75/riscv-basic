@@ -289,7 +289,7 @@ jobs:
       - run: make os-ktest-shuffle
 
   # KT5: the instruction counts of the main syscall paths, at one hart under `-icount shift=0` (deterministic), against bench/counts.tsv (a rise of
-  # more than 5 % fails).
+  # more than 25 % fails, T223; TEST-TOOLS.md).
   kernel-counts:
     name: kernel (counts)
     needs: [changes, qemu]

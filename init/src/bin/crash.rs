@@ -772,6 +772,26 @@ fn pattern(round: u64) -> u64 {
     0x5eed_0000_0000_0000 | (round * 0x0101_0101)
 }
 
+/// How many turns a waiting thread of these tests spins before it yields its hart.
+const SPINS_PER_YIELD: u64 = 4096;
+
+/// One turn of a wait in the sibling tests (`spins` counts the turns so far): mostly a spin, so that a thread on a hart of its own keeps
+/// running there with its translations cached (the point of the tests), and every [`SPINS_PER_YIELD`] turns a yield. With fewer harts
+/// than threads (one hart: the kernel-only boots and KT5's instruction counts) the thread being waited for gets the hart at once instead
+/// of at the end of the waiter's time slice: a round there took a dozen time slices, and the 300 rounds of each test most of a minute.
+///
+/// The tests' power at several harts rests on this: a yield with nothing else queued on the hart (`yield_fast`) leaves the caller where it
+/// is, with no `satp` write, no `sfence` and no migration, so its cached translations survive it. A change to what a yield does must rerun
+/// the three negative controls of `os-boot-test-smp-neg` at four harts (`fault-skip-shootdown`, `fault-decommit-no-shootdown`,
+/// `fault-protect-no-shootdown`): they are in the soak tier, so no gate would notice the tests going blind.
+fn relax(spins: u64) {
+    if spins.is_multiple_of(SPINS_PER_YIELD) {
+        rt::sys::thread_yield();
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
 /// Two sibling threads read a page that the main thread unmaps and remaps, round after round,
 /// with the harts they run on caching the translation in between. If an unmap did not reach the
 /// other harts' TLBs, a worker would read the *previous* round's data through its stale entry
@@ -820,7 +840,7 @@ fn unmap_while_siblings_touch() -> i32 {
             if spins > 400_000_000 {
                 return 920;
             }
-            core::hint::spin_loop();
+            relax(spins);
         }
         PHASE.store((round << 2) | IDLE, Ordering::Release);
         spins = 0;
@@ -829,7 +849,7 @@ fn unmap_while_siblings_touch() -> i32 {
             if spins > 400_000_000 {
                 return 921;
             }
-            core::hint::spin_loop();
+            relax(spins);
         }
         // nobody is reading X now; take the mapping away and free the frame
         if rt::sys::process_unmap(me, X).status != 0 {
@@ -851,6 +871,7 @@ fn unmap_while_siblings_touch() -> i32 {
 extern "C" fn reader(_id: usize) -> ! {
     let mut read_round = 0u64;
     let mut idle_round = 0u64;
+    let mut spins = 0u64;
     loop {
         let ph = PHASE.load(Ordering::Acquire);
         let (round, state) = (ph >> 2, ph & 3);
@@ -869,7 +890,8 @@ extern "C" fn reader(_id: usize) -> ! {
             idle_round = round;
             IDLE_ACKS.fetch_add(1, Ordering::AcqRel);
         }
-        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        relax(spins);
     }
 }
 
@@ -886,6 +908,7 @@ static D_FAIL: AtomicU64 = AtomicU64::new(0);
 /// decommitted it and given the frame to another VMO, expects zeros. A stale translation shows the frame's new owner's bytes.
 extern "C" fn decommit_reader(_id: usize) -> ! {
     let (mut read_round, mut zero_round) = (0u64, 0u64);
+    let mut spins = 0u64;
     loop {
         let ph = D_PHASE.load(Ordering::Acquire);
         let (round, state) = (ph >> 2, ph & 3);
@@ -910,7 +933,8 @@ extern "C" fn decommit_reader(_id: usize) -> ! {
             zero_round = round;
             D_ZERO_ACKS.fetch_add(1, Ordering::AcqRel);
         }
-        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        relax(spins);
     }
 }
 
@@ -921,7 +945,7 @@ fn spin_until(acks: &AtomicU64, want: u64) -> bool {
         if spins > 400_000_000 {
             return false;
         }
-        core::hint::spin_loop();
+        relax(spins);
     }
     true
 }
@@ -1007,6 +1031,8 @@ extern "C" fn protect_writer(id: usize) -> ! {
             done2 = true;
             P_ACKS2.fetch_add(1, Ordering::AcqRel);
         }
+        // (a bare spin on purpose, not `relax`: a writer switched out between its two writes would lose the writable translation the test
+        // needs; at one hart each of the twenty processes costs a time slice or two, which is cheap)
         core::hint::spin_loop();
     }
 }
