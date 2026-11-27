@@ -1,0 +1,7 @@
+[package]
+name = "virtio"
+version = "0.1.0"
+edition = "2021"
+description = "OS track IOMMU8: the modern virtio-pci transport (common configuration, feature negotiation, notification) and the split virtqueue as pure code, shared by the drivers and the suite"
+
+[dependencies]
