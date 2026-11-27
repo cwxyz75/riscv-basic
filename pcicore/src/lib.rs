@@ -9,6 +9,10 @@
 //! has a step bound and a visited set, every size and offset is checked arithmetic, and a malformed function is an [`Error`],
 //! never a hang or a panic.
 //!
+//! MSI-X (IOMMU9) is a caller-driven sequence: [`msix_enable`] and [`msix_disable`] say every register access through
+//! [`MsixAccess`], which the caller implements with volatile accesses (or, in the host tests, with a model of a function that checks
+//! what a real device requires). [`claim`] is the supervisor's claim of IOMMU-SPEC 9 over the same access and a [`claim::Kernel`].
+//!
 //! What it covers is X-BUS's committed part: one ECAM host, bus 0, type-0 headers (a bridge is listed and never configured), memory
 //! BARs (I/O BARs are found and never assigned), MSI-X (the older MSI capability and INTx routing are not read: IOMMU-SPEC 8.6),
 //! the virtio-pci capabilities (VIRTIO 1.x, section 4.1.4), and the function-level reset of the PCI Express and Advanced Features
@@ -109,6 +113,8 @@ pub enum Error {
     VirtioCap(u8),
     /// A virtio device without the common, notify or ISR structure, or with them in more than one BAR.
     VirtioLayout,
+    /// An MSI-X entry index outside the table the capability describes, or named twice in one programming.
+    MsixEntry(u16),
 }
 
 /// A function's address on its bus: bus, device, function.
@@ -838,4 +844,370 @@ pub fn describe(bdf: Bdf, cfg: &[u8], masks: &[u32; 6]) -> Result<Option<Functio
         virtio,
         flr,
     }))
+}
+
+// ---- MSI-X programming (IOMMU9; IOMMU-SPEC 8, 9 and 10.6) ------------------------------------------------------------------------
+
+/// The register accesses the MSI-X sequence makes, which the caller performs: configuration space (16-bit registers, offsets from the
+/// function's start) and the BARs that hold the table and the pending-bit array (32-bit words, offsets from the BAR's start). The
+/// sequence checks every BAR offset against the BAR's size (from the function's [`Bar`]s) before it asks for it.
+pub trait MsixAccess {
+    fn cfg_read16(&mut self, off: u16) -> u16;
+    fn cfg_write16(&mut self, off: u16, v: u16);
+    fn bar_read32(&mut self, bar: u8, off: u64) -> u32;
+    fn bar_write32(&mut self, bar: u8, off: u64, v: u32);
+}
+
+/// The words of a table entry: message address low and high, message data, vector control.
+const ENTRY_ADDR_LO: u64 = 0;
+const ENTRY_ADDR_HI: u64 = 4;
+const ENTRY_DATA: u64 = 8;
+const ENTRY_CONTROL: u64 = 12;
+
+/// Entry `i`'s word `w` inside the table's BAR, checked against the table and the BAR.
+fn entry_word(m: &Msix, bars: &[Bar], i: u16, w: u64) -> Result<u64, Error> {
+    let off = m
+        .entry_offset(i)
+        .ok_or(Error::MsixEntry(i))?
+        .checked_add(w)
+        .ok_or(Error::MsixPlacement)?;
+    let size = bars
+        .iter()
+        .find(|b| b.index == m.table_bar && b.is_memory())
+        .map(|b| b.size)
+        .ok_or(Error::MsixBar(m.table_bar))?;
+    if off.checked_add(4).is_none_or(|e| e > size) {
+        return Err(Error::MsixPlacement);
+    }
+    Ok(off)
+}
+
+/// Set (`masked`) or clear the mask bit of entry `i`'s vector control, keeping its reserved bits (PCI local bus specification 3.0,
+/// "Vector control for MSI-X table entries": bits 31:1 are reserved and must be preserved).
+fn entry_mask(
+    m: &Msix,
+    bars: &[Bar],
+    a: &mut dyn MsixAccess,
+    i: u16,
+    masked: bool,
+) -> Result<(), Error> {
+    let off = entry_word(m, bars, i, ENTRY_CONTROL)?;
+    let vc = a.bar_read32(m.table_bar, off);
+    let want = if masked {
+        vc | msix::VECTOR_MASKED
+    } else {
+        vc & !msix::VECTOR_MASKED
+    };
+    a.bar_write32(m.table_bar, off, want);
+    Ok(())
+}
+
+/// Program the function's MSI-X table with `entries` (index, entry) and turn MSI-X on (IOMMU-SPEC 9 step 4), in the order a device
+/// requires (PCI local bus specification 3.0, "MSI-X capability and table structure": an entry's address and data are changed only
+/// while it, or the whole function, is masked):
+///
+/// 1. message control: MSI-X off, the function masked (the other bits kept);
+/// 2. every entry of the table masked, and its address and data written: those of `entries`, zero for every other entry (an entry the
+///    caller did not name is left masked with no address, so a device pointed at it sends nothing);
+/// 3. the entries of `entries` that are not `masked` unmasked;
+/// 4. MSI-X enabled, the function still masked;
+/// 5. INTx disabled in the command register (IOMMU-SPEC 8.6);
+/// 6. the function unmasked.
+///
+/// Before any access the table is checked to lie inside its BAR ([`check_msix`]) and every index to be inside the table and named
+/// once; an error writes nothing.
+pub fn msix_enable(
+    m: &Msix,
+    bars: &[Bar],
+    entries: &[(u16, MsixEntry)],
+    a: &mut dyn MsixAccess,
+) -> Result<(), Error> {
+    check_msix(m, bars, &[])?;
+    for (k, &(i, _)) in entries.iter().enumerate() {
+        if i >= m.table_size || entries.iter().take(k).any(|&(j, _)| j == i) {
+            return Err(Error::MsixEntry(i));
+        }
+    }
+    let ctl = m.control_offset();
+    let cur = a.cfg_read16(ctl);
+    a.cfg_write16(ctl, msix_control(cur, false, true));
+    for i in 0..m.table_size {
+        entry_mask(m, bars, a, i, true)?;
+        let e = entries
+            .iter()
+            .find(|&&(j, _)| j == i)
+            .map_or(
+                MsixEntry {
+                    address: 0,
+                    data: 0,
+                    masked: true,
+                },
+                |&(_, e)| e,
+            )
+            .encode();
+        for (w, v) in [ENTRY_ADDR_LO, ENTRY_ADDR_HI, ENTRY_DATA]
+            .into_iter()
+            .zip(e)
+        {
+            let off = entry_word(m, bars, i, w)?;
+            a.bar_write32(m.table_bar, off, v);
+        }
+    }
+    for &(i, e) in entries {
+        if !e.masked {
+            entry_mask(m, bars, a, i, false)?;
+        }
+    }
+    let cur = a.cfg_read16(ctl);
+    a.cfg_write16(ctl, msix_control(cur, true, true));
+    let cmd = a.cfg_read16(reg::COMMAND);
+    a.cfg_write16(reg::COMMAND, cmd | command::INTX_DISABLE);
+    let cur = a.cfg_read16(ctl);
+    a.cfg_write16(ctl, msix_control(cur, true, false));
+    Ok(())
+}
+
+/// Turn MSI-X off (IOMMU-SPEC 10.1 and 10.2 step 2, 10.6 step 1): the function masked, MSI-X disabled, then every entry masked and its
+/// address and data cleared, so nothing of this claim is left in the table for the next. The table is checked first, as in
+/// [`msix_enable`].
+pub fn msix_disable(m: &Msix, bars: &[Bar], a: &mut dyn MsixAccess) -> Result<(), Error> {
+    check_msix(m, bars, &[])?;
+    let ctl = m.control_offset();
+    let cur = a.cfg_read16(ctl);
+    a.cfg_write16(ctl, msix_control(cur, cur & msix::ENABLE != 0, true));
+    let cur = a.cfg_read16(ctl);
+    a.cfg_write16(ctl, msix_control(cur, false, true));
+    for i in 0..m.table_size {
+        entry_mask(m, bars, a, i, true)?;
+        for w in [ENTRY_ADDR_LO, ENTRY_ADDR_HI, ENTRY_DATA] {
+            let off = entry_word(m, bars, i, w)?;
+            a.bar_write32(m.table_bar, off, 0);
+        }
+    }
+    Ok(())
+}
+
+/// The entries whose pending bit is set in the pending-bit array (a diagnostic: nothing depends on it). Bits past the table are not
+/// reported.
+pub fn msix_pending(m: &Msix, bars: &[Bar], a: &mut dyn MsixAccess) -> Result<Vec<u16>, Error> {
+    check_msix(m, bars, &[])?;
+    let mut out = Vec::new();
+    let words = m.pba_bytes() / 4;
+    for w in 0..words {
+        let off = w
+            .checked_mul(4)
+            .and_then(|o| o.checked_add(u64::from(m.pba_offset)))
+            .ok_or(Error::MsixPlacement)?;
+        let v = a.bar_read32(m.pba_bar, off);
+        for b in 0..32u64 {
+            let i = w.saturating_mul(32).saturating_add(b);
+            if v & (1 << b) != 0 && i < u64::from(m.table_size) {
+                out.push(i as u16);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The supervisor's claim of a PCI function (IOMMU-SPEC 9, steps 2 to 4) as pure code: the driver class's plan, and the sequence that
+/// either gives a claim every vector its class asks for or undoes all of it. `devmgr` runs it over the system calls; the host tests
+/// run it over a model of the kernel and of the device with every failure point.
+pub mod claim {
+    use super::{msix_disable, msix_enable, Bar, Error as PciError, Msix, MsixAccess, MsixEntry};
+    use alloc::vec::Vec;
+
+    /// What an interrupt of a driver means: the configuration-change event, or a queue's used buffers (VIRTIO 1.x, 4.1.5.1.2).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Irq {
+        Config,
+        Queue(u16),
+    }
+
+    impl Irq {
+        /// The MSI-X table entry (and the domain's vector index: IOMMU-SPEC 8.2, entry `k` is vector `k`) of this interrupt: 0 for
+        /// the configuration change, `n + 1` for queue `n`, so that the entry follows from the meaning alone.
+        pub fn entry(self) -> u16 {
+            match self {
+                Irq::Config => 0,
+                Irq::Queue(n) => n.saturating_add(1),
+            }
+        }
+    }
+
+    /// A driver class's needs: the pages of each DMA VMO the driver gets, and its interrupts. A table in the source, not a guess
+    /// from the device.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        pub class: &'static str,
+        pub dma_pages: &'static [u32],
+        pub irqs: &'static [Irq],
+    }
+
+    /// The I/O-mapped pages a driver job may hold beyond its DMA VMOs' pages (a buffer mapped twice while it is moved, say).
+    pub const IO_MARGIN_PAGES: u64 = 2;
+
+    /// A block device: the rings, the data pages; the configuration change and its one request queue.
+    pub const BLOCK: Plan = Plan {
+        class: "block",
+        dma_pages: &[1, 4],
+        irqs: &[Irq::Config, Irq::Queue(0)],
+    };
+    /// A network device (NET-SPEC 4.3, 5.1): the queues, the receive pool, the transmit pool; the configuration change, receive and
+    /// transmit.
+    pub const NET: Plan = Plan {
+        class: "network",
+        dma_pages: &[2, 64, 64],
+        irqs: &[Irq::Config, Irq::Queue(0), Irq::Queue(1)],
+    };
+    /// An entropy device: the rings, the bytes it fills; its one queue.
+    pub const ENTROPY: Plan = Plan {
+        class: "entropy",
+        dma_pages: &[1, 1],
+        irqs: &[Irq::Queue(0)],
+    };
+
+    /// The plan of a virtio device id (1 network, 2 block, 4 entropy), or `None`: no driver class.
+    pub fn for_virtio(id: u16) -> Option<&'static Plan> {
+        match id {
+            1 => Some(&NET),
+            2 => Some(&BLOCK),
+            4 => Some(&ENTROPY),
+            _ => None,
+        }
+    }
+
+    impl Plan {
+        /// The job's limit of I/O-mapped pages: the DMA VMOs' pages and the margin.
+        pub fn io_pages(&self) -> u64 {
+            self.dma_pages
+                .iter()
+                .fold(IO_MARGIN_PAGES, |a, &p| a.saturating_add(u64::from(p)))
+        }
+        /// The job's limit of interrupt vectors: exactly the plan's.
+        pub fn vectors(&self) -> u64 {
+            self.irqs.len() as u64
+        }
+        /// The MSI-X table size the plan needs (its highest entry, plus one).
+        pub fn table_needed(&self) -> u16 {
+            self.irqs
+                .iter()
+                .map(|i| i.entry().saturating_add(1))
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    /// The kernel calls of a claim, made for one function and one driver job (which the implementation holds). Each returns `None`
+    /// (or false) on any failure; the claim then undoes what it made.
+    pub trait Kernel {
+        /// `job_set_io_limits(job, pages, vectors)`.
+        fn set_io_limits(&mut self, pages: u64, vectors: u64) -> bool;
+        /// `iodomain_create` for the function, charged to the job: the control handle.
+        fn domain_create(&mut self) -> Option<u64>;
+        /// `vmo_create_dma_in(pages)`, charged to the job.
+        fn dma_create(&mut self, pages: u32) -> Option<u64>;
+        /// `iodomain_grant_vector(domain, index)`: the interrupt handle and the MSI-X address.
+        fn grant(&mut self, domain: u64, index: u16) -> Option<(u64, u64)>;
+        /// `iodomain_destroy`: false if it failed (the caller says so, loudly).
+        fn domain_destroy(&mut self, domain: u64) -> bool;
+        fn close(&mut self, h: u64);
+    }
+
+    /// A claim: the domain's control handle, the DMA VMOs (which the caller hands to the driver, taking them out), and the interrupt
+    /// handles with their meaning (the supervisor's own; the driver gets duplicates).
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Claim {
+        pub domain: u64,
+        pub dma: Vec<u64>,
+        pub irqs: Vec<(Irq, u64)>,
+    }
+
+    /// Where a claim failed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Failed {
+        /// The function's MSI-X table is smaller than the plan needs (nothing was made).
+        TableTooSmall {
+            has: u16,
+            needs: u16,
+        },
+        Limits,
+        Domain,
+        Dma(usize),
+        Grant(Irq),
+        /// The table could not be programmed (its placement, from the capability, does not fit its BAR).
+        Msix(PciError),
+    }
+
+    /// The claim, steps 2 to 4 of IOMMU-SPEC 9: finite limits of both kinds on the driver's job (the plan's pages with the margin,
+    /// and exactly its vectors), the domain, the DMA VMOs, every vector of the plan granted, then the table programmed with the pairs
+    /// the kernel returned (`msi_data` is the ABI's constant) with the function masked, INTx disabled and MSI-X enabled
+    /// ([`msix_enable`]). All or nothing: on a failure at any step MSI-X is turned off again and the domain destroyed (which revokes
+    /// every vector granted so far), and every handle made is closed.
+    pub fn claim(
+        plan: &Plan,
+        m: &Msix,
+        bars: &[Bar],
+        msi_data: u32,
+        k: &mut dyn Kernel,
+        a: &mut dyn MsixAccess,
+    ) -> Result<Claim, Failed> {
+        if m.table_size < plan.table_needed() {
+            return Err(Failed::TableTooSmall {
+                has: m.table_size,
+                needs: plan.table_needed(),
+            });
+        }
+        if !k.set_io_limits(plan.io_pages(), plan.vectors()) {
+            return Err(Failed::Limits);
+        }
+        let domain = k.domain_create().ok_or(Failed::Domain)?;
+        let mut c = Claim {
+            domain,
+            dma: Vec::new(),
+            irqs: Vec::new(),
+        };
+        let r = (|| {
+            for (n, &pages) in plan.dma_pages.iter().enumerate() {
+                c.dma.push(k.dma_create(pages).ok_or(Failed::Dma(n))?);
+            }
+            let mut entries = Vec::with_capacity(plan.irqs.len());
+            for &irq in plan.irqs {
+                let (h, address) = k.grant(domain, irq.entry()).ok_or(Failed::Grant(irq))?;
+                c.irqs.push((irq, h));
+                entries.push((
+                    irq.entry(),
+                    MsixEntry {
+                        address,
+                        data: msi_data,
+                        masked: false,
+                    },
+                ));
+            }
+            msix_enable(m, bars, &entries, a).map_err(Failed::Msix)
+        })();
+        match r {
+            Ok(()) => Ok(c),
+            Err(e) => {
+                let _ = msix_disable(m, bars, a);
+                release(c, k);
+                Err(e)
+            }
+        }
+    }
+
+    /// The end of a claim, after the caller turned MSI-X off ([`msix_disable`]), cleared bus mastering and reset the function
+    /// (IOMMU-SPEC 10.1, 10.2): the domain destroyed (the kernel revokes every vector and removes every mapping), then every handle
+    /// the claim still holds closed. False if the destruction failed (the caller says so; the handles are closed anyway, and the
+    /// last one destroys the domain: IOMMU-SPEC 10.3).
+    pub fn release(c: Claim, k: &mut dyn Kernel) -> bool {
+        let ok = k.domain_destroy(c.domain);
+        for (_, h) in c.irqs {
+            k.close(h);
+        }
+        for h in c.dma {
+            k.close(h);
+        }
+        k.close(c.domain);
+        ok
+    }
 }

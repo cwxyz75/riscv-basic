@@ -166,6 +166,22 @@ pub fn file_arm<M: PhysMem64>(mem: &M, file: u64) -> bool {
     false
 }
 
+/// The acknowledgement's half of D5 for a vector: `file_arm`. The negative-control builds break it (IOMMU9): `fault-vector-no-unmask`
+/// leaves the identity disabled (nothing is delivered after the first), `fault-vector-no-repend` enables it but drops the message
+/// that came while it was masked.
+fn ack_arm<M: PhysMem64>(mem: &M, file: u64) -> bool {
+    if cfg!(feature = "fault-vector-no-unmask") {
+        return false;
+    }
+    if cfg!(feature = "fault-vector-no-repend") {
+        if let Ok(f) = Mrif::new(file) {
+            let _ = f.enable(mem, VECTOR_DATA);
+        }
+        return false;
+    }
+    file_arm(mem, file)
+}
+
 /// Take and count the stray bits of a file (8.4): pending bits of identities other than the granted one.
 pub fn file_strays<M: PhysMem64>(mem: &M, file: u64) -> u64 {
     Mrif::new(file)
@@ -556,7 +572,7 @@ impl Vectors {
             _ => return Err(Status::BadHandle),
         }
         self.strays = self.strays.saturating_add(file_strays(mem, file));
-        if file_arm(mem, file) {
+        if ack_arm(mem, file) {
             fire(objs, obj);
         }
         if place {

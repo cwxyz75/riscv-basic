@@ -25,6 +25,11 @@ fault-iommu-skip-inval = []
 # IOMMU7's negative control: a granted vector's MSI entry is written in basic-translate mode to the target hart's file (the forbidden
 # mode of IO11), so the device's own data word reaches the hart: the suite's `msi_forgery_faults` must fail (its "wrong data" row).
 fault-iommu-msi-basic = ["iommucore/fault-msi-basic"]
+# IOMMU9's negative controls, the vector twins of the kernel's `fault-aia-no-unmask` and `fault-aia-no-repend`: an acknowledged vector's
+# identity is never enabled again, or is enabled with the message that came while it was masked dropped. The suite's
+# `pci_virtio_blk_interrupts_through_msix` must fail under each.
+fault-vector-no-unmask = []
+fault-vector-no-repend = []
 
 # Concurrency checkers, host only (they are dependencies, not dev-dependencies,
 # because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")

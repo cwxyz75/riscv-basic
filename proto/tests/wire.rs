@@ -46,6 +46,37 @@ const STARTUP_HEX: &str =
      01 00 00 00 01 00 00 00  02 00 00 00 02 00 00 00";
 
 #[test]
+fn startup_names_a_drivers_interrupts_by_what_they_are_for() {
+    use proto::devmgr::IRQ_CONFIG;
+    assert_eq!(Role::device_irq(IRQ_CONFIG), Some(Role::DeviceIrqConfig));
+    for q in 0..proto::startup::MAX_DEVICE_IRQ_QUEUES {
+        let r = Role::device_irq(q).unwrap();
+        assert_eq!(r.device_irq_what(), Some(q));
+        assert_eq!(Role::from_u32(r as u32), Some(r));
+    }
+    assert_eq!(
+        Role::device_irq(proto::startup::MAX_DEVICE_IRQ_QUEUES),
+        None
+    );
+    assert_eq!(Role::DeviceIrqConfig.device_irq_what(), Some(IRQ_CONFIG));
+    assert_eq!(Role::Debug.device_irq_what(), None);
+    assert_eq!(
+        (Role::DeviceIrqConfig as u32, Role::DeviceIrqQueue7 as u32),
+        (44, 52)
+    );
+    // a driver's startup with its interrupts round-trips
+    let s = Startup {
+        args: vec![b"blkd".to_vec()],
+        roles: vec![(Role::DeviceIrqConfig, 0), (Role::DeviceIrqQueue0, 1)],
+        ..Startup::default()
+    };
+    let b = s.encode().unwrap();
+    let d = Startup::decode(&b, 2).unwrap();
+    assert_eq!(d, s);
+    assert_eq!(d.handle_of(Role::DeviceIrqQueue0), Some(1));
+}
+
+#[test]
 fn startup_golden_bytes() {
     let want = hex(STARTUP_HEX);
     assert_eq!(want.len(), 55);
@@ -82,10 +113,10 @@ fn startup_rejects_every_kind_of_malformation() {
     let mut c = good.clone();
     c[8] = 9;
     assert!(d(&c, 3).is_err());
-    // unknown role (44) and duplicate role (both Stdin)
+    // unknown role (53) and duplicate role (both Stdin)
     let mut r = good.clone();
     let n = r.len();
-    r[n - 8] = 44;
+    r[n - 8] = 53;
     assert_eq!(d(&r, 3), Err(StartupError::UnknownRole));
     let mut r = good.clone();
     r[n - 8] = 1;
@@ -1148,6 +1179,13 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
         isr: (0x1000, 0x1000),
         device_cfg: (0x2000, 0x1000),
         dma_pages: vec![1, 4],
+        irqs: vec![
+            PciIrq {
+                entry: 0,
+                what: IRQ_CONFIG,
+            },
+            PciIrq { entry: 1, what: 0 },
+        ],
     };
     let r = encode_claim_pci_reply(9, &c).unwrap();
     assert_eq!(
@@ -1159,9 +1197,23 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
              04 00 00 00 \
              00 10 00 00 00 10 00 00 \
              00 20 00 00 00 10 00 00 \
-             02 00 00 00 01 00 00 00 04 00 00 00")
+             02 00 00 00 01 00 00 00 04 00 00 00 \
+             02 00 00 00 00 00 ff ff 01 00 00 00")
     );
-    assert_eq!(c.handles(), 4, "the BAR, the domain, two DMA VMOs");
+    assert_eq!(
+        c.handles(),
+        6,
+        "the BAR, the domain, two DMA VMOs, two interrupts"
+    );
+    assert_eq!(
+        (c.irq(IRQ_CONFIG), c.irq(0), c.irq(1)),
+        (Some((4, 0)), Some((5, 1)), None),
+        "the handle index and entry of each interrupt"
+    );
+    assert_eq!(
+        (irq_entry(IRQ_CONFIG), irq_entry(0), irq_entry(2)),
+        (0, 1, 3)
+    );
     assert_eq!(
         decode_claim_pci_reply(&r),
         Some((9, Status::Ok, Some(c.clone())))
@@ -1169,7 +1221,21 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
     assert_eq!(
         decode_claim_pci_reply(&r[..r.len() - 4]),
         None,
-        "a page count missing"
+        "an interrupt missing"
+    );
+    let mut lying = r.clone();
+    lying[68] = 17;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "more interrupts than the limit"
+    );
+    let mut lying = r.clone();
+    lying[68] = 1;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "an interrupt count that disagrees with the length"
     );
     let mut lying = r.clone();
     lying[56] = 9;
@@ -1204,6 +1270,11 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
     );
     let many = PciClaim {
         dma_pages: vec![1; MAX_CLAIM_DMA + 1],
+        ..c.clone()
+    };
+    assert_eq!(encode_claim_pci_reply(9, &many), None);
+    let many = PciClaim {
+        irqs: vec![PciIrq { entry: 1, what: 0 }; MAX_CLAIM_IRQS + 1],
         ..c
     };
     assert_eq!(encode_claim_pci_reply(9, &many), None);

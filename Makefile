@@ -105,6 +105,8 @@ OS_NOCBZE_ELF := target/os-fault-cbze/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
+OS_VNOUNMASK_ELF := target/os-fault-vunmask/$(KERNEL_TARGET)/debug/kernel
+OS_VNOREPEND_ELF := target/os-fault-vrepend/$(KERNEL_TARGET)/debug/kernel
 OS_NOMSIRETIRE_ELF := target/os-fault-msiid/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
@@ -406,6 +408,11 @@ os-boot-test-aia: kernel
 	# (IOMMU4, IO12: an interrupt identity freed at the move instead of after its hart retired it)
 	cd kernel && cargo build --features fault-msiid-free-at-move --target-dir ../target/os-fault-msiid
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOMSIRETIRE_ELF) interrupt_moves_do_not_lose_or_leak
+	# (IOMMU9: the same two controls for an MSI-X vector, D5 through the MRIF)
+	cd kernel && cargo build --features fault-vector-no-unmask --target-dir ../target/os-fault-vunmask
+	OS_SHARD=k python3 scripts/os_boot_test.py --neg $(OS_VNOUNMASK_ELF) pci_virtio_blk_interrupts_through_msix
+	cd kernel && cargo build --features fault-vector-no-repend --target-dir ../target/os-fault-vrepend
+	OS_SHARD=k python3 scripts/os_boot_test.py --neg $(OS_VNOREPEND_ELF) pci_virtio_blk_interrupts_through_msix
 
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.
