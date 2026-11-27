@@ -40,6 +40,12 @@ opt-level = 2
 [profile.dev.package.svc]
 debug = 0
 opt-level = 2
+[profile.dev.package.pcicore]
+debug = 0
+opt-level = 2
+[profile.dev.package.virtio]
+debug = 0
+opt-level = 2
 [profile.dev.package.linked_list_allocator]
 debug = 0
 opt-level = 2

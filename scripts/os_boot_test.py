@@ -124,6 +124,81 @@ LAST_IOMMU_FENCES = []
 IOMMU_BOOT = re.compile(r"^kernel: iommu version=(\d+)\.(\d+) mode=(\S+) caps=0x([0-9a-f]+)(?: handover=(\S+))?$", re.M)
 # The bus address of the function the harness puts behind the IOMMU (`-device virtio-rng-pci,...,addr=0x4`, in `run`)
 IOMMU_TEST_DEV = "00:04.0"
+# IOMMU8: the PCI functions of every boot, in one table (the command line and the check of `devmgr`'s lines both come from it):
+# (slot, QEMU device, vendor:device, what `pci_device` adds). PCI slots are stable, unlike the virtio-mmio order: the suite names the
+# same slots (`IOMMU_TEST_SLOT`, `PCI_BLK_SLOT`). Every one goes through `pci_device`, which adds `iommu_platform=on` (without it QEMU's
+# virtio device bypasses the IOMMU: IOMMU-SPEC 15.1 L1) and `disable-legacy=on`, and never `vectors=0` (a function without MSI-X is
+# not claimable: Q-IOMMU-MSI 5).
+PCI_DEVICES = [
+    (4, "virtio-rng-pci", "1af4:1044", ""),
+    (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0"),
+]
+# The host bridge QEMU puts at 00:00.0, which `devmgr` lists too (not claimable).
+PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
+# The bus address of the block function (`pci_virtio_*` tests).
+PCI_BLK_DEV = "00:05.0"
+# `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable | not-claimable <why> | refused <why>>`, then
+# `## devmgr: pci functions=<n>` (one enumeration), and `## devmgr: pci <bb:dd.f> reset failed <what>` (a reset that did not complete).
+# A process's `##` line reaches the console as `user: ##...` (the kernel's prefix, so that no program can forge a kernel line).
+DEVMGR_PCI = re.compile(r"^user: ## devmgr: pci (?:([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) (?:([0-9a-f]{4}:[0-9a-f]{4}) class=([0-9a-f]{6}) "
+                        r"(claimable|not-claimable|refused)(?: (.+))?|reset failed (.+))|functions=(\d+))$")
+LAST_DEVMGR_PCI = []
+
+
+def pci_device(slot, model, extra):
+    """The one way a PCI function gets on the command line (see PCI_DEVICES)."""
+    return ["-device", f"{model},iommu_platform=on,disable-legacy=on,addr={slot:#x}{extra}"]
+
+
+def pci_disk():
+    """A 64 KiB raw image for the PCI block function, read-only, whose sector 0 holds its own pattern (byte i = (i * 13 + 1) mod
+    256): `pci_virtio_blk_reads_through_the_iommu` checks every byte. A fresh copy per boot."""
+    import atexit, tempfile
+    f = tempfile.NamedTemporaryFile(prefix="os-pcidisk-", suffix=".img", delete=False)
+    f.write(bytes((i * 13 + 1) & 0xFF for i in range(512)))
+    f.truncate(64 * 1024)
+    f.close()
+    atexit.register(lambda: os.path.exists(f.name) and os.unlink(f.name))
+    return f.name
+
+
+def pci_args():
+    """The PCI functions of PCI_DEVICES and the block function's drive (with `OS_PCI_TEST=0`, none: the no-IOMMU boot). Under record
+    and replay the drive goes through QEMU's `blkreplay` filter, which block devices need in that mode."""
+    if os.environ.get("OS_PCI_TEST") == "0":
+        return []
+    disk = pci_disk()
+    if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
+        drive = ["-drive", f"file={disk},if=none,format=raw,readonly=on,id=pd0-direct",
+                 "-drive", "driver=blkreplay,if=none,image=pd0-direct,readonly=on,id=pd0"]
+    else:
+        drive = ["-drive", f"file={disk},if=none,format=raw,readonly=on,id=pd0"]
+    return drive + [a for slot, model, _, extra in PCI_DEVICES for a in pci_device(slot, model, extra)]
+
+
+def devmgr_pci_problems():
+    """Every enumeration `devmgr` printed lists exactly the functions the command line put on bus 0 (and the host bridge), with each
+    virtio function claimable; no reset failed."""
+    found, current = [], []
+    want = {PCI_HOST_BRIDGE[0]: PCI_HOST_BRIDGE[1]}
+    if os.environ.get("OS_PCI_TEST") != "0":
+        want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _ in PCI_DEVICES})
+    for m in LAST_DEVMGR_PCI:
+        if m[6] is not None:  # an enumeration's last line
+            got = {bdf: ids for bdf, ids, _, _, _ in current}
+            if got != want or len(current) != int(m[6]):
+                found.append(f"devmgr listed {sorted(got.items())}, the command line has {sorted(want.items())}")
+            for bdf, ids, _, verdict, why in current:
+                if bdf != PCI_HOST_BRIDGE[0] and verdict != "claimable":
+                    found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: every test function is claimable")
+            current = []
+        elif m[5] is not None:
+            found.append(f"devmgr: {m[0]} reset failed {m[5]}")
+        else:
+            current.append((m[0], m[1], m[2], m[3], m[4]))
+    if current:
+        found.append("devmgr printed PCI functions without the closing 'functions=' line")
+    return found
 # `##FF <name>=<value> ...` (T189): what the kernel understood of an `ff=` boot argument (test builds), so a run meant to start counters near their end cannot pass on a typo
 LAST_FF = []
 
@@ -1083,11 +1158,11 @@ def run(kernel: str, extra=()):
         "-cpu", os.environ.get("OS_CPU", "rva23s64"),  # PL1: the profile CPU is the only test CPU (only the negative control overrides it)
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
-        # IOMMU5: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and this virtio-pci function sits behind
-        # it at 00:04.0 (`iommu_platform=on`: its DMA and its MSI-X messages go through the IOMMU). Nothing drives it but the suite's
-        # `iommu_*` tests, which program it by hand to show that a function with no domain can neither reach memory nor interrupt.
-        *([] if os.environ.get("OS_PCI_TEST") == "0" else [
-            "-device", "virtio-rng-pci,iommu_platform=on,disable-legacy=on,addr=0x4"]),
+        # IOMMU5, IOMMU8: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and the functions of PCI_DEVICES sit
+        # behind it (`iommu_platform=on`: their DMA and their MSI-X messages go through the IOMMU): the entropy function at 00:04.0,
+        # which the suite's `iommu_*`, `iodomain_*` and `msi_*` tests program by hand, and the block function at 00:05.0, which the
+        # `pci_*` tests drive (by hand, and through `devmgr`'s claim). `devmgr` enumerates them all.
+        *pci_args(),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
         # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off
         *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") and not rr_args() else []),
@@ -1140,6 +1215,7 @@ def parse(lines):
     LAST_FF.clear()
     LAST_IOMMU_FAULTS.clear()
     LAST_IOMMU_FENCES.clear()
+    LAST_DEVMGR_PCI.clear()
     for line in lines:
         if line.startswith("##FF "):
             LAST_FF.append(line)
@@ -1147,6 +1223,8 @@ def parse(lines):
             LAST_IOMMU_FAULTS.append((int(m[1]), m[2], int(m[3], 16), m[4]))
         elif m := IOMMU_FENCE.match(line):
             LAST_IOMMU_FENCES.append(m[1])
+        elif m := DEVMGR_PCI.match(line):
+            LAST_DEVMGR_PCI.append(m.groups())
         elif m := BOOT.match(line):
             boot = m.groups()
         elif m := TEST.match(line):
@@ -1381,6 +1459,15 @@ def main() -> int:
                     if not any(f[3] == want and f[0] == 258 for f in mine):
                         found.append(f"no '## iommu: fault cause=258 dev={IOMMU_TEST_DEV} ... {want}' line "
                                      f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
+            # IOMMU8: the negative test of the block function (IOMMU-SPEC 15.1 L1) shows on the console as a fault naming it
+            if any(n == "pci_virtio_outside_its_mapping_faults" and ok for n, ok, _ in tests_run):
+                if not any(f[1] == PCI_BLK_DEV for f in LAST_IOMMU_FAULTS):
+                    found.append(f"no '## iommu: fault ... dev={PCI_BLK_DEV}' line from pci_virtio_outside_its_mapping_faults "
+                                 f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
+            # IOMMU8: `devmgr` listed the bus the command line built, every time it enumerated it
+            found += devmgr_pci_problems()
+            if SHARD != "k" and strict and not RELEASE_SUITE and not LAST_DEVMGR_PCI and os.environ.get("OS_PCI_TEST") != "0":
+                found.append("devmgr printed no '## devmgr: pci' lines (pci_devices_are_found_and_claimed starts it)")
         # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
         if (strict and os.environ.get("OS_DISK") != "0"
                 and "s6: interrupt path exercised" not in text):

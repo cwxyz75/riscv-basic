@@ -400,6 +400,14 @@ pub fn app_main() -> i32 {
             {
                 code |= 4;
             }
+            // IOMMU8: nor the PCI host's configuration space, a BAR in its memory window, or a function's domain
+            if [(77, -1), (ev, -2)].iter().all(|&(h, e)| {
+                rt::sys::vmo_create_physical(h, 0x3000_0000, 4096).status == e
+                    && rt::sys::vmo_create_physical(h, 0x4000_0000, 4096).status == e
+                    && rt::sys::iodomain_create(h, 0x28, 0).status == e
+            }) {
+                code |= 8;
+            }
             return code;
         }
         32 => {

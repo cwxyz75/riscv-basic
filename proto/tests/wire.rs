@@ -1056,3 +1056,140 @@ fn terminal_provider_requests_round_trip_and_reject_junk() {
     junk[6] = 1;
     assert_eq!(decode(&junk, 0), None);
 }
+
+// --- devmgr: the PCI operations (IOMMU8; the bytes worked out by hand from the layout in proto/src/devmgr.rs) ---
+
+#[test]
+fn devmgr_list_pci_golden_bytes_and_errors() {
+    use proto::devmgr::*;
+    assert_eq!(encode_list_pci(7), hex("07 00 00 00 06 00 00 00"));
+    assert_eq!(decode_list_pci(&hex("07 00 00 00 06 00 00 00")), Ok(7));
+    assert_eq!(
+        decode_list_pci(&hex("07 00 00 00 06 00 01 00")),
+        Err(Some(7)),
+        "nonzero index"
+    );
+    assert_eq!(decode_list_pci(&encode_claim_pci(7, 0)), Err(Some(7)));
+    let e = [
+        PciEntry {
+            rid: 0x20,
+            vendor: 0x1af4,
+            device: 0x1044,
+            flags: PCI_CLAIMABLE | PCI_MSIX | PCI_VIRTIO | PCI_ACCESS_PLATFORM,
+            class: 0x00ff00,
+        },
+        PciEntry {
+            rid: 0x28,
+            vendor: 0x1af4,
+            device: 0x1042,
+            flags: PCI_MSIX | PCI_VIRTIO | PCI_CLAIMED,
+            class: 0x010000,
+        },
+    ];
+    let r = encode_list_pci_reply(9, &e).unwrap();
+    assert_eq!(
+        r,
+        hex("09 00 00 00 00 00 00 00 02 00 00 00 \
+             20 00 f4 1a 44 10 0f 00 00 ff 00 00 \
+             28 00 f4 1a 42 10 26 00 00 00 01 00")
+    );
+    assert_eq!(decode_list_pci_reply(&r), Some((9, Status::Ok, e.to_vec())));
+    assert_eq!(decode_list_pci_reply(&r[..r.len() - 1]), None, "short");
+    let mut lying = r.clone();
+    lying[8] = 3; // a count the message does not hold
+    assert_eq!(decode_list_pci_reply(&lying), None);
+    lying[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(decode_list_pci_reply(&lying), None);
+    assert_eq!(
+        decode_list_pci_reply(&encode_reply(9, Status::Failed)),
+        Some((9, Status::Failed, vec![]))
+    );
+    assert_eq!(
+        encode_list_pci_reply(1, &vec![e[0]; MAX_PCI_ENTRIES + 1]),
+        None
+    );
+    assert_eq!(Status::from_i32(6), Some(Status::Refused));
+}
+
+#[test]
+fn devmgr_claim_pci_golden_bytes_and_errors() {
+    use proto::devmgr::*;
+    assert_eq!(encode_claim_pci(7, 0x28), hex("07 00 00 00 07 00 28 00"));
+    assert_eq!(
+        decode_claim_pci(&hex("07 00 00 00 07 00 28 00")),
+        Ok((7, 0x28))
+    );
+    assert_eq!(decode_claim_pci(&hex("07 00 00 00 07 00 28")), Err(Some(7)));
+    assert_eq!(decode_claim_pci(&encode_claim_net(7, 0x28)), Err(Some(7)));
+    assert_eq!(
+        decode_request(&encode_claim_pci(7, 0)),
+        Err(Some(7)),
+        "OpenBlock refuses it"
+    );
+    let c = PciClaim {
+        vendor: 0x1af4,
+        device: 0x1042,
+        bar_bytes: 0x4000,
+        common: (0, 0x1000),
+        notify: (0x3000, 0x1000),
+        notify_multiplier: 4,
+        isr: (0x1000, 0x1000),
+        device_cfg: (0x2000, 0x1000),
+        dma_pages: vec![1, 4],
+    };
+    let r = encode_claim_pci_reply(9, &c).unwrap();
+    assert_eq!(
+        r,
+        hex("09 00 00 00 00 00 00 00 f4 1a 42 10 \
+             00 40 00 00 00 00 00 00 \
+             00 00 00 00 00 10 00 00 \
+             00 30 00 00 00 10 00 00 \
+             04 00 00 00 \
+             00 10 00 00 00 10 00 00 \
+             00 20 00 00 00 10 00 00 \
+             02 00 00 00 01 00 00 00 04 00 00 00")
+    );
+    assert_eq!(c.handles(), 4, "the BAR, the domain, two DMA VMOs");
+    assert_eq!(
+        decode_claim_pci_reply(&r),
+        Some((9, Status::Ok, Some(c.clone())))
+    );
+    assert_eq!(
+        decode_claim_pci_reply(&r[..r.len() - 4]),
+        None,
+        "a page count missing"
+    );
+    let mut lying = r.clone();
+    lying[56] = 9;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "more DMA VMOs than the limit"
+    );
+    let mut lying = r.clone();
+    lying[4] = 3;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "a long reply that is not Ok"
+    );
+    assert_eq!(
+        decode_claim_pci_reply(&encode_reply(9, Status::Refused)),
+        Some((9, Status::Refused, None))
+    );
+    let many = PciClaim {
+        dma_pages: vec![1; MAX_CLAIM_DMA + 1],
+        ..c
+    };
+    assert_eq!(encode_claim_pci_reply(9, &many), None);
+    // random bytes never panic
+    let mut r = Rng(0x5eed);
+    for _ in 0..20000 {
+        let n = r.below(120) as usize;
+        let b: Vec<u8> = (0..n).map(|_| r.next() as u8).collect();
+        let _ = decode_claim_pci_reply(&b);
+        let _ = decode_list_pci_reply(&b);
+        let _ = decode_claim_pci(&b);
+        let _ = decode_list_pci(&b);
+    }
+}
