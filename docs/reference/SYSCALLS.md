@@ -295,7 +295,7 @@ a device's message at an identity the kernel gave an interrupt object, to see th
 `which` 164 (IOMMU12, test builds only) takes a user virtual address of the caller's own space in `a2` and returns the physical address it
 is mapped to, or all ones when nothing is mapped there (read under the address-space lock). It is the suite's oracle for the frames a
 device must not reach (the hostile-driver matrix aims a device at them) and for a test device that reads memory back by physical address;
-a release kernel answers all ones, so no physical address is learnable from user mode on a release build (INVARIANTS D2). Like every
+a release kernel answers all ones (the translate path is not compiled into it), so no frame's physical address is learnable through a call on a release build (INVARIANTS D2). Like every
 selector it needs the debug resource with INSPECT.
 
 `which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
@@ -317,7 +317,7 @@ check wants 146 and 149 at zero.
 
 `which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
 
-`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; the identities of device sources are the kernel's choice, per hart, IOMMU-SPEC 8.1).
+`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout and are fixed after boot; the suite uses them for the physical-VMO refusals and to aim a hostile device at the kernel image. They say where RAM and the kernel are, never where a VMO's or a mapping's frame is (D2), and are answered in every build to a holder of the debug resource. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; the identities of device sources are the kernel's choice, per hart, IOMMU-SPEC 8.1).
 
 ### debug_write(debug, ptr, len) -> status
 

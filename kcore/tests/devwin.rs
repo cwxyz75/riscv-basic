@@ -402,3 +402,32 @@ fn a_cut_that_ends_at_a_windows_end_leaves_no_empty_range() {
     );
     assert!(w.iter().all(|&(a, b)| a < b), "every range is non-empty");
 }
+
+/// IOMMU12 review: an admitted device whose `reg` is less than a page is widened to the page, and a device that is not admitted in the
+/// same page (here a `virtio,mmio` slot, whose DMA is outside the IOMMU) must not become mappable through it: the neighbour's page is
+/// cut, so the page is no window at all; a neighbour in another page leaves the admitted page alone.
+#[test]
+fn a_sub_page_device_never_opens_its_page_to_a_neighbour_that_is_not_admitted() {
+    let w = windows_of(
+        &machine(&[
+            dev("rtc@50000100", 0x5000_0100, 0x100),
+            (
+                "virtio_mmio@50000800",
+                "virtio,mmio",
+                "",
+                vec![(0x5000_0800, 0x200)],
+            ),
+            dev("rtc@60000000", 0x6000_0000, 0x100),
+            (
+                "virtio_mmio@60001000",
+                "virtio,mmio",
+                "",
+                vec![(0x6000_1000, 0x200)],
+            ),
+            dev("rtc@70000000", 0x7000_0000, 0x100),
+            ("rtc@70000800", RTC, "disabled", vec![(0x7000_0800, 0x100)]), // a disabled one is not admitted either
+        ]),
+        &[],
+    );
+    assert_eq!(w, vec![(0x6000_0000, 0x6000_1000)]);
+}

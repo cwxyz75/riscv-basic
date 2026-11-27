@@ -527,17 +527,27 @@ fn debug_phys_of(a: [u64; 6]) -> Reply {
             .map_err(|e| (e, None, None))?;
         Ok(p.aspace.clone())
     })?;
-    if crate::RELEASE || a[2] >= abi::user::TOP {
-        return Ok((Some(u64::MAX), None));
+    // (a release kernel has no translate path here at all: the code below is not compiled into it, so the answer cannot depend on a
+    // run-time flag)
+    #[cfg(all(feature = "release", not(feature = "release-suite")))]
+    {
+        let _ = (aspace, a);
+        Ok((Some(u64::MAX), None))
     }
-    let _as = klock::aslock::AsCell::hold(&aspace);
-    let k = kmem::mem();
-    let at = aspace
-        .held_ref()
-        .table()
-        .translate(k.mm, a[2])
-        .map_or(u64::MAX, |t| (t.pfn << 12) | (a[2] & 0xfff));
-    Ok((Some(at), None))
+    #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+    {
+        if a[2] >= abi::user::TOP {
+            return Ok((Some(u64::MAX), None));
+        }
+        let _as = klock::aslock::AsCell::hold(&aspace);
+        let k = kmem::mem();
+        let at = aspace
+            .held_ref()
+            .table()
+            .translate(k.mm, a[2])
+            .map_or(u64::MAX, |t| (t.pfn << 12) | (a[2] & 0xfff));
+        Ok((Some(at), None))
+    }
 }
 
 /// The attention epoch (L12b): bumped, under the big lock, whenever a process is marked killed or stopped, **after** the mark is set and

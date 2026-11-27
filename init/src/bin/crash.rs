@@ -699,8 +699,11 @@ pub fn app_main() -> i32 {
 /// IOMMU12, the hostile-driver matrix: a driver process that holds exactly the handles it is sent (a device claim's, in the driver's
 /// job) and makes the calls the suite asks for with them, nothing of its own. The first message carries the handles; the reply is
 /// their numbers here (8 bytes each). Then each request is eight words: an operation (0 a system call by number, 1 the library's
-/// `sys_vmo_phys_addr`, 2 its two-argument `sys_vmo_create_dma`, 3 exit), the number and six arguments; the reply is three words, the
-/// status (sign-extended), `a1` and `a2`. A closed channel ends it too.
+/// `sys_vmo_phys_addr`, 2 its two-argument `sys_vmo_create_dma`, 3 map one of its handles into itself anywhere (handle, offset,
+/// bytes, permissions; `a1` the address), 4 a store to its own memory or device mapping (address, width 1, 2, 4 or 8, value), 5 a load
+/// (address, width; `a1` the value), anything else exit), the number and six arguments; the reply is three words, the status
+/// (sign-extended), `a1` and `a2`. A closed channel ends it too. With 3 to 5 it drives its device itself: it writes the descriptors
+/// in its rings and rings the doorbell in its own mapping of the register BAR it was given.
 fn hostile_driver() -> i32 {
     let rd = |m: &mut [u8], h: &mut [u64]| {
         if rt::sys::object_wait(
@@ -745,6 +748,58 @@ fn hostile_driver() -> i32 {
             0 => rt::syscall(w(1) as usize, args),
             1 => rt::sys::vmo_phys_addr(w(2)),
             2 => rt::sys::vmo_create_dma(w(2), w(3)),
+            3 => {
+                let me = rt::sys::process_self();
+                if me.status != 0 {
+                    me
+                } else {
+                    let r = rt::sys::process_map(
+                        me.a1 as u64,
+                        w(2),
+                        0,
+                        w(3),
+                        w(4),
+                        w(5) | rt::abi::map_flags::ANYWHERE,
+                    );
+                    rt::sys::handle_close(me.a1 as u64);
+                    r
+                }
+            }
+            4 => {
+                let a = w(2) as usize;
+                // SAFETY: none in the usual sense: this process is a deliberately hostile driver that stores wherever the suite tells it
+                // to (its own mappings, by the protocol); a wrong address faults the process, which the suite sees as a dead driver.
+                unsafe {
+                    match w(3) {
+                        1 => core::ptr::write_volatile(a as *mut u8, w(4) as u8),
+                        2 => core::ptr::write_volatile(a as *mut u16, w(4) as u16),
+                        4 => core::ptr::write_volatile(a as *mut u32, w(4) as u32),
+                        _ => core::ptr::write_volatile(a as *mut u64, w(4)),
+                    }
+                }
+                rt::Ret {
+                    status: 0,
+                    a1: 0,
+                    a2: 0,
+                }
+            }
+            5 => {
+                let a = w(2) as usize;
+                // SAFETY: as for 4, a load.
+                let v = unsafe {
+                    match w(3) {
+                        1 => u64::from(core::ptr::read_volatile(a as *const u8)),
+                        2 => u64::from(core::ptr::read_volatile(a as *const u16)),
+                        4 => u64::from(core::ptr::read_volatile(a as *const u32)),
+                        _ => core::ptr::read_volatile(a as *const u64),
+                    }
+                };
+                rt::Ret {
+                    status: 0,
+                    a1: v as usize,
+                    a2: 0,
+                }
+            }
             _ => return 0,
         };
         let mut rep = [0u8; 24];

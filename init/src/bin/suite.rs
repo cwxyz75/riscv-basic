@@ -12067,9 +12067,26 @@ struct Matrix<'a> {
     tdev: MDev,
     /// The pattern frame (another process's memory, as far as the drivers are concerned: neither domain maps it).
     pa: u64,
+    /// Where the hostile driver mapped, in its own space, the entropy function's doorbell (the notify register itself), the test
+    /// device's register BAR and the entropy function's rings: it drives both devices itself through these (`hst`, `hld`).
+    h_notify: u64,
+    h_tdev: u64,
+    h_rings: u64,
 }
 
 impl Matrix<'_> {
+    /// A store by the hostile driver to its own mapping (`width` 1, 2, 4 or 8 bytes).
+    fn hst(&self, va: u64, width: u64, v: u64) -> Outcome {
+        let (s, _, _) = self.drv.op(4, 0, [va, width, v, 0, 0, 0])?;
+        ensure_eq!(s, Some(S::Ok), "the driver's store at {va:#x}");
+        Ok(())
+    }
+    /// A load by the hostile driver from its own mapping.
+    fn hld(&self, va: u64, width: u64) -> Result<u64, Detail> {
+        let (s, v, _) = self.drv.op(5, 0, [va, width, 0, 0, 0, 0])?;
+        ensure_eq!(s, Some(S::Ok), "the driver's load at {va:#x}");
+        Ok(v)
+    }
     fn dev(&self, d: Dut) -> &MDev {
         match d {
             Dut::Rng => &self.rng,
@@ -12269,8 +12286,34 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
             };
             let mut rng = dev(IOMMU_TEST_DID, BUF_VA)?;
             let mut tdev = dev(TDEV_DID, TDEV_BUF_VA)?;
+            // and what a driver drives its device with (IOMMU-SPEC 10.1 step 5): the entropy function's doorbell page and the test
+            // device's register BAR (physical VMOs, as a claim hands over the BAR), and the rings (the queue memory)
+            let npa = rng_bar() + (f.notify - PCI_BAR_VA);
+            let nvmo = ok(
+                sys::vmo_create_physical(res, npa & !0xfff, 4096),
+                "the entropy function's doorbell page",
+            )?
+            .a1 as u64;
+            pending.push(nvmo);
+            let tvmo = ok(
+                sys::vmo_create_physical(res, tdev_bar(), 4096),
+                "the test device's register BAR",
+            )?
+            .a1 as u64;
+            pending.push(tvmo);
+            let rdup = ok(
+                sys::handle_duplicate(
+                    rings,
+                    Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::TRANSFER.0,
+                ),
+                "the driver's rings",
+            )?
+            .a1 as u64;
+            pending.push(rdup);
             // the drivers' handles move to the hostile driver (whatever happens: `Hostile::start` consumes them)
-            let moved = [rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf];
+            let moved = [
+                rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf, nvmo, tvmo, rdup,
+            ];
             pending.retain(|h| !moved.contains(h));
             let drv = Hostile::start(dj, &moved)?;
             (rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf) =
@@ -12284,12 +12327,25 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
                 rng,
                 tdev,
                 pa,
+                h_notify: 0,
+                h_tdev: 0,
+                h_rings: 0,
             };
             let r = (|| {
+                // the driver maps its device's registers and its rings into itself
+                let at = |h: u64, what: &str| -> Result<u64, Detail> {
+                    let (s, a, _) = m.drv.op(3, 0, [h, 0, 4096, PF_R | PF_W, 0, 0])?;
+                    ensure_eq!(s, Some(S::Ok), "the driver maps {what}");
+                    Ok(a)
+                };
+                let h_notify = at(m.drv.hs[4], "its doorbell page")? + (npa & 0xfff);
+                let h_tdev = at(m.drv.hs[5], "the test device's BAR")?;
+                let h_rings = at(m.drv.hs[6], "its rings")?;
+                (m.h_notify, m.h_tdev, m.h_rings) = (h_notify, h_tdev, h_rings);
                 // the rig works: each device writes its own buffer
                 fill_page(m.rng.buf_va, 1);
                 ensure!(
-                    rng_request(m.f, m.rings_io, m.rng.buf_io, 64, 2000)?,
+                    hostile_rng_request(&m, m.rng.buf_io, 64, 2000)?,
                     "the entropy function serves a request into its buffer"
                 );
                 ensure!(
@@ -12297,7 +12353,7 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
                     "the entropy function's bytes landed in its buffer"
                 );
                 ensure_eq!(
-                    tdev_dma(m.tdev.buf_io, m.tdev.buf_pa)?,
+                    hostile_tdev_dma(&m, m.tdev.buf_io, m.tdev.buf_pa)?,
                     0,
                     "the test device writes its buffer and reads it back at the frame's physical address"
                 );
@@ -12359,13 +12415,92 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
         .and(vectors_at_baseline(live, ids))
 }
 
-/// Make device `d` write at I/O address `target` (the entropy function: 64 bytes of a request; the test device: its value). Whether
-/// the device said it was done (the entropy function returned the descriptor; the test device's result was 0).
-fn dut_write(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
+/// `rng_request`, driven by the hostile driver: it writes the descriptor (`buf`, `len` bytes, device-writable) and the available ring in
+/// its own mapping of the rings and rings the doorbell in its own mapping of the BAR. The supervisor's part is only the bring-up
+/// (`virtio_up_entry`: reset, the rings' I/O addresses, DRIVER_OK), as `devmgr` resets a function before a claim; it then watches the
+/// used ring.
+fn hostile_rng_request(m: &Matrix, buf: u64, len: u32, wait_ms: u64) -> Result<bool, Detail> {
+    let r = m.h_rings;
+    for i in 0..(0x300 / 8) {
+        m.hst(r + 8 * i, 8, 0)?;
+    }
+    m.hst(r, 8, buf)?; // descriptor 0: the address,
+    m.hst(r + 8, 8, u64::from(len) | (2 << 32))?; // its length, VIRTQ_DESC_F_WRITE, no next
+    m.hst(r + 0x100, 2, 1)?; // VIRTQ_AVAIL_F_NO_INTERRUPT
+    m.hst(r + 0x104, 2, 0)?; // ring[0] = descriptor 0
+    m.hst(r + 0x102, 2, 1)?; // idx 1
+    virtio_up_entry(
+        m.f,
+        (m.rings_io, m.rings_io + 0x100, m.rings_io + 0x200),
+        pcicore::MsixEntry {
+            address: 0,
+            data: 0,
+            masked: true,
+        },
+    )?;
+    m.hst(m.h_notify, 2, 0)?; // the doorbell: queue 0
+    let t0 = sys::clock_get();
+    while sys::clock_get() < t0 + wait_ms {
+        if m.hld(r + 0x202, 2)? == 1 {
+            return Ok(true);
+        }
+        sys::thread_yield();
+    }
+    Ok(false)
+}
+
+/// `tdev_dma`, driven by the hostile driver through its own mapping of the test device's BAR.
+fn hostile_tdev_dma(m: &Matrix, iova: u64, pa: u64) -> Result<u32, Detail> {
+    let b = m.h_tdev;
+    for (off, v) in [
+        (0x04, iova as u32),
+        (0x08, (iova >> 32) as u32),
+        (0x0c, 8),
+        (0x18, 0),
+        (0x1c, pa as u32),
+        (0x20, (pa >> 32) as u32),
+        (0x14, 1), // arm
+    ] {
+        m.hst(b + off, 4, u64::from(v))?;
+    }
+    let _ = m.hld(b, 4)?; // the read runs it
+    let t0 = sys::clock_get();
+    loop {
+        let r = m.hld(b + 0x10, 4)? as u32;
+        if r != 0xffff_ffff && r != 0xffff_fffe {
+            return Ok(r);
+        }
+        ensure!(
+            sys::clock_get() < t0 + 1000,
+            "the test device did not finish ({r:#x})"
+        );
+        sys::thread_yield();
+    }
+}
+
+/// `dut_write` with the suite driving the device itself (through its own mappings of the BAR and the rings): only for a row whose driver
+/// is dead.
+fn dut_write_by_the_suite(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
     match d {
         Dut::Rng => rng_request(m.f, m.rings_io, target, 64, 300),
         Dut::Tdev => {
             let r = tdev_dma(target, 0)?;
+            ensure!(
+                r == 0 || r == TDEV_REFUSED || r == 0xdead_0003 || r == 0xdead_0004,
+                "the test device's result {r:#x}"
+            );
+            Ok(r != TDEV_REFUSED)
+        }
+    }
+}
+
+/// Make device `d` write at I/O address `target`, driven by the hostile driver (`hostile_rng_request`, `hostile_tdev_dma`): whether
+/// the device was served (the entropy function returned the request; the test device's write was not refused).
+fn dut_write(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
+    match d {
+        Dut::Rng => hostile_rng_request(m, target, 64, 300),
+        Dut::Tdev => {
+            let r = hostile_tdev_dma(m, target, 0)?;
             ensure!(
                 r == 0 || r == TDEV_REFUSED || r == 0xdead_0003 || r == 0xdead_0004,
                 "the test device's result {r:#x}"
@@ -12420,7 +12555,14 @@ fn dut_refused(m: &Matrix, d: Dut, target: u64, own: Option<Dut>, what: &str) ->
     let what = alloc::format!("{d:?}: {what}");
     let base = (sys::debug_stat(162), sys::debug_stat(140));
     let before = iommu_faults();
-    dut_write(m, d, target)?;
+    let served = dut_write(m, d, target)?;
+    // (the test device's result says whether the IOMMU refused its write; the entropy function returns a request whose write was
+    // refused like any other, as QEMU's virtio does, so for it the fault records below are the oracle)
+    ensure!(
+        d == Dut::Rng || !served,
+        "{what}: the test device's write was not refused"
+    );
+    // (at least one record: the entropy function writes its 64 bytes as several transactions, each refused and recorded)
     ensure!(
         iommu_wait_faults(before).is_some(),
         "{what}: the IOMMU took no fault"
@@ -12481,7 +12623,9 @@ fn hostile_dma_at_another_device_bar() -> Outcome {
 }
 
 /// Row: an IMSIC page as DMA: a device write into every hart's supervisor interrupt file (its `seteipnum` register takes the low word
-/// as an identity). Refused as a translation (the files are not in any domain), and no hart is interrupted.
+/// as an identity). Refused as a translation (the files are not in any domain): the fault and the refusal are the check. Neither
+/// device can choose a word that is a live identity (the test device writes 0x12345678, the entropy function random bytes), so "no hart
+/// is interrupted" (the bystander check) is a backstop here, not the oracle.
 fn hostile_dma_at_an_interrupt_file() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let harts = hart_count(res);
@@ -12669,9 +12813,11 @@ fn hostile_dma_after_its_supervisor_died() -> Outcome {
                 domains + 1,
                 "{d:?}: the domain went with its last handle"
             );
+            // (no driver is left to drive the device: the suite rings it with the dead driver's descriptor, as a device that kept a
+            // stale request would)
             let faults = iommu_faults();
             ensure!(
-                !dut_write(m, d, x.buf_io)?,
+                !dut_write_by_the_suite(m, d, x.buf_io)?,
                 "{d:?}: the device reached its old buffer after both died"
             );
             msi_settle();
@@ -12954,6 +13100,10 @@ fn hostile_cannot_read_or_wait_for_its_faults() -> Outcome {
     })
 }
 
+/// Own-handle row (IOMMU-SPEC 4.8, INVARIANTS D2): the driver learns no physical address by any way it has. The library's two old
+/// calls answer NOT_SUPPORTED without entering the kernel; the retired numbers themselves, issued raw with each of its handles, are
+/// BAD_SYSCALL; the test kernel's physical-address selector (`debug_stat` 164) refuses every handle it holds (none is a debug
+/// resource) and no handle; and it can obtain neither the debug resource nor the root resource.
 fn hostile_learns_no_physical_address() -> Outcome {
     hostile_own_handle_row(
         "learn its buffer's physical address",
@@ -12962,6 +13112,41 @@ fn hostile_learns_no_physical_address() -> Outcome {
     )?;
     hostile_own_handle_row("make a DMA VMO by the old call", S::NotSupported, |d| {
         d.op(2, 0, [d.hs[3], 1, 0, 0, 0, 0])
+    })?;
+    with_claimed_hostile(|_, drv, _, _| {
+        for &(name, nr) in rt::abi::syscall::RETIRED {
+            for &h in drv.hs.iter().chain(&[0u64]) {
+                let (s, _, _) = drv.call(nr, [h, 1, 0, 0, 0, 0])?;
+                ensure_eq!(
+                    s,
+                    Some(S::BadSyscall),
+                    "the retired {name} ({nr}) raw, with handle {h}"
+                );
+            }
+        }
+        // (a refused call leaves `a1` as it was, the selector: the status is the check)
+        for &h in &drv.hs {
+            let (s, _, _) = drv.call(rt::abi::syscall::DEBUG_STAT, [h, 164, 0x1_0000, 0, 0, 0])?;
+            ensure_eq!(
+                s,
+                Some(S::WrongType),
+                "debug_stat 164 with its handle {h} (no debug resource)"
+            );
+        }
+        let (s, _, _) = drv.call(rt::abi::syscall::DEBUG_STAT, [0, 164, 0x1_0000, 0, 0, 0])?;
+        ensure_eq!(s, Some(S::BadHandle), "debug_stat 164 with no handle");
+        for (nr, what) in [
+            (rt::abi::syscall::DEBUG_ROOT, "the debug resource"),
+            (rt::abi::syscall::RESOURCE_ROOT, "the root resource"),
+        ] {
+            let (s, a1, _) = drv.call(nr, [0; 6])?;
+            ensure_eq!(
+                (s, a1),
+                (Some(S::AccessDenied), 0),
+                "the driver asks for {what}"
+            );
+        }
+        Ok(())
     })
 }
 
@@ -15732,7 +15917,8 @@ extern "C" fn placement_probe(_: usize) -> ! {
 }
 
 /// IOMMU12 (IOMMU-SPEC 2.6, 4.8; D1, D2): no device that can do DMA is reachable outside the IOMMU, and no physical address is
-/// learnable. With the root resource, every virtio-mmio slot of the tree (whose DMA the IOMMU does not see), fw-cfg (whose DMA interface
+/// learnable. With the root resource, the eight virtio-mmio slots of QEMU `virt` at their fixed addresses (whose DMA the IOMMU does not
+/// see; `kcore/tests/devwin.rs` checks the real tree as a whole), fw-cfg (whose DMA interface
 /// writes guest RAM) and the IOMMU's own registers are refused as device memory, and the slots' interrupt sources are not admitted;
 /// `sys_vmo_phys_addr` and the two-argument `sys_vmo_create_dma` are the library's stubs, which answer NOT_SUPPORTED whatever the
 /// arguments; and their old numbers are not calls of the kernel (BAD_SYSCALL), through the library's raw entry or a bare `ecall`.

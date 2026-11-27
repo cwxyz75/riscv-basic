@@ -123,9 +123,16 @@ pub fn device_windows(
         }
         if ALLOWED.iter().any(|c| n.is_compatible(c)) && !disabled(n) && physical(n, nodes) {
             if n.is_compatible(crate::iommutree::PCI_HOST) {
+                if !crate::iommutree::fully_behind_the_iommu(n, nodes) {
+                    cut.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+                }
                 continue; // (below: only behind the IOMMU, and with its ranges)
             }
             want.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+        } else if physical(n, nodes) {
+            // a device that is not admitted (or disabled) is cut too, page-widened like a window: an admitted node whose `reg` is less
+            // than a page never opens the page to a neighbour that shares it (IOMMU12: a `virtio,mmio` slot beside an admitted device)
+            cut.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
         }
     }
     want.extend(
