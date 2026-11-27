@@ -3239,7 +3239,13 @@ fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
         STOP.store(0, Ordering::SeqCst);
         STARTED.store(0, Ordering::SeqCst);
         for n in 1..=harts as u32 + 1 {
-            spinners.push(new_thread(spinner, 0)?);
+            match new_thread(spinner, 0) {
+                Ok(t) => spinners.push(t),
+                Err(e) => {
+                    disband(spinners); // (the ones already running stop: they would hold their harts for the rest of the suite)
+                    return Err(e);
+                }
+            }
             let until = sys::clock_get() + 5_000;
             while STARTED.load(Ordering::SeqCst) < n {
                 if sys::clock_get() > until {
@@ -3251,8 +3257,11 @@ fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
         }
         Ok(())
     }
-    /// One round: a chain of `LINKS` channels, each queuing both ends of the one before, and the close of its head.
-    fn round() -> Outcome {
+    /// One round: a chain of `LINKS` channels, each queuing both ends of the one before, and the close of its head. Returns the interrupts
+    /// taken in windows and the windows made while the head was being closed. (The counters are the machine's: the other threads that run
+    /// meanwhile are the spinners, which make no system call, and the idle threads, which make no window; what the close hands on to be freed
+    /// is part of the close.)
+    fn round() -> Result<(u64, u64), Detail> {
         let mut prev: Option<(u64, u64)> = None;
         let mut head = (0, 0);
         for _ in 0..LINKS {
@@ -3267,21 +3276,27 @@ fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
             prev = Some((a, b));
             head = (a, b);
         }
+        let (t0, n0) = (sys::debug_stat(214), sys::debug_stat(215));
         sys::handle_close(head.0);
         sys::handle_close(head.1);
-        Ok(())
+        Ok((sys::debug_stat(214) - t0, sys::debug_stat(215) - n0))
     }
     let harts = job_use(root_job()?, 7)?.0 as usize;
     let mut spinners = Vec::new();
     muster(harts, &mut spinners)?;
-    let before_traps = sys::debug_stat(214);
-    let before_windows = sys::debug_stat(215);
-    let (mut rounds, mut alone) = (0, 0);
-    while sys::debug_stat(214) == before_traps && rounds < 40 {
+    // (only the interrupts taken while a chain was being closed count: a tick in a window of the spinners' own teardown between rounds does not)
+    let (mut rounds, mut alone, mut traps, mut windows) = (0, 0, 0, 0);
+    while traps == 0 && rounds < 40 {
         let (w0, c0) = (sys::clock_ns(), sys::thread_cpu_ns(0).a1 as u64);
-        if let Err(e) = round() {
-            disband(&mut spinners);
-            return Err(e);
+        match round() {
+            Ok((t, n)) => {
+                traps += t;
+                windows += n;
+            }
+            Err(e) => {
+                disband(&mut spinners);
+                return Err(e);
+            }
         }
         rounds += 1;
         // (the premise, checked: with an equal thread waiting on its hart this thread runs a half or a third of the round; nine tenths or
@@ -3293,15 +3308,14 @@ fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
             muster(harts, &mut spinners)?;
         }
     }
-    if sys::debug_stat(214) == before_traps {
+    if traps == 0 {
         sys::debug_stat(132); // (debug builds: every hart's scheduler state, where the spinners and this thread are)
     }
     disband(&mut spinners);
     ensure!(
-        sys::debug_stat(214) > before_traps,
-        "no interrupt was taken inside a window in {rounds} rounds of closing a chain ({} windows were made; in {alone} rounds this thread \
-         was alone on its hart)",
-        sys::debug_stat(215) - before_windows
+        traps > 0,
+        "no interrupt was taken inside a window in {rounds} rounds of closing a chain ({windows} windows were made while closing; in {alone} \
+         rounds this thread was alone on its hart)"
     );
     // (everything is gone: a channel can be made again, and nothing of the chain is left to count against the budget)
     let (a, b) = channel()?;

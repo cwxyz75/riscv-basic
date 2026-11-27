@@ -978,9 +978,10 @@ pub fn reschedule_fast() -> bool {
 }
 
 /// Print what the scheduler knows (for `debug_stat` 132: `user::trap::debug_stat_call`, which also prints the user state its call holds).
+/// Interrupts off (`sched()` requires it).
 #[cfg(debug_assertions)]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report that holds a thread record
-pub fn dump_sched() {
+pub(crate) fn dump_sched() {
     use core::fmt::Write;
     let sc = sched();
     let mut out = crate::console::Console;
