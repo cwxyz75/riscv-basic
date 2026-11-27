@@ -3,8 +3,38 @@ name: overnight
 # Tier 3 of TESTING.md (KT6, OD142): the long runs, hours each. It runs ONLY when the owner starts it by hand
 # (Actions > overnight > Run workflow, or `gh workflow run overnight.yml`). There is no schedule and no pull-request trigger, and
 # nobody else starts it. Never required to merge. A red run is a work item the same day (OD140), not noise.
+# With no input it runs every job below. With `target` it runs that one overnight target alone, as a piece of at most two hours (STAB0,
+# T283), in the `piece` job, with the piece's size: `chaos_seeds` for os-chaos, `n` for overnight-repeat-smp, `pkg` and `shard` for
+# os-mutants (`gh workflow run overnight.yml --ref <branch> -f target=os-chaos -f chaos_seeds=1..40`). `make overnight-piece` refuses a
+# target that is not an overnight target and a malformed value.
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "One overnight target to run alone, as a piece of at most two hours (empty: every job)"
+        required: false
+        default: ''
+        type: string
+      chaos_seeds:
+        description: "os-chaos: the seed range of the piece (A..B or A,B,C)"
+        required: false
+        default: ''
+        type: string
+      n:
+        description: "overnight-repeat-smp: how many boots (about 20 fit two hours)"
+        required: false
+        default: ''
+        type: string
+      pkg:
+        description: "os-mutants: the crate"
+        required: false
+        default: ''
+        type: string
+      shard:
+        description: "os-mutants: the shard, k/n"
+        required: false
+        default: ''
+        type: string
 
 jobs:
   # CI's QEMU (TEST-TOOLS.md, "CI's QEMU"): look the cache entry up, and build it if this branch's cache has none; the jobs that boot
@@ -23,6 +53,7 @@ jobs:
   repeat-smp:
     name: overnight (repeat smp)
     needs: qemu
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
@@ -60,6 +91,7 @@ jobs:
   checked:
     name: overnight (checked release)
     needs: qemu
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -95,6 +127,7 @@ jobs:
   chaos:
     name: overnight (schedule perturbation)
     needs: qemu
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
@@ -124,6 +157,7 @@ jobs:
 
   mutants:
     name: overnight (mutants ${{ matrix.pkg }} ${{ matrix.shard }})
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -165,6 +199,7 @@ jobs:
 
   coverage:
     name: overnight (coverage)
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -194,6 +229,7 @@ jobs:
 
   fuzz-host:
     name: overnight (host fuzz)
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -212,6 +248,7 @@ jobs:
   allocfail:
     name: overnight (allocation failure)
     needs: qemu
+    if: inputs.target == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -229,3 +266,69 @@ jobs:
         if: always()
         run: |
           echo "## overnight (allocation failure): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # one overnight target alone (the `target` input, with its size): the owner's two-hour piece (STAB0, T283)
+  piece:
+    name: overnight piece (${{ inputs.target }})
+    needs: qemu
+    if: inputs.target != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      BENCH_RATIO: "10"
+      # (the inputs come through the environment, never into the script's text; `make overnight-piece` checks their form)
+      PIECE: ${{ inputs.target }}
+      IN_CHAOS_SEEDS: ${{ inputs.chaos_seeds }}
+      IN_N: ${{ inputs.n }}
+      IN_PKG: ${{ inputs.pkg }}
+      IN_SHARD: ${{ inputs.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-piece-${{ inputs.target }}
+      - name: Install QEMU
+        uses: ./.github/actions/install-qemu
+      - uses: actions/cache@v4
+        with:
+          path: third_party/fetched
+          key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
+      - name: Fetch BusyBox (pinned by sha256)
+        run: FETCH_ONLY="busybox kilo sqlite gzip" make fetch-third-party
+      - name: Install cargo-mutants (os-mutants only; a tool, not a dependency of any crate; pinned)
+        if: inputs.target == 'os-mutants'
+        run: cargo install cargo-mutants --locked --version 25.3.1
+      - name: Install llvm-tools and cargo-llvm-cov (os-coverage only; pinned)
+        if: inputs.target == 'os-coverage'
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked --version 0.9.2
+      - name: Run the piece
+        run: |
+          args=()
+          if [ -n "$IN_CHAOS_SEEDS" ]; then args+=("CHAOS_SEEDS=$IN_CHAOS_SEEDS"); fi
+          if [ -n "$IN_N" ]; then args+=("N=$IN_N"); fi
+          if [ -n "$IN_PKG" ]; then args+=("PKG=$IN_PKG"); fi
+          if [ -n "$IN_SHARD" ]; then args+=("SHARD=$IN_SHARD"); fi
+          make overnight-piece PIECE="$PIECE" "${args[@]}"
+      - name: Summary
+        if: always()
+        run: |
+          echo "## overnight piece ($PIECE $IN_CHAOS_SEEDS $IN_N $IN_PKG $IN_SHARD): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          ls target/chaos 2>/dev/null | sed 's/^/- failing: /' >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Keep the logs and lists of the piece
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: piece-logs
+          path: |
+            target/fail-logs/
+            target/repeat/
+            target/chaos/
+            target/mutants-*/mutants.out/missed.txt
+            target/mutants-*/mutants.out/timeout.txt
+            target/mutants-*/mutants.out/caught.txt
+            target/cov/html
+          if-no-files-found: ignore

@@ -3,7 +3,8 @@
 document that says something false is a bug. This cannot prove the documents right; it keeps the known-stale
 statements from coming back and checks the decision log's bookkeeping.
 
-Usage: check_docs.py   (run from anywhere; exits 1 with a list of problems)
+Usage: check_docs.py               (run from anywhere; exits 1 with a list of problems)
+       check_docs.py --self-test   (the rules for the soak and overnight workflows' dispatch inputs, on planted workflows)
 """
 import os
 import re
@@ -98,6 +99,197 @@ def check_ci_qemu(wf, text, rules):
     return out
 
 
+# T283 (STAB0): the soak and overnight workflows take dispatch inputs that run one target as a piece of at most two hours. The only
+# trigger is a manual dispatch; the inputs are these, strings that default to empty; the `piece` job runs only when `target` is set,
+# within PIECE_BUDGET_MINUTES, and only `make <tier>-piece`, which refuses a target outside the tier; every other job (but the tool-build
+# job) runs only when it is not set, so a dispatch with no inputs is the whole tier as before.
+PIECE_INPUTS = {"soak.yml": {"target"}, "overnight.yml": {"target", "chaos_seeds", "n", "pkg", "shard"}}
+PIECE_TARGET = {"soak.yml": "soak-piece", "overnight.yml": "overnight-piece"}
+PIECE_BUDGET_MINUTES = 120
+PIECE_IF, WHOLE_IF = "inputs.target != ''", "inputs.target == ''"
+
+
+def yaml_block(text, key, indent):
+    """The lines under `key:` at `indent` spaces (up to the next line indented as much or less), or None when there is no such key."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.fullmatch(rf" {{{indent}}}{re.escape(key)}:\s*(#.*)?", line):
+            out = []
+            for l in lines[i + 1:]:
+                if l.strip() and not l.lstrip().startswith("#") and len(l) - len(l.lstrip()) <= indent:
+                    break
+                out.append(l)
+            return out
+    return None
+
+
+def keys_at(lines, indent):
+    return [m.group(1) for l in lines if (m := re.fullmatch(rf" {{{indent}}}([\w-]+):.*", l))]
+
+
+def check_dispatch(name, text):
+    """The triggers and the piece job of soak.yml or overnight.yml (OD142, T283)."""
+    out = []
+    on = yaml_block(text, "on", 0)
+    if on is None:
+        return [f"{name}: no `on:` block"]
+    if re.search(r"^on:[ \t]*[^\s#]", text, re.M):
+        out.append(f"{name}: `on:` must be a block with `workflow_dispatch:` alone (OD142)")
+    for t in keys_at(on, 2):
+        if t != "workflow_dispatch":
+            out.append(f"{name}: the trigger `{t}` is forbidden; the owner starts it by hand, `workflow_dispatch` only (OD142)")
+    wd = yaml_block("\n".join(on), "workflow_dispatch", 2) or []
+    for k in keys_at(wd, 4):
+        if k != "inputs":
+            out.append(f"{name}: `workflow_dispatch` takes `inputs:` only, not `{k}`")
+    inputs = yaml_block("\n".join(wd), "inputs", 4) or []
+    names = keys_at(inputs, 6)
+    for n in names:
+        if n not in PIECE_INPUTS.get(name, set()):
+            out.append(f"{name}: the dispatch input `{n}` is not one of the piece inputs {sorted(PIECE_INPUTS.get(name, set()))} (T283)")
+        props = yaml_block("\n".join(inputs), n, 6) or []
+        for k in keys_at(props, 8):
+            if k not in ("description", "required", "default", "type"):
+                out.append(f"{name}: the dispatch input `{n}` has `{k}`; an input is a description, `required: false`, `default: ''` and `type: string`")
+        body = "\n".join(props)
+        if not re.search(r"^ {8}type:\s*string\s*$", body, re.M) or not re.search(r"^ {8}required:\s*false\s*$", body, re.M) \
+                or not re.search(r"^ {8}default:\s*''\s*$", body, re.M):
+            out.append(f"{name}: the dispatch input `{n}` must be `type: string`, `required: false`, `default: ''` (empty: the whole tier)")
+    if not names:
+        return out
+    if "target" not in names:
+        out.append(f"{name}: the piece inputs need `target`")
+    jobs = re.split(r"^  (?=[a-z][\w-]*:\s*$)", text.split("\njobs:\n", 1)[-1], flags=re.M)
+    seen_piece = False
+    for job in jobs:
+        jname = job.split(":", 1)[0].strip()
+        if not re.fullmatch(r"[a-z][\w-]*", jname) or jname == TOOL_BUILD_JOB:
+            continue
+        cond = re.search(r"^    if:\s*(.*)$", job, re.M)
+        cond = cond.group(1).strip() if cond else ""
+        if jname == "piece":
+            seen_piece = True
+            if cond != PIECE_IF:
+                out.append(f"{name}: the piece job runs only when `target` is set (`if: {PIECE_IF}`)")
+            t = re.findall(r"timeout-minutes:\s*(\d+)", job)
+            if not t or any(int(x) > PIECE_BUDGET_MINUTES for x in t):
+                out.append(f"{name}: the piece job needs `timeout-minutes` of at most {PIECE_BUDGET_MINUTES} (a piece is two hours, STAB0)")
+            makes = re.findall(r"(?<![\w-])make\s+(?:-\S+\s+)*([a-z][\w-]*)", "\n".join(l for l in job.splitlines() if not l.lstrip().startswith("#")))
+            if PIECE_TARGET[name] not in makes:
+                out.append(f"{name}: the piece job must run `make {PIECE_TARGET[name]}` (which refuses a target outside the tier)")
+            for m in makes:
+                if m not in (PIECE_TARGET[name], "fetch-third-party"):
+                    out.append(f"{name}: the piece job runs `make {m}`; it runs only `make {PIECE_TARGET[name]}`")
+            # (an input may name the job, key a cache or set an environment variable; anywhere else, a script would see its text)
+            if any("${{ inputs." in l and not re.match(r"\s*(?:- )?(?:name|key|[A-Z][A-Z0-9_]*):", l) for l in job.splitlines()):
+                out.append(f"{name}: the piece job puts an input into a script's text; pass it through `env:`")
+        elif WHOLE_IF not in cond:
+            out.append(f"{name}: job {jname} must not run in a piece (`if: {WHOLE_IF}`), so a dispatch with no inputs is the whole tier")
+    if not seen_piece:
+        out.append(f"{name}: the dispatch inputs need a `piece` job")
+    return out
+
+
+def check_pieces(makefile, rules):
+    """`make soak-piece` and `make overnight-piece` validate the piece against the tier's own targets (T283)."""
+    out = []
+    soak, night = make_var(makefile, "SOAK_TARGETS"), make_var(makefile, "OVERNIGHT_TARGETS")
+    allowed = {"soak-piece": set(soak) | {p for parts in SOAK_SPLIT.values() for p in parts} | {"os-miri"}, "overnight-piece": set(night)}
+    lists = {"soak-piece": "SOAK_PIECES", "overnight-piece": "OVERNIGHT_TARGETS"}
+    for target, var in lists.items():
+        if target not in rules:
+            out.append(f"Makefile: the target {target} is missing (T283)")
+            continue
+        recipe = rules[target][1]
+        first = next((l for l in recipe.splitlines() if not l.strip().startswith("#")), "")
+        if not re.search(rf'python3 scripts/tier\.py piece "\$\$PIECE" \$\({var}\)', first):
+            out.append(f"Makefile: {target} must first check the piece with `python3 scripts/tier.py piece \"$$PIECE\" $({var})` (the shell's "
+                       "variable: make's $(PIECE) would paste the input into the script before it is checked)")
+        extra = set(make_var(makefile, var)) - allowed[target]
+        if extra:
+            out.append(f"Makefile: {var} names targets outside its tier: {sorted(extra)}")
+    return out
+
+
+def dispatch_self_test():
+    """Planted workflows: the rules accept the piece inputs and refuse an extra trigger, a stray input, a piece job without its budget or
+    its guard, and a whole-tier job that would also run in a piece."""
+    good = """on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "one target"
+        required: false
+        default: ''
+        type: string
+      chaos_seeds:
+        description: "seeds"
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  qemu:
+    runs-on: ubuntu-latest
+  chaos:
+    needs: qemu
+    if: inputs.target == ''
+    timeout-minutes: 300
+    steps:
+      - run: make os-chaos
+  piece:
+    needs: qemu
+    if: inputs.target != ''
+    timeout-minutes: 120
+    env:
+      PIECE: ${{ inputs.target }}
+    steps:
+      - run: make overnight-piece PIECE="$PIECE"
+"""
+    assert check_dispatch("overnight.yml", good) == [], check_dispatch("overnight.yml", good)
+    plain = "on:\n  workflow_dispatch:\n\njobs:\n  kernel:\n    steps:\n      - run: make os-bench\n"
+    assert check_dispatch("soak.yml", plain) == [], "no inputs: the tier as it was"
+    bad = {
+        "a schedule beside the dispatch": good.replace("  workflow_dispatch:\n", "  schedule:\n    - cron: '0 3 * * *'\n  workflow_dispatch:\n"),
+        "a push trigger": good.replace("\njobs:", "  push:\n    branches: [main]\n\njobs:"),
+        "a workflow_call trigger that takes the same inputs": good.replace("  workflow_dispatch:\n", "  workflow_call:\n    inputs:\n      target:\n        type: string\n  workflow_dispatch:\n"),
+        "an input indented into a trigger": good.replace("      chaos_seeds:\n", "  repository_dispatch:\n      chaos_seeds:\n"),
+        "an input that is not a piece input": good.replace("      chaos_seeds:", "      cron:"),
+        "an input of another type": good.replace("        type: string\n      chaos_seeds", "        type: choice\n      chaos_seeds"),
+        "an input that is required": good.replace("        required: false\n        default: ''\n        type: string\n\n", "        required: true\n        default: ''\n        type: string\n\n"),
+        "an input with a default": good.replace("        default: ''\n        type: string\n\njobs", "        default: '1..200'\n        type: string\n\njobs"),
+        "a piece over two hours": good.replace("timeout-minutes: 120", "timeout-minutes: 300"),
+        "a piece with no timeout": good.replace("    timeout-minutes: 120\n", ""),
+        "a piece that runs whatever it is given": good.replace("make overnight-piece PIECE=\"$PIECE\"", "make \"$PIECE\""),
+        "a piece that runs a smoke target too": good.replace("      - run: make overnight-piece", "      - run: make os-ktest-4\n      - run: make overnight-piece"),
+        "an input in the script's text": good.replace("make overnight-piece PIECE=\"$PIECE\"", "make overnight-piece PIECE=${{ inputs.target }}"),
+        "an input in a block script's text": good.replace("      - run: make overnight-piece PIECE=\"$PIECE\"", "      - run: |\n          echo ${{ inputs.chaos_seeds }}\n          make overnight-piece PIECE=\"$PIECE\""),
+        "a piece job that runs on every dispatch": good.replace("    if: inputs.target != ''\n", ""),
+        "a whole-tier job that also runs in a piece": good.replace("    if: inputs.target == ''\n", ""),
+        "inputs with no piece job": good.split("  piece:")[0],
+    }
+    for what, text in bad.items():
+        found = check_dispatch("overnight.yml", text)
+        assert found, f"not refused: {what}"
+        if os.environ.get("CHECK_DOCS_VERBOSE"):
+            print(f"{what}: {found}")
+    assert check_dispatch("soak.yml", good), "soak.yml takes `target` only"
+    # the workflows in the tree pass
+    for wf in ("soak.yml", "overnight.yml"):
+        found = check_dispatch(wf, read(f".github/workflows/{wf}"))
+        assert found == [], found
+    makefile = read("Makefile")
+    assert check_pieces(makefile, make_rules(makefile)) == [], check_pieces(makefile, make_rules(makefile))
+    planted = makefile.replace("SOAK_PIECES := $(SOAK_TARGETS)", "SOAK_PIECES := os-ktest-4 $(SOAK_TARGETS)")
+    assert any("outside its tier" in p for p in check_pieces(planted, make_rules(planted))), "a smoke target among the soak pieces"
+    unchecked = makefile.replace('\tpython3 scripts/tier.py piece "$$PIECE" $(OVERNIGHT_TARGETS)\n', "")
+    assert unchecked != makefile and any("must first check" in p for p in check_pieces(unchecked, make_rules(unchecked))), "a piece target without its check"
+    pasted = makefile.replace('\tpython3 scripts/tier.py piece "$$PIECE" $(OVERNIGHT_TARGETS)\n', '\tpython3 scripts/tier.py piece "$(PIECE)" $(OVERNIGHT_TARGETS)\n')
+    assert pasted != makefile and any("must first check" in p for p in check_pieces(pasted, make_rules(pasted))), "make's text pasted into the check"
+    print(f"check_docs self-test passed ({len(bad)} planted workflows refused, the piece inputs accepted)")
+    return 0
+
+
 def check_tiers():
     """The testing tiers (OD83, OD144, TESTING.md) are enforced mechanically, so they cannot drift back: the feature gate
     starts no emulator; the epic gate (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget;
@@ -183,6 +375,8 @@ def check_tiers():
             text = read(f".github/workflows/{name}")
             if re.search(r"^\s*schedule\s*:", text, re.M) or re.search(r"^\s*pull_request(_target)?\s*:", text, re.M) or re.search(r"^\s*push\s*:", text, re.M):
                 out.append(f"{name}: a schedule, push or pull_request trigger is forbidden; the owner starts it by hand (OD142)")
+            out += check_dispatch(name, text)
+        out += check_pieces(makefile, rules)
     if not os.path.exists(os.path.join(ROOT, "docs", "reference", "TESTING.md")):
         out.append("docs/reference/TESTING.md is missing")
     return out
@@ -527,4 +721,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(dispatch_self_test())
     sys.exit(main())

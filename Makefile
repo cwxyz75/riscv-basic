@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: soak-piece overnight-piece lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -357,7 +357,7 @@ os-boot-test-overflow: kernel-main
 # (3x on the machine that made the baseline; CI runners are several times slower, so soak.yml sets BENCH_RATIO=30: the futex pair numbers swing by 30 times between runs with where the pair is placed, T231, T232)
 BENCH_RATIO ?= 3
 os-bench: kernel-main
-	rm -f target/bench.tsv
+	python3 scripts/bench_compare.py --provenance > target/bench.tsv
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling.tsv
@@ -368,14 +368,15 @@ os-bench: kernel-main
 # No disks (OS_DISK=0): under `sleep=off` guest time does not bound the host's disk I/O, so the block tests cannot be judged there (the
 # harness refuses the combination); the disk path through the IOMMU is the other Kernel boots' (os-ktest-small, os-ktest-4).
 os-count: kernel-main
-	rm -f target/count.tsv
+	python3 scripts/bench_compare.py --provenance > target/count.tsv
 	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_DISK=0 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/count.tsv bench/counts.tsv --prefix count_ --max-ratio 1.25
 
 os-count-record: kernel-main
-	rm -f target/count.tsv
+	python3 scripts/bench_compare.py --provenance > target/count.tsv
 	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_DISK=0 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
-	awk -F'\t' '$$2 ~ /^count_/' target/count.tsv > bench/counts.tsv
+	# (the `#@` lines name the machine and the QEMU the counts were measured on, T195: bench_compare says when a run's differ)
+	awk -F'\t' '/^#@ / || $$2 ~ /^count_/' target/count.tsv > bench/counts.tsv
 
 # S9 Q30 (soak tier): the bulk TCP tests (fetch, httpd, echo) with the guest's network behind the lossy relay
 # (scripts/net_lossy_relay.py: loss 2%, duplication 1%, reordering 5%, delay 5 ms on TCP frames) for each seed, at two and four
@@ -397,7 +398,7 @@ OS_LATENCY_ELF := target/os-latency/$(KERNEL_TARGET)/debug/kernel
 # threshold is generous like `os-bench`'s)
 os-latency: kernel-main
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
-	rm -f target/latency.tsv
+	python3 scripts/bench_compare.py --provenance > target/latency.tsv
 	OS_BENCH=target/latency.tsv OS_BENCH_FULL=1 OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
 	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO) --scaling-floor bench/scaling-latency.tsv
 
@@ -526,6 +527,11 @@ libc-gap: fetch-third-party
 docs-check:
 	python3 scripts/check_docs.py
 	python3 scripts/bench_compare.py --self-test
+	# T195: two boots at once get their own host fixture ports, and the kernel line tells each guest its own
+	python3 scripts/host_fixtures.py --self-test
+	# T283: the tiers' summary and pieces, and the docs check's own rules for the workflows' dispatch inputs
+	python3 scripts/tier.py --self-test
+	python3 scripts/check_docs.py --self-test
 	# IOMMU-SPEC amendment 2026-11-27 part 2 (L7, OD175): the boot harness refuses a device that reads memory at a physical address
 	python3 scripts/refused_devices.py --self-test
 	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-probe.pcap --self-test
@@ -560,19 +566,38 @@ SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest o
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
-# owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
-# in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
+# owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The targets run one at a time
+# (SOAK_JOBS, default 1, T195): the boots follow the host's clock, so several at once on one machine report timing failures that are
+# not bugs (the first full soak, 2026-11-21, at three at a time: eight targets failed that passed alone). `make soak` keeps going after a
+# failure and ends with one line per target (PASS or FAIL, its wall time, the log of a failing one under target/tier/).
 SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
-SOAK_JOBS ?= 3
+SOAK_JOBS ?= 1
 soak:
-	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
+	python3 scripts/tier.py run "$(SOAK_JOBS)" "$(MAKE)" $(SOAK_TARGETS)
+
+# One soak target as a piece of at most two hours (STAB0, T283): `make soak-piece PIECE=os-boot-test-smp`. soak.yml's `piece` job runs it
+# when the owner dispatches the workflow with a `target`; a PIECE that is not one of SOAK_PIECES is refused. (SOAK_PIECES: the soak
+# targets, the parts soak.yml runs `os-boot-test` as, and Miri.)
+SOAK_PIECES := $(SOAK_TARGETS) os-boot-test-main os-boot-test-rr os-boot-test-release os-miri
+soak-piece:
+	# (the shell's $$PIECE, from the command line through the environment: never make's text pasted into the script before it is checked)
+	python3 scripts/tier.py piece "$$PIECE" $(SOAK_PIECES)
+	$(MAKE) $(PIECE)
 
 # Tier 3 (overnight): hours-long runs, started ONLY by the owner (OD142, KT6): `overnight.yml` has a manual trigger and nothing else.
 # Each KT item that adds a long run adds its target here, and `overnight.yml` runs it as a job. Never required to merge.
 OVERNIGHT_TARGETS := overnight-repeat-smp os-boot-test-checked os-chaos os-mutants os-coverage os-fuzz-host os-allocfail
-# 20 consecutive boots of the smp suite: the intermittent-failure hunt of OD140 (a red run is a work item the same day).
+# N (20) consecutive kernel-only boots at four harts: the intermittent-failure hunt of OD140 (a red run is a work item the same day). It
+# repeats `os-ktest-4`, the boot the epic gate runs (OD161, Q3 of T266); a piece of two hours is about N=20 on a hosted runner.
 overnight-repeat-smp:
-	$(MAKE) os-repeat TARGET=os-boot-test-smp N=20
+	$(MAKE) os-repeat TARGET=os-ktest-4 N=$(N)
+
+# One overnight target as a piece of at most two hours (STAB0, T283): `make overnight-piece PIECE=os-chaos CHAOS_SEEDS=1..40`,
+# `PIECE=overnight-repeat-smp N=10`, `PIECE=os-mutants PKG=kcore SHARD=3/8`. overnight.yml's `piece` job runs it when the owner
+# dispatches the workflow with a `target`; a PIECE that is not an overnight target, or a malformed variable, is refused.
+overnight-piece:
+	python3 scripts/tier.py piece "$$PIECE" $(OVERNIGHT_TARGETS)
+	$(MAKE) $(PIECE)
 
 # KT12: the release kernel with the debug assertions on, through the whole suite at four harts and the kernel-only shard at one, two and eight.
 OS_KCHK_ELF := target/os-kchecked/$(KERNEL_TARGET)/release-checked/kernel

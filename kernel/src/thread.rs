@@ -1771,6 +1771,11 @@ pub fn wake_stat(which: u64) -> u64 {
         14 => crate::latency::take_window(),
         // 9: 1 if the kernel command line has `net=lossy` (the harness runs the guest behind the lossy relay, S9-SPEC Q30)
         9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
+        // 15: the host ports of this boot's test fixtures (`hostports=<tcp>,<dns>,<http>` on the kernel line, T195: the harness binds them where
+        // the host has room, so two boots on one host do not collide), as `kcore::testlog::host_ports` packs them; 0 when the line has none
+        15 => {
+            crate::dtb::boot_arg_value("hostports=").map_or(0, |v| kcore::testlog::host_ports(&v))
+        }
         // 13: which part of the suite the kernel line asks for: 0 all of it, 1 `shard=a` (the larger part), 2
         // `shard=b` (the network tests and the heaviest stress tests; the list is in the suite), 3 `shard=k` (the kernel-only boot: the Kernel tests, `init/ktests.txt`); CI runs the two as parallel jobs (TESTING.md, OD121)
         13 => {

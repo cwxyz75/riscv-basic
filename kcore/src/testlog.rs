@@ -50,6 +50,43 @@ impl<W: Write> Write for OneLine<'_, W> {
     }
 }
 
+/// The host ports of the test harness's fixtures for one boot (T195), from the value of `hostports=<tcp>,<dns>,<http>` on the kernel
+/// line: the host TCP server, the scripted DNS server (UDP) and the HTTP server, which the guest reaches at 10.0.2.2 through slirp.
+/// The harness binds each where the host has room (port 0), so two boots on one host get different ports. Packed for `debug_stat` 15 as
+/// `tcp | dns << 16 | http << 32`; 0 (no fixtures: the tests that need them skip) unless the value is exactly three ports from 1 to 65535.
+pub fn host_ports(value: &str) -> u64 {
+    let mut parts = value.split(',');
+    let mut packed = 0u64;
+    for shift in [0u32, 16, 32] {
+        // (digits only: `u16::from_str` would also take a leading `+`)
+        let port = parts
+            .next()
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u16>().ok());
+        match port {
+            Some(port) if port != 0 => packed |= u64::from(port) << shift,
+            _ => return 0,
+        }
+    }
+    if parts.next().is_some() {
+        return 0;
+    }
+    packed
+}
+
+/// One port out of [`host_ports`]'s packing: `which` 0 the TCP server, 1 the DNS server, 2 the HTTP server; `None` when there is none
+/// (or `which` names no fixture).
+pub fn host_port(packed: u64, which: u32) -> Option<u16> {
+    let shift = match which {
+        0 => 0,
+        1 => 16,
+        2 => 32,
+        _ => return None,
+    };
+    let port = (packed >> shift) as u16;
+    (port != 0).then_some(port)
+}
+
 #[cfg(all(test, not(any(loom, shuttle))))]
 mod tests {
     extern crate std;
