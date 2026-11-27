@@ -266,13 +266,15 @@ pub fn run_all() -> Report {
     })();
     // A child that outlived init dies asynchronously (kill flag, then its own exit): give it a
     // bounded time, so one leaking test does not also fail the leak checks below.
-    // (T265: how long the processes left when init ended took to go, how many there were and how many sweeps ran meanwhile: printed for
-    // every boot as one `leak: settle` line, so a slow teardown shows its size before any check fails)
+    // (T265, T278: init's end kills every child it left, some fifty at four harts, and their teardowns run at once; that took about 0.3 s
+    // on a quiet host and longer on a loaded one, past the 0.2 s this wait had, which failed the checks below on processes that were only
+    // slow. The wait is now for every process to be gone from the table and from the record of those on their way out, up to the 5 s of
+    // the leak watch: a stuck teardown still fails, a slow one does not, and how long it took is printed for every boot as one `leak:
+    // settle` line, with how many processes there were and how many sweeps ran meanwhile.)
     let (t0, left, sweeps0) = (thread::ticks(), user::process_count(), user::sweep_epoch());
-    for _ in 0..200 {
-        if user::process_count() == 0 && user::dying::count() == 0 {
-            break;
-        }
+    while (user::process_count() != 0 || user::dying::count() != 0)
+        && thread::ticks().wrapping_sub(t0) < LEAK_RESAMPLE_TICKS
+    {
         thread::sleep_ticks(1);
     }
     let _ = core::fmt::Write::write_fmt(
