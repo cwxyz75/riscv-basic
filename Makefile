@@ -500,6 +500,8 @@ OS_IOMMUINVAL_ELF := target/os-fault-iommuinval/$(KERNEL_TARGET)/debug/kernel
 os-boot-test-iommu-inval: kernel-main
 	cd kernel && cargo build --features fault-iommu-skip-inval --target-dir ../target/os-fault-iommuinval
 	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUINVAL_ELF) iodomain_unmap_stops_the_device
+	# (IOMMU12: the hostile-driver matrix's row that uses its own unmapped mapping is a second test the control must fail)
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUINVAL_ELF) hostile_dma_after_its_own_unmap
 
 # IOMMU7 negative control (TESTING.md rule 9): a kernel that writes basic-translate MSI entries (the device's own data word reaches the
 # hart's file) must fail `msi_forgery_faults` (IO11). Kernel-only boot.

@@ -10933,13 +10933,10 @@ impl BlkRig {
                     "the queue memory",
                     "the data buffer",
                 ]) {
-                    ensure!(
-                        matches!(
-                            st(sys::vmo_phys_addr(h)),
-                            Some(S::WrongType | S::AccessDenied)
-                        ),
-                        "{what}: no physical address ({:?})",
-                        st(sys::vmo_phys_addr(h))
+                    ensure_eq!(
+                        st(sys::vmo_phys_addr(h)),
+                        Some(S::NotSupported),
+                        "{what}: no physical address (IOMMU-SPEC 4.8)"
                     );
                 }
                 for (r, what) in [
@@ -11804,7 +11801,7 @@ fn blk_driver_cannot_reach_outside() -> Outcome {
                     if k == 0 {
                         ensure_eq!(
                             st(sys::vmo_phys_addr(b.hs[3])),
-                            Some(S::WrongType),
+                            Some(S::NotSupported),
                             "the driver's data VMO has no physical address"
                         );
                     }
@@ -11858,6 +11855,1587 @@ fn blk_driver_cannot_reach_outside() -> Outcome {
         pattern_drop(frame);
         r
     })
+}
+
+// ---- IOMMU12: the hostile-driver matrix (IOMMU-SPEC 10 and 13; OD148, OD166 point 4) -------------------------------------------------
+//
+// OD148's sentence, "a device reaches only the frames it has been mapped", attacked from a driver's seat. The driver is a process of
+// its own (`crash` mode 121, `Hostile`) started in a driver's job with exactly the handles a real driver is given, and nothing else:
+// it makes the calls the suite asks for with them and reports what the kernel said. Two rigs:
+//
+// * **The device rig** (`with_matrix`): the suite is the supervisor, as `devmgr` is, with the root resource. Two devices are brought up
+//   by hand, each with a domain charged to one driver's job that has finite limits (`MATRIX_IO_PAGES`, `MATRIX_VECTORS`, as `devmgr`
+//   sets them): the entropy function (a real virtio-pci device, slot 4) with its rings and a buffer mapped and vector 0 granted, and
+//   `iommu-testdev` (slot 8, which `devmgr` lists but never claims: it has no MSI-X) with a buffer mapped and a vector granted that no
+//   device ever sends to. The hostile driver holds the two drivers' domain handles (IO_MAP and IO_UNMAP) and the two buffers (DMA, READ,
+//   WRITE); the suite keeps the control handles, and writes the descriptors and rings the doorbells through its own mappings of the
+//   same memory (the IOMMU sees only the device's requests, so who wrote a descriptor does not matter to it). Each device row aims one
+//   device at a target and checks: the IOMMU took a fault, the device's domain holds a record at the target (the other device's domain
+//   holds none), the last fault names this device, the targets and every bystander's memory are intact, no vector fired and no notice
+//   or message on an identity with no route reached a hart. The message rows (the entropy function only: the test device sends no
+//   messages) are the worst case of Q-IOMMU-MSI 6: the rig holds the function's MSI-X table, which a real driver never does.
+// * **The claim rig** (`with_claimed_hostile`): the scratch disk claimed through `devmgr`'s `ClaimPci` for a driver job, and the
+//   claim's handles (blkd's set: the BAR, the domain handle, the queue memory and the data buffer, two interrupts) moved to the
+//   hostile driver, plus a duplicate of its data buffer without DMA and one without WRITE. The rows with its own handles and the
+//   map-until-refused row run here, against the limits `devmgr` set.
+//
+// The legitimate use of each rig is checked first (the entropy function writes its buffer; the test device writes its buffer and reads
+// the value back at the frame's physical address), so a refusal is not the rig being broken.
+
+/// The driver's job limits of the device rig (`devmgr`'s claims set limits of the same kind: `pcicore::claim`).
+const MATRIX_IO_PAGES: u64 = 16;
+const MATRIX_VECTORS: u64 = 4;
+/// `iommu-testdev` at slot 8 (`scripts/os_boot_test.py`, PCI_DEVICES): device id 0x40, and where its configuration page, its BAR and
+/// its buffer are mapped here.
+const TDEV_SLOT: u64 = 8;
+const TDEV_DID: u64 = TDEV_SLOT << 3;
+const TDEV_ID: u32 = 0x0005_1b36;
+const TDEV_CFG_VA: u64 = 0x7d0_0000;
+const TDEV_VA: u64 = 0x7d0_1000;
+const TDEV_BUF_VA: u64 = 0x7d1_0000;
+/// The test device's result register: the write through the IOMMU failed (records note 2026-11-25 section 1).
+const TDEV_REFUSED: u32 = 0xdead_0002;
+
+/// A hostile driver: a `crash` child (mode 121) in a driver's job, holding exactly the handles it was sent.
+struct Hostile {
+    p: u64,
+    ch: u64,
+    /// The handles it was sent, as numbered in its own table (the suite holds none of them).
+    hs: Vec<u64>,
+}
+
+impl Hostile {
+    /// Start it in `job` and move `handles` to it.
+    fn start(job: u64, handles: &[u64]) -> Result<Hostile, Detail> {
+        let (p, ch) = match launch_image_in(IMAGE.load(Ordering::Relaxed), 121, job) {
+            Ok(x) => x,
+            Err(e) => {
+                for &h in handles {
+                    sys::handle_close(h);
+                }
+                return Err(e);
+            }
+        };
+        let x = Hostile {
+            p,
+            ch,
+            hs: Vec::new(),
+        };
+        let hs = (|| {
+            ensure_eq!(
+                st(sys::channel_write(
+                    ch,
+                    [0u8; 4].as_ptr(),
+                    4,
+                    handles.as_ptr(),
+                    handles.len()
+                )),
+                Some(S::Ok),
+                "move the driver's handles to it"
+            );
+            ensure_eq!(
+                st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+                Some(S::Ok),
+                "the driver says its handles"
+            );
+            let mut b = [0u8; 128];
+            let r = sys::channel_read(ch, b.as_mut_ptr(), b.len(), core::ptr::null_mut(), 0);
+            ensure_eq!(st(r), Some(S::Ok), "read them");
+            ensure_eq!(r.a1, 8 * handles.len(), "one number per handle");
+            Ok(b[..r.a1]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect::<Vec<u64>>())
+        })();
+        match hs {
+            Ok(hs) => Ok(Hostile { hs, ..x }),
+            Err(e) => {
+                x.end();
+                Err(e)
+            }
+        }
+    }
+
+    /// One operation (0 a system call, 1 the library's `sys_vmo_phys_addr`): the status, `a1` and `a2`.
+    fn op(&self, op: u64, nr: u64, a: [u64; 6]) -> Result<(Option<S>, u64, u64), Detail> {
+        let mut m = [0u8; 64];
+        for (i, w) in [op, nr, a[0], a[1], a[2], a[3], a[4], a[5]]
+            .iter()
+            .enumerate()
+        {
+            m[8 * i..8 * i + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        ensure_eq!(
+            st(sys::channel_write(
+                self.ch,
+                m.as_ptr(),
+                64,
+                core::ptr::null(),
+                0
+            )),
+            Some(S::Ok),
+            "ask the driver"
+        );
+        ensure_eq!(
+            st(sys::object_wait(
+                self.ch,
+                sig::READABLE,
+                sys::clock_get() + 5000
+            )),
+            Some(S::Ok),
+            "the driver answers"
+        );
+        let mut b = [0u8; 24];
+        let r = sys::channel_read(self.ch, b.as_mut_ptr(), 24, core::ptr::null_mut(), 0);
+        ensure_eq!((st(r), r.a1), (Some(S::Ok), 24), "read its answer");
+        let w = |i: usize| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
+        let ret = Ret {
+            status: w(0) as i64 as i32,
+            a1: w(1) as usize,
+            a2: w(2) as usize,
+        };
+        Ok((st(ret), w(1), w(2)))
+    }
+
+    fn call(&self, nr: usize, a: [u64; 6]) -> Result<(Option<S>, u64, u64), Detail> {
+        self.op(0, nr as u64, a)
+    }
+
+    /// Map one page of `vmo` into `dom` with `access` (`abi::iodomain` READ and WRITE): the status and the I/O address.
+    fn map(&self, dom: u64, vmo: u64, access: u64) -> Result<(Option<S>, u64), Detail> {
+        let (s, io, _) = self.call(rt::abi::syscall::IODOMAIN_MAP, [dom, vmo, 0, 1, access, 0])?;
+        Ok((s, io))
+    }
+
+    fn unmap(&self, dom: u64, io: u64) -> Result<Option<S>, Detail> {
+        Ok(self
+            .call(rt::abi::syscall::IODOMAIN_UNMAP, [dom, io, 1, 0, 0, 0])?
+            .0)
+    }
+
+    /// Kill it and wait for it: every handle it held is closed by its teardown.
+    fn end(self) {
+        if self.p == 0 {
+            return;
+        }
+        let _ = sys::process_kill(self.p, 9);
+        let _ = wait_ended(self.p, 2000);
+        sys::handle_close(self.p);
+        sys::handle_close(self.ch);
+    }
+}
+
+/// One device of the device rig.
+struct MDev {
+    did: u64,
+    /// The supervisor's control handle (0 once it was given away).
+    sup: u64,
+    /// The driver's buffer: our handle, where we map it, its I/O address and its physical address.
+    buf: u64,
+    buf_va: u64,
+    buf_io: u64,
+    buf_pa: u64,
+    /// A vector granted on the domain, and its MSI-X address.
+    irq: u64,
+    address: u64,
+    /// The hostile driver's numbers for its domain handle and its buffer.
+    h_dom: u64,
+    h_buf: u64,
+}
+
+/// What a row needs of a device after it changed the rig (a copy, so the rig can be changed again).
+struct MDevAt {
+    did: u64,
+    buf_io: u64,
+    buf_va: u64,
+}
+
+/// The device under test of a row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dut {
+    Rng,
+    Tdev,
+}
+
+struct Matrix<'a> {
+    drv: Hostile,
+    f: &'a PciFn,
+    rings_io: u64,
+    rng: MDev,
+    tdev: MDev,
+    /// The pattern frame (another process's memory, as far as the drivers are concerned: neither domain maps it).
+    pa: u64,
+    /// Where the hostile driver mapped, in its own space, the entropy function's doorbell (the notify register itself), the test
+    /// device's register BAR and the entropy function's rings: it drives both devices itself through these (`hst`, `hld`).
+    h_notify: u64,
+    h_tdev: u64,
+    h_rings: u64,
+}
+
+impl Matrix<'_> {
+    /// A store by the hostile driver to its own mapping (`width` 1, 2, 4 or 8 bytes).
+    fn hst(&self, va: u64, width: u64, v: u64) -> Outcome {
+        let (s, _, _) = self.drv.op(4, 0, [va, width, v, 0, 0, 0])?;
+        ensure_eq!(s, Some(S::Ok), "the driver's store at {va:#x}");
+        Ok(())
+    }
+    /// A load by the hostile driver from its own mapping.
+    fn hld(&self, va: u64, width: u64) -> Result<u64, Detail> {
+        let (s, v, _) = self.drv.op(5, 0, [va, width, 0, 0, 0, 0])?;
+        ensure_eq!(s, Some(S::Ok), "the driver's load at {va:#x}");
+        Ok(v)
+    }
+    fn dev(&self, d: Dut) -> &MDev {
+        match d {
+            Dut::Rng => &self.rng,
+            Dut::Tdev => &self.tdev,
+        }
+    }
+    fn other(&self, d: Dut) -> &MDev {
+        match d {
+            Dut::Rng => &self.tdev,
+            Dut::Tdev => &self.rng,
+        }
+    }
+    /// The domain of the entropy function as `msi_send` wants it.
+    fn rng_domain(&self) -> Domain {
+        Domain {
+            sup: self.rng.sup,
+            drv: 0,
+            rings_io: self.rings_io,
+        }
+    }
+}
+
+fn tdev_rd(off: u64) -> u32 {
+    mmio_rd32(TDEV_VA + off)
+}
+fn tdev_wr(off: u64, v: u32) {
+    mmio_wr32(TDEV_VA + off, v)
+}
+
+/// Map the test device's configuration page and its BAR 0 (assigned by `pci_bus_program`, which `pci_fn_up` ran) and turn memory
+/// decoding on. It needs no bus mastering (records note 2026-11-25 section 1).
+fn tdev_map(res: u64) -> Outcome {
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let r = (|| {
+        let cfg = ok(
+            sys::vmo_create_physical(res, PCI_ECAM + (TDEV_SLOT << 15), 4096),
+            "the test device's configuration page",
+        )?
+        .a1 as u64;
+        let m = sys::process_map(me, cfg, TDEV_CFG_VA, 0, 4096, PF_R | PF_W);
+        sys::handle_close(cfg);
+        ensure_eq!(st(m), Some(S::Ok), "map it");
+        ensure_eq!(
+            mmio_rd32(TDEV_CFG_VA),
+            TDEV_ID,
+            "iommu-testdev at slot 8 (scripts/os_boot_test.py, PCI_DEVICES)"
+        );
+        let bar = u64::from(mmio_rd32(TDEV_CFG_VA + 0x10) & !0xf);
+        ensure!(
+            (PCI_MEM32..PCI_MEM32 + PCI_MEM32_LEN).contains(&bar),
+            "the test device's BAR 0 is assigned: {bar:#x}"
+        );
+        let v = ok(
+            sys::vmo_create_physical(res, bar, 4096),
+            "the test device's BAR",
+        )?
+        .a1 as u64;
+        let m = sys::process_map(me, v, TDEV_VA, 0, 4096, PF_R | PF_W);
+        sys::handle_close(v);
+        ensure_eq!(st(m), Some(S::Ok), "map the BAR");
+        mmio_wr16(TDEV_CFG_VA + 4, 1 << 1); // memory decoding
+        Ok(())
+    })();
+    sys::handle_close(me);
+    r
+}
+
+fn tdev_unmap() {
+    if let Ok(me) = ok(sys::process_self(), "process_self") {
+        let me = me.a1 as u64;
+        // (whichever is mapped: decoding off first)
+        if st(sys::process_unmap(me, TDEV_VA)) == Some(S::Ok) {
+            mmio_wr16(TDEV_CFG_VA + 4, 0);
+        }
+        sys::process_unmap(me, TDEV_CFG_VA);
+        sys::handle_close(me);
+    }
+}
+
+/// The test device's BAR 0 (its physical address).
+fn tdev_bar() -> u64 {
+    u64::from(mmio_rd32(TDEV_CFG_VA + 0x10) & !0xf)
+}
+
+/// One DMA of the test device: it writes 0x12345678 (eight bytes) at I/O address `iova` through the IOMMU, then reads `pa` back
+/// directly and compares. Its result register: 0 for a write that landed at `pa`, TDEV_REFUSED for one the IOMMU refused.
+fn tdev_dma(iova: u64, pa: u64) -> Result<u32, Detail> {
+    tdev_wr(0x04, iova as u32);
+    tdev_wr(0x08, (iova >> 32) as u32);
+    tdev_wr(0x0c, 8);
+    tdev_wr(0x18, 0);
+    tdev_wr(0x1c, pa as u32);
+    tdev_wr(0x20, (pa >> 32) as u32);
+    tdev_wr(0x14, 1); // arm
+    let _ = tdev_rd(0x00); // the read runs it
+    let t0 = sys::clock_get();
+    loop {
+        let r = tdev_rd(0x10);
+        if r != 0xffff_ffff && r != 0xffff_fffe {
+            return Ok(r);
+        }
+        ensure!(
+            sys::clock_get() < t0 + 1000,
+            "the test device did not finish ({r:#x})"
+        );
+        sys::thread_yield();
+    }
+}
+
+/// The entropy function's lowest memory BAR (its physical address), read from its configuration page (`pci_fn_up` maps it).
+fn rng_bar() -> u64 {
+    (0..6u64)
+        .map(|i| u64::from(cfg_rd32(0x10 + 4 * i) & !0xf))
+        .filter(|&a| (PCI_MEM32..PCI_MEM32 + PCI_MEM32_LEN).contains(&a))
+        .min()
+        .unwrap_or(0)
+}
+
+/// Fill a page we have mapped at `va` with the pattern (`salt` makes each page's its own).
+fn fill_page(va: u64, salt: u64) {
+    for i in 0..512 {
+        wr64(va + 8 * i, pattern_word(i) ^ salt);
+    }
+}
+
+fn page_intact(va: u64, salt: u64) -> bool {
+    (0..512).all(|i| rd64(va + 8 * i) == pattern_word(i) ^ salt)
+}
+
+/// The device rig (see the section's comment): `body` gets the rig. Afterwards everything is undone and the leak oracles hold: no
+/// domain, mapped page or vector is left, and the driver's job is back to nothing.
+fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
+    let doms = (sys::debug_stat(159), sys::debug_stat(160));
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let r = with_test_function(|res, f, pa| {
+        let root = root_job()?;
+        let dj = job(root, u64::MAX, u64::MAX, u64::MAX);
+        sys::handle_close(root);
+        let dj = dj?;
+        // the handles of ours made before the rig owns them (closed here on a failure on the way)
+        let mut pending: Vec<u64> = Vec::new();
+        let r = (|| {
+            ok(
+                sys::job_set_io_limits(dj, MATRIX_IO_PAGES, MATRIX_VECTORS),
+                "the driver's job's I/O limits",
+            )?;
+            tdev_map(res)?;
+            // the entropy function's rings first (mapped by the supervisor; the rows do not aim at them), so that the page after its
+            // buffer is the first free one of its domain
+            let rings = ok(sys::vmo_create_dma_in(res, 1, dj), "the rings")?.a1 as u64;
+            pending.push(rings);
+            map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
+            let mut rings_io = 0;
+            let mut dev = |did: u64, buf_va: u64| -> Result<MDev, Detail> {
+                let sup = ok(sys::iodomain_create(res, did, dj), "iodomain_create")?.a1 as u64;
+                pending.push(sup);
+                let drv = ok(
+                    sys::handle_duplicate(
+                        sup,
+                        Rights::IO_MAP.0 | Rights::IO_UNMAP.0 | Rights::TRANSFER.0,
+                    ),
+                    "the driver's domain handle",
+                )?
+                .a1 as u64;
+                pending.push(drv);
+                if did == IOMMU_TEST_DID {
+                    rings_io =
+                        ok(sys::iodomain_map(drv, rings, 0, 1, 3), "map the rings")?.a1 as u64;
+                }
+                let buf = ok(sys::vmo_create_dma_in(res, 1, dj), "the driver's buffer")?.a1 as u64;
+                pending.push(buf);
+                map_here(buf, buf_va, 1, PF_R | PF_W)?;
+                let buf_io = ok(sys::iodomain_map(drv, buf, 0, 1, 3), "map the buffer")?.a1 as u64;
+                let g = ok(sys::iodomain_grant_vector(sup, 0), "grant vector 0")?;
+                pending.push(g.a1 as u64);
+                let dup = ok(
+                    sys::handle_duplicate(
+                        buf,
+                        Rights::DMA.0 | Rights::READ.0 | Rights::WRITE.0 | Rights::TRANSFER.0,
+                    ),
+                    "the driver's buffer handle",
+                )?
+                .a1 as u64;
+                pending.push(dup);
+                Ok(MDev {
+                    did,
+                    sup,
+                    buf,
+                    buf_va,
+                    buf_io,
+                    buf_pa: phys_of(buf_va)?,
+                    irq: g.a1 as u64,
+                    address: g.a2 as u64,
+                    h_dom: drv,
+                    h_buf: dup,
+                })
+            };
+            let mut rng = dev(IOMMU_TEST_DID, BUF_VA)?;
+            let mut tdev = dev(TDEV_DID, TDEV_BUF_VA)?;
+            // and what a driver drives its device with (IOMMU-SPEC 10.1 step 5): the entropy function's doorbell page and the test
+            // device's register BAR (physical VMOs, as a claim hands over the BAR), and the rings (the queue memory)
+            let npa = rng_bar() + (f.notify - PCI_BAR_VA);
+            let nvmo = ok(
+                sys::vmo_create_physical(res, npa & !0xfff, 4096),
+                "the entropy function's doorbell page",
+            )?
+            .a1 as u64;
+            pending.push(nvmo);
+            let tvmo = ok(
+                sys::vmo_create_physical(res, tdev_bar(), 4096),
+                "the test device's register BAR",
+            )?
+            .a1 as u64;
+            pending.push(tvmo);
+            let rdup = ok(
+                sys::handle_duplicate(
+                    rings,
+                    Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::TRANSFER.0,
+                ),
+                "the driver's rings",
+            )?
+            .a1 as u64;
+            pending.push(rdup);
+            // the drivers' handles move to the hostile driver (whatever happens: `Hostile::start` consumes them)
+            let moved = [
+                rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf, nvmo, tvmo, rdup,
+            ];
+            pending.retain(|h| !moved.contains(h));
+            let drv = Hostile::start(dj, &moved)?;
+            (rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf) =
+                (drv.hs[0], drv.hs[1], drv.hs[2], drv.hs[3]);
+            // from here the rig owns every handle: its fields say which are still ours
+            pending.clear();
+            let mut m = Matrix {
+                drv,
+                f,
+                rings_io,
+                rng,
+                tdev,
+                pa,
+                h_notify: 0,
+                h_tdev: 0,
+                h_rings: 0,
+            };
+            let r = (|| {
+                // the driver maps its device's registers and its rings into itself
+                let at = |h: u64, what: &str| -> Result<u64, Detail> {
+                    let (s, a, _) = m.drv.op(3, 0, [h, 0, 4096, PF_R | PF_W, 0, 0])?;
+                    ensure_eq!(s, Some(S::Ok), "the driver maps {what}");
+                    Ok(a)
+                };
+                let h_notify = at(m.drv.hs[4], "its doorbell page")? + (npa & 0xfff);
+                let h_tdev = at(m.drv.hs[5], "the test device's BAR")?;
+                let h_rings = at(m.drv.hs[6], "its rings")?;
+                (m.h_notify, m.h_tdev, m.h_rings) = (h_notify, h_tdev, h_rings);
+                // the rig works: each device writes its own buffer
+                fill_page(m.rng.buf_va, 1);
+                ensure!(
+                    hostile_rng_request(&m, m.rng.buf_io, 64, 2000)?,
+                    "the entropy function serves a request into its buffer"
+                );
+                ensure!(
+                    !page_intact(m.rng.buf_va, 1),
+                    "the entropy function's bytes landed in its buffer"
+                );
+                ensure_eq!(
+                    hostile_tdev_dma(&m, m.tdev.buf_io, m.tdev.buf_pa)?,
+                    0,
+                    "the test device writes its buffer and reads it back at the frame's physical address"
+                );
+                ensure_eq!(
+                    rd64(m.tdev.buf_va),
+                    0x1234_5678_1234_5678,
+                    "the test device's value is in its buffer"
+                );
+                fill_page(m.rng.buf_va, 1);
+                fill_page(m.tdev.buf_va, 2);
+                drain_domain_faults(m.rng.sup);
+                drain_domain_faults(m.tdev.sup);
+                body(&mut m)
+            })();
+            mmio_wr8(m.f.common + 0x14, 0); // the function stops before its memory and its domain go
+            let drv = core::mem::replace(
+                &mut m.drv,
+                Hostile {
+                    p: 0,
+                    ch: 0,
+                    hs: Vec::new(),
+                },
+            );
+            drv.end();
+            for h in [
+                m.rng.sup, m.rng.buf, m.rng.irq, m.tdev.sup, m.tdev.buf, m.tdev.irq, rings,
+            ] {
+                if h != 0 {
+                    sys::handle_close(h);
+                }
+            }
+            r
+        })();
+        for h in pending {
+            sys::handle_close(h);
+        }
+        tdev_unmap();
+        unmap_here(RINGS_VA);
+        unmap_here(BUF_VA);
+        unmap_here(TDEV_BUF_VA);
+        let used = (|| {
+            let t0 = sys::clock_get();
+            while (sys::job_info(dj, 12).a1, sys::job_info(dj, 13).a1) != (0, 0)
+                && sys::clock_get() < t0 + 2000
+            {
+                sys::thread_yield();
+            }
+            ensure_eq!(
+                (sys::job_info(dj, 12).a1, sys::job_info(dj, 13).a1),
+                (0, 0),
+                "the driver's job holds no I/O page or vector afterwards"
+            );
+            Ok(())
+        })();
+        sys::handle_close(dj);
+        r.and(used)
+    });
+    r.and(domains_at_baseline(doms))
+        .and(vectors_at_baseline(live, ids))
+}
+
+/// `rng_request`, driven by the hostile driver: it writes the descriptor (`buf`, `len` bytes, device-writable) and the available ring in
+/// its own mapping of the rings and rings the doorbell in its own mapping of the BAR. The supervisor's part is only the bring-up
+/// (`virtio_up_entry`: reset, the rings' I/O addresses, DRIVER_OK), as `devmgr` resets a function before a claim; it then watches the
+/// used ring.
+fn hostile_rng_request(m: &Matrix, buf: u64, len: u32, wait_ms: u64) -> Result<bool, Detail> {
+    let r = m.h_rings;
+    for i in 0..(0x300 / 8) {
+        m.hst(r + 8 * i, 8, 0)?;
+    }
+    m.hst(r, 8, buf)?; // descriptor 0: the address,
+    m.hst(r + 8, 8, u64::from(len) | (2 << 32))?; // its length, VIRTQ_DESC_F_WRITE, no next
+    m.hst(r + 0x100, 2, 1)?; // VIRTQ_AVAIL_F_NO_INTERRUPT
+    m.hst(r + 0x104, 2, 0)?; // ring[0] = descriptor 0
+    m.hst(r + 0x102, 2, 1)?; // idx 1
+    virtio_up_entry(
+        m.f,
+        (m.rings_io, m.rings_io + 0x100, m.rings_io + 0x200),
+        pcicore::MsixEntry {
+            address: 0,
+            data: 0,
+            masked: true,
+        },
+    )?;
+    m.hst(m.h_notify, 2, 0)?; // the doorbell: queue 0
+    let t0 = sys::clock_get();
+    while sys::clock_get() < t0 + wait_ms {
+        if m.hld(r + 0x202, 2)? == 1 {
+            return Ok(true);
+        }
+        sys::thread_yield();
+    }
+    Ok(false)
+}
+
+/// `tdev_dma`, driven by the hostile driver through its own mapping of the test device's BAR.
+fn hostile_tdev_dma(m: &Matrix, iova: u64, pa: u64) -> Result<u32, Detail> {
+    let b = m.h_tdev;
+    for (off, v) in [
+        (0x04, iova as u32),
+        (0x08, (iova >> 32) as u32),
+        (0x0c, 8),
+        (0x18, 0),
+        (0x1c, pa as u32),
+        (0x20, (pa >> 32) as u32),
+        (0x14, 1), // arm
+    ] {
+        m.hst(b + off, 4, u64::from(v))?;
+    }
+    let _ = m.hld(b, 4)?; // the read runs it
+    let t0 = sys::clock_get();
+    loop {
+        let r = m.hld(b + 0x10, 4)? as u32;
+        if r != 0xffff_ffff && r != 0xffff_fffe {
+            return Ok(r);
+        }
+        ensure!(
+            sys::clock_get() < t0 + 1000,
+            "the test device did not finish ({r:#x})"
+        );
+        sys::thread_yield();
+    }
+}
+
+/// `dut_write` with the suite driving the device itself (through its own mappings of the BAR and the rings): only for a row whose driver
+/// is dead.
+fn dut_write_by_the_suite(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
+    match d {
+        Dut::Rng => rng_request(m.f, m.rings_io, target, 64, 300),
+        Dut::Tdev => {
+            let r = tdev_dma(target, 0)?;
+            ensure!(
+                r == 0 || r == TDEV_REFUSED || r == 0xdead_0003 || r == 0xdead_0004,
+                "the test device's result {r:#x}"
+            );
+            Ok(r != TDEV_REFUSED)
+        }
+    }
+}
+
+/// Make device `d` write at I/O address `target`, driven by the hostile driver (`hostile_rng_request`, `hostile_tdev_dma`): whether
+/// the device was served (the entropy function returned the request; the test device's write was not refused).
+fn dut_write(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
+    match d {
+        Dut::Rng => hostile_rng_request(m, target, 64, 300),
+        Dut::Tdev => {
+            let r = hostile_tdev_dma(m, target, 0)?;
+            ensure!(
+                r == 0 || r == TDEV_REFUSED || r == 0xdead_0003 || r == 0xdead_0004,
+                "the test device's result {r:#x}"
+            );
+            Ok(r != TDEV_REFUSED)
+        }
+    }
+}
+
+/// The bystanders after a row: the pattern frame, both buffers (as last filled: the device under test's own only when `own` is set),
+/// no vector fired, no notice and no message on an identity with no route since `(notices, no_route)`.
+fn bystanders_intact(
+    m: &Matrix,
+    own: Option<Dut>,
+    (notices, no_route): (u64, u64),
+    what: &str,
+) -> Outcome {
+    if let Some(i) = pattern_intact() {
+        ensure!(false, "{what}: the pattern frame changed at word {i}");
+    }
+    for (d, salt) in [(Dut::Rng, 1), (Dut::Tdev, 2)] {
+        if own != Some(d) {
+            ensure!(
+                page_intact(m.dev(d).buf_va, salt),
+                "{what}: the {d:?} buffer changed"
+            );
+        }
+        if m.dev(d).irq != 0 {
+            ensure_eq!(
+                sys::object_signals(m.dev(d).irq).a1 as u32 & sig::INTERRUPT,
+                0,
+                "{what}: the {d:?} domain's vector fired"
+            );
+        }
+    }
+    ensure_eq!(
+        sys::debug_stat(162),
+        notices,
+        "{what}: a notice reached a hart"
+    );
+    ensure_eq!(
+        sys::debug_stat(140),
+        no_route,
+        "{what}: a message on an identity with no route"
+    );
+    Ok(())
+}
+
+/// A device row: device `d` aimed at `target` is refused. The IOMMU faults, `d`'s domain holds a write record at the target's page
+/// and the other domain none, the last fault names `d`, and every bystander is intact (`own` as `bystanders_intact`).
+fn dut_refused(m: &Matrix, d: Dut, target: u64, own: Option<Dut>, what: &str) -> Outcome {
+    let what = alloc::format!("{d:?}: {what}");
+    let base = (sys::debug_stat(162), sys::debug_stat(140));
+    let before = iommu_faults();
+    let served = dut_write(m, d, target)?;
+    // (the test device's result says whether the IOMMU refused its write; the entropy function returns a request whose write was
+    // refused like any other, as QEMU's virtio does, so for it the fault records below are the oracle)
+    ensure!(
+        d == Dut::Rng || !served,
+        "{what}: the test device's write was not refused"
+    );
+    // (at least one record: the entropy function writes its 64 bytes as several transactions, each refused and recorded)
+    ensure!(
+        iommu_wait_faults(before).is_some(),
+        "{what}: the IOMMU took no fault"
+    );
+    let (did, _, _, _) = iommu_last_fault();
+    ensure_eq!(did, m.dev(d).did, "{what}: the last fault names the device");
+    let recs = drain_domain_faults(m.dev(d).sup);
+    ensure!(
+        recs.iter()
+            .any(|&(_, a, dir, _)| a & !0xfff == target & !0xfff && dir == DIR_WRITE),
+        "{what}: no write record at {target:#x} in the device's domain: {recs:x?}"
+    );
+    let others = drain_domain_faults(m.other(d).sup);
+    ensure!(
+        others.is_empty(),
+        "{what}: the other device's domain has records: {others:x?}"
+    );
+    bystanders_intact(m, own, base, &what)
+}
+
+/// Each device of the rig, aimed at the target `target(m, d)` gives.
+fn matrix_row(what: &str, target: impl Fn(&Matrix, Dut) -> Result<u64, Detail>) -> Outcome {
+    with_matrix(|m| {
+        for d in [Dut::Rng, Dut::Tdev] {
+            let t = target(m, d)?;
+            dut_refused(m, d, t, None, what)?;
+        }
+        Ok(())
+    })
+}
+
+/// Row: a descriptor at a kernel address (the first page of the kernel image, `debug_stat` 104).
+fn hostile_dma_at_a_kernel_address() -> Outcome {
+    matrix_row("the kernel image", |_, _| Ok(sys::debug_stat(104)))
+}
+
+/// Row: a descriptor at another process's frame (the pattern frame, by its physical address).
+fn hostile_dma_at_another_process_frame() -> Outcome {
+    matrix_row("another process's frame", |m, _| Ok(m.pa))
+}
+
+/// Row: a descriptor at another device's buffer, by its physical address (by its I/O address it would be this device's own window:
+/// each domain has its own).
+fn hostile_dma_at_another_device_buffer() -> Outcome {
+    matrix_row("another device's buffer", |m, d| Ok(m.other(d).buf_pa))
+}
+
+/// Row: a descriptor at another device's BAR (peer to peer: an address the IOMMU does not map is refused like any other).
+fn hostile_dma_at_another_device_bar() -> Outcome {
+    matrix_row("another device's BAR", |_, d| {
+        let bar = match d {
+            Dut::Rng => tdev_bar(),
+            Dut::Tdev => rng_bar(),
+        };
+        ensure!(bar != 0, "the other device's BAR");
+        Ok(bar)
+    })
+}
+
+/// Row: an IMSIC page as DMA: a device write into every hart's supervisor interrupt file (its `seteipnum` register takes the low word
+/// as an identity). Refused as a translation (the files are not in any domain): the fault and the refusal are the check. Neither
+/// device can choose a word that is a live identity (the test device writes 0x12345678, the entropy function random bytes), so "no hart
+/// is interrupted" (the bystander check) is a backstop here, not the oracle.
+fn hostile_dma_at_an_interrupt_file() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let harts = hart_count(res);
+    sys::handle_close(res);
+    with_matrix(|m| {
+        for d in [Dut::Rng, Dut::Tdev] {
+            for h in 0..harts {
+                dut_refused(
+                    m,
+                    d,
+                    IMSIC_S + h * 4096,
+                    None,
+                    &alloc::format!("hart {h}'s file"),
+                )?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Row: its own buffer, one page beyond (the domain's first free page: its mappings are made lowest first, the buffer last).
+fn hostile_dma_one_page_past_its_buffer() -> Outcome {
+    matrix_row("one page past its buffer", |m, d| {
+        ensure!(
+            d == Dut::Tdev || m.rings_io < m.rng.buf_io,
+            "the rings are below the buffer"
+        );
+        Ok(m.dev(d).buf_io + 4096)
+    })
+}
+
+/// Row: a write through a read-only mapping: the driver maps its own buffer again, for the device to read only, and the device writes
+/// there. Its buffer (both mappings name it) is intact.
+fn hostile_dma_through_a_read_only_mapping() -> Outcome {
+    with_matrix(|m| {
+        for d in [Dut::Rng, Dut::Tdev] {
+            let x = m.dev(d);
+            let (s, ro) = m.drv.map(x.h_dom, x.h_buf, rt::abi::iodomain::READ)?;
+            ensure_eq!(
+                s,
+                Some(S::Ok),
+                "{d:?}: the driver maps its buffer read-only"
+            );
+            let r = dut_refused(m, d, ro, None, "a read-only mapping");
+            ensure_eq!(
+                m.drv.unmap(x.h_dom, ro)?,
+                Some(S::Ok),
+                "{d:?}: and unmaps it"
+            );
+            r?;
+        }
+        Ok(())
+    })
+}
+
+/// Row: use after its own unmap: the driver maps its buffer again, the device writes there (it lands), the driver unmaps it, the
+/// device writes there again: refused, and the buffer keeps what it held after the first write.
+fn hostile_dma_after_its_own_unmap() -> Outcome {
+    with_matrix(|m| {
+        for (d, salt) in [(Dut::Rng, 1), (Dut::Tdev, 2)] {
+            let x = m.dev(d);
+            let (s, io) = m.drv.map(x.h_dom, x.h_buf, 3)?;
+            ensure_eq!(s, Some(S::Ok), "{d:?}: the driver maps its buffer again");
+            let served = dut_write(m, d, io)?;
+            ensure!(
+                served && !page_intact(x.buf_va, salt),
+                "{d:?}: the write through the second mapping lands"
+            );
+            ensure_eq!(m.drv.unmap(x.h_dom, io)?, Some(S::Ok), "{d:?}: unmap it");
+            fill_page(x.buf_va, salt);
+            dut_refused(m, d, io, None, "after its own unmap")?;
+            ensure!(
+                page_intact(x.buf_va, salt),
+                "{d:?}: the unmapped write reached the buffer"
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Row: use after its supervisor destroyed the domain. The device is quarantined (IOMMU-SPEC 6.3, A14): its writes, at its old buffer
+/// address included, are refused and not reported, and the buffer (still the driver's, mapped here) keeps its contents.
+fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
+    for d in [Dut::Rng, Dut::Tdev] {
+        with_matrix(|m| {
+            let x = m.dev(d);
+            let base = (sys::debug_stat(162), sys::debug_stat(140));
+            ok(
+                sys::iodomain_destroy(x.sup),
+                "the supervisor destroys the domain",
+            )?;
+            let faults = iommu_faults();
+            for (target, what) in [(x.buf_io, "its old buffer"), (m.pa, "another frame")] {
+                let served = dut_write(m, d, target)?;
+                ensure!(
+                    !served,
+                    "{d:?}: the quarantined device was served at {what}"
+                );
+            }
+            msi_settle();
+            ensure_eq!(
+                iommu_faults(),
+                faults,
+                "{d:?}: a quarantined device's faults are not reported (A14)"
+            );
+            ensure!(
+                page_intact(x.buf_va, if d == Dut::Rng { 1 } else { 2 }),
+                "{d:?}: the destroyed domain's buffer changed"
+            );
+            bystanders_intact(m, None, base, "after the destroy")
+        })?;
+    }
+    Ok(())
+}
+
+/// Row: use after its supervisor died. The control handle goes to a child that is killed; the domain lives on through the driver's
+/// handle (IOMMU-SPEC 4.5: the last handle destroys it), so the device still reaches its buffer and nothing else (a fault, nobody to
+/// read it); when the driver dies too, the domain goes and the device reaches nothing, unreported.
+fn hostile_dma_after_its_supervisor_died() -> Outcome {
+    for d in [Dut::Rng, Dut::Tdev] {
+        let domains = sys::debug_stat(159);
+        with_matrix(|m| {
+            let sup = match d {
+                Dut::Rng => core::mem::take(&mut m.rng.sup),
+                Dut::Tdev => core::mem::take(&mut m.tdev.sup),
+            };
+            let (supervisor, ch) = launch(15)?;
+            let w = sys::channel_write(ch, [0u8; 4].as_ptr(), 4, [sup].as_ptr(), 1);
+            let killed = sys::process_kill(supervisor, 9);
+            let ended = wait_ended(supervisor, 1000);
+            sys::handle_close(supervisor);
+            sys::handle_close(ch);
+            ensure_eq!(
+                st(w),
+                Some(S::Ok),
+                "the supervisor is given the control handle"
+            );
+            ok(killed, "kill the supervisor")?;
+            ended?;
+            ensure_eq!(
+                sys::debug_stat(159),
+                domains + 2,
+                "{d:?}: the domain outlives its supervisor while the driver holds it"
+            );
+            let x = MDevAt {
+                did: m.dev(d).did,
+                buf_io: m.dev(d).buf_io,
+                buf_va: m.dev(d).buf_va,
+            };
+            let salt = if d == Dut::Rng { 1 } else { 2 };
+            ensure!(
+                dut_write(m, d, x.buf_io)?,
+                "{d:?}: the device reaches its buffer"
+            );
+            fill_page(x.buf_va, salt);
+            let base = (sys::debug_stat(162), sys::debug_stat(140));
+            let before = iommu_faults();
+            dut_write(m, d, m.pa)?;
+            ensure!(
+                iommu_wait_faults(before).is_some(),
+                "{d:?}: the write outside its mapping faulted"
+            );
+            ensure_eq!(
+                iommu_last_fault().0,
+                x.did,
+                "{d:?}: the fault names the device"
+            );
+            bystanders_intact(m, None, base, "after the supervisor died")?;
+            // the driver dies too: the last handle goes and the domain with it
+            let drv = core::mem::replace(
+                &mut m.drv,
+                Hostile {
+                    p: 0,
+                    ch: 0,
+                    hs: Vec::new(),
+                },
+            );
+            drv.end();
+            let t0 = sys::clock_get();
+            while sys::debug_stat(159) != domains + 1 && sys::clock_get() < t0 + 2000 {
+                sys::thread_yield();
+            }
+            ensure_eq!(
+                sys::debug_stat(159),
+                domains + 1,
+                "{d:?}: the domain went with its last handle"
+            );
+            // (no driver is left to drive the device: the suite rings it with the dead driver's descriptor, as a device that kept a
+            // stale request would)
+            let faults = iommu_faults();
+            ensure!(
+                !dut_write_by_the_suite(m, d, x.buf_io)?,
+                "{d:?}: the device reached its old buffer after both died"
+            );
+            msi_settle();
+            ensure_eq!(
+                iommu_faults(),
+                faults,
+                "{d:?}: quarantined: nothing reported"
+            );
+            ensure!(page_intact(x.buf_va, salt), "{d:?}: the old buffer changed");
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// A message row on the entropy function (its MSI-X entry 0 says `(address, data)`, which the rig writes: the worst case of
+/// Q-IOMMU-MSI 6): an IOMMU fault naming the function whose cause is `cause` (any when None), and the bystanders intact.
+fn msi_refused(m: &Matrix, address: u64, data: u32, cause: Option<u64>, what: &str) -> Outcome {
+    let base = (sys::debug_stat(162), sys::debug_stat(140));
+    let before = iommu_faults();
+    msi_send(m.f, &m.rng_domain(), address, data)?;
+    ensure!(
+        iommu_wait_faults(before).is_some(),
+        "{what}: the message raised no fault"
+    );
+    let (did, _, c, ttype) = iommu_last_fault();
+    ensure_eq!(
+        (did, ttype),
+        (IOMMU_TEST_DID, TTYPE_WRITE),
+        "{what}: the fault names the function, a write"
+    );
+    if let Some(cause) = cause {
+        ensure_eq!(c, cause, "{what}: the cause");
+    }
+    msi_settle();
+    ensure!(
+        drain_domain_faults(m.tdev.sup).is_empty(),
+        "{what}: the test device's domain has records"
+    );
+    drain_domain_faults(m.rng.sup);
+    bystanders_intact(m, Some(Dut::Rng), base, what)
+}
+
+/// Message row: another device's vector page and identity (the test device's granted vector: where the kernel sends its notice, as
+/// `debug_stat` 148 says). Refused as a translation (no domain maps an interrupt file) and the vector does not fire.
+fn hostile_msi_at_another_device_vector() -> Outcome {
+    with_matrix(|m| {
+        let route = vector_route(m.tdev.irq);
+        ensure!(route != u64::MAX, "the test device's vector has a route");
+        let (file, id) = (route >> 16, route & 0xffff);
+        msi_refused(
+            m,
+            IMSIC_S + file * 4096,
+            id as u32,
+            None,
+            "another device's vector",
+        )
+    })
+}
+
+/// Message row: the inter-hart identity on every hart's file.
+fn hostile_msi_at_the_inter_hart_identity() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let harts = hart_count(res);
+    sys::handle_close(res);
+    with_matrix(|m| {
+        for h in 0..harts {
+            msi_refused(
+                m,
+                IMSIC_S + h * 4096,
+                1,
+                None,
+                &alloc::format!("the IPI identity of hart {h}"),
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// Message row: the IOMMU's own interrupt identities (its fault queue's and command queue's wired sources, which the kernel routes:
+/// every wired source with a route that the suite did not make, `debug_stat` 145).
+fn hostile_msi_at_the_iommu_identity() -> Outcome {
+    with_matrix(|m| {
+        let mut n = 0;
+        for src in 1..128u64 {
+            let r = rt::syscall(
+                rt::abi::syscall::DEBUG_STAT,
+                [rt::debug::handle() as usize, 145, src as usize, 0, 0, 0],
+            );
+            if r.status != 0 || r.a1 == usize::MAX || src == u64::from(RTC_IRQ) {
+                continue;
+            }
+            let (file, id) = ((r.a1 as u64) >> 16, r.a1 as u64 & 0xffff);
+            msi_refused(
+                m,
+                IMSIC_S + file * 4096,
+                id as u32,
+                None,
+                &alloc::format!("the kernel's source {src} (identity {id} on file {file})"),
+            )?;
+            n += 1;
+        }
+        ensure!(n >= 1, "the IOMMU's fault source has a route");
+        Ok(())
+    })
+}
+
+/// Message row: an ungranted vector of its own (page 3 of its window): MSI entry not valid (cause 262).
+fn hostile_msi_on_an_ungranted_vector() -> Outcome {
+    with_matrix(|m| {
+        let a = m.rng.address + 3 * 4096;
+        msi_refused(m, a, 1, Some(CAUSE_MSI_INVALID), "an ungranted vector")
+    })
+}
+
+/// Message row: a granted vector with a wrong data word. No fault by design (IOMMU-SPEC 8.4: the word sets a bit in the vector's own
+/// file, which sends nothing); the vector does not fire for it, and the stray bit is found and counted (`debug_stat` 147) at the
+/// acknowledgement of a real message.
+fn hostile_msi_with_a_wrong_data_word() -> Outcome {
+    with_matrix(|m| {
+        let base = (sys::debug_stat(162), sys::debug_stat(140));
+        let (before, strays) = (iommu_faults(), sys::debug_stat(147));
+        msi_send(m.f, &m.rng_domain(), m.rng.address, 6)?;
+        msi_settle();
+        ensure_eq!(iommu_faults(), before, "a wrong data word is no fault");
+        bystanders_intact(m, Some(Dut::Rng), base, "a wrong data word")?;
+        msi_send(m.f, &m.rng_domain(), m.rng.address, 1)?;
+        ensure_eq!(
+            st(sys::object_wait(
+                m.rng.irq,
+                sig::INTERRUPT,
+                sys::clock_get() + 2000
+            )),
+            Some(S::Ok),
+            "the right word fires the vector"
+        );
+        ok(sys::interrupt_ack(m.rng.irq), "acknowledge")?;
+        ensure_eq!(
+            sys::debug_stat(147),
+            strays + 1,
+            "the stray bit is counted once"
+        );
+        Ok(())
+    })
+}
+
+/// Message row: after its vectors were revoked (the last handle to the interrupt closed): MSI entry not valid, nothing delivered.
+fn hostile_msi_after_the_vector_is_revoked() -> Outcome {
+    with_matrix(|m| {
+        sys::handle_close(core::mem::take(&mut m.rng.irq));
+        msi_refused(
+            m,
+            m.rng.address,
+            1,
+            Some(CAUSE_MSI_INVALID),
+            "a revoked vector",
+        )
+    })
+}
+
+/// The claim rig (see the section's comment): `body` gets the hostile driver, holding the scratch disk's claim (its handles in
+/// `hs[0..]` in the claim's order: the BAR, the domain, the queue memory, the data buffer, the interrupts) and then a duplicate of the
+/// data buffer without DMA and one without WRITE; and the driver's job. No disk (the no-disk boot): nothing to do.
+fn with_claimed_hostile(body: impl FnOnce(u64, &Hostile, u64, &mut Claimed) -> Outcome) -> Outcome {
+    if !pci_disks_present()? {
+        return Ok(());
+    }
+    with_devmgr(|res, mgr| {
+        let mut b = claim_and_bring_up(mgr, 1, PCI_BLK_DID as u16, 0, &blk_vectors())?;
+        let r = (|| {
+            let data = b.hs[3];
+            let nodma = ok(
+                sys::handle_duplicate(
+                    data,
+                    Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::TRANSFER.0,
+                ),
+                "the buffer without DMA",
+            )?
+            .a1 as u64;
+            let ro = ok(
+                sys::handle_duplicate(
+                    data,
+                    Rights::DMA.0 | Rights::READ.0 | Rights::MAP.0 | Rights::TRANSFER.0,
+                ),
+                "the buffer without WRITE",
+            )?
+            .a1 as u64;
+            let mut hs = core::mem::take(&mut b.hs);
+            hs.extend([nodma, ro]);
+            let drv = Hostile::start(b.job, &hs)?;
+            let r = body(res, &drv, b.job, &mut b);
+            drv.end();
+            r
+        })();
+        b.drop_all();
+        r
+    })
+}
+
+/// The driver's own handles, with no device involved: each refused, and nothing changes (its job's I/O pages, the live mappings).
+fn hostile_own_handle_row(
+    what: &str,
+    want: S,
+    call: impl Fn(&Hostile) -> Result<(Option<S>, u64, u64), Detail>,
+) -> Outcome {
+    with_claimed_hostile(|_, drv, job, _| {
+        let before = (
+            sys::job_info(job, 12).a1,
+            sys::debug_stat(160),
+            sys::debug_stat(159),
+        );
+        let (s, _, _) = call(drv)?;
+        ensure_eq!(s, Some(want), "the driver cannot {what}");
+        ensure_eq!(
+            (
+                sys::job_info(job, 12).a1,
+                sys::debug_stat(160),
+                sys::debug_stat(159)
+            ),
+            before,
+            "{what}: nothing changed"
+        );
+        // and its domain handle still does what it may
+        let (s, io) = drv.map(drv.hs[1], drv.hs[3], 3)?;
+        ensure_eq!(s, Some(S::Ok), "{what}: the driver still maps its buffer");
+        ensure_eq!(drv.unmap(drv.hs[1], io)?, Some(S::Ok), "and unmaps it");
+        Ok(())
+    })
+}
+
+fn hostile_cannot_map_without_the_dma_right() -> Outcome {
+    hostile_own_handle_row("map a VMO it holds without DMA", S::AccessDenied, |d| {
+        d.call(
+            rt::abi::syscall::IODOMAIN_MAP,
+            [d.hs[1], d.hs[d.hs.len() - 2], 0, 1, 3, 0],
+        )
+    })
+}
+
+fn hostile_cannot_map_writable_without_write() -> Outcome {
+    hostile_own_handle_row(
+        "map read-write a buffer it holds without WRITE",
+        S::AccessDenied,
+        |d| {
+            d.call(
+                rt::abi::syscall::IODOMAIN_MAP,
+                [d.hs[1], d.hs[d.hs.len() - 1], 0, 1, 3, 0],
+            )
+        },
+    )
+}
+
+fn hostile_cannot_destroy_its_domain() -> Outcome {
+    hostile_own_handle_row("destroy its domain", S::AccessDenied, |d| {
+        d.call(rt::abi::syscall::IODOMAIN_DESTROY, [d.hs[1], 0, 0, 0, 0, 0])
+    })
+}
+
+fn hostile_cannot_grant_itself_a_vector() -> Outcome {
+    hostile_own_handle_row("grant itself a vector", S::AccessDenied, |d| {
+        d.call(
+            rt::abi::syscall::IODOMAIN_GRANT_VECTOR,
+            [d.hs[1], 2, 0, 0, 0, 0],
+        )
+    })
+}
+
+fn hostile_cannot_read_or_wait_for_its_faults() -> Outcome {
+    hostile_own_handle_row("read its device's faults", S::AccessDenied, |d| {
+        d.call(
+            rt::abi::syscall::IODOMAIN_FAULT_READ,
+            [d.hs[1], 0, 0, 0, 0, 0],
+        )
+    })?;
+    hostile_own_handle_row("wait for its device's faults", S::AccessDenied, |d| {
+        d.call(
+            rt::abi::syscall::OBJECT_WAIT,
+            [d.hs[1], u64::from(sig::DEVICE_FAULT), 0, 0, 0, 0],
+        )
+    })
+}
+
+/// Own-handle row (IOMMU-SPEC 4.8, INVARIANTS D2): the driver learns no physical address by any way it has. The library's two old
+/// calls answer NOT_SUPPORTED without entering the kernel; the retired numbers themselves, issued raw with each of its handles, are
+/// BAD_SYSCALL; the test kernel's physical-address selector (`debug_stat` 164) refuses every handle it holds (none is a debug
+/// resource) and no handle; and it can obtain neither the debug resource nor the root resource.
+fn hostile_learns_no_physical_address() -> Outcome {
+    hostile_own_handle_row(
+        "learn its buffer's physical address",
+        S::NotSupported,
+        |d| d.op(1, 0, [d.hs[3], 0, 0, 0, 0, 0]),
+    )?;
+    hostile_own_handle_row("make a DMA VMO by the old call", S::NotSupported, |d| {
+        d.op(2, 0, [d.hs[3], 1, 0, 0, 0, 0])
+    })?;
+    with_claimed_hostile(|_, drv, _, _| {
+        for &(name, nr) in rt::abi::syscall::RETIRED {
+            for &h in drv.hs.iter().chain(&[0u64]) {
+                let (s, _, _) = drv.call(nr, [h, 1, 0, 0, 0, 0])?;
+                ensure_eq!(
+                    s,
+                    Some(S::BadSyscall),
+                    "the retired {name} ({nr}) raw, with handle {h}"
+                );
+            }
+        }
+        // (a refused call leaves `a1` as it was, the selector: the status is the check)
+        for &h in &drv.hs {
+            let (s, _, _) = drv.call(rt::abi::syscall::DEBUG_STAT, [h, 164, 0x1_0000, 0, 0, 0])?;
+            ensure_eq!(
+                s,
+                Some(S::WrongType),
+                "debug_stat 164 with its handle {h} (no debug resource)"
+            );
+        }
+        let (s, _, _) = drv.call(rt::abi::syscall::DEBUG_STAT, [0, 164, 0x1_0000, 0, 0, 0])?;
+        ensure_eq!(s, Some(S::BadHandle), "debug_stat 164 with no handle");
+        for (nr, what) in [
+            (rt::abi::syscall::DEBUG_ROOT, "the debug resource"),
+            (rt::abi::syscall::RESOURCE_ROOT, "the root resource"),
+        ] {
+            let (s, a1, _) = drv.call(nr, [0; 6])?;
+            ensure_eq!(
+                (s, a1),
+                (Some(S::AccessDenied), 0),
+                "the driver asks for {what}"
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Limits row (OD166 point 4): the driver maps its buffer until refused. NO_MEMORY exactly at the limit `devmgr` set on its job
+/// (`job_info` 12), and then the mappings are given back with nothing leaked; another driver's job (the entropy function claimed
+/// beside it) is not disturbed, before or after.
+fn hostile_maps_until_its_job_refuses() -> Outcome {
+    with_claimed_hostile(|_, drv, job, _| {
+        let doms = (sys::debug_stat(159), sys::debug_stat(160));
+        let (used, limit) = (
+            sys::job_info(job, 12).a1 as u64,
+            sys::job_info(job, 12).a2 as u64,
+        );
+        ensure!(
+            limit != u64::MAX && limit >= used,
+            "the driver's job has a finite limit on I/O-mapped pages: {used} of {limit}"
+        );
+        let mut ios = Vec::new();
+        let r = (|| {
+            loop {
+                let (s, io) = drv.map(drv.hs[1], drv.hs[3], 3)?;
+                match s {
+                    Some(S::Ok) => ios.push(io),
+                    Some(S::NoMemory) => break,
+                    other => ensure!(false, "map {}: {other:?}", ios.len()),
+                }
+                ensure!(ios.len() as u64 <= limit, "more mappings than the limit");
+            }
+            ensure_eq!(
+                used + ios.len() as u64,
+                limit,
+                "refused exactly at the job's limit"
+            );
+            ensure_eq!(
+                sys::job_info(job, 12).a1 as u64,
+                limit,
+                "the job's usage is at its limit"
+            );
+            Ok(())
+        })();
+        for &io in &ios {
+            ensure_eq!(drv.unmap(drv.hs[1], io)?, Some(S::Ok), "unmap {io:#x}");
+        }
+        r?;
+        ensure_eq!(
+            (
+                sys::job_info(job, 12).a1 as u64,
+                sys::debug_stat(159),
+                sys::debug_stat(160)
+            ),
+            (used, doms.0, doms.1),
+            "every mapping came back"
+        );
+        Ok(())
+    })
+}
+
+/// Limits row: a child job with no limits of its own is held to its parent's (the limits are hierarchical, IOMMU-SPEC 5.3). A domain
+/// charged to a child of a driver's job maps and holds vectors only up to the parent's limits; then the child's usage is gone.
+fn hostile_child_job_is_held_to_the_parents_limits() -> Outcome {
+    let doms = (sys::debug_stat(159), sys::debug_stat(160));
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let r = with_test_function(|res, _, _| {
+        let root = root_job()?;
+        let dj = job(root, u64::MAX, u64::MAX, u64::MAX);
+        sys::handle_close(root);
+        let dj = dj?;
+        let r = (|| {
+            ok(sys::job_set_io_limits(dj, 3, 2), "the parent's limits")?;
+            let cj = job(dj, u64::MAX, u64::MAX, u64::MAX)?;
+            let r = (|| {
+                ensure_eq!(
+                    (
+                        sys::job_info(cj, 12).a2 as u64,
+                        sys::job_info(cj, 13).a2 as u64
+                    ),
+                    (3, 2),
+                    "the child's effective limits are the parent's"
+                );
+                let sup = ok(
+                    sys::iodomain_create(res, TDEV_DID, cj),
+                    "a domain charged to the child",
+                )?
+                .a1 as u64;
+                let buf = ok(sys::vmo_create_dma_in(res, 1, cj), "a buffer")?.a1 as u64;
+                let r = (|| {
+                    let drv = Hostile::start(
+                        cj,
+                        &[
+                            ok(
+                                sys::handle_duplicate(
+                                    sup,
+                                    Rights::IO_MAP.0 | Rights::IO_UNMAP.0 | Rights::TRANSFER.0,
+                                ),
+                                "dup",
+                            )?
+                            .a1 as u64,
+                            ok(sys::handle_duplicate(buf, Rights::SAME.0), "dup")?.a1 as u64,
+                        ],
+                    )?;
+                    let r = (|| {
+                        let mut n = 0;
+                        loop {
+                            let (s, _) = drv.map(drv.hs[0], drv.hs[1], 3)?;
+                            match s {
+                                Some(S::Ok) => n += 1,
+                                Some(S::NoMemory) => break,
+                                other => ensure!(false, "map {n}: {other:?}"),
+                            }
+                            ensure!(n <= 3, "past the parent's limit");
+                        }
+                        ensure_eq!(n, 3, "the child maps up to the parent's limit of 3 pages");
+                        ensure_eq!(sys::job_info(dj, 12).a1 as u64, 3, "counted on the parent");
+                        let mut irqs = Vec::new();
+                        for i in 0..4 {
+                            let g = sys::iodomain_grant_vector(sup, i);
+                            if st(g) == Some(S::Ok) {
+                                irqs.push(g.a1 as u64);
+                            } else {
+                                ensure_eq!(st(g), Some(S::NoMemory), "vector {i}: the limit");
+                                break;
+                            }
+                        }
+                        let held = irqs.len();
+                        for h in irqs {
+                            sys::handle_close(h);
+                        }
+                        ensure_eq!(
+                            held,
+                            2,
+                            "the child's domain holds the parent's limit of 2 vectors"
+                        );
+                        Ok(())
+                    })();
+                    drv.end();
+                    r
+                })();
+                sys::handle_close(buf);
+                sys::handle_close(sup);
+                r
+            })();
+            let t0 = sys::clock_get();
+            while (sys::job_info(dj, 12).a1, sys::job_info(dj, 13).a1) != (0, 0)
+                && sys::clock_get() < t0 + 2000
+            {
+                sys::thread_yield();
+            }
+            let back = (sys::job_info(dj, 12).a1, sys::job_info(dj, 13).a1);
+            sys::handle_close(cj);
+            r?;
+            ensure_eq!(back, (0, 0), "the parent's usage comes back");
+            Ok(())
+        })();
+        sys::handle_close(dj);
+        r
+    });
+    r.and(domains_at_baseline(doms))
+        .and(vectors_at_baseline(live, ids))
+}
+
+/// Limits row: every driver job `devmgr` claims for has finite limits of both kinds (`job_info` 12 and 13), seen on the jobs the
+/// suite names in its claims: the block function (`ClaimPci`) and the entropy source (`ClaimPci` of its requester id). (`OpenBlock`,
+/// `ClaimNet` and `ClaimRng` set them through the same `pcicore::claim`, whose host test checks the limits for every class.)
+fn every_driver_job_has_finite_io_limits() -> Outcome {
+    if !pci_disks_present()? {
+        return Ok(());
+    }
+    with_devmgr(|_, mgr| {
+        for (k, rid, vectors) in [
+            (0u64, PCI_BLK_DID as u16, blk_vectors()),
+            (
+                1,
+                PCI_RNG_RID,
+                virtio::VectorMap {
+                    config: virtio::NO_VECTOR,
+                    queues: vec![0],
+                },
+            ),
+        ] {
+            let b = claim_and_bring_up(mgr, 10 + k as u32, rid, k, &vectors)?;
+            let r = (|| {
+                for which in [12u64, 13] {
+                    let i = sys::job_info(b.job, which);
+                    ensure_eq!(st(i), Some(S::Ok), "job_info {which}");
+                    ensure!(
+                        (i.a2 as u64) < 1 << 20 && i.a2 as u64 >= i.a1 as u64,
+                        "{rid:#x}: the driver's job's limit {which} is finite: {} of {:#x}",
+                        i.a1,
+                        i.a2
+                    );
+                }
+                Ok(())
+            })();
+            b.drop_all();
+            r?;
+        }
+        Ok(())
+    })
+}
+
+/// T42 (2026-11-24) section 4, against the kernel's mechanism: a supervisor (`devmgr`) and its `blkd` are killed with a read in flight
+/// (the device writing the driver's buffer). The domain goes with its last handle, after its fence (IOMMU-SPEC 6.3), and only then
+/// are the buffer's frames freed. The test then fills memory with a pattern (fresh DMA VMOs: the frames the allocator gives back first
+/// are the ones just freed), waits well past the request, and checks the pattern; then every baseline. The negative control
+/// `fault-iommu-skip-inval` (an unmap that frees without the invalidation and the fence) is run against it by hand (TEST-TOOLS.md):
+/// as with `iodomain_unmap_stops_the_device`, QEMU's device finishes a request before the kernel frees anything far more often than
+/// not, so the control fails here only when the request is still running at the free.
+fn dma_survives_a_dead_supervisor() -> Outcome {
+    let Some(rig) = blk_rig()? else {
+        return Ok(());
+    };
+    let doms = (sys::debug_stat(159), sys::debug_stat(160));
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let leaked = sys::debug_stat(158);
+    let r = (|| {
+        let d = rig.spawn()?;
+        // a request answered: the driver has the device up; then a long read in flight
+        let (s, _) = blk_call(
+            d.ch,
+            1,
+            blk::Op::Read {
+                sector: 0,
+                count: 1,
+            },
+        )?;
+        ensure_eq!(s, blk::Status::Ok, "a first read");
+        let req = blk::Request {
+            txid: 2,
+            op: blk::Op::Read {
+                sector: 100,
+                count: 16,
+            },
+        }
+        .encode();
+        ensure_eq!(
+            st(sys::channel_write(
+                d.ch,
+                req.as_ptr(),
+                req.len(),
+                core::ptr::null(),
+                0
+            )),
+            Some(S::Ok),
+            "a read in flight"
+        );
+        // both die at once: the driver and the supervisor that holds the domain's control handle
+        let k1 = sys::process_kill(d.p, 9);
+        let k2 = sys::process_kill(rig.mgr, 9);
+        ensure_eq!((st(k1), st(k2)), (Some(S::Ok), Some(S::Ok)), "kill both");
+        wait_ended(d.p, 2000)?;
+        wait_ended(rig.mgr, 2000)?;
+        drop(d);
+        // reused frames, filled
+        let res = rig.res;
+        let mut fills = Vec::new();
+        let r = (|| {
+            for k in 0..8u64 {
+                let v = ok(sys::vmo_create_dma_in(res, 4, 0), "fill memory")?.a1 as u64;
+                fills.push(v);
+                map_here(v, SCRATCH_VA + k * 4 * 4096, 4, PF_R | PF_W)?;
+                for p in 0..4 {
+                    fill_page(SCRATCH_VA + (k * 4 + p) * 4096, k * 4 + p);
+                }
+            }
+            nap_ticks(300);
+            for k in 0..32u64 {
+                ensure!(
+                    page_intact(SCRATCH_VA + k * 4096, k),
+                    "page {k} of the reused memory changed after the supervisor and the driver died"
+                );
+            }
+            Ok(())
+        })();
+        for (k, v) in fills.into_iter().enumerate() {
+            unmap_here(SCRATCH_VA + k as u64 * 4 * 4096);
+            sys::handle_close(v);
+        }
+        r
+    })();
+    // the supervisor that would have reset the function is dead: it is left running (DRIVER_OK, MSI-X on, bus mastering on, every
+    // transaction refused), so the suite stands in for the teardown `devmgr` would have done, for the tests after this one
+    let quiet = with_function(PCI_BLK_SLOT, PCI_BLK_ID, |_, _, _| Ok(()));
+    drop(rig);
+    r?;
+    quiet?;
+    domains_at_baseline(doms)?;
+    vectors_at_baseline(live, ids)?;
+    ensure_eq!(sys::debug_stat(158), leaked, "no frame leaked");
+    Ok(())
 }
 
 // --- Futexes and sleeping locks (S7b) -----------------------------------------------------------
@@ -14338,29 +15916,122 @@ extern "C" fn placement_probe(_: usize) -> ! {
     sys::thread_exit(0)
 }
 
+/// IOMMU12 (IOMMU-SPEC 2.6, 4.8; D1, D2): no device that can do DMA is reachable outside the IOMMU, and no physical address is
+/// learnable. With the root resource, the eight virtio-mmio slots of QEMU `virt` at their fixed addresses (whose DMA the IOMMU does not
+/// see; `kcore/tests/devwin.rs` checks the real tree as a whole), fw-cfg (whose DMA interface
+/// writes guest RAM) and the IOMMU's own registers are refused as device memory, and the slots' interrupt sources are not admitted;
+/// `sys_vmo_phys_addr` and the two-argument `sys_vmo_create_dma` are the library's stubs, which answer NOT_SUPPORTED whatever the
+/// arguments; and their old numbers are not calls of the kernel (BAD_SYSCALL), through the library's raw entry or a bare `ecall`.
+fn no_dma_device_outside_the_iommu() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let r = (|| {
+        for slot in 0..8u64 {
+            let pa = 0x1000_1000 + slot * 0x1000;
+            ensure_eq!(
+                st(sys::vmo_create_physical(res, pa, 4096)),
+                Some(S::InvalidArgs),
+                "virtio-mmio slot {slot} at {pa:#x} is no device window"
+            );
+            // its wired source (1 + slot on QEMU `virt`) is not admitted either
+            ensure_eq!(
+                st(sys::interrupt_create(res, 1 + slot as u32)),
+                Some(S::InvalidArgs),
+                "virtio-mmio slot {slot}'s interrupt source"
+            );
+        }
+        for (pa, len, what) in [
+            (
+                0x1000_1000u64,
+                0x8000u64,
+                "the eight virtio-mmio slots at once",
+            ),
+            (0x1010_0000, 4096, "fw-cfg"),
+            (0x1010_0000, 0x1000, "fw-cfg's DMA interface page"),
+            (0x301_0000, 4096, "the IOMMU's register page"),
+        ] {
+            ensure_eq!(
+                st(sys::vmo_create_physical(res, pa, len)),
+                Some(S::InvalidArgs),
+                "{what}"
+            );
+        }
+        // the two calls the kernel no longer provides: the library keeps them as stubs (KERNEL-V1-SPEC 3.1) that answer NOT_SUPPORTED
+        // without entering the kernel, whatever the arguments, a real DMA VMO, a plain one and the resource included
+        for name in ["VMO_PHYS_ADDR", "VMO_CREATE_DMA"] {
+            ensure!(
+                rt::library::stub(name) != 0,
+                "the system library has the stub of {name}"
+            );
+        }
+        let dma = ok(sys::vmo_create_dma_in(res, 1, 0), "a DMA VMO")?.a1 as u64;
+        let plain = vmo(1)?;
+        let args = [0, 1, 4, 64, 65, 1024, u64::MAX, res, dma, plain];
+        for &a in &args {
+            let r = sys::vmo_phys_addr(a);
+            ensure_eq!(
+                (st(r), r.a1, r.a2),
+                (Some(S::NotSupported), 0, 0),
+                "sys_vmo_phys_addr({a:#x})"
+            );
+            for &b in &args {
+                let r = sys::vmo_create_dma(a, b);
+                ensure_eq!(
+                    (st(r), r.a1, r.a2),
+                    (Some(S::NotSupported), 0, 0),
+                    "sys_vmo_create_dma({a:#x}, {b:#x})"
+                );
+            }
+        }
+        // and their numbers are not calls: through the library's raw entry and a bare `ecall` alike
+        for &(name, n) in rt::abi::syscall::RETIRED {
+            for a in [
+                [0usize; 6],
+                [res as usize, 1, 0, 0, 0, 0],
+                [dma as usize, 0, 0, 0, 0, 0],
+            ] {
+                ensure_eq!(
+                    st(rt::library::raw(n, a)),
+                    Some(S::BadSyscall),
+                    "{name} ({n}) through sys_raw"
+                );
+                ensure_eq!(
+                    st(rt::syscall(n, a)),
+                    Some(S::BadSyscall),
+                    "{name} ({n}) by ecall"
+                );
+            }
+        }
+        sys::handle_close(dma);
+        sys::handle_close(plain);
+        Ok(())
+    })();
+    sys::handle_close(res);
+    r
+}
+
 fn device_caps_need_the_resource() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let ev = event()?;
     let plain = vmo(1)?;
-    // no resource, no device objects
+    // no resource, no device objects (the RTC's page is a window of every machine here)
     ensure_eq!(
-        st(sys::vmo_create_physical(0xdead, 0x1000_1000, 4096)),
+        st(sys::vmo_create_physical(0xdead, 0x10_1000, 4096)),
         Some(S::BadHandle),
         "bad handle"
     );
     ensure_eq!(
-        st(sys::vmo_create_physical(ev, 0x1000_1000, 4096)),
+        st(sys::vmo_create_physical(ev, 0x10_1000, 4096)),
         Some(S::WrongType),
         "an event is no resource"
     );
     ensure_eq!(
-        st(sys::vmo_create_dma(ev, 1)),
+        st(sys::vmo_create_dma_in(ev, 1, 0)),
         Some(S::WrongType),
         "dma: an event is no resource"
     );
     let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u64;
     ensure_eq!(
-        st(sys::vmo_create_physical(weak, 0x1000_1000, 4096)),
+        st(sys::vmo_create_physical(weak, 0x10_1000, 4096)),
         Some(S::AccessDenied),
         "no MANAGE"
     );
@@ -14387,7 +16058,7 @@ fn device_caps_need_the_resource() -> Outcome {
         );
     }
     ensure_eq!(
-        st(sys::vmo_create_dma(weak, 1)),
+        st(sys::vmo_create_dma_in(weak, 1, 0)),
         Some(S::AccessDenied),
         "dma: no MANAGE"
     );
@@ -14444,18 +16115,22 @@ fn device_caps_need_the_resource() -> Outcome {
     for (pa, len, what) in [
         (sys::debug_stat(100), 4096u64, "RAM"),
         (sys::debug_stat(104), 4096, "the kernel image"),
-        (0x1000_0000, 4096, "just below the window"),
-        (0x1000_9000, 4096, "just above the window"),
-        (0x1000_8000, 8192, "straddling the end"),
-        (0x1000_1001, 4096, "misaligned"),
-        (0x1000_1000, 0, "empty"),
-        (0x1000_1000, 100, "not a whole page"),
+        (
+            0x10_0000,
+            4096,
+            "just below the RTC's page (the test finisher)",
+        ),
+        (0x10_2000, 4096, "just above the RTC's page"),
+        (0x10_1000, 8192, "straddling the RTC's page's end"),
+        (0x10_1001, 4096, "misaligned"),
+        (0x10_1000, 0, "empty"),
+        (0x10_1000, 100, "not a whole page"),
         (u64::MAX - 4095, 4096, "wrapping"),
         // PL5a: the windows come from the device tree and fail closed. What the kernel or the firmware drives, and what nobody decided
-        // a process may touch, on the live tree, are refused: the test finisher, the CLINT, the M-level APLIC, the S-level APLIC and its
-        // upper half, both IMSIC files, fw-cfg (its DMA interface writes guest RAM), both flash banks, the IOMMU's registers (IOMMU5:
-        // the kernel drives them), the PCI host's I/O-port window (IOMMU-SPEC 2.6: only its ECAM and memory windows are windows)
-        (0x10_0000, 4096, "the test finisher"),
+        // a process may touch, on the live tree, are refused: the CLINT, the M-level APLIC, the S-level APLIC and its upper half, both
+        // IMSIC files, fw-cfg (its DMA interface writes guest RAM), both flash banks, the IOMMU's registers (IOMMU5: the kernel drives
+        // them), the PCI host's I/O-port window (IOMMU-SPEC 2.6: only its ECAM and memory windows are windows), and since IOMMU12 every
+        // virtio-mmio slot (their DMA is outside the IOMMU: `no_dma_device_outside_the_iommu`)
         (0x200_0000, 4096, "the CLINT"),
         (0xc00_0000, 4096, "the M-level APLIC"),
         (0xd00_0000, 4096, "the S-level APLIC"),
@@ -14467,6 +16142,7 @@ fn device_caps_need_the_resource() -> Outcome {
         (0x2200_0000, 4096, "flash bank 1"),
         (0x301_0000, 4096, "the IOMMU's registers"),
         (0x300_0000, 4096, "the PCI I/O-port window"),
+        (0x1000_1000, 4096, "the first virtio-mmio slot"),
         (0x8000_0000, 4096, "just above the PCI 32-bit window (RAM)"),
     ] {
         let r = sys::vmo_create_physical(res, pa, len);
@@ -14484,17 +16160,10 @@ fn device_caps_need_the_resource() -> Outcome {
         let r = ok(sys::vmo_create_physical(res, pa, 4096), what)?;
         sys::handle_close(r.a1 as u64);
     }
-    // the RTC page is a window too (the first entry of the table the kernel built from the tree)
-    let rtc = ok(
+    // a good one, the RTC page (the first entry of the table the kernel built from the tree); the kernel will not copy through it
+    let dev = ok(
         sys::vmo_create_physical(res, 0x10_1000, 4096),
         "the RTC page",
-    )?
-    .a1 as u64;
-    sys::handle_close(rtc);
-    // a good one; the kernel will not copy through it
-    let dev = ok(
-        sys::vmo_create_physical(res, 0x1000_1000, 4096),
-        "an MMIO VMO",
     )?
     .a1 as u64;
     let mut b = [0u8; 4];
@@ -14508,53 +16177,61 @@ fn device_caps_need_the_resource() -> Outcome {
         Some(S::NotSupported),
         "no vmo_write of device memory"
     );
+    // nor through a mapping of it: a syscall pointing into device memory is refused (D1)
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, dev, 0x400_0000, 0, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the RTC page"
+    );
+    ensure_eq!(
+        st(sys::vmo_read(plain, 0, 0x400_0010 as *mut u8, 4)),
+        Some(S::InvalidArgs),
+        "kernel copy into a device mapping"
+    );
+    ensure_eq!(
+        st(sys::debug_write(
+            // SAFETY: the range is mapped (device memory); the slice is only handed to the kernel, which must refuse it, and never
+            // read here.
+            unsafe { core::slice::from_raw_parts(0x400_0000 as *const u8, 4) }
+        )),
+        Some(S::InvalidArgs),
+        "kernel copy out of a device mapping"
+    );
+    ensure_eq!(st(sys::process_unmap(me, 0x400_0000)), Some(S::Ok), "unmap");
+    sys::handle_close(me);
+    // D2 (IOMMU-SPEC 4.8): no physical address, for device memory, a plain VMO or a DMA VMO, with or without the DMA right
     ensure_eq!(
         st(sys::vmo_phys_addr(dev)),
-        Some(S::AccessDenied),
-        "an MMIO VMO has no DMA right"
+        Some(S::NotSupported),
+        "device memory has no address to learn"
     );
     ensure_eq!(
         st(sys::vmo_phys_addr(plain)),
-        Some(S::AccessDenied),
-        "a plain VMO has no DMA right"
+        Some(S::NotSupported),
+        "a plain VMO has no address to learn"
     );
-    // DMA: limits, charging, the address only through the DMA right
+    // DMA (`vmo_create_dma_in`): limits, charging, zeroed
     ensure_eq!(
-        st(sys::vmo_create_dma(res, 0)),
+        st(sys::vmo_create_dma_in(res, 0, 0)),
         Some(S::InvalidArgs),
         "zero pages"
     );
-    ensure_eq!(
-        st(sys::vmo_create_dma(res, 65)),
-        Some(S::InvalidArgs),
-        "over the per-object limit"
-    );
     let root = root_job()?;
     let before = job_use(root, 2)?.0;
-    let dma = ok(sys::vmo_create_dma(res, 4), "a DMA VMO")?.a1 as u64;
+    let dma = ok(sys::vmo_create_dma_in(res, 4, 0), "a DMA VMO")?.a1 as u64;
     let after = job_use(root, 2)?.0;
     ensure_eq!(
         after - before,
         4,
         "the pages are charged to the creator's job at creation"
     );
-    let pa = ok(sys::vmo_phys_addr(dma), "phys addr")?.a1 as u64;
-    ensure!(
-        pa.is_multiple_of(4096)
-            && (sys::debug_stat(100)..sys::debug_stat(101)).contains(&(pa as u64)),
-        "a RAM address: {pa:#x}"
+    ensure_eq!(
+        st(sys::vmo_phys_addr(dma)),
+        Some(S::NotSupported),
+        "a DMA VMO with the DMA right has no address to learn"
     );
     ensure_eq!(job_use(root, 2)?.0, after, "asking costs nothing");
-    let lesser = ok(
-        sys::handle_duplicate(dma, Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0),
-        "dup without DMA",
-    )?
-    .a1 as u64;
-    ensure_eq!(
-        st(sys::vmo_phys_addr(lesser)),
-        Some(S::AccessDenied),
-        "a duplicate without DMA cannot learn the address"
-    );
     // zeroed, readable and writable through the normal calls
     let mut buf = [0xffu8; 16];
     ensure_eq!(
@@ -14565,7 +16242,6 @@ fn device_caps_need_the_resource() -> Outcome {
     ensure!(buf == [0u8; 16], "a DMA buffer starts zeroed");
     // closing every handle gives the pages back
     sys::handle_close(dma);
-    sys::handle_close(lesser);
     job_use_settles(root, 2, before, 1000)?;
     sys::handle_close(dev);
     for h in [res, weak, ev, plain, root] {
@@ -14587,123 +16263,10 @@ fn a_child_has_no_device_authority() -> Outcome {
     Ok(())
 }
 
-/// A virtio-blk device found by scanning the eight slots: its mapped page and PLIC source.
-struct Blk {
-    regs: *mut u32,
-    irq: u32,
-}
-
-const MMIO_VA: u64 = 0x600_0000;
-const DMA_VA: u64 = 0x500_0000;
-
-fn rd(b: &Blk, off: usize) -> u32 {
-    // SAFETY: `b.regs` is a mapped virtio-mmio slot (4 KiB of device memory) and `off` is a
-    // register offset inside it.
-    unsafe { core::ptr::read_volatile(b.regs.byte_add(off)) }
-}
-
-fn wr(b: &Blk, off: usize, v: u32) {
-    // SAFETY: as in `rd`.
-    unsafe { core::ptr::write_volatile(b.regs.byte_add(off), v) }
-}
-
-/// Map the virtio-mmio window and find a block device (None when the machine has no disk).
-fn find_blk(res: u64) -> Result<Option<Blk>, Detail> {
-    let dev = ok(
-        sys::vmo_create_physical(res, 0x1000_1000, 8 * 4096),
-        "the MMIO window",
-    )?
-    .a1 as u64;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-    ensure_eq!(
-        st(sys::process_map(me, dev, MMIO_VA, 0, 8 * 4096, PF_R | PF_W)),
-        Some(S::Ok),
-        "map the window"
-    );
-    for slot in 0..8usize {
-        let b = Blk {
-            regs: (MMIO_VA as usize + slot * 4096) as *mut u32,
-            irq: slot as u32 + 1,
-        };
-        if rd(&b, 0) == 0x7472_6976 && rd(&b, 8) == 2 {
-            ensure_eq!(
-                rd(&b, 4),
-                2,
-                "the modern transport (the harness passes force-legacy=false)"
-            );
-            sys::handle_close(dev);
-            sys::handle_close(me);
-            return Ok(Some(b));
-        }
-    }
-    // no block device: leave nothing mapped (a later caller maps the window again)
-    sys::process_unmap(me, MMIO_VA);
-    sys::handle_close(dev);
-    sys::handle_close(me);
-    Ok(None)
-}
-
-/// Bring the device up with one queue of 8 descriptors in the DMA buffer at `pa`; the buffer
-/// layout is: descriptors at 0, available ring at 128, used ring at 256, request header at 512,
-/// data at 1024, status byte at 2048.
-fn blk_up(b: &Blk, pa: u64) -> Outcome {
-    wr(b, 0x70, 0); // reset
-    wr(b, 0x70, 1); // ACKNOWLEDGE
-    wr(b, 0x70, 1 | 2); // DRIVER
-    wr(b, 0x14, 1); // device features, high word
-    ensure!(rd(b, 0x10) & 1 != 0, "the device offers VIRTIO_F_VERSION_1");
-    wr(b, 0x24, 1);
-    wr(b, 0x20, 1); // we accept VERSION_1 and nothing else
-    wr(b, 0x24, 0);
-    wr(b, 0x20, 0);
-    wr(b, 0x70, 1 | 2 | 8); // FEATURES_OK
-    ensure!(rd(b, 0x70) & 8 != 0, "the device accepted our features");
-    wr(b, 0x30, 0); // queue 0
-    ensure!(rd(b, 0x34) >= 8, "queue size");
-    wr(b, 0x38, 8);
-    for (lo, at) in [(0x80, 0u64), (0x90, 128), (0xa0, 256)] {
-        wr(b, lo, (pa + at) as u32);
-        wr(b, lo + 4, ((pa + at) >> 32) as u32);
-    }
-    wr(b, 0x44, 1); // QueueReady
-    wr(b, 0x70, 1 | 2 | 8 | 4); // DRIVER_OK
-    Ok(())
-}
-
-/// Submit one read of sector 0 (3 descriptors) and ring the doorbell. `n` is how many requests
-/// were submitted before (the available index).
-fn blk_read_sector0(b: &Blk, pa: u64, n: u16) {
-    let base = DMA_VA as usize;
-    let put = |off: usize, v: u64, len: usize| {
-        for i in 0..len {
-            // SAFETY: the DMA buffer is mapped read-write at DMA_VA for 4 pages.
-            unsafe { core::ptr::write_volatile((base + off + i) as *mut u8, (v >> (8 * i)) as u8) };
-        }
-    };
-    // header: type 0 (IN), reserved 0, sector 0
-    put(512, 0, 8);
-    put(520, 0, 8);
-    // descriptors: addr (8), len (4), flags (2), next (2)
-    for (d, (addr, len, flags, next)) in [
-        (pa + 512, 16u64, 1u64, 1u64),
-        (pa + 1024, 512, 1 | 2, 2),
-        (pa + 2048, 1, 2, 0),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        put(d * 16, addr, 8);
-        put(d * 16 + 8, len | (flags << 32) | (next << 48), 8);
-    }
-    put(2048, 0xff, 1); // status the device must overwrite
-                        // available ring: flags 0, idx n+1, ring[n % 8] = 0
-    put(128 + 4 + 2 * (n as usize % 8), 0, 2);
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    put(128 + 2, u64::from(n) + 1, 2);
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    wr(b, 0x50, 0); // QueueNotify
-}
-
+/// D5 for a wired source (IOMMU4's route code; since IOMMU12 on the RTC, the one wired device left: its alarm raises a level that stays
+/// high until cleared): the object fires once for a raised line, the source stays masked until the acknowledgement, an acknowledgement
+/// with the line still high fires again at once (the kernel re-pends it: `fault-aia-no-repend` must fail here), the acknowledgement
+/// unmasks it (`fault-aia-no-unmask` must fail here), and closing the object frees the source.
 fn interrupt_object_fires_and_masks() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     // argument checks that hold on every machine
@@ -14715,168 +16278,134 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     ensure_eq!(
         st(sys::interrupt_create(res, 9)),
         Some(S::InvalidArgs),
-        "above the allowed range"
+        "a source of no admitted device"
     );
     ensure_eq!(
-        st(sys::interrupt_create(0xdead, 1)),
+        st(sys::interrupt_create(0xdead, RTC_IRQ)),
         Some(S::BadHandle),
         "no resource"
     );
     let ev = event()?;
     ensure_eq!(
-        st(sys::interrupt_create(ev, 1)),
+        st(sys::interrupt_create(ev, RTC_IRQ)),
         Some(S::WrongType),
         "an event is no resource"
     );
-    let Some(b) = find_blk(res)? else {
-        return Ok(()); // no disk attached (OS_DISK=0): nothing more to provoke
-    };
-    let probe = sys::interrupt_create(res, b.irq);
-    if st(probe) == Some(S::NotSupported) {
-        // no interrupt controller (plain `virt`): drivers poll; the harness checks which machine this is
-        // (the window stays mapped otherwise, and the next test that looks for the disk cannot map it)
-        let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-        sys::process_unmap(me, MMIO_VA);
-        return Ok(());
-    }
-    let irq = ok(probe, "interrupt_create")?.a1 as u64;
-    ensure_eq!(
-        st(sys::interrupt_create(res, b.irq)),
-        Some(S::BadState),
-        "one object per source"
-    );
-    // a DMA buffer for the queue and one request
-    let dma = ok(sys::vmo_create_dma(res, 4), "DMA")?.a1 as u64;
-    let pa = ok(sys::vmo_phys_addr(dma), "phys")?.a1 as u64;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-    ensure_eq!(
-        st(sys::process_map(me, dma, DMA_VA, 0, 4 * 4096, PF_R | PF_W)),
-        Some(S::Ok),
-        "map the DMA buffer"
-    );
-    blk_up(&b, pa)?; // resets the device, so its line is low from here on
-                     // A source can be asserted from before the object existed (an earlier driver's last request, a
-                     // level the AIA re-pends when the source is enabled): one spurious interrupt after create is allowed
-                     // (SYSCALLS.md). Take it if it came, then the object must be idle.
-    nap_ticks(3);
-    let mut base = 0; // claims taken before the real request (the spurious one counts)
-    if sys::object_signals(irq).a1 as u32 & sig::INTERRUPT != 0 {
-        let spurious = sys::interrupt_ack(irq);
-        ensure_eq!(
-            st(spurious),
-            Some(S::Ok),
-            "acknowledge the spurious interrupt"
-        );
-        base = spurious.a1;
-        nap_ticks(3);
-    }
-    ensure_eq!(
-        st(sys::interrupt_ack(irq)),
-        Some(S::BadState),
-        "nothing to acknowledge yet"
-    );
-    ensure_eq!(
-        sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
-        0,
-        "quiet before anything happens"
-    );
-    sys::debug_write(b"s6: interrupt path exercised\n");
-    let t0 = sys::clock_get();
-    blk_read_sector0(&b, pa, 0);
-    let r = sys::object_wait(irq, sig::INTERRUPT, t0 + 1000);
-    ensure_eq!(
-        st(r),
-        Some(S::Ok),
-        "the device's interrupt reaches the object"
-    );
-    // woken by the interrupt, not by the deadline running out (the wait re-reads the signals at
-    // its deadline, so a missing wake-up would still return Ok, a second late)
-    ensure!(sys::clock_get() - t0 < 200, "the waiter was woken late");
-    ensure!(
-        rd(&b, 0x60) & 1 != 0,
-        "the device says a used buffer is pending"
-    );
-    // SAFETY: the status byte and first data bytes of the buffer mapped above.
-    let (status, d0, d1) = unsafe {
-        (
-            core::ptr::read_volatile((DMA_VA + 2048) as *const u8),
-            core::ptr::read_volatile((DMA_VA + 1024) as *const u8),
-            core::ptr::read_volatile((DMA_VA + 1025) as *const u8),
-        )
-    };
-    ensure_eq!(
-        (status, d0, d1),
-        (0, 3, 10),
-        "the sector 0 pattern came through DMA"
-    );
-    // the device line stays asserted until we clear InterruptStatus: the source is masked, so the
-    // kernel is not taking it again and again. Give it time, then count the claims.
-    let t0 = sys::clock_get();
-    let _ = sys::object_wait(ev, 1 << 24, t0 + 30);
-    ensure_eq!(
-        sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
-        sig::INTERRUPT,
-        "still pending until acknowledged"
-    );
-    // acknowledge with the line still high: the source is unmasked and the level fires again at
-    // once (an AIA source in MSI mode pends only on a rising edge, so the kernel must re-pend it)
-    let ack = ok(
-        sys::interrupt_ack(irq),
-        "acknowledge with the line still high",
-    )?;
-    ensure_eq!(ack.a1, base + 1, "exactly one claim for one request");
-    let again = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 200);
-    ensure_eq!(
-        st(again),
-        Some(S::Ok),
-        "an acknowledged source whose line is still high fires again"
-    );
-    // quiet the device, then acknowledge: the source is unmasked and nothing more arrives
-    wr(&b, 0x64, 1);
-    let ack = ok(sys::interrupt_ack(irq), "acknowledge")?;
-    ensure_eq!(ack.a1, base + 2, "the re-fire was the second claim");
-    ensure_eq!(
-        sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
-        0,
-        "the acknowledgement clears the signal"
-    );
-    let r = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20);
-    ensure_eq!(
-        st(r),
-        Some(S::TimedOut),
-        "nothing more once the device is quiet"
-    );
-    let t1 = sys::clock_get();
-    blk_read_sector0(&b, pa, 1);
-    let r = sys::object_wait(irq, sig::INTERRUPT, t1 + 1000);
-    ensure_eq!(st(r), Some(S::Ok), "a later request interrupts again");
-    ensure!(
-        sys::clock_get() - t1 < 200,
-        "the second waiter was woken late"
-    );
-    wr(&b, 0x64, 1);
-    sys::interrupt_ack(irq);
-    // leave the device quiet and everything released
-    wr(&b, 0x70, 0);
-    ensure_eq!(st(sys::process_unmap(me, DMA_VA)), Some(S::Ok), "unmap DMA");
-    ensure_eq!(
-        st(sys::process_unmap(me, MMIO_VA)),
-        Some(S::Ok),
-        "unmap MMIO"
-    );
-    // closing the object releases the source: a new object can own it, with a pending interrupt
-    // or not, and nothing is left enabled when the last one goes
-    sys::handle_close(irq);
-    let again = ok(
-        sys::interrupt_create(res, b.irq),
-        "the source is free again after close",
-    )?
-    .a1 as u64;
-    sys::handle_close(again);
-    for h in [dma, me, res, ev] {
-        sys::handle_close(h);
-    }
-    Ok(())
+    sys::handle_close(ev);
+    sys::handle_close(res);
+    with_rtc(|res| {
+        let Some(irq) = rtc_object(res)? else {
+            return Ok(()); // no interrupt controller or no admitted RTC source: nothing to provoke
+        };
+        let r = (|| {
+            ensure_eq!(
+                st(sys::interrupt_create(res, RTC_IRQ)),
+                Some(S::BadState),
+                "one object per source"
+            );
+            rtc_quiet();
+            // A source can be asserted from before the object existed (an earlier test's alarm, a level the AIA re-pends when the
+            // source is enabled): one spurious interrupt after create is allowed (SYSCALLS.md). Take it if it came, then the object
+            // must be idle.
+            nap_ticks(3);
+            let mut base = 0; // claims taken before the real one (the spurious one counts)
+            if sys::object_signals(irq).a1 as u32 & sig::INTERRUPT != 0 {
+                let spurious = sys::interrupt_ack(irq);
+                ensure_eq!(
+                    st(spurious),
+                    Some(S::Ok),
+                    "acknowledge the spurious interrupt"
+                );
+                base = spurious.a1;
+                nap_ticks(3);
+            }
+            ensure_eq!(
+                st(sys::interrupt_ack(irq)),
+                Some(S::BadState),
+                "nothing to acknowledge yet"
+            );
+            ensure_eq!(
+                sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
+                0,
+                "quiet before anything happens"
+            );
+            sys::debug_write(b"s6: interrupt path exercised\n");
+            let t0 = sys::clock_get();
+            rtc_raise();
+            ensure_eq!(
+                st(sys::object_wait(irq, sig::INTERRUPT, t0 + 1000)),
+                Some(S::Ok),
+                "the RTC's interrupt reaches the object"
+            );
+            // woken by the interrupt, not by the deadline running out (the wait re-reads the signals at its deadline, so a missing
+            // wake-up would still return Ok, a second late)
+            ensure!(sys::clock_get() - t0 < 200, "the waiter was woken late");
+            // the line stays high until the alarm is cleared: the source is masked, so the kernel is not taking it again and again.
+            // Give it time, then count the claims.
+            nap_ticks(30);
+            ensure_eq!(
+                sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
+                sig::INTERRUPT,
+                "still pending until acknowledged"
+            );
+            // acknowledge with the line still high: the source is unmasked and the level fires again at once (an AIA source in MSI
+            // mode pends only on a rising edge, so the kernel must re-pend it)
+            let ack = ok(
+                sys::interrupt_ack(irq),
+                "acknowledge with the line still high",
+            )?;
+            ensure_eq!(ack.a1, base + 1, "exactly one claim for one raised line");
+            ensure_eq!(
+                st(sys::object_wait(
+                    irq,
+                    sig::INTERRUPT,
+                    sys::clock_get() + 200
+                )),
+                Some(S::Ok),
+                "an acknowledged source whose line is still high fires again"
+            );
+            // quiet the device, then acknowledge: the source is unmasked and nothing more arrives
+            rtc_quiet();
+            let ack = ok(sys::interrupt_ack(irq), "acknowledge")?;
+            ensure_eq!(ack.a1, base + 2, "the re-fire was the second claim");
+            ensure_eq!(
+                sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
+                0,
+                "the acknowledgement clears the signal"
+            );
+            ensure_eq!(
+                st(sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20)),
+                Some(S::TimedOut),
+                "nothing more once the device is quiet"
+            );
+            // the unmask took: a later alarm interrupts again
+            let t1 = sys::clock_get();
+            rtc_raise();
+            ensure_eq!(
+                st(sys::object_wait(irq, sig::INTERRUPT, t1 + 1000)),
+                Some(S::Ok),
+                "a later alarm interrupts again"
+            );
+            ensure!(
+                sys::clock_get() - t1 < 200,
+                "the second waiter was woken late"
+            );
+            rtc_quiet();
+            ok(sys::interrupt_ack(irq), "acknowledge the second")?;
+            Ok(())
+        })();
+        rtc_quiet();
+        sys::handle_close(irq);
+        r?;
+        // closing the object releases the source: a new object can own it, and nothing is left enabled when the last one goes
+        let again = ok(
+            sys::interrupt_create(res, RTC_IRQ),
+            "the source is free again after close",
+        )?
+        .a1 as u64;
+        sys::handle_close(again);
+        Ok(())
+    })
 }
 
 /// Slice I: on the AIA a device interrupt goes to the hart that asked for it (the last one to create
@@ -15442,19 +16971,40 @@ fn virtio_message(f: &PciFn) {
     mmio_wr16(f.common + 0x1c, 2);
 }
 
-/// A frame the test owns, filled with a pattern, mapped at PATTERN_VA: (its VMO, its physical address).
+/// A frame the test owns, filled with a pattern, mapped at PATTERN_VA: (its VMO, its physical address). The address comes from the
+/// test kernel's debug selector (`phys_of`): no call tells a program a physical address (IOMMU-SPEC 4.8), and a hostile device is
+/// aimed at the frame by it.
 fn pattern_frame(res: u64) -> Result<(u64, u64), Detail> {
-    let dma = ok(sys::vmo_create_dma(res, 1), "a DMA frame")?.a1 as u64;
-    let pa = ok(sys::vmo_phys_addr(dma), "its physical address")?.a1 as u64;
+    let dma = ok(sys::vmo_create_dma_in(res, 1, 0), "a DMA frame")?.a1 as u64;
     let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     let m = sys::process_map(me, dma, PATTERN_VA, 0, 4096, PF_R | PF_W);
     sys::handle_close(me);
     ensure_eq!(st(m), Some(S::Ok), "map the pattern frame");
+    let pa = phys_of(PATTERN_VA)?;
     for i in 0..512u64 {
         // SAFETY: PATTERN_VA maps the frame read-write for 4096 bytes.
         unsafe { core::ptr::write_volatile((PATTERN_VA + 8 * i) as *mut u64, pattern_word(i)) };
     }
     Ok((dma, pa))
+}
+
+/// The physical address of the page this process has mapped at `va`: the test kernel's `debug_stat` 164 (IOMMU12), for a test that
+/// aims a device at a frame. Refused (all ones) in a release kernel and for an address with nothing mapped.
+fn phys_of(va: u64) -> Result<u64, Detail> {
+    // (touch the page, so that it is mapped and not only reserved)
+    // SAFETY: the caller mapped `va` readable.
+    let _ = unsafe { core::ptr::read_volatile(va as *const u8) };
+    let r = rt::syscall(
+        rt::abi::syscall::DEBUG_STAT,
+        [rt::debug::handle() as usize, 164, va as usize, 0, 0, 0],
+    );
+    ensure!(
+        r.status == 0 && r.a1 != usize::MAX,
+        "the physical address of {va:#x} (debug_stat 164): {} {:#x}",
+        r.status,
+        r.a1
+    );
+    Ok(r.a1 as u64)
 }
 
 fn pattern_word(i: u64) -> u64 {
@@ -18209,59 +19759,6 @@ fn moves_do_not_lose_or_leak(res: u64) -> Outcome {
     Ok(())
 }
 
-fn mmio_reads_the_virtio_magic() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let dev = ok(
-        sys::vmo_create_physical(res, 0x1000_1000, 4096),
-        "an MMIO VMO",
-    )?
-    .a1 as u64;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-    ensure_eq!(
-        st(sys::process_map(me, dev, 0x400_0000, 0, 4096, PF_R | PF_W)),
-        Some(S::Ok),
-        "map the first virtio-mmio slot"
-    );
-    // SAFETY: 0x400_0000 was just mapped (device memory, 4 KiB) in this process; the registers at
-    // offsets 0, 4 and 8 are read-only magic, version and device id.
-    let (magic, version, device) = unsafe {
-        (
-            core::ptr::read_volatile(0x400_0000 as *const u32),
-            core::ptr::read_volatile(0x400_0004 as *const u32),
-            core::ptr::read_volatile(0x400_0008 as *const u32),
-        )
-    };
-    ensure_eq!(magic, 0x7472_6976, "the virtio magic ('virt')");
-    ensure!(
-        version == 1 || version == 2,
-        "virtio-mmio version {version}"
-    );
-    ensure!(device < 64, "a plausible device id {device}");
-    // the kernel never copies through device memory: a syscall pointing at it is refused
-    let plain = vmo(1)?;
-    ensure_eq!(
-        st(sys::vmo_read(plain, 0, 0x400_0010 as *mut u8, 4)),
-        Some(S::InvalidArgs),
-        "kernel copy into an MMIO mapping"
-    );
-    ensure_eq!(
-        st(sys::debug_write(
-            // SAFETY: the range is mapped (device memory); the slice is only handed to the kernel,
-            // which must refuse it, and never read here.
-            unsafe { core::slice::from_raw_parts(0x400_0000 as *const u8, 4) }
-        )),
-        Some(S::InvalidArgs),
-        "kernel copy out of an MMIO mapping"
-    );
-    ensure_eq!(st(sys::process_unmap(me, 0x400_0000)), Some(S::Ok), "unmap");
-    // the VMO is closable while mapped and after
-    sys::handle_close(dev);
-    sys::handle_close(res);
-    sys::handle_close(me);
-    sys::handle_close(plain);
-    Ok(())
-}
-
 fn root_job() -> Result<u64, Detail> {
     Ok(ok(sys::job_root(), "job_root")?.a1 as u64)
 }
@@ -19678,46 +21175,78 @@ fn the_page_index_is_charged_to_the_job() -> Outcome {
     Ok(())
 }
 
-/// MM2: contiguous runs come from the buddy allocator and go back to it. The most one DMA object may hold is 64 pages (`MAX_DMA_PAGES`;
-/// PL8 derives the limits from RAM later), and 1024 pages may be held in all: runs of 64 pages are made and closed many times, several
-/// live at once (each at its own address, all in RAM, none overlapping), and runs of an odd length round up and give the tail back.
-/// The kernel's final audit says nothing leaked and the free lists merged back.
+/// MM2, IOMMU12 (IOMMU-SPEC 4.7): DMA VMOs (`vmo_create_dma_in`, not promised contiguous and with no per-object limit) are made and
+/// closed many times, at sizes above the old call's 64 pages, several live at once up to the system's DMA backstop (`debug_stat` 124:
+/// then NO_MEMORY), and odd sizes. Each is zeroed; every page comes back (what was taken can be taken again, as one object, after the
+/// last close), and the kernel's final audit says nothing leaked.
 fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    for round in 0..40u32 {
-        let v = ok(sys::vmo_create_dma(res, 64), "a 64-page DMA run")?.a1 as u64;
-        let pa = ok(sys::vmo_phys_addr(v), "its address")?.a1;
-        ensure_eq!(pa % 4096, 0, "page aligned, round {round}");
-        ensure!(
-            (sys::debug_stat(100)..sys::debug_stat(101)).contains(&(pa as u64)),
-            "inside RAM: {pa:#x}"
-        );
-        sys::handle_close(v);
-    }
-    // several at once: no two overlap (sixteen runs of 64 pages is the whole 1024-page allowance)
-    let mut live = alloc::vec::Vec::new();
-    for _ in 0..16 {
-        let v = ok(sys::vmo_create_dma(res, 64), "sixteen runs live at once")?.a1 as u64;
-        live.push((v, ok(sys::vmo_phys_addr(v), "address")?.a1));
-    }
-    for (i, (_, a)) in live.iter().enumerate() {
-        for (_, b) in live.iter().skip(i + 1) {
-            ensure!(
-                a.abs_diff(*b) >= 64 * 4096,
-                "runs {a:#x} and {b:#x} overlap"
-            );
+    let r = (|| {
+        let total = sys::debug_stat(124);
+        ensure!(total >= 256, "a DMA backstop of {total} pages");
+        for round in 0..40u64 {
+            let pages = 65 + (round % 4) * 61; // 65, 126, 187, 248
+            let v = ok(
+                sys::vmo_create_dma_in(res, pages, 0),
+                "a DMA VMO above 64 pages",
+            )?
+            .a1 as u64;
+            let mut w = [0xffu8; 8];
+            let rd = sys::vmo_read(v, (pages - 1) * 4096 + 4088, w.as_mut_ptr(), 8);
+            sys::handle_close(v);
+            ensure_eq!(st(rd), Some(S::Ok), "read its last word, round {round}");
+            ensure_eq!(w, [0u8; 8], "zeroed, round {round}");
         }
-    }
-    for (v, _) in live {
-        sys::handle_close(v);
-    }
-    // an odd length, repeatedly: the rounded-up tail must come back each time
-    for _ in 0..40 {
-        let v = ok(sys::vmo_create_dma(res, 37), "a 37-page DMA run")?.a1 as u64;
-        sys::handle_close(v);
-    }
+        // what is left of the backstop (other programs may hold some) taken at once, in objects of 100 pages and then single pages,
+        // until it is NO_MEMORY
+        let mut live = alloc::vec::Vec::new();
+        let mut got = 0u64;
+        let r = (|| {
+            for n in [100u64, 1] {
+                loop {
+                    let v = sys::vmo_create_dma_in(res, n, 0);
+                    match st(v) {
+                        Some(S::Ok) => {
+                            live.push(v.a1 as u64);
+                            got += n;
+                        }
+                        Some(S::NoMemory) => break,
+                        other => ensure!(false, "a DMA VMO of {n} pages: {other:?}"),
+                    }
+                    ensure!(got <= total, "{got} pages past the backstop of {total}");
+                }
+            }
+            ensure!(got >= 128, "only {got} of {total} pages were free to take");
+            Ok(())
+        })();
+        for v in live {
+            sys::handle_close(v);
+        }
+        r?;
+        // an odd length, repeatedly; and the backstop is whole again
+        for _ in 0..40 {
+            let v = ok(sys::vmo_create_dma_in(res, 37, 0), "a 37-page DMA VMO")?.a1 as u64;
+            sys::handle_close(v);
+        }
+        let t0 = sys::clock_get();
+        loop {
+            let v = sys::vmo_create_dma_in(res, got, 0);
+            if st(v) == Some(S::Ok) {
+                sys::handle_close(v.a1 as u64);
+                break;
+            }
+            // (a large VMO's frames go back in batches: KT9)
+            ensure!(
+                sys::clock_get() < t0 + 2000,
+                "the {got} pages never came back: {:?}",
+                st(v)
+            );
+            sys::thread_yield();
+        }
+        Ok(())
+    })();
     sys::handle_close(res);
-    Ok(())
+    r
 }
 
 fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
@@ -21173,6 +22702,10 @@ pub fn app_main() -> i32 {
         ("socket_end_of_stream", socket_end_of_stream),
         ("socket_half_close", socket_half_close),
         (
+            "no_dma_device_outside_the_iommu",
+            no_dma_device_outside_the_iommu,
+        ),
+        (
             "device_caps_need_the_resource",
             device_caps_need_the_resource,
         ),
@@ -21227,7 +22760,6 @@ pub fn app_main() -> i32 {
             "a_child_has_no_device_authority",
             a_child_has_no_device_authority,
         ),
-        ("mmio_reads_the_virtio_magic", mmio_reads_the_virtio_magic),
         (
             "interrupt_object_fires_and_masks",
             interrupt_object_fires_and_masks,
@@ -21301,6 +22833,34 @@ pub fn app_main() -> i32 {
             "pci_driver_cannot_forge_through_devmgr",
             pci_driver_cannot_forge_through_devmgr,
         ),
+        // (IOMMU12: the hostile-driver matrix after every test that needs a device id never given a domain: a destroyed domain leaves its
+        // device quarantined, unreported (A14), so `iommu_is_on_and_denies_by_default` and its neighbours must come first)
+        ("hostile_dma_at_a_kernel_address", hostile_dma_at_a_kernel_address),
+        ("hostile_dma_at_another_process_frame", hostile_dma_at_another_process_frame),
+        ("hostile_dma_at_another_device_buffer", hostile_dma_at_another_device_buffer),
+        ("hostile_dma_at_another_device_bar", hostile_dma_at_another_device_bar),
+        ("hostile_dma_at_an_interrupt_file", hostile_dma_at_an_interrupt_file),
+        ("hostile_dma_one_page_past_its_buffer", hostile_dma_one_page_past_its_buffer),
+        ("hostile_dma_through_a_read_only_mapping", hostile_dma_through_a_read_only_mapping),
+        ("hostile_dma_after_its_own_unmap", hostile_dma_after_its_own_unmap),
+        ("hostile_dma_after_the_domain_is_destroyed", hostile_dma_after_the_domain_is_destroyed),
+        ("hostile_dma_after_its_supervisor_died", hostile_dma_after_its_supervisor_died),
+        ("hostile_msi_at_another_device_vector", hostile_msi_at_another_device_vector),
+        ("hostile_msi_at_the_inter_hart_identity", hostile_msi_at_the_inter_hart_identity),
+        ("hostile_msi_at_the_iommu_identity", hostile_msi_at_the_iommu_identity),
+        ("hostile_msi_on_an_ungranted_vector", hostile_msi_on_an_ungranted_vector),
+        ("hostile_msi_with_a_wrong_data_word", hostile_msi_with_a_wrong_data_word),
+        ("hostile_msi_after_the_vector_is_revoked", hostile_msi_after_the_vector_is_revoked),
+        ("hostile_cannot_map_without_the_dma_right", hostile_cannot_map_without_the_dma_right),
+        ("hostile_cannot_map_writable_without_write", hostile_cannot_map_writable_without_write),
+        ("hostile_cannot_destroy_its_domain", hostile_cannot_destroy_its_domain),
+        ("hostile_cannot_grant_itself_a_vector", hostile_cannot_grant_itself_a_vector),
+        ("hostile_cannot_read_or_wait_for_its_faults", hostile_cannot_read_or_wait_for_its_faults),
+        ("hostile_learns_no_physical_address", hostile_learns_no_physical_address),
+        ("hostile_maps_until_its_job_refuses", hostile_maps_until_its_job_refuses),
+        ("hostile_child_job_is_held_to_the_parents_limits", hostile_child_job_is_held_to_the_parents_limits),
+        ("every_driver_job_has_finite_io_limits", every_driver_job_has_finite_io_limits),
+        ("dma_survives_a_dead_supervisor", dma_survives_a_dead_supervisor),
         (
             "socket_ends_travel_over_channels",
             socket_ends_travel_over_channels,

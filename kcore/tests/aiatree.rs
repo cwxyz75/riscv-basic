@@ -1,7 +1,9 @@
 //! The interrupt controller from the device tree (PL5c). Expectations for the real QEMU `virt` trees come from `dtc`'s listing: the
 //! supervisor APLIC at 0xd000000 with 96 sources, the harts in the order of the IMSIC's `interrupts-extended` (phandles 8, 6, 4, 2 are the
 //! interrupt controllers of cpu@0 .. cpu@3: the order of the list, not the numbering of the phandles, is the hart index), and the sources
-//! the admitted devices name: virtio-mmio 1 to 8 and the RTC, 11. Synthetic trees cover hart ids that are not dense or not in order.
+//! the admitted devices name: the RTC, 11 (the virtio-mmio slots' 1 to 8 left with IOMMU12: those devices are not admitted, IOMMU-SPEC
+//! 2.6). Synthetic trees cover hart ids that are not dense or not in order; their admitted device is an RTC (`google,goldfish-rtc`), and
+//! one virtio-mmio node checks that its source is not taken.
 mod common;
 use common::Dt;
 use kcore::aiatree::discover;
@@ -19,7 +21,11 @@ fn the_real_virt_trees_give_the_supervisor_aplic_the_hart_order_and_the_device_s
     assert_eq!(a.imsic_base, 0x2800_0000);
     assert_eq!(a.hart_order, vec![0]);
     assert_eq!(a.num_ids, 255, "QEMU 11.1.3: riscv,num-ids = <0xff>");
-    assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+    assert_eq!(
+        a.sources,
+        vec![11],
+        "the RTC only: no virtio-mmio slot (IOMMU12)"
+    );
     assert!(a.dropped.is_empty());
     let a = discover(&fdt::parse(FOUR).unwrap()).unwrap();
     assert_eq!(a.aplic_base, 0xd00_0000);
@@ -29,7 +35,11 @@ fn the_real_virt_trees_give_the_supervisor_aplic_the_hart_order_and_the_device_s
         "phandles 8, 6, 4, 2 name cpu0 .. cpu3"
     );
     assert_eq!(a.num_ids, 255);
-    assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+    assert_eq!(
+        a.sources,
+        vec![11],
+        "the RTC only: no virtio-mmio slot (IOMMU12)"
+    );
 }
 
 #[test]
@@ -124,16 +134,17 @@ fn hart_ids_need_not_be_dense_or_in_order_and_the_imsic_list_is_the_hart_index()
 #[test]
 fn only_admitted_devices_on_this_aplic_and_within_its_sources_are_interrupts_a_process_may_take() {
     let devices = [
-        ("virtio,mmio", 3, "", true),
-        ("virtio,mmio", 3, "", true), // the same source twice: once
+        ("google,goldfish-rtc", 3, "", true),
+        ("google,goldfish-rtc", 3, "", true), // the same source twice: once
         ("google,goldfish-rtc", 11, "okay", true),
-        ("virtio,mmio", 4, "disabled", true), // disabled
-        ("virtio,mmio", 5, "", false),        // interrupts go to some other controller
-        ("acme,unknown", 6, "", true),        // not an admitted device
-        ("virtio,mmio", 90, "", true), // above 63: as good as any (IOMMU4: no identity is source + 1)
-        ("virtio,mmio", 0, "", true),  // source 0 does not exist
-        ("virtio,mmio", 70, "", true), // above 63
-        ("virtio,mmio", 97, "", true), // past the controller's 96: said at boot, not used
+        ("google,goldfish-rtc", 4, "disabled", true), // disabled
+        ("google,goldfish-rtc", 5, "", false),        // interrupts go to some other controller
+        ("acme,unknown", 6, "", true),                // not an admitted device
+        ("virtio,mmio", 8, "okay", true), // DMA-capable and not behind the IOMMU: never admitted (IOMMU12)
+        ("google,goldfish-rtc", 90, "", true), // above 63: as good as any (IOMMU4: no identity is source + 1)
+        ("google,goldfish-rtc", 0, "", true),  // source 0 does not exist
+        ("google,goldfish-rtc", 70, "", true), // above 63
+        ("google,goldfish-rtc", 97, "", true), // past the controller's 96: said at boot, not used
     ];
     let t = machine(&[0], &[0], &devices, 96);
     let a = discover(&fdt::parse(&t).unwrap()).unwrap();
@@ -143,7 +154,10 @@ fn only_admitted_devices_on_this_aplic_and_within_its_sources_are_interrupts_a_p
     let t = machine(
         &[0],
         &[0],
-        &[("virtio,mmio", 20, "", true), ("virtio,mmio", 7, "", true)],
+        &[
+            ("google,goldfish-rtc", 20, "", true),
+            ("google,goldfish-rtc", 7, "", true),
+        ],
         10,
     );
     let a = discover(&fdt::parse(&t).unwrap()).unwrap();
@@ -236,7 +250,7 @@ fn two_levels(
     d.end();
     for (i, (src, with_ext)) in devices.iter().enumerate() {
         d.begin(&format!("dev@{:x}", 0x1000_0000 + i * 0x1000));
-        d.prop("compatible", b"virtio,mmio\0");
+        d.prop("compatible", b"google,goldfish-rtc\0");
         d.reg(&[(0x1000_0000 + i as u64 * 0x1000, 0x1000)]);
         d.u32s("interrupts", &[*src, 4]);
         if *with_ext {
@@ -384,13 +398,13 @@ fn a_device_behind_an_interrupt_nexus_does_not_inherit_the_roots_parent() {
     d.prop("interrupt-map", &[]);
     d.prop("ranges", &[]);
     d.begin("dev@1000");
-    d.prop("compatible", b"virtio,mmio\0");
+    d.prop("compatible", b"google,goldfish-rtc\0");
     d.reg(&[(0x1000, 0x1000)]);
     d.u32s("interrupts", &[3]);
     d.end();
     d.end();
     d.begin("dev@2000");
-    d.prop("compatible", b"virtio,mmio\0");
+    d.prop("compatible", b"google,goldfish-rtc\0");
     d.reg(&[(0x2000, 0x1000)]);
     d.u32s("interrupts", &[4]);
     d.end();
@@ -493,5 +507,9 @@ fn no_source_of_the_pci_hosts_interrupt_map_is_admitted() {
             a.sources
         );
     }
-    assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+    assert_eq!(
+        a.sources,
+        vec![11],
+        "the RTC only: no virtio-mmio slot (IOMMU12)"
+    );
 }

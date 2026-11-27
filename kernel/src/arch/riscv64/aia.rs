@@ -236,7 +236,7 @@ pub fn slots() -> usize {
     info().map_or(0, |i| i.sources.last().map_or(0, |&s| s as usize + 1))
 }
 
-/// May a process take source `irq`? Only the sources the admitted devices name in the tree (virtio-mmio and the RTC on `virt`).
+/// May a process take source `irq`? Only the sources the admitted devices name in the tree (the RTC alone on `virt`, IOMMU12).
 pub fn irq_allowed(irq: u32) -> bool {
     info().is_some_and(|i| i.sources.binary_search(&irq).is_ok())
 }
@@ -314,7 +314,7 @@ const TARGET: u64 = 0x3004; // + 4 * (source - 1)
 
 /// domaincfg: interrupt enable (bit 8) and MSI delivery mode (bit 2).
 const DOMAINCFG_IE_MSI: u32 = (1 << 8) | (1 << 2);
-/// sourcecfg: level-sensitive, active high (what virtio-mmio asserts).
+/// sourcecfg: level-sensitive, active high (what the RTC asserts).
 const SM_LEVEL_HIGH: u32 = 6;
 /// sourcecfg: edge-sensitive, rising edge (the IOMMU's wired interrupts on `virt`: the tree's trigger type 1).
 const SM_EDGE_RISE: u32 = 4;
