@@ -470,23 +470,39 @@ pub fn init() {
             image_end: image_end.div_ceil(PAGE_SIZE),
         };
     }
-    // What the tree says about the devices (parsed once): the interrupt controller (PL5c) and the windows a physical VMO may name (PL5, D1):
-    // every admitted device range minus what the kernel itself drives (the console, the test finisher and the APLIC's pages, all found in the
-    // tree) and minus RAM and everything reserved.
+    // What the tree says about the devices (parsed once): the IOMMU (IOMMU5) and the interrupt controller (PL5c, with the IOMMU's sources),
+    // and what the windows a physical VMO may name (PL5, D1) are made of: every admitted device range minus what the kernel itself drives
+    // (the console, the test finisher, the APLIC's pages and the IOMMU's registers, all found in the tree) and minus RAM and everything
+    // reserved. The windows themselves are built only once the IOMMU denies every device (`build_windows`, IOMMU-SPEC 2.4).
     {
         let nodes = crate::dtb::dtb_blob()
             .and_then(|b| kcore::fdt::parse(b).ok())
             .unwrap_or_default();
         let ram: alloc::vec::Vec<(u64, u64)> =
             memory.iter().chain(reserved.iter()).copied().collect();
-        crate::aia::discover(&nodes, &ram);
+        crate::iommu::discover(&nodes, &ram);
+        crate::aia::discover(&nodes, &ram, crate::iommu::kernel_sources());
         let mut driven: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
         driven.extend(crate::console::base().map(|b| (b, 0x1000)));
         driven.extend(crate::finisher::base().map(|b| (b, 0x1000)));
         driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
-        let windows = kcore::devwin::device_windows(&nodes, &driven, &ram);
+        driven.extend(crate::iommu::page().map(|p| (p, 0x1000)));
+        // a host whose map puts only some of its functions behind the IOMMU gets no window (IOMMU-SPEC 2.6): say so, or the
+        // cause of every later PCI failure is invisible
+        for host in nodes.iter().filter(|n| {
+            n.is_compatible(kcore::iommutree::PCI_HOST)
+                && n.prop("iommu-map").is_some()
+                && !kcore::iommutree::fully_behind_the_iommu(n, &nodes)
+        }) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                crate::console::Console,
+                "kernel: iommu: PCI host {} is not wholly behind the IOMMU (its iommu-map): no device window",
+                host.path
+            );
+        }
         // SAFETY: boot code, one hart, before anything reads it.
-        unsafe { *addr_of_mut!(WINDOWS) = windows };
+        unsafe { *addr_of_mut!(WINDOW_INPUTS) = Some((nodes, driven, ram)) };
     }
     let mut mm = Mm {
         db: FrameDb::with_ranges(&managed_ranges, storage).expect("room for the frame metadata"),
@@ -545,6 +561,7 @@ pub fn init() {
         .into_iter()
         .chain(crate::finisher::base().filter(|_| !crate::RELEASE))
         .chain(crate::aia::pages())
+        .chain(crate::iommu::page())
         .map(|d| d & !(PAGE_SIZE - 1))
         .collect();
     pages.sort_unstable();
@@ -604,6 +621,31 @@ pub struct MemStats {
 
 /// The device windows (page-aligned `(start, end)` byte ranges) built at boot from the tree; read-only afterwards.
 static mut WINDOWS: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+
+/// What `build_windows` builds the windows from (the parsed tree, the ranges the kernel drives, RAM and reserved memory), kept by
+/// `init` until then.
+#[allow(clippy::type_complexity)]
+static mut WINDOW_INPUTS: Option<(
+    alloc::vec::Vec<kcore::fdt::Node>,
+    alloc::vec::Vec<(u64, u64)>,
+    alloc::vec::Vec<(u64, u64)>,
+)> = None;
+
+/// Build the device windows (PL5, D1; IOMMU-SPEC 2.6). Only after the IOMMU denies every device (2.4 step 5, asserted): a PCI
+/// window lets the holder of the root resource make a function a bus master, and that is safe only with the directory empty.
+/// Boot only, once, on the boot hart.
+pub fn build_windows() {
+    assert!(
+        crate::iommu::is_on(),
+        "the device windows were built before the IOMMU denied every device (IOMMU-SPEC 2.4)"
+    );
+    // SAFETY: boot code, one hart, before any other hart or thread runs and before anything reads `WINDOWS`.
+    unsafe {
+        if let Some((nodes, driven, ram)) = (*addr_of_mut!(WINDOW_INPUTS)).take() {
+            *addr_of_mut!(WINDOWS) = kcore::devwin::device_windows(&nodes, &driven, &ram);
+        }
+    }
+}
 
 /// The device windows a physical VMO may name.
 pub fn device_windows() -> &'static [(u64, u64)] {

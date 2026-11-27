@@ -7,7 +7,20 @@
 
 pub mod aia {
     pub const PAGE_COUNT: usize = 0;
-    pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+    /// A wired source the kernel itself handles (IOMMU5: the IOMMU's own interrupts).
+    pub struct KernelSource {
+        pub source: u32,
+        pub edge: bool,
+        pub handler: fn(u32) -> bool,
+    }
+    pub fn discover(
+        nodes: &[kcore::fdt::Node],
+        ram: &[(u64, u64)],
+        kernel: alloc::vec::Vec<KernelSource>,
+    ) {
+        unimplemented!()
+    }
+    pub fn route_of(s: u32) -> Option<u64> {
         unimplemented!()
     }
     pub const IPI_BIT: u64 = 0;
@@ -56,7 +69,76 @@ pub mod aia {
     pub fn disable(irq: u32) {
         unimplemented!()
     }
+    /// IOMMU4's routes (`interrupt_create`, an object's destruction, a hart going offline): stubs, as the rest.
+    pub fn take(irq: u32) -> Result<(), abi::status::Status> {
+        unimplemented!()
+    }
+    pub fn release(irq: u32) {
+        unimplemented!()
+    }
+    pub fn evacuate_locked(v: usize) -> Result<(), abi::status::Status> {
+        unimplemented!()
+    }
     pub fn handle(fired: impl FnMut(u32) -> bool) -> bool {
+        unimplemented!()
+    }
+    /// IOMMU7's placement of a wired source (`interrupt_deliver_here`): a stub, as the rest.
+    pub fn move_here(irq: u32) -> Result<(), abi::status::Status> {
+        unimplemented!()
+    }
+}
+
+/// IOMMU5's bring-up (the SMMU would stand here): stubs, as the rest.
+pub mod iommu {
+    pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+        unimplemented!()
+    }
+    pub fn kernel_sources() -> alloc::vec::Vec<super::aia::KernelSource> {
+        unimplemented!()
+    }
+    pub fn page() -> Option<u64> {
+        unimplemented!()
+    }
+    pub fn is_on() -> bool {
+        unimplemented!()
+    }
+    pub fn init() {
+        unimplemented!()
+    }
+    pub fn stat(which: u64) -> u64 {
+        unimplemented!()
+    }
+    pub fn call(n: usize, a: [u64; 6]) -> Option<ksys::Reply> {
+        unimplemented!()
+    }
+    pub fn closed(domain: u64) {
+        unimplemented!()
+    }
+    pub fn drain() {
+        unimplemented!()
+    }
+    pub fn directory_frames() -> usize {
+        unimplemented!()
+    }
+    /// IOMMU7's vectors: stubs, as the rest.
+    pub fn vector_closed(v: kcore::ipc::VectorRef) {
+        unimplemented!()
+    }
+    pub fn first_wait(h: u64) {
+        unimplemented!()
+    }
+    pub fn settle_moves() {
+        unimplemented!()
+    }
+    pub fn vector_route(
+        objs: &kcore::ipc::Kobjs,
+        handles: &kcore::handle::HandleTable,
+        h: u64,
+    ) -> Option<u64> {
+        unimplemented!()
+    }
+    #[cfg(not(feature = "release"))]
+    pub fn selftest() -> Result<(), alloc::string::String> {
         unimplemented!()
     }
 }
@@ -375,6 +457,9 @@ pub mod switch {
     impl Context {
         pub fn new(entry: fn(usize), arg: usize, stack_top: usize) -> alloc::boxed::Box<Context> {
             unimplemented!()
+        }
+        pub fn saved(&self) -> (u64, u64) {
+            (0, 0)
         }
     }
     /// # Safety

@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 
-MACHINE = "virt,aia=aplic-imsic"
+MACHINE = "virt,aia=aplic-imsic,iommu-sys=on"
 LINE = re.compile(r"kaslr: image slid (0x[0-9a-f]+) bytes, direct map at (0x[0-9a-f]+)")
 
 

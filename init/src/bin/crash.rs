@@ -37,9 +37,9 @@ pub fn app_main() -> i32 {
             unsafe { asm!("csrr t0, sstatus") };
         }
         6 => {
-            // jump to an address nothing maps
+            // jump to an address nothing maps (the last page of the user half: above the stack arena nothing is placed, T272)
             // SAFETY: as above.
-            unsafe { asm!("jr {}", in(reg) 0x30_0000_0000usize) };
+            unsafe { asm!("jr {}", in(reg) rt::abi::user::TOP as usize - 4096) };
         }
         7 => {
             // load through the null pointer
@@ -182,18 +182,10 @@ pub fn app_main() -> i32 {
             }
         }
         25 => {
-            // touch the 4 stack pages the parent mapped at 0x20_0000_0000 (present in the page
-            // table, so a thread started on them takes no first-touch fault), then block forever
-            // Give the parent time to map the pages (a scheduler that runs the child first, as
-            // the round-robin class does, would otherwise fault here before they exist).
-            let ev = rt::sys::event_create().a1 as u64;
-            rt::sys::object_wait(ev, rt::abi::signals::USER_MASK, rt::sys::clock_get() + 60);
-            for page in 0..4usize {
-                // SAFETY: the parent mapped these pages read-write before starting us.
-                unsafe {
-                    core::ptr::write_volatile((0x20_0000_0000usize + page * 4096) as *mut u8, 1)
-                };
-            }
+            // block forever while the parent adds a thread on a stack it mapped ANYWHERE
+            // (`child_with_a_ready_exit_thread`). This used to touch 4 pages at the fixed
+            // 0x20_0000_0000 first, which since HD2 nobody maps: a child the parent was slow to
+            // kill would have faulted there (T272).
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
@@ -755,8 +747,8 @@ extern "C" fn exit_eight_late(_: usize) -> ! {
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Where the changing mapping lives.
-const X: u64 = 0x30_0000_0000;
+/// Where the changing mapping lives: above the stack arena, where nothing the kernel places lands (in the stack arena a thread stack may be, T272).
+const X: u64 = rt::abi::user::STACK_ARENA_END;
 const ROUNDS: u64 = 300;
 const READ: u64 = 1;
 const IDLE: u64 = 2;
@@ -770,6 +762,26 @@ static FAIL: AtomicU64 = AtomicU64::new(0);
 
 fn pattern(round: u64) -> u64 {
     0x5eed_0000_0000_0000 | (round * 0x0101_0101)
+}
+
+/// How many turns a waiting thread of these tests spins before it yields its hart.
+const SPINS_PER_YIELD: u64 = 4096;
+
+/// One turn of a wait in the sibling tests (`spins` counts the turns so far): mostly a spin, so that a thread on a hart of its own keeps
+/// running there with its translations cached (the point of the tests), and every [`SPINS_PER_YIELD`] turns a yield. With fewer harts
+/// than threads (one hart: the kernel-only boots and KT5's instruction counts) the thread being waited for gets the hart at once instead
+/// of at the end of the waiter's time slice: a round there took a dozen time slices, and the 300 rounds of each test most of a minute.
+///
+/// The tests' power at several harts rests on this: a yield with nothing else queued on the hart (`yield_fast`) leaves the caller where it
+/// is, with no `satp` write, no `sfence` and no migration, so its cached translations survive it. A change to what a yield does must rerun
+/// the three negative controls of `os-boot-test-smp-neg` at four harts (`fault-skip-shootdown`, `fault-decommit-no-shootdown`,
+/// `fault-protect-no-shootdown`): they are in the soak tier, so no gate would notice the tests going blind.
+fn relax(spins: u64) {
+    if spins.is_multiple_of(SPINS_PER_YIELD) {
+        rt::sys::thread_yield();
+    } else {
+        core::hint::spin_loop();
+    }
 }
 
 /// Two sibling threads read a page that the main thread unmaps and remaps, round after round,
@@ -820,7 +832,7 @@ fn unmap_while_siblings_touch() -> i32 {
             if spins > 400_000_000 {
                 return 920;
             }
-            core::hint::spin_loop();
+            relax(spins);
         }
         PHASE.store((round << 2) | IDLE, Ordering::Release);
         spins = 0;
@@ -829,7 +841,7 @@ fn unmap_while_siblings_touch() -> i32 {
             if spins > 400_000_000 {
                 return 921;
             }
-            core::hint::spin_loop();
+            relax(spins);
         }
         // nobody is reading X now; take the mapping away and free the frame
         if rt::sys::process_unmap(me, X).status != 0 {
@@ -851,6 +863,7 @@ fn unmap_while_siblings_touch() -> i32 {
 extern "C" fn reader(_id: usize) -> ! {
     let mut read_round = 0u64;
     let mut idle_round = 0u64;
+    let mut spins = 0u64;
     loop {
         let ph = PHASE.load(Ordering::Acquire);
         let (round, state) = (ph >> 2, ph & 3);
@@ -869,7 +882,8 @@ extern "C" fn reader(_id: usize) -> ! {
             idle_round = round;
             IDLE_ACKS.fetch_add(1, Ordering::AcqRel);
         }
-        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        relax(spins);
     }
 }
 
@@ -886,6 +900,7 @@ static D_FAIL: AtomicU64 = AtomicU64::new(0);
 /// decommitted it and given the frame to another VMO, expects zeros. A stale translation shows the frame's new owner's bytes.
 extern "C" fn decommit_reader(_id: usize) -> ! {
     let (mut read_round, mut zero_round) = (0u64, 0u64);
+    let mut spins = 0u64;
     loop {
         let ph = D_PHASE.load(Ordering::Acquire);
         let (round, state) = (ph >> 2, ph & 3);
@@ -910,7 +925,8 @@ extern "C" fn decommit_reader(_id: usize) -> ! {
             zero_round = round;
             D_ZERO_ACKS.fetch_add(1, Ordering::AcqRel);
         }
-        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        relax(spins);
     }
 }
 
@@ -921,7 +937,7 @@ fn spin_until(acks: &AtomicU64, want: u64) -> bool {
         if spins > 400_000_000 {
             return false;
         }
-        core::hint::spin_loop();
+        relax(spins);
     }
     true
 }
@@ -1007,6 +1023,8 @@ extern "C" fn protect_writer(id: usize) -> ! {
             done2 = true;
             P_ACKS2.fetch_add(1, Ordering::AcqRel);
         }
+        // (a bare spin on purpose, not `relax`: a writer switched out between its two writes would lose the writable translation the test
+        // needs; at one hart each of the twenty processes costs a time slice or two, which is cheap)
         core::hint::spin_loop();
     }
 }
@@ -1107,7 +1125,7 @@ fn churn(seed: u64) -> i32 {
                 if rt::sys::vmo_write(vmo, 0, buf.as_ptr(), 4096).status != 0 {
                     return 111;
                 }
-                let at = 0x31_0000_0000 + rnd(8) * 0x2_0000;
+                let at = rt::abi::user::STACK_ARENA_END + 0x1_0000_0000 + rnd(8) * 0x2_0000;
                 let m = rt::sys::process_map(me, vmo, at, 0, 4 * 4096, 3);
                 if m.status != 0 {
                     // (the status is in the code: a failure seen once in CI, T251)

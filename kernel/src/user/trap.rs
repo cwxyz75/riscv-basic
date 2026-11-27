@@ -492,6 +492,18 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
             _ => {}
         }
+        // 145: where wired source `a2` is delivered, as (interrupt file << 16) | identity, or all ones without a Live route (IOMMU5: the
+        // suite aims a device's message at an identity the kernel gave an object, to see that it is refused). Read under this lock.
+        if a[1] == 145 {
+            let at = u32::try_from(a[2]).ok().and_then(crate::aia::route_of);
+            return Ok((Some(at.unwrap_or(u64::MAX)), None));
+        }
+        // 148 (IOMMU7): where the vector of the caller's interrupt handle `a2` sends its notices (the fenced entry's target), as
+        // (interrupt file << 16) | identity, or all ones for anything else
+        if a[1] == 148 {
+            let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
+            return Ok((Some(at.unwrap_or(u64::MAX)), None));
+        }
         // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
         if let Some(v) = backstop_stat(s, a[1]) {
             return Ok((Some(v), None));
@@ -958,6 +970,31 @@ pub(super) fn status_ret(frame: &mut crate::trap::TrapFrame, s: Status) {
     frame.set_return(s.code() as i64 as u64, None, None);
 }
 
+/// The device-domain calls (IOMMU6) and a vector's `interrupt_ack` and `interrupt_deliver_here` (IOMMU7), answered by the device-domain
+/// layer: whether this call was one of its (`vector`: only if the handle names a vector; a wired source's are `dispatch`'s). A frame of
+/// its own, never inlined into `syscall`: folded in, it made the syscall path deeper under every call, not only these (KT13).
+#[inline(never)]
+fn device_domain_call(
+    frame: &mut crate::trap::TrapFrame,
+    n: usize,
+    a: [u64; 6],
+    vector: bool,
+) -> bool {
+    let r = match ksys::wide_argument_error(n, &a) {
+        Some(_) if vector => return false,
+        Some(s) => fail(s),
+        None if vector && !crate::iommu::is_on() => return false,
+        None => match crate::iommu::call(n, a) {
+            Some(r) => r,
+            None if vector => return false,
+            None => fail(Status::BadSyscall),
+        },
+    };
+    notify();
+    reply(frame, r);
+    true
+}
+
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
@@ -989,7 +1026,25 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
         nr::VMO_READ | nr::VMO_WRITE => reply(frame, vmo_rw_call(n == nr::VMO_WRITE, a)),
         nr::VMO_COMMIT => reply(frame, vmo_commit_call(a)),
-        nr::OBJECT_WAIT => reply(frame, object_wait(a)),
+        // (IOMMU6) the device-domain calls: phases under the object lock, `IOMMU` and the memory locks, and the fence waits with none
+        nr::IODOMAIN_CREATE
+        | nr::IODOMAIN_MAP
+        | nr::IODOMAIN_UNMAP
+        | nr::IODOMAIN_DESTROY
+        | nr::IODOMAIN_FAULT_READ
+        | nr::VMO_CREATE_DMA_IN
+        | nr::IODOMAIN_GRANT_VECTOR => {
+            let _ = device_domain_call(frame, n, a, false);
+        }
+        nr::OBJECT_WAIT => {
+            // (IOMMU-SPEC 8.5: the first wait on a vector moves it to this hart, with no lock held)
+            crate::iommu::first_wait(a[0]);
+            reply(frame, object_wait(a))
+        }
+        // (IOMMU7) a vector's acknowledgement and `interrupt_deliver_here` are the device-domain layer's; a wired source's are `dispatch`'s
+        // (the guard is the call: `device_domain_call` answers a vector's and replies; false sends a wired source on to `dispatch`)
+        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE if device_domain_call(frame, n, a, true) => {
+        }
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)
             let r = port_wait(a);
@@ -1365,10 +1420,18 @@ fn dispatch_in(
                 return fail(Status::InvalidArgs);
             }
             let slot = irq as usize;
-            let owned = matches!(*irq_objs.get(slot).unwrap_or(&None), Some(o)
+            // (T183: the table is sized by the highest allowed source, so an allowed source has a slot; a missing one is refused, not ignored)
+            let Some(&current) = irq_objs.get(slot) else {
+                return fail(Status::InvalidArgs);
+            };
+            let owned = matches!(current, Some(o)
                 if matches!(objs.get(o), Some(ipc::KObj::Interrupt(i)) if i.irq == irq as u32));
             if owned {
                 return fail(Status::BadState);
+            }
+            // an identity on the calling hart's interrupt file first (IOMMU4: the kernel's choice, never source + 1), then the object
+            if let Err(e) = crate::aia::take(irq as u32) {
+                return fail(e);
             }
             match ipc::interrupt_object_create_in(
                 objs,
@@ -1383,8 +1446,19 @@ fn dispatch_in(
                     crate::aia::enable(irq as u32);
                     Ok((Some(hd.0), None))
                 }
-                Err(e) => fail(e),
+                Err(e) => {
+                    // (the identity goes back; the source stays masked, as it was)
+                    crate::aia::release(irq as u32);
+                    fail(e)
+                }
             }
+        }
+        nr::INTERRUPT_DELIVER_HERE => {
+            // (a wired source: its identity moves to this hart's file, IOMMU-SPEC 8.5; a vector's was the device-domain layer's)
+            let (_, irq) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
+                .map_err(|e| (e, None, None))?;
+            crate::aia::move_here(irq).map_err(|e| (e, None, None))?;
+            Ok((None, None))
         }
         nr::INTERRUPT_ACK => {
             let (obj, _) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)

@@ -57,3 +57,9 @@ impl Backstops {
         }
     }
 }
+
+/// The device backstops (IOMMU-SPEC 5.3) behind the two job limits of `kcore::job::IoResource`, which have no default: whatever a job's
+/// limits are, a domain maps at most the DMA part of its window (`kcore::iodomain::IO_DMA_PAGES` pages, bounded again by the job's
+/// kernel bytes, which pay for the mapping records and the tables), and a device has at most this many vectors (one MSI page-table
+/// entry per page of the interrupt window). The pages DMA VMOs hold together stay behind `Backstops::dma_total_pages`.
+pub const VECTORS_PER_DEVICE: u64 = 256;

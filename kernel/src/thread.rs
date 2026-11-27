@@ -522,6 +522,28 @@ pub fn hart_set_online(v: u64, online: bool) -> Result<(), abi::status::Status> 
     if st.hart_state.load(Ordering::Acquire) == to {
         return Ok(());
     }
+    // One change of a hart at a time (IOMMU4): an offline call reads the other harts' states to choose where the interrupt routes go,
+    // and a second call making one of them Draining in the meantime would leave none to choose. A call while another runs: BAD_STATE.
+    static CHANGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if CHANGING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Status::BadState);
+    }
+    let r = hart_change(st, v, online, (from, through, to));
+    CHANGING.store(false, Ordering::Release);
+    r
+}
+
+fn hart_change(
+    st: &crate::percpu::PerHart,
+    v: usize,
+    online: bool,
+    (from, through, to): (u8, u8, u8),
+) -> Result<(), abi::status::Status> {
+    use crate::percpu::HART_ONLINE;
+    use abi::status::Status;
     if st
         .hart_state
         .compare_exchange(from, through, Ordering::AcqRel, Ordering::Acquire)
@@ -530,20 +552,24 @@ pub fn hart_set_online(v: u64, online: bool) -> Result<(), abi::status::Status> 
         return Err(Status::BadState);
     }
     if !online {
-        let refused = irq::off(|| sched().begin_offline(v).is_err());
-        if refused {
+        // IOMMU-SPEC 8.5: every interrupt route on it moves first, to the online hart with the fewest routes, and only if the hart may
+        // go at all; under the object lock, so nothing places a route or pins a thread in between. A refusal changes nothing:
+        // BAD_STATE (the last hart, a pinned thread), NO_MEMORY (the others have too few free identities). A hart that is Draining is
+        // no target, so nothing moves back to it.
+        let r = irq::without(|| {
+            if sched().offline_refused(v) {
+                return Err(Status::BadState);
+            }
+            crate::aia::evacuate_locked(v)?;
+            sched().begin_offline(v).map_err(|_| Status::BadState)
+        });
+        if let Err(e) = r {
             st.hart_state.store(HART_ONLINE, Ordering::Release);
-            return Err(Status::BadState);
+            return Err(e);
         }
-        // (device interrupts aimed at it go to the lowest other online hart)
-        if let Some(t) = (0..crate::smp::started()).find(|&i| {
-            i != v && crate::percpu::hart(i).hart_state.load(Ordering::Acquire) == HART_ONLINE
-        }) {
-            crate::aia::retarget_from(
-                st.hart_id.load(Ordering::Relaxed),
-                crate::percpu::hart(t).hart_id.load(Ordering::Relaxed),
-            );
-        }
+        // (IOMMU7: a vector that moved has its entry rewritten to the new identity and fenced, with no lock held; the old identity
+        // keeps taking messages on this hart, which still takes its file's, until the fence)
+        crate::iommu::settle_moves();
     }
     crate::smp::send_ipi(v, crate::percpu::IPI_RESCHED);
     let give_up = now_ns().saturating_add(2_000_000_000);
@@ -1736,7 +1762,10 @@ pub fn wake_stat(which: u64) -> u64 {
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
-        3..=5 => crate::aia::stat(which),
+        // (IOMMU7: 146 live vectors, 149 vectors leaked, 162 vector notices, 163 notices that fired their object)
+        3..=5 | 140..=144 | 146 | 149 | 162 | 163 => crate::aia::stat(which),
+        // 150 to 157: the IOMMU's counters (IOMMU5, IOMMU-SPEC 7.3); 147: the stray identities taken (IOMMU7)
+        147 | 150..=161 => crate::iommu::stat(which),
         // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),
@@ -1773,11 +1802,7 @@ pub fn wake_stat(which: u64) -> u64 {
         // 109: the kernel heap's leak oracle (`heap::leak_oracle`, wrapping): taken before and after something, `before - after` is the heap
         // bytes it kept (MM5's acceptance test: what a confined program holds against what its job was charged)
         109 => heap_free() as u64,
-        100 => crate::kmem::stats().ram_first << 12,
-        101 => crate::kmem::stats().ram_end << 12,
-        102 => crate::kmem::stats().memory_frames,
-        103 => crate::kmem::stats().managed_frames,
-        104 => crate::kmem::stats().image_first << 12,
+        100..=104 => memory_stat(which),
         // 105: the frequency of the `time` counter (selector 6), in hertz, from the device tree
         105 => crate::timer::timebase(),
         // 107: the first eight bytes the entropy pool produced after it was keyed (test builds; 0 in release), different at every boot; 108: 1 if
@@ -1793,6 +1818,18 @@ pub fn wake_stat(which: u64) -> u64 {
             .bkl_takes
             .load(Relaxed),
         _ => 0,
+    }
+}
+
+/// `wake_stat`'s 100 to 104 (PL4), apart so that its frame does not hold five copies of the memory statistics.
+fn memory_stat(which: u64) -> u64 {
+    let m = crate::kmem::stats();
+    match which {
+        100 => m.ram_first << 12,
+        101 => m.ram_end << 12,
+        102 => m.memory_frames,
+        103 => m.managed_frames,
+        _ => m.image_first << 12,
     }
 }
 
@@ -1817,6 +1854,117 @@ pub fn heap_free() -> usize {
 
 pub fn thread_count() -> usize {
     irq::off(|| kernel().threads.len())
+}
+
+/// The ids of every thread in the table (a leak test's snapshot, for [`report_threads`]).
+pub fn tids() -> Vec<Tid> {
+    irq::off(|| kernel().threads.keys().copied().collect())
+}
+
+/// How many words of a stack [`report_threads`] prints that look like kernel return addresses.
+const REPORT_TEXT_WORDS: usize = 24;
+
+/// How many threads [`report_threads`] describes (the rest are counted): the scan runs with the thread table held and interrupts off,
+/// so a mass leak must not hold it for long.
+const REPORT_THREADS: usize = 32;
+
+/// One thread, as a leak report shows it: its id, name, process, scheduler state, saved return address, whether it is running on a
+/// hart or in transit (switched away from, its context not yet saved), and the words on its stack that are addresses in the kernel's
+/// text (the callers of where it waits). They are printed as linked (KASLR's slide taken off), so `llvm-addr2line -e <kernel ELF>` or
+/// `scripts/resolve_trace.py` names them as they are.
+struct ThreadReport {
+    tid: Tid,
+    name: &'static str,
+    pid: Option<u64>,
+    state: Option<State>,
+    ra: u64,
+    on_hart: bool,
+    in_transit: bool,
+    text: Vec<u64>,
+}
+
+/// Print every thread not in `skip` (a leak test's failure report, T278: a thread that survived names itself and where it waits), at
+/// most [`REPORT_THREADS`] of them. A thread running on a hart or in transit is named but its stack is not read (its saved context is
+/// stale or half written).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: addresses inside one kernel stack, read a word at a time; counts far below usize::MAX
+#[allow(clippy::large_stack_frames)] // KT13: audited, a failure-only report of the leak checks, run once on the boot thread's stack after init has ended
+pub fn report_threads(skip: &[Tid]) {
+    use core::fmt::Write as _;
+    let (text_lo, text_hi) = crate::kmem::sections().text;
+    let (reports, more): (Vec<ThreadReport>, usize) = irq::off(|| {
+        let sc = sched();
+        let k = kernel();
+        // (read under the thread table: a hart sets its `running` word as it dispatches, under this lock, so the two agree)
+        let running: Vec<Tid> = (0..crate::smp::started())
+            .map(|h| crate::percpu::hart(h).running.load(Ordering::Acquire))
+            .collect();
+        let mut out = Vec::new();
+        let mut more = 0usize;
+        for (&tid, t) in k.threads.iter() {
+            if skip.contains(&tid) {
+                continue;
+            }
+            if out.len() >= REPORT_THREADS {
+                more += 1;
+                continue;
+            }
+            let on_hart = running.contains(&tid);
+            let in_transit = sc.is_in_transit(tid);
+            let (ra, sp) = t.ctx.saved();
+            let mut text = Vec::new();
+            if let (false, false, Some(stack)) = (on_hart, in_transit, t.stack.as_ref()) {
+                let (bottom, top) = (stack.bottom() as u64, stack.top() as u64);
+                let mut a = sp & !7;
+                if a < bottom {
+                    a = bottom;
+                }
+                while a < top && text.len() < REPORT_TEXT_WORDS {
+                    // SAFETY: `a` is word-aligned and inside `[bottom, top)` of a kernel-stack slot, whose pages are mapped read-write for as
+                    // long as the kernel runs (slots are never unmapped, `kstack.rs`), so the read is valid whatever the thread does. If the
+                    // thread was dispatched since the checks above, a concurrent write only makes the word stale, which the report prints as it
+                    // is; the aliasing caveat of reading a live stack is the one `kstack.rs` records under T242.
+                    let w = unsafe { core::ptr::read_volatile(a as *const u64) };
+                    if (text_lo..text_hi).contains(&w) {
+                        text.push(w);
+                    }
+                    a += 8;
+                }
+            }
+            out.push(ThreadReport {
+                tid,
+                name: t.name,
+                pid: t.user.map(|u| u.pid),
+                state: sc.state(tid),
+                ra,
+                on_hart,
+                in_transit,
+                text,
+            });
+        }
+        (out, more)
+    });
+    let slide = crate::arch::slide();
+    let mut con = crate::console::Console;
+    for r in reports {
+        // (one line, one print: the console lock is per print, and another hart's output must not land inside it)
+        let mut line = alloc::format!(
+            "leak: thread {} {:?} pid {:?} state {:?} on a hart {} in transit {} ra {:#x} [stack",
+            r.tid,
+            r.name,
+            r.pid,
+            r.state,
+            r.on_hart,
+            r.in_transit,
+            r.ra.wrapping_sub(slide)
+        );
+        for w in r.text {
+            let _ = write!(line, " {:#x}", w.wrapping_sub(slide));
+        }
+        let _ = writeln!(con, "{line}]");
+    }
+    if more > 0 {
+        let _ = writeln!(con, "leak: and {more} more threads");
+    }
 }
 
 /// How many threads the scheduler core tracks (must equal `thread_count`).

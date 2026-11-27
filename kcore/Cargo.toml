@@ -6,6 +6,8 @@ description = "OS track: pure kernel logic (no hardware, no unsafe), tested on t
 
 [dependencies]
 abi = { path = "../abi" }
+# IOMMU3: the device-domain store (`kcore::iodomain`) is built on the IOMMU's formats (OD148 step b).
+iommucore = { path = "../iommucore" }
 
 [features]
 # Negative control (L11d): a hart never pulls work from another hart's queue. Off in every real build; the kernel's
@@ -15,6 +17,14 @@ fault-skip-pull = []
 fault-skip-overloaded = []
 # PM1's negative control: a hart going offline leaves its blocked threads (and their timers) homed there, and the HT1 and HT2 tests must fail.
 fault-offline-skip-blocked = []
+# IOMMU4's negative control: an interrupt identity is freed when its route moves, not when its old hart retired it; `msiid_model` must fail.
+fault-msiid-free-at-move = []
+# IOMMU6's negative control: an unmap clears its leaves and its record is released without the invalidation and the fence;
+# the suite's `iodomain_unmap_stops_the_device` must fail (the device still reaches the frame through the IOMMU's cache).
+fault-iommu-skip-inval = []
+# IOMMU7's negative control: a granted vector's MSI entry is written in basic-translate mode to the target hart's file (the forbidden
+# mode of IO11), so the device's own data word reaches the hart: the suite's `msi_forgery_faults` must fail (its "wrong data" row).
+fault-iommu-msi-basic = ["iommucore/fault-msi-basic"]
 
 # Concurrency checkers, host only (they are dependencies, not dev-dependencies,
 # because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")
@@ -24,6 +34,10 @@ loom = "0.7"
 
 [target.'cfg(shuttle)'.dependencies]
 shuttle = "0.8"
+
+# The model, concurrency and allocation tests of `kcore::iodomain` drive the simulated IOMMU as the hardware (IOMMU3).
+[dev-dependencies]
+iommucore = { path = "../iommucore", features = ["sim"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }

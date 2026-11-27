@@ -118,13 +118,44 @@ pub struct SocketEnd {
     shut: bool,
 }
 
-/// An interrupt object: one PLIC source. When it fires the kernel masks the source and sets
-/// `fired` (the INTERRUPT signal); `interrupt_ack` clears it and unmasks.
+/// An interrupt object (IOMMU-SPEC 8.3): of the kind *wired source* (`irq`, an APLIC source: when it fires the kernel masks the source
+/// and sets `fired`, the INTERRUPT signal; `interrupt_ack` clears it and unmasks), or of the kind *vector* of a device domain (`vector`,
+/// `irq` 0: masked by its interrupt file's enable bit, `kcore::iovec`).
 pub struct IrqObj {
     pub irq: u32,
     pub fired: bool,
     /// How many times the kernel claimed this source (a storm would show here).
     pub claims: u64,
+    /// A vector's route in the kernel's vector table (`kcore::iovec`): its slot and the slot's generation (a stale one names a dead
+    /// vector: it never fires and its acknowledgement is BAD_STATE).
+    pub vector: Option<VectorRef>,
+}
+
+/// A vector object's name for its route: the slot of the kernel's vector table and its generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorRef {
+    pub n: u32,
+    pub gen: u32,
+}
+
+/// A device domain (IOMMU-SPEC 4): the domain's id in the kernel's store (`kcore::iodomain::DomainId::raw`), the job that pays for it
+/// (the object holds a use of it until its last handle goes: 4.5), and whether a fault record waits in its ring (DEVICE_FAULT, 7.4).
+/// The last handle destroys the domain (`needs_cleanup`).
+pub struct IoDomainObj {
+    pub domain: u64,
+    pub job: JobId,
+    pub fault: bool,
+    /// `iodomain_destroy` was called (maps are BAD_STATE from then on; a second destroy does nothing).
+    pub destroyed: bool,
+}
+
+/// A resolved device-domain handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoDomainRef {
+    pub obj: ObjId,
+    pub domain: u64,
+    pub job: JobId,
+    pub destroyed: bool,
 }
 
 /// One binding of a port: watch `obj` for `mask`, report as `key`.
@@ -167,6 +198,8 @@ pub enum KObj {
     Interrupt(IrqObj),
     /// The root resource (S6): the authority to mint device memory, DMA buffers and interrupts.
     Resource,
+    /// A device domain (IOMMU6).
+    IoDomain(IoDomainObj),
     /// The debug resource (HD4): the authority to write to the kernel's console and read its counters.
     Debug,
 }
@@ -210,6 +243,7 @@ impl Object for KObj {
                 | KObj::Process(_)
                 | KObj::Job(_)
                 | KObj::Interrupt(_)
+                | KObj::IoDomain(_)
                 | KObj::Exception(_)
                 | KObj::Pager(_)
         )
@@ -794,6 +828,13 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
         KObj::Interrupt(i) => {
             if i.fired {
                 signals::INTERRUPT
+            } else {
+                0
+            }
+        }
+        KObj::IoDomain(d) => {
+            if d.fault {
+                signals::DEVICE_FAULT
             } else {
                 0
             }
@@ -1487,6 +1528,7 @@ pub fn interrupt_object_create_in(
             irq,
             fired: false,
             claims: 0,
+            vector: None,
         }),
         q.job,
     );
@@ -1494,6 +1536,55 @@ pub fn interrupt_object_create_in(
         .insert(reg, obj, Rights::INTERRUPT)
         .expect("room was checked");
     Ok((h, obj))
+}
+
+/// A new interrupt object of the kind vector (IOMMU-SPEC 8.3), for the vector route `v`, with a handle carrying `Rights::INTERRUPT`
+/// (wait and acknowledge: it names nothing else). The object and the handle are charged to `q`'s job (the caller's).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn vector_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    v: VectorRef,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(
+        KObj::Interrupt(IrqObj {
+            irq: 0,
+            fired: false,
+            claims: 0,
+            vector: Some(v),
+        }),
+        q.job,
+    );
+    let h = table
+        .insert(reg, obj, Rights::INTERRUPT)
+        .expect("room was checked");
+    Ok((h, obj))
+}
+
+/// An interrupt object handle that carries `need`: the object and its vector route (`None` for a wired source).
+pub fn interrupt_kind_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(ObjId, Option<VectorRef>), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Interrupt(i)) => {
+            if entry.rights.contains(need) {
+                Ok((entry.obj, i.vector))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
 }
 
 /// The source of an interrupt object handle that carries `need`.
@@ -1522,7 +1613,7 @@ pub fn interrupt_of(
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 claim counter
 pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
     match reg.get_mut(obj) {
-        Some(KObj::Interrupt(i)) if i.irq == irq => {
+        Some(KObj::Interrupt(i)) if i.irq == irq && i.vector.is_none() => {
             i.claims += 1;
             let first = !i.fired;
             i.fired = true;
@@ -1536,12 +1627,90 @@ pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
 /// of claims so far.
 pub fn interrupt_ack(reg: &mut Kobjs, obj: ObjId) -> Result<(u32, u64), Status> {
     match reg.get_mut(obj) {
-        Some(KObj::Interrupt(i)) if i.fired => {
+        Some(KObj::Interrupt(i)) if i.fired && i.vector.is_none() => {
             i.fired = false;
             Ok((i.irq, i.claims))
         }
         Some(KObj::Interrupt(_)) => Err(Status::BadState),
         _ => Err(Status::BadHandle),
+    }
+}
+
+/// A new device-domain object for store domain `domain`, paid for by `job` (whose use it takes: released by the object's cleanup), with a
+/// handle carrying `Rights::IODOMAIN` (IOMMU-SPEC 4.1). The object and the handle are charged to `q`'s job (the caller's).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn iodomain_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    domain: u64,
+    job: JobId,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    q.jobs.retain(job);
+    let obj = reg.create_charged(
+        KObj::IoDomain(IoDomainObj {
+            domain,
+            job,
+            fault: false,
+            destroyed: false,
+        }),
+        q.job,
+    );
+    let h = table
+        .insert(reg, obj, Rights::IODOMAIN)
+        .expect("room was checked");
+    Ok((h, obj))
+}
+
+/// The domain of a device-domain handle that carries `need`: (object, store domain, job).
+pub fn iodomain_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<IoDomainRef, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::IoDomain(d)) => {
+            if entry.rights.contains(need) {
+                Ok(IoDomainRef {
+                    obj: entry.obj,
+                    domain: d.domain,
+                    job: d.job,
+                    destroyed: d.destroyed,
+                })
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// Raise or clear DEVICE_FAULT on a device-domain object (the fault path and `iodomain_fault_read`); false if `obj` is not one.
+pub fn iodomain_set_fault(reg: &mut Kobjs, obj: ObjId, fault: bool) -> bool {
+    match reg.get_mut(obj) {
+        Some(KObj::IoDomain(d)) => {
+            d.fault = fault;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mark a device-domain object destroyed (`iodomain_destroy`); true if it was not already.
+pub fn iodomain_mark_destroyed(reg: &mut Kobjs, obj: ObjId) -> bool {
+    match reg.get_mut(obj) {
+        Some(KObj::IoDomain(d)) if !d.destroyed => {
+            d.destroyed = true;
+            true
+        }
+        _ => false,
     }
 }
 

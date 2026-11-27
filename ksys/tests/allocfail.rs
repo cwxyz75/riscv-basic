@@ -367,6 +367,7 @@ fn all_names() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = scenarios().iter().map(|s| s.name).collect();
     v.extend(pscenarios().iter().map(|s| s.name));
     v.extend(uscenarios().iter().map(|s| s.name));
+    v.extend(iscenarios().iter().map(|s| s.name));
     v
 }
 
@@ -376,6 +377,9 @@ fn child(name: &str, n: usize, persist: bool) {
     }
     if uscenarios().iter().any(|s| s.name == name) {
         return uchild(name, n, persist);
+    }
+    if iscenarios().iter().any(|s| s.name == name) {
+        return ichild(name, n, persist);
     }
     let sc = scenarios()
         .into_iter()
@@ -1033,4 +1037,232 @@ fn uchild(name: &str, n: usize, persist: bool) {
         "scenario {name}, failing allocation {n}: objects alive after every handle was closed"
     );
     println!("ALLOCS={made}");
+}
+
+// ---- the device-domain calls (IOMMU6): a world with the simulated IOMMU, as `iodomain_calls.rs` has ----
+
+use common::iohost::{Host, IoMem};
+
+type IGo<'a, 'm> = &'a mut dyn FnMut(&mut Host<'m>, usize, [u64; 6]) -> Reply;
+
+struct IScenario {
+    name: &'static str,
+    run: for<'a, 'm> fn(&mut Host<'m>, IGo<'a, 'm>),
+}
+
+/// A domain for device 5 and a DMA VMO of `pages` pages, made unarmed: (resource, domain, VMO).
+fn idomain(h: &mut Host, pages: u64) -> (u64, u64, u64) {
+    let res = h.resource();
+    let d = h.domain(res, 5);
+    let v = h.dma(res, pages);
+    (res, d, v)
+}
+
+fn iscenarios() -> Vec<IScenario> {
+    vec![
+        IScenario {
+            name: "iodomain_create",
+            run: |h, go| {
+                let res = h.resource();
+                let _ = go(h, nr::IODOMAIN_CREATE, [res, 3, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "vmo_create_dma_in",
+            run: |h, go| {
+                let res = h.resource();
+                let _ = go(h, nr::VMO_CREATE_DMA_IN, [res, 70, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "iodomain_map_and_unmap",
+            run: |h, go| {
+                let (_, d, v) = idomain(h, 4);
+                if let Ok((Some(io), _)) = go(h, nr::IODOMAIN_MAP, [d, v, 0, 4, 3, 0]) {
+                    let _ = go(h, nr::IODOMAIN_UNMAP, [d, io, 4, 0, 0, 0]);
+                }
+            },
+        },
+        IScenario {
+            name: "iodomain_map_past_a_step",
+            run: |h, go| {
+                let (_, d, v) = idomain(h, 130);
+                if let Ok((Some(io), _)) = go(h, nr::IODOMAIN_MAP, [d, v, 0, 130, 1, 0]) {
+                    let _ = go(h, nr::IODOMAIN_UNMAP, [d, io, 130, 0, 0, 0]);
+                }
+            },
+        },
+        IScenario {
+            name: "iodomain_destroy_with_mappings",
+            run: |h, go| {
+                let (_, d, v) = idomain(h, 8);
+                h.map(d, v, 0, 8, 3);
+                h.map(d, v, 2, 3, 1);
+                let _ = go(h, nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "iodomain_close_with_mappings",
+            run: |h, go| {
+                let (_, d, v) = idomain(h, 8);
+                h.map(d, v, 0, 8, 3);
+                let _ = go(h, nr::HANDLE_CLOSE, [d, 0, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "iodomain_fault_read",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                let _ = h.sim.write(5, 0x7000, 1);
+                h.fault_interrupt();
+                let _ = go(h, nr::IODOMAIN_FAULT_READ, [d, 0, 0, 0, 0, 0]);
+            },
+        },
+        // (IOMMU7) a vector granted, signalled, acknowledged, moved and revoked; and a destruction that revokes them
+        IScenario {
+            name: "iodomain_grant_vector",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                let _ = go(h, nr::IODOMAIN_GRANT_VECTOR, [d, 3, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "vector_ack_and_move",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                let (x, _) = h.grant(d, 0);
+                let _ = h.signal(5, 0);
+                let _ = go(h, nr::INTERRUPT_ACK, [x, 0, 0, 0, 0, 0]);
+                h.harts.here = 2;
+                let _ = go(h, nr::INTERRUPT_DELIVER_HERE, [x, 0, 0, 0, 0, 0]);
+                let _ = go(h, nr::HANDLE_CLOSE, [x, 0, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "iodomain_destroy_with_vectors",
+            run: |h, go| {
+                let (_, d, _) = idomain(h, 1);
+                h.grant(d, 0);
+                h.grant(d, 9);
+                let _ = go(h, nr::IODOMAIN_DESTROY, [d, 0, 0, 0, 0, 0]);
+            },
+        },
+        IScenario {
+            name: "job_set_io_limits",
+            run: |h, go| {
+                let job = h.child_job([UNLIMITED_6; 6]);
+                let _ = go(h, nr::JOB_SET_IO_LIMITS, [job, 10, 2, 0, 0, 0]);
+            },
+        },
+    ]
+}
+
+const UNLIMITED_6: u64 = kcore::job::UNLIMITED;
+
+fn ichild(name: &str, n: usize, persist: bool) {
+    let sc = iscenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("scenario");
+    let mem = IoMem::default();
+    let mut h = Host::new(&mem);
+    h.w.poke(BASE, &[0; 64]); // (the scenarios' scratch page, committed before the free frames are counted)
+    let free = h.w.mm.db.free_count();
+    let free_ids = h.ids.free_total();
+    PERSIST.store(usize::from(persist), Ordering::Relaxed);
+    let mut made = 0;
+    start(n);
+    let mut go = |h: &mut Host, nr: usize, a: [u64; 6]| -> Reply {
+        arm();
+        let r = match ksys::wide_argument_error(nr, &a) {
+            Some(st) => Err((st, None, None)),
+            None => h.call(nr, a),
+        };
+        let this = disarm() - made;
+        if made < n && n <= made + this {
+            if let Err((st, _, _)) = &r {
+                assert!(
+                    matches!(*st, abi::status::Status::NoMemory),
+                    "scenario {name}, failing allocation {n}: the call returned {st:?}, not NO_MEMORY"
+                );
+                made += this;
+                let was = PERSIST.swap(0, Ordering::Relaxed);
+                let again = h.call(nr, a);
+                PERSIST.store(was, Ordering::Relaxed);
+                assert!(
+                    again.is_ok(),
+                    "scenario {name}, failing allocation {n}: after NO_MEMORY the same call, with memory, returned {again:?}: work was lost (call {nr} {a:?})"
+                );
+                return r;
+            }
+        }
+        made += this;
+        r
+    };
+    (sc.run)(&mut h, &mut go);
+    PERSIST.store(0, Ordering::Relaxed);
+    // everything closed: no domain, no mapping, no hold, nothing charged, every frame back
+    h.w.handles.drain(&mut h.w.objs);
+    h.settle();
+    h.w.objs.sweep(&[]);
+    h.settle();
+    kcore::ipc::settle(&mut h.w.objs, &mut h.w.jobs);
+    let st = h.store.stats();
+    assert_eq!(
+        (
+            st.domains,
+            st.holds_leaked,
+            st.pages_leaked,
+            st.tables_leaked
+        ),
+        (0, 0, 0, 0),
+        "scenario {name}, failing allocation {n}: domains or leaks left"
+    );
+    assert!(
+        h.timeouts.is_empty(),
+        "scenario {name}, failing allocation {n}: a fence timed out"
+    );
+    // (IOMMU7) no vector route, identity or charge left behind
+    let c = h.vecs.counts();
+    assert_eq!(
+        (c.live, c.dead, c.leaked, h.ids.free_total(), h.no_route),
+        (0, 0, 0, free_ids, 0),
+        "scenario {name}, failing allocation {n}: a vector or an identity left: {c:?}"
+    );
+    assert_eq!(
+        h.w.jobs
+            .io_usage(kcore::job::JobId::ROOT, kcore::job::IoResource::Vectors),
+        Some(0),
+        "scenario {name}, failing allocation {n}: vectors still charged"
+    );
+    assert_eq!(
+        h.w.objs.live(),
+        0,
+        "scenario {name}, failing allocation {n}: objects alive after every handle was closed"
+    );
+    assert_eq!(
+        h.io_used(kcore::job::JobId::ROOT),
+        0,
+        "scenario {name}, failing allocation {n}: I/O-mapped pages still charged"
+    );
+    for r in [
+        kcore::job::Resource::Objects,
+        kcore::job::Resource::IpcBytes,
+    ] {
+        let used =
+            h.w.jobs
+                .usage(kcore::job::JobId::ROOT)
+                .map_or(0, |u| u.get(r));
+        assert_eq!(
+            used, 0,
+            "scenario {name}, failing allocation {n}: the root job still holds {used} of {r:?}"
+        );
+    }
+    assert_eq!(
+        h.w.mm.db.free_count(),
+        free,
+        "scenario {name}, failing allocation {n}: frames not given back"
+    );
+    audit(&mut h.w).unwrap_or_else(|e| panic!("scenario {name}, failing allocation {n}: {e}"));
+    println!("ALLOCS={}", COUNT.load(Ordering::Relaxed));
 }

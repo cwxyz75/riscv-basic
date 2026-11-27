@@ -128,7 +128,7 @@ fn more_than_eight_locks_is_a_bug() {
 
 #[test]
 fn the_class_numbers_are_the_documented_ones() {
-    // SCHED-SMP-SPEC 3.3 numbers them in order, 1 to 14, since the amendment of 2026-11-23 (the object lock, OBJ, is class 1 and the old LEGACY slot is gone); the kernel's masks and the INVARIANTS table rely on it
+    // SCHED-SMP-SPEC 3.3 numbers them in order, 1 to 15, since the amendment of 2026-11-23 (the object lock, OBJ, is class 1 and the old LEGACY slot is gone) and IOMMU-SPEC 11.1 (IOMMU between KSTACK and FRAME, IOMMU5); the kernel's masks and the INVARIANTS table rely on it
     for (i, &c) in Class::ALL.iter().enumerate() {
         assert_eq!(c as usize, i + 1, "{c:?}");
     }
@@ -167,4 +167,29 @@ fn address_spaces_may_be_taken_ascending_up_to_the_process_limit() {
         h.check(Class::As, 1).is_err(),
         "AS before the memory locks, never after"
     );
+}
+
+#[test]
+fn the_iommu_lock_sits_between_the_kernel_stacks_and_the_frames() {
+    // IOMMU-SPEC 11.1: the fault interrupt holds OBJ and takes IOMMU; a map takes table frames (FRAME, HEAP) under it; nothing
+    // under it takes VMO, JOBS, an AS lock or OBJ; never two
+    let h = held_with(&[(Class::Obj, 0), (Class::Iommu, 0)]);
+    for c in [Class::Frame, Class::Heap, Class::Entropy, Class::Uart] {
+        assert!(h.check(c, 0).is_ok(), "{c:?} under IOMMU");
+    }
+    for c in [
+        Class::As,
+        Class::Vmo,
+        Class::Jobs,
+        Class::Tt,
+        Class::Rq,
+        Class::Kstack,
+    ] {
+        assert!(h.check(c, 0).is_err(), "{c:?} under IOMMU");
+    }
+    assert!(h.check(Class::Iommu, 1).is_err(), "never two");
+    let h = held_with(&[(Class::Vmo, 0), (Class::Jobs, 0), (Class::Kstack, 0)]);
+    assert!(h.check(Class::Iommu, 0).is_ok());
+    let h = held_with(&[(Class::Frame, 0)]);
+    assert!(h.check(Class::Iommu, 0).is_err(), "FRAME then IOMMU");
 }

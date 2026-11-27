@@ -180,6 +180,10 @@ pub(super) fn teardown(pid: u64) -> i32 {
     // one hold. The slices take it themselves, one at a time (`irq::without` ends in a switch point at depth 1); nothing here holds a borrow of the state.
     let depth = crate::bkl::release_all();
     teardown_objects(&mut process, code);
+    // (IOMMU6, IOMMU-SPEC 10.2) the device domains whose last handle was the process's are detached and emptied now, before its memory
+    // goes: the cleanup begins each destruction under the object lock, the drain completes it with no lock held
+    super::wake::cleanup_dead();
+    crate::iommu::drain();
     teardown_memory(process);
     crate::bkl::reacquire(depth);
     kmem::flush_tlb();

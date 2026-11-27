@@ -298,6 +298,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "iommucore"
+version = "0.1.0"
+dependencies = [
+ "iommucore",
+]
+
+[[package]]
 name = "ish"
 version = "0.1.0"
 dependencies = [
@@ -309,6 +316,7 @@ name = "kcore"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "iommucore",
  "loom",
  "shuttle",
 ]
@@ -318,6 +326,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "iommucore",
  "kcore",
  "klock",
  "ksys",
@@ -348,6 +357,7 @@ name = "ksys"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "iommucore",
  "kcore",
  "kfuzz-gen",
  "klock",

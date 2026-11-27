@@ -184,3 +184,29 @@ testdev (1), but virtio stops at status 0 (the device state is reset by the virt
 6. Direct directory-mode to directory-mode changes of `ddtp` are ignored (15).
 7. Open, **not established**: 3 (spec's stage choice), 7 (DBG usage), 9 (independent walk vectors), 10 to 12 (hardware text), A4
    fault absence, M12, INTx silencing, stopped-hart IMSIC.
+
+## Addendum 2026-11-26 (IOMMU7, observed)
+
+These come from a kernel-only boot (`OS_SHARD=k`, one hart, `-cpu rva23s64`, virtio-rng-pci at 00:04.0 behind MRIF entries) with
+`OS_SHOW='## iommu: fault'`. The fault lines of the four MSI suite tests:
+
+- **Cause 262** (the entry not valid: a message to an ungranted page, and to a revoked vector's page) reports **`iotval` 0**:
+  `cause=262 dev=00:04.0 iova=0x0 write`, twice. So both MSI causes this machine raises, 262 and 263, carry no address. The section 10
+  remark about 263 holds for 262 too.
+- **Cause 263** (data 4096 on a granted page): `iova=0x0`.
+- **An unaligned address on a granted MRIF page** (window page + 2, data 1): **no fault**, nothing delivered, and no notice. This is
+  M12 again, now through an MRIF entry. It is still unexplained against the source's alignment check.
+- **A device write to the S-mode IMSIC page** (0x28000000): an ordinary translation fault (cause 23, `iova` the address). It is not an
+  MSI fault, because the address is outside the window.
+
+
+## Addendum 2026-11-26 (CI pins QEMU 11.1.3)
+
+CI ran the boots on Ubuntu 26.04's QEMU, `1:10.2.1+ds-1ubuntu3.3`, whose `virt` machine with `iommu-sys=on` writes
+`iommu-map = <0 ph 0 0>, <0 ph 0 0xffff>`: requester id 0xffff is outside the IOMMU, so the kernel (IOMMU-SPEC 2.2) kept the PCI windows
+closed and the epic's IOMMU, MSI and device-capability tests failed. 11.1.0 is the first release with the single full entry; 11.1.3
+writes `iommu-map = <0x0 0x8000 0x0 0x10000>` [observed, on a developer's machine and on CI]. By the owner's decision of 2026-11-26,
+CI now builds 11.1.3, the version of this record, from the release tarball (sha256 and release-key signature checked) and caches it;
+every job that boots asserts the version, and `qemu.yml` checks the `iommu-map` above (`docs/reference/TEST-TOOLS.md`, "CI's QEMU").
+The bundled firmware is OpenSBI 1.8.1. A cold build on a hosted runner took 165 to 196 s (`riscv64-softmmu` only); restoring the cached
+install (29 MB without the UEFI images) took about a second.

@@ -7,7 +7,7 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::Handle;
 use kcore::ipc;
-use kcore::job::{JobError, Limits, Resource};
+use kcore::job::{IoResource, JobError, Limits, Resource};
 use kcore::pagetable::PhysMem;
 use kcore::usercopy::copy_from_user;
 
@@ -85,6 +85,15 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 .map_err(|x| e(job_status(x)))?;
             Ok((None, None))
         })(),
+        // `job_set_io_limits(job, io_pages, vectors)` (IOMMU-SPEC 5.3): the job's limits on I/O-mapped pages and on interrupt vectors
+        // (`u64::MAX`: none of its own; the smallest along the ancestors applies). Needs SET_LIMITS. Usage above a new limit is not undone.
+        nr::JOB_SET_IO_LIMITS => (|| {
+            let job = ipc::job_of(c.objs, c.handles, h, Rights::SET_LIMITS).map_err(e)?;
+            c.jobs
+                .set_io_limits(job, a[1], a[2])
+                .map_err(|x| e(job_status(x)))?;
+            Ok((None, None))
+        })(),
         nr::JOB_SET_LIMITS => (|| {
             let job = ipc::job_of(c.objs, c.handles, h, Rights::SET_LIMITS).map_err(e)?;
             let limits = read_limits(c, a[1]).map_err(e)?;
@@ -141,6 +150,17 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                         .region_limit(job)
                         .min(abi::limits::MAX_REGIONS as u64);
                     return Ok((Some(l), Some(l)));
+                }
+                // 12 and 13 (IOMMU-SPEC 5.3): I/O-mapped pages and interrupt vectors of the job's device domains and of those below it,
+                // and the effective limit (the smallest along the ancestors; `u64::MAX`: none)
+                12 | 13 => {
+                    let r = if a[1] == 12 {
+                        IoResource::MappedPages
+                    } else {
+                        IoResource::Vectors
+                    };
+                    let used = c.jobs.io_usage(job, r).ok_or(e(Status::BadState))?;
+                    return Ok((Some(used), Some(c.jobs.io_limit(job, r))));
                 }
                 _ => return fail(Status::InvalidArgs),
             };

@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -28,7 +28,7 @@ help:
 	@echo "make check      the epic gate (smoke): what CI runs on a pull request into main"
 
 test:
-	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -42,7 +42,7 @@ fmt-check:
 lint: lint-host lint-target
 
 lint-host:
-	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 
 lint-target:
 	cd home/kernel && cargo clippy -- -D warnings
@@ -105,6 +105,7 @@ OS_NOCBZE_ELF := target/os-fault-cbze/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
+OS_NOMSIRETIRE_ELF := target/os-fault-msiid/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
 OS_NOPULL_ELF  := target/os-fault-pull/$(KERNEL_TARGET)/debug/kernel
@@ -128,7 +129,7 @@ kernel: kernel-main
 # Host tests of the OS crates: plain, then the same code under the loom and
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
 os-test:
-	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock
+	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore
 	$(MAKE) os-models
 
 # AR1 (OD143): the kernel compiles against the AArch64 stub in kernel/src/arch/aarch64 (no code is built or run for it).
@@ -140,6 +141,8 @@ os-models:
 	@if cargo test -p kcore --features fault-offline-skip-blocked --test sched_offline --target-dir target/neg-offline >/dev/null 2>&1; then echo 'fault-offline-skip-blocked was not caught by sched_offline'; exit 1; fi
 	# SC2's negative control: with no hart ever marked overloaded the masks' acceptance test must fail
 	@if cargo test -p kcore --features fault-skip-overloaded --test sched_masks --target-dir target/neg-overloaded >/dev/null 2>&1; then echo 'fault-skip-overloaded was not caught by sched_masks'; exit 1; fi
+	# IOMMU7's negative control on the host: basic-translate MSI entries (the device's data word reaches the hart) must fail the vector model
+	@if cargo test -p kcore --features fault-iommu-msi-basic --test iodomain_vectors_model --target-dir target/neg-msi >/dev/null 2>&1; then echo 'fault-iommu-msi-basic was not caught by iodomain_vectors_model'; exit 1; fi
 	RUSTFLAGS="--cfg loom" cargo test -p klock --release --test spin_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p netring --release --test doorbell_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p klock --release --test spin_concurrency --target-dir target/shuttle
@@ -157,6 +160,8 @@ os-models:
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test vmofamily_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test pager_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test park_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test iodomain_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test iodomain_vectors_concurrency --target-dir target/shuttle
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
 # nightly --profile minimal --component miri); CI runs it, `make check` does not.
@@ -171,6 +176,7 @@ os-miri:
 	# (the allocation-failure sweep starts child processes of itself, which Miri cannot do; the host run and `os-allocfail` cover it)
 	cargo +nightly miri test -p ksys --target-dir target/miri -- --skip every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean
 	cargo +nightly miri test -p klock --target-dir target/miri
+	cargo +nightly miri test -p iommucore --target-dir target/miri
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
 # kernel at four harts is also the fastest full run (35 s: waits overlap).
@@ -397,6 +403,9 @@ os-boot-test-aia: kernel
 	python3 scripts/os_boot_test.py --neg $(OS_NOUNMASK_ELF) interrupt_object_fires_and_masks
 	cd kernel && cargo build --features fault-aia-no-repend --target-dir ../target/os-fault-repend
 	python3 scripts/os_boot_test.py --neg $(OS_NOREPEND_ELF) interrupt_object_fires_and_masks
+	# (IOMMU4, IO12: an interrupt identity freed at the move instead of after its hart retired it)
+	cd kernel && cargo build --features fault-msiid-free-at-move --target-dir ../target/os-fault-msiid
+	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOMSIRETIRE_ELF) interrupt_moves_do_not_lose_or_leak
 
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.
@@ -409,7 +418,7 @@ os-interactive: os-user
 
 # Boot the OS to its shell in this terminal (type `basic`; Ctrl-A then X leaves QEMU).
 os-run: os-interactive
-	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
 
 # The system as it is meant to be used (T48): optimised kernel and programs, no boot self-tests, no
 # test banners. `make os-release-run` boots it in this terminal; `os-release-smoke` boots it
@@ -421,7 +430,7 @@ os-release:
 	cd kernel && OS_USER_PROFILE=release CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --features release --target-dir ../target/os-release-run
 
 os-release-run: os-release
-	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
 
 os-release-smoke: os-release
 	python3 scripts/release_symbols.py --self-test
@@ -466,6 +475,31 @@ os-boot-test-entropy: kernel
 # PL1 (OD47, OD127): a CPU without the profile must end the boot in `##PANIC missing extension` (QEMU's plain rv64 has no V, Zicond or Svade).
 os-boot-test-cpu-neg: kernel
 	OS_CPU=rv64 OS_BOOT_TIMEOUT=60 python3 scripts/os_boot_test.py --expect-panic "missing extension" $(OS_ELF)
+
+# IOMMU5 (IOMMU-SPEC 2.5): the machine without its platform IOMMU (no `iommu-sys=on`) must end in `##PANIC ... no IOMMU`.
+os-boot-test-iommu-neg: kernel-main
+	OS_MACHINE=virt,aia=aplic-imsic OS_PCI_TEST=0 OS_BOOT_TIMEOUT=60 python3 scripts/os_boot_test.py --expect-panic "no IOMMU" $(OS_ELF)
+
+# IOMMU5 negative control (TESTING.md rule 9): a kernel that writes `ddtp` Bare (no translation, no isolation) must fail
+# `iommu_is_on_and_denies_by_default`. Kernel-only boot.
+OS_IOMMUBARE_ELF := target/os-fault-iommubare/$(KERNEL_TARGET)/debug/kernel
+os-boot-test-iommu-bare: kernel-main
+	cd kernel && cargo build --features fault-iommu-bare --target-dir ../target/os-fault-iommubare
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUBARE_ELF) iommu_is_on_and_denies_by_default
+
+# IOMMU6 negative control (TESTING.md rule 9): a kernel whose unmap clears the leaves and frees without the invalidation and fence
+# must fail `iodomain_unmap_stops_the_device` (the device still reaches the frame through the IOMMU's cache). Kernel-only boot.
+OS_IOMMUINVAL_ELF := target/os-fault-iommuinval/$(KERNEL_TARGET)/debug/kernel
+os-boot-test-iommu-inval: kernel-main
+	cd kernel && cargo build --features fault-iommu-skip-inval --target-dir ../target/os-fault-iommuinval
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUINVAL_ELF) iodomain_unmap_stops_the_device
+
+# IOMMU7 negative control (TESTING.md rule 9): a kernel that writes basic-translate MSI entries (the device's own data word reaches the
+# hart's file) must fail `msi_forgery_faults` (IO11). Kernel-only boot.
+OS_IOMMUMSI_ELF := target/os-fault-iommumsi/$(KERNEL_TARGET)/debug/kernel
+os-boot-test-iommu-msi: kernel-main
+	cd kernel && cargo build --features fault-iommu-msi-basic --target-dir ../target/os-fault-iommumsi
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUMSI_ELF) msi_forgery_faults
 
 # Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
 # third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
@@ -515,7 +549,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
@@ -548,12 +582,13 @@ os-chaos:
 	cd kernel && cargo build --features chaos --target-dir ../target/os-chaos
 	python3 scripts/chaos.py $(OS_CHAOS_ELF) "$(CHAOS_SEEDS)"
 
-# KT10: mutation testing of kcore and klock with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
-# `make os-mutants` runs both crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
+# KT10: mutation testing of kcore, klock and iommucore with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
+# `make os-mutants` runs the three crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
 # Fails on a surviving mutant that is not in mutants-accepted.txt with a reason. Hours: the owner starts it (OD142).
 os-mutants:
 ifeq ($(PKG),)
 	python3 scripts/mutants.py klock
+	python3 scripts/mutants.py iommucore
 	python3 scripts/mutants.py kcore
 else
 	python3 scripts/mutants.py $(PKG) $(if $(SHARD),--shard $(SHARD),)
@@ -564,7 +599,7 @@ endif
 # artifact in CI). Not a gate. (0.6.16 cannot read the coverage data of rustc 1.100 and reports 0 percent everywhere: found by the first overnight
 # run, 2026-11-21; with 0.9.2 the host tests of the four crates cover 90.4 percent of regions and 91.3 percent of lines.)
 os-coverage:
-	cargo llvm-cov -p kcore -p klock -p abi -p ksys --summary-only
+	cargo llvm-cov -p kcore -p klock -p abi -p ksys -p iommucore --summary-only
 	cargo llvm-cov report --html --output-dir target/cov
 
 # KT8: the host fuzzer of the syscall layer (`ksys/tests/fuzz.rs`, sequences from `kfuzz-gen`, audits after every call) over many seeds. A failing

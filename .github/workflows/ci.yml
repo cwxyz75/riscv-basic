@@ -7,7 +7,8 @@ name: ci
 #     on a push to main, and when started by hand on any branch (Actions > ci > Run workflow, or `gh workflow run ci.yml --ref
 #     epic/...`: a checkpoint on a long epic, never required).
 # Every job's timeout is its budget (7 minutes; the jobs run side by side, so the whole gate stays inside 10); a job that outgrows it
-# fails loudly and the budget is raised (or the work cut) on purpose, in TESTING.md. The full matrix (tier 2) is `soak.yml`: started
+# fails loudly and the budget is raised (or the work cut) on purpose, in TESTING.md. The one exception is `qemu`, the tool-build job
+# (CI's QEMU into the cache; seconds when the cache is warm). The full matrix (tier 2) is `soak.yml`: started
 # only by the owner, by hand (OD142); never required.
 on:
   push:
@@ -51,6 +52,24 @@ jobs:
           case "$files" in *home/basic/*|*home/console/*|*home/basic-script/*|*home/turtle/*|*home/logo/*|*home/rv64/*|*home/cartfs/*) os=true ;; esac
           echo "os=$os" >> "$GITHUB_OUTPUT"; echo "home=$home" >> "$GITHUB_OUTPUT"
 
+  # CI's QEMU (TEST-TOOLS.md, "CI's QEMU"): the release pinned in .github/actions/install-qemu/build-qemu.sh, built from its tarball
+  # and kept in the Actions cache. Every job that boots needs this one and restores the entry (failing if it is not there, never
+  # building it). On a warm cache this job only looks the entry up (seconds); on a cold one (the first smoke in a cache scope) it
+  # builds and saves it. It is the tool-build job: no test, no boot, no make target, so its timeout is the tool-build budget, not
+  # the gate's (TESTING.md, "Budgets"; the docs check allows this one job).
+  qemu:
+    needs: changes
+    if: ${{ needs.changes.outputs.smoke == 'true' && (needs.changes.outputs.os == 'true' || needs.changes.outputs.home == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look up CI's QEMU, and build it into the cache if it is missing
+        uses: ./.github/actions/install-qemu
+        with:
+          mode: fill
+          packages: ''
+
   host:
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -61,8 +80,8 @@ jobs:
         run: rustup toolchain install
       - run: cargo fmt --all -- --check
       - run: python3 scripts/check_docs.py
-      - run: cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
-      - run: cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+      - run: cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+      - run: cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
       - name: The kernel against the AArch64 stub (AR1)
         run: make os-aarch64-check
       - name: Check the demo pictures against the independent renderer
@@ -98,6 +117,7 @@ jobs:
         uses: ./.github/actions/install-qemu
         with:
           packages: clang llvm
+          qemu: 'false'
       - run: make lint-target
       - run: make build
 
@@ -118,6 +138,7 @@ jobs:
         uses: ./.github/actions/install-qemu
         with:
           packages: clang llvm
+          qemu: 'false'
       - run: make os-release
 
   # The epic gate's boots (tier 1) from here on: each job needs `smoke`.
@@ -128,7 +149,7 @@ jobs:
   # (The fail-demo check, when the harness changed, is the separate job `harness (fail-demo)`.)
   kernel:
     name: kernel (smoke a)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -141,18 +162,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: smoke
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
-      - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
-        run: |
-          qemu-system-riscv64 --version | head -1
-          qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
-          dpkg -l opensbi | tail -1
+      - name: The QEMU on the PATH is CI's pinned build (fails otherwise)
+        run: .github/actions/install-qemu/check-qemu.sh
       - run: make os-boot-test-smoke-a
 
   kernel-net:
     name: kernel (smoke b)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -165,19 +183,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: smoke
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
-      - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
-        run: |
-          qemu-system-riscv64 --version | head -1
-          qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
-          dpkg -l opensbi | tail -1
+      - name: The QEMU on the PATH is CI's pinned build (fails otherwise)
+        run: .github/actions/install-qemu/check-qemu.sh
       - run: make os-boot-test-smoke-b
 
   # The kernel-only boot (KT1), in three parallel jobs: one and two harts (without the slow tests), four harts, and the optimised kernel at four.
   kernel-only:
     name: kernel (ktest)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -190,13 +205,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ktest
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-small
 
   kernel-only-4:
     name: kernel (ktest 4 harts)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -209,13 +224,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ktest4
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-4
 
   kernel-only-big:
     name: kernel (ktest 4 GiB, latency)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -228,13 +243,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ktestbig
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-big
 
   kernel-only-release:
     name: kernel (ktest release)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -247,7 +262,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ktest-release
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-release
       - run: make os-ktest-release-content
@@ -255,7 +270,7 @@ jobs:
   # AB8: the negative control of the entry check, and the suite at shuffled syscall numbers (ABI_SHUFFLE_SEED).
   kernel-only-abi:
     name: kernel (abi)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -268,16 +283,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ktest-release
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-entry-neg
       - run: make os-ktest-shuffle
 
   # KT5: the instruction counts of the main syscall paths, at one hart under `-icount shift=0` (deterministic), against bench/counts.tsv (a rise of
-  # more than 5 % fails).
+  # more than 25 % fails, T223; TEST-TOOLS.md).
   kernel-counts:
     name: kernel (counts)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -290,14 +305,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: counts
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-count
 
   # The release smoke: the release image boots to the shell and reports no test banners (its own job, in parallel with the boots).
   release-smoke:
     name: kernel (release smoke)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -310,7 +325,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-smoke
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - run: make os-release-smoke
 
@@ -318,7 +333,7 @@ jobs:
   # the archive is pinned by its sha256 in third_party/fetch-manifest.txt), not committed. Without them `busybox` is a stub.
   shell-test:
     name: kernel (shell test)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -329,7 +344,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: shell-test
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
       - uses: actions/cache@v4
         with:
@@ -346,7 +361,7 @@ jobs:
   # deliberate fault must fail the boot test. Its own job, so its minutes do not come out of the smoke job's budget.
   harness-fail-demo:
     name: harness (fail-demo)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -369,7 +384,7 @@ jobs:
         if: steps.h.outputs.changed == 'true'
         with:
           key: smoke
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         if: steps.h.outputs.changed == 'true'
         uses: ./.github/actions/install-qemu
       - name: fail-demo
@@ -380,7 +395,7 @@ jobs:
   # The home computer is its own job: it only needs to run when home/ or something shared changed.
   home-kernel:
     name: kernel (home computer)
-    needs: changes
+    needs: [changes, qemu]
     if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.home == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
@@ -391,8 +406,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: home
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
         with:
-          packages: qemu-system-riscv opensbi
+          packages: ''
       - run: make home-boot-test

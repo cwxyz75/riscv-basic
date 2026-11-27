@@ -7,7 +7,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  # CI's QEMU (TEST-TOOLS.md, "CI's QEMU"): look the cache entry up, and build it if this branch's cache has none; the jobs that boot
+  # restore it.
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look up CI's QEMU, and build it into the cache if it is missing
+        uses: ./.github/actions/install-qemu
+        with:
+          mode: fill
+          packages: ''
+
   kernel:
+    needs: qemu
     name: soak (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 80
@@ -31,7 +45,7 @@ jobs:
           - name: lossy relay
             targets: os-boot-test-lossy
           - name: AIA, RVA23, no disk, serial
-            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-serial-test os-release-smoke
+            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-serial-test os-release-smoke
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
@@ -39,22 +53,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: soak-${{ matrix.name }}
-      - name: Install QEMU and OpenSBI
+      - name: Install QEMU
         uses: ./.github/actions/install-qemu
         with:
-          packages: qemu-system-riscv opensbi clang llvm device-tree-compiler
+          packages: clang llvm device-tree-compiler
       - uses: actions/cache@v4
         with:
           path: third_party/fetched
           key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
       - name: Fetch BusyBox (pinned by sha256; the serial tests run its applets)
         run: FETCH_ONLY="busybox kilo sqlite gzip" make fetch-third-party
-      - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
+      - name: The QEMU on the PATH is CI's pinned build (fails otherwise), and the clang version
         run: |
-          qemu-system-riscv64 --version | head -1
-          qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
-          qemu-system-riscv64 -cpu help | grep -i rva23 || echo "NO RVA23 CPU"
-          dpkg -l opensbi | tail -1
+          .github/actions/install-qemu/check-qemu.sh
           clang --version | head -1
       - run: make ${{ matrix.targets }}
       # the serial log of every failing boot (scripts/os_boot_test.py writes it to target/fail-logs/) and of a failing repeat run

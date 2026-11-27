@@ -141,6 +141,12 @@ fn cleanup_dead_held() {
                     crate::heap::nofail(|| request_kill(p.pid, -2000))
                 }
                 ipc::KObj::Job(id) => kmem::jobs().jobs.release(id),
+                // the last handle of a device domain (IOMMU-SPEC 4.5): its destruction begins (6.3 step 1, under `IOMMU`) and is completed
+                // with no lock held at the tail of this call or fault (`iommu::drain`); the object's use of its job goes
+                ipc::KObj::IoDomain(d) => {
+                    crate::iommu::closed(d.domain);
+                    kmem::jobs().jobs.release(d.job);
+                }
                 // the last handle to an exception was closed without a decision: it is NEXT (EX2)
                 ipc::KObj::Exception(e) => crate::heap::nofail(|| {
                     act_on_resolution(with_state(|s| {
@@ -152,15 +158,21 @@ fn cleanup_dead_held() {
                     with_state(|s| ksys::pager::pager_destroyed(s, id));
                     super::waits::wake_pager_waiters();
                 }
+                // (IOMMU7: a vector's revoke begins under the object lock, and `drain` completes it with none; it owns no wired source)
+                ipc::KObj::Interrupt(i) if i.vector.is_some() => with_state(|_| {
+                    if let Some(v) = i.vector {
+                        crate::iommu::vector_closed(v);
+                    }
+                }),
                 ipc::KObj::Interrupt(i) => with_state(|s| {
-                    // mask the source unless a newer object already owns it
+                    // mask the source and end its route (its identity is retired by its hart) unless a newer object already owns it
                     let owned = matches!(s.irq_objs.get(i.irq as usize), Some(Some(o))
                         if matches!(s.objs.get(*o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
                     if !owned {
                         if let Some(slot) = s.irq_objs.get_mut(i.irq as usize) {
                             *slot = None;
                         }
-                        crate::aia::disable(i.irq);
+                        crate::aia::release(i.irq);
                     }
                 }),
                 _ => {}

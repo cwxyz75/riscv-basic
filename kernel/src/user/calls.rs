@@ -10,7 +10,10 @@ pub(super) fn bad(s: Status) -> Reply {
     Err((s, None, None))
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+/// The process, thread, job and pager calls. A thin dispatcher: every arm is a function of its own that is never inlined here, so the
+/// frame on the stack of a call is that call's own and not the largest of all of them (KT13, T172: folded together the dispatcher was a
+/// 4.3 KiB frame under every one of these calls, and `process_kill`'s teardown and wakes went below it, the deepest path of the suite).
+#[allow(clippy::large_stack_frames)] // KT13: audited: clippy's estimate (1.5 KiB) adds up a result slot per arm, sixty of them; the optimised frame holds one, and the boot-time high-water budget check bounds the sum
 pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
     match n {
         nr::PROCESS_CREATE => process_create(a),
@@ -347,6 +350,7 @@ fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
 
 /// The calls that only read and change the process table (`ksys::proc_call`).
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the call table's locals; T172 shrinks them)
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
     if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
         thread::charge_running(); // (the CPU time of what runs now, the caller included, is brought up to date before it is read: AB6)
@@ -390,6 +394,8 @@ pub(crate) fn cow_sync() {
     if kcore::aspace::DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         drain_dying();
     }
+    // (IOMMU6) a device domain whose last handle went in this call or fault is destroyed before the thread is back in user mode (6.3)
+    crate::iommu::drain();
     if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -445,6 +451,7 @@ pub(super) fn caller_pid(s: &UserState) -> Result<u64, Status> {
     s.pid_of(thread::current()).ok_or(Status::BadState)
 }
 
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_create(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -465,7 +472,9 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_start(a: [u64; 6]) -> Reply {
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
@@ -492,6 +501,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     Ok((None, None))
 }
 
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_kill(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0]);
     let code = a[1] as i32;
@@ -511,6 +521,7 @@ pub(super) fn process_kill(a: [u64; 6]) -> Reply {
 /// `process_suspend(process)` and `process_resume(process)` (SIG2): stop or continue every thread of a process. Both need
 /// KILL on the handle (the right to end a process is the right to stop it), are idempotent, and refuse an ended process
 /// (BAD_STATE). A process may stop itself: its calling thread parks as it returns.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     let ph = Handle(a[0]);
     let tpid = locked_state(|s| -> Result<u64, ReplyErr> {
@@ -549,7 +560,9 @@ fn spawn_registered(
 }
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
@@ -576,6 +589,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
 /// wait that would sleep (object_wait, port_wait, futex_wait, channel_call, with a deadline other than 0) returns
 /// INTERRUPTED and takes the flag; one that is satisfied, or a poll, leaves it. It ends waits, not running code.
 /// Needs MANAGE on a thread handle; a thread that has ended is BAD_STATE.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
     let tid = locked_state(|s| -> Result<Tid, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -596,6 +610,7 @@ fn job_of(s: &UserState, tid: kcore::sched::Tid) -> Option<kcore::job::JobId> {
 }
 
 /// `pager_create() -> (pager, channel)` (MM9).
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn pager_create_call() -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -606,7 +621,9 @@ pub(super) fn pager_create_call() -> Reply {
 }
 
 /// `pager_supply(pager, vmo, offset, length, source, source_offset)` (MM9). A partly done supply still ends the waits of the pages it moved.
-#[allow(clippy::large_stack_frames)] // INVARIANT: the lock set of every address space and the supply's arguments: one frame on the syscall path, no recursion
+#[allow(clippy::large_stack_frames)]
+// INVARIANT: the lock set of every address space and the supply's arguments: one frame on the syscall path, no recursion
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
     let r = locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -629,6 +646,7 @@ pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
 }
 
 /// `pager_fail(pager, vmo, offset, length, status)` (MM9).
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn pager_fail_call(a: [u64; 6]) -> Reply {
     let r = locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -642,6 +660,7 @@ pub(super) fn pager_fail_call(a: [u64; 6]) -> Reply {
 
 /// `process_exception_channel(process) -> channel` and `job_exception_channel(job) -> channel` (EX2): the user end of the channel the kernel writes
 /// the exceptions of that process's threads (or of the processes below that job) on.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn exception_channel_call(a: [u64; 6], job: bool) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -672,6 +691,7 @@ pub(super) fn act_on_resolution(r: Option<ksys::exception::Resolved>) {
 }
 
 /// `exception_resume(exception, how)` (EX2): RETRY, NEXT or KILL.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn exception_resume_call(a: [u64; 6]) -> Reply {
     let r = locked_state(|s| -> Result<ksys::exception::Resolved, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -684,6 +704,7 @@ pub(super) fn exception_resume_call(a: [u64; 6]) -> Reply {
 
 /// `thread_suspend(thread)` (EX1): raise the thread's suspend count. It stops at its next return to user mode (a thread running user code on
 /// another hart is reached by the same kick as a kill), or where it is if it is blocked in a call.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_suspend_call(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -697,6 +718,7 @@ pub(super) fn thread_suspend_call(a: [u64; 6]) -> Reply {
 }
 
 /// `thread_resume(thread)` (EX1): lower the count; at 0 the thread runs again (a parked one is woken).
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_resume_call(a: [u64; 6]) -> Reply {
     let (tid, wake) = locked_state(|s| -> Result<(Tid, bool), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -737,7 +759,9 @@ fn general_of(
 
 /// `thread_read_state(thread, kind, buffer, length)` and `thread_write_state(...)` (EX1): the registers of a thread that has stopped. The
 /// layouts are in `abi::thread_state`; `length` must be exactly the layout's size (VECTOR: 32 + 32 `vlenb` bytes).
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: vlenb is a small power of two (at most 8 KiB), so the layout's size is far below u64::MAX
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: vlenb is a small power of two (at most 8 KiB), so the layout's size is far below u64::MAX
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_state_call(a: [u64; 6], write: bool) -> Reply {
     use abi::thread_state as ts;
     let (kind, buf, len) = (a[1], a[2], a[3]);
@@ -923,6 +947,7 @@ pub(super) fn thread_target(
 /// `thread_set_sched(thread, priority, flags)`: set a thread's base priority (1 to 63) and flags (bit 0: round robin
 /// within its level). Needs MANAGE on the handle (none for 0, the caller), and the priority may not exceed the
 /// thread's job's `max_prio`.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -945,6 +970,7 @@ pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
 
 /// `thread_get_sched(thread) -> sched, tid`: `sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and
 /// the effective priority (16 to 23: the base raised by what is donated to the thread, L23). Needs INSPECT (none for 0).
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -958,7 +984,9 @@ pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
 
 /// `job_set_sched(job, max_prio, rt_budget_ns, cpu_weight)`: needs SET_LIMITS. No value may exceed the parent job's;
 /// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -996,6 +1024,7 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
 /// `job_kill(job, code)`: end every process in the job and its descendants with exit code
 /// `code` and forbid new processes and threads there (their limits become 0). Needs KILL. A
 /// caller inside the job ends too, last.
+#[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn job_kill(a: [u64; 6]) -> Reply {
     let code = a[1] as i32;
     let (job, me_inside, me) = locked_state(|s| -> Result<(_, bool, u64), ReplyErr> {

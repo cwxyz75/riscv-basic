@@ -174,6 +174,50 @@ fn counting_sleeper(_: usize) {
     }
 }
 
+/// Each hart's counters at one moment (`harts_go_offline_and_come_back`'s failure message): timer ticks, inter-hart interrupts, idle entries,
+/// idle microseconds, big-lock takes, whether it runs a thread, and its state.
+fn hart_window_snapshot(n: usize) -> alloc::vec::Vec<[u64; 7]> {
+    (0..n)
+        .map(|h| {
+            let p = percpu::hart(h);
+            [
+                p.timer_ticks.load(Ordering::Relaxed),
+                p.ipis.load(Ordering::Relaxed),
+                p.idle_wfi.load(Ordering::Relaxed) + p.idle_suspend.load(Ordering::Relaxed),
+                p.idle_ns.load(Ordering::Relaxed) / 1000,
+                p.bkl_takes.load(Ordering::Relaxed),
+                p.running.load(Ordering::Relaxed),
+                u64::from(p.hart_state.load(Ordering::Relaxed)),
+            ]
+        })
+        .collect()
+}
+
+/// The window between two snapshots, per hart: the first five counters as deltas, then running and state as they ended.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB in a test (the formatting's temporaries), run only on a failure, no recursion
+fn hart_window_report(a: &[[u64; 7]], b: &[[u64; 7]], elapsed_ns: u64) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "window {} us; per hart (ticks, ipis, idle entries, idle us, lock takes; running, state):",
+        elapsed_ns / 1000
+    );
+    for (h, (x, y)) in a.iter().zip(b).enumerate() {
+        let _ = write!(out, " {h}: (");
+        for i in 0..5 {
+            let _ = write!(
+                out,
+                "{}{}",
+                y[i].wrapping_sub(x[i]),
+                if i < 4 { ", " } else { "; " }
+            );
+        }
+        let _ = write!(out, "{}, {})", y[5], y[6]);
+    }
+    out
+}
+
 /// PM1 (KERNEL-V1-SPEC 5.3): harts go offline and come back in a random order while sleepers keep waking (their timers migrate), the last online hart refuses, and the
 /// offline hart takes no wakes and shows as offline; everything is online again at the end.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
@@ -208,9 +252,12 @@ fn harts_go_offline_and_come_back() -> Result<(), String> {
             percpu::hart(h).idle_wfi.load(Ordering::Relaxed)
                 + percpu::hart(h).idle_suspend.load(Ordering::Relaxed)
         };
+        // (for the failure message, T267 part T49: what every hart did in the window, so a stalled vCPU and a misplaced timer can be told apart)
+        let (s0, n0) = (hart_window_snapshot(n), thread::now_ns());
         let (t0, e0) = (TICKS.load(Ordering::Relaxed), entries(v));
         thread::sleep_ticks(10);
         let t1 = TICKS.load(Ordering::Relaxed);
+        let (s1, n1) = (hart_window_snapshot(n), thread::now_ns());
         if state(v) != HART_OFFLINE || percpu::hart(v).online.load(Ordering::Acquire) {
             result = Err(format!(
                 "round {round}: hart {v} is not offline (state {})",
@@ -220,8 +267,9 @@ fn harts_go_offline_and_come_back() -> Result<(), String> {
         }
         if t1 < t0 + (baseline / 4).max(2) {
             result = Err(format!(
-                "round {round}: the sleepers made {} wakes in 10 ms with hart {v} offline (baseline {baseline})",
-                t1 - t0
+                "round {round}: the sleepers made {} wakes in 10 ms with hart {v} offline (baseline {baseline}); {}",
+                t1 - t0,
+                hart_window_report(&s0, &s1, n1.saturating_sub(n0))
             ));
             break;
         }
@@ -583,6 +631,12 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
         (Class::Jobs, Class::Frame, false),
         (Class::Procs, Class::Futex, false),
         (Class::Futex, Class::Procs, true),
+        // the IOMMU (IOMMU-SPEC 11.1): after OBJ and the memory locks, before FRAME
+        (Class::Obj, Class::Iommu, false),
+        (Class::Iommu, Class::Frame, false),
+        (Class::Frame, Class::Iommu, true),
+        (Class::Iommu, Class::Vmo, true),
+        (Class::Iommu, Class::Obj, true),
     ] {
         if order_check(held, probe) != bad {
             return Err(format!(

@@ -500,6 +500,75 @@ pub mod sys {
     pub fn vmo_phys_addr(vmo: u64) -> Ret {
         syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
     }
+    /// A DMA VMO of `pages` zeroed, pinned frames (not promised contiguous), charged to `job` (0: the caller's) (IOMMU-SPEC 4.7).
+    pub fn vmo_create_dma_in(resource: u64, pages: u64, job: u64) -> Ret {
+        syscall(
+            VMO_CREATE_DMA_IN,
+            [resource as usize, pages as usize, job as usize, 0, 0, 0],
+        )
+    }
+    /// A device domain for `device_id`, attached at once, paid for by `job` (0: the caller's) (IOMMU-SPEC 4.2).
+    pub fn iodomain_create(resource: u64, device_id: u64, job: u64) -> Ret {
+        syscall(
+            IODOMAIN_CREATE,
+            [resource as usize, device_id as usize, job as usize, 0, 0, 0],
+        )
+    }
+    /// Map `pages` pages of a DMA VMO from byte `offset` into the domain: `a1` is the I/O address the kernel chose (4.3).
+    pub fn iodomain_map(domain: u64, vmo: u64, offset: u64, pages: u64, access: u64) -> Ret {
+        syscall(
+            IODOMAIN_MAP,
+            [
+                domain as usize,
+                vmo as usize,
+                offset as usize,
+                pages as usize,
+                access as usize,
+                0,
+            ],
+        )
+    }
+    /// Remove exactly the mapping `iodomain_map` returned at `io_address` (4.4).
+    pub fn iodomain_unmap(domain: u64, io_address: u64, pages: u64) -> Ret {
+        syscall(
+            IODOMAIN_UNMAP,
+            [
+                domain as usize,
+                io_address as usize,
+                pages as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+    /// Detach the device and empty the domain (4.5).
+    pub fn iodomain_destroy(domain: u64) -> Ret {
+        syscall(IODOMAIN_DESTROY, [domain as usize, 0, 0, 0, 0, 0])
+    }
+    /// The oldest unread fault: `a1` is cause | direction << 16 | dropped << 32, `a2` the I/O address (7.4).
+    pub fn iodomain_fault_read(domain: u64) -> Ret {
+        syscall(IODOMAIN_FAULT_READ, [domain as usize, 0, 0, 0, 0, 0])
+    }
+    /// Grant vector `index` of the domain's device (IOMMU-SPEC 8.3, needs IO_GRANT): `a1` an interrupt handle, `a2` the MSI-X address;
+    /// the data word is `abi::iodomain::MSI_DATA`.
+    pub fn iodomain_grant_vector(domain: u64, index: u64) -> Ret {
+        syscall(
+            IODOMAIN_GRANT_VECTOR,
+            [domain as usize, index as usize, 0, 0, 0, 0],
+        )
+    }
+    /// Move the interrupt's delivery to the calling hart (8.5; needs MANAGE).
+    pub fn interrupt_deliver_here(interrupt: u64) -> Ret {
+        syscall(INTERRUPT_DELIVER_HERE, [interrupt as usize, 0, 0, 0, 0, 0])
+    }
+    /// Set a job's limits on I/O-mapped pages and interrupt vectors (`u64::MAX`: none of its own) (5.3): SET_LIMITS.
+    pub fn job_set_io_limits(job: u64, io_pages: u64, vectors: u64) -> Ret {
+        syscall(
+            JOB_SET_IO_LIMITS,
+            [job as usize, io_pages as usize, vectors as usize, 0, 0, 0],
+        )
+    }
     /// Choose how a wake picks a hart (PM4): 0 spread (the default), 1 pack (consolidate load on the low harts, so the others idle).
     pub fn system_set_placement(resource: u64, policy: u64) -> Ret {
         syscall(

@@ -23,9 +23,9 @@ pub const ETIMEDOUT: c_int = 110;
 const KEYS: usize = 32;
 /// The default thread stack: 256 KiB (the kernel maps it in the stack arena, committed lazily, with a guard below).
 const STACK_BYTES: u64 = 256 * 1024;
-/// The main thread's stack: 1 MiB, mapped lazily below `MAIN_STACK_TOP`.
+/// The main thread's stack: 1 MiB, mapped lazily where the kernel chooses (ANYWHERE: a fixed address in the mapping arena may hold the
+/// program's image or the system library, which are placed at random, T272).
 const MAIN_STACK_BYTES: u64 = 1024 * 1024;
-const MAIN_STACK_TOP: u64 = 0x10_0100_0000;
 
 const EXITED: u32 = 1;
 const DETACHED: u32 = 2;
@@ -132,16 +132,22 @@ extern "C" {
 /// Run `f(arg)` on a fresh 1 MiB stack (the loader gives a program 256 KiB, too tight for Lua's
 /// nested C calls); on any failure to map one, on the current stack.
 pub fn on_big_stack(f: extern "C" fn(usize) -> c_int, arg: usize) -> c_int {
-    let base = MAIN_STACK_TOP - MAIN_STACK_BYTES;
-    let vmo = rt::sys::vmo_create(MAIN_STACK_BYTES / 4096);
+    // (a page more than the stack, and that page unmapped again: a guard below it, so an overflow faults instead of running into a neighbour)
+    let vmo = rt::sys::vmo_create(MAIN_STACK_BYTES / 4096 + 1);
     if vmo.status == 0 {
         let me = rt::sys::process_self().a1 as u64;
-        let m = rt::sys::process_map(me, vmo.a1 as u64, base, 0, MAIN_STACK_BYTES, 3);
+        let m = rt::sys::process_map_anywhere(me, vmo.a1 as u64, 0, MAIN_STACK_BYTES + 4096, 3);
+        let guarded =
+            m.status == 0 && rt::sys::process_unmap_range(me, m.a1 as u64, 4096).status == 0;
+        if m.status == 0 && !guarded {
+            rt::sys::process_unmap_range(me, m.a1 as u64, MAIN_STACK_BYTES + 4096);
+        }
         rt::sys::handle_close(vmo.a1 as u64);
         rt::sys::handle_close(me);
-        if m.status == 0 {
-            // SAFETY: the stack was just mapped; `f` is a plain function.
-            return unsafe { os_call_on_stack(MAIN_STACK_TOP as usize, f, arg) };
+        if guarded {
+            let top = m.a1 as u64 + 4096 + MAIN_STACK_BYTES;
+            // SAFETY: the stack `[top - MAIN_STACK_BYTES, top)` was just mapped read-write; `f` is a plain function.
+            return unsafe { os_call_on_stack(top as usize, f, arg) };
         }
     }
     f(arg)

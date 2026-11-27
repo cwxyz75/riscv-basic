@@ -14,8 +14,10 @@ use crate::report::Outcome;
 /// `abi::arch::fault`): every page fault is one kind, whatever the access.
 use abi::arch::fault::{exit_code, ILLEGAL, PAGE_FAULT};
 
+/// Free frames, plus the device directory's (IOMMU6): the first domain of a device id grows the directory for good (its device stays
+/// quarantined after the domain goes), which is the kernel's structure, not a leak.
 fn free_frames() -> usize {
-    crate::irq::without(kmem::free_frames_accounted)
+    crate::irq::without(kmem::free_frames_accounted) + crate::iommu::directory_frames()
 }
 
 /// The four terms of `free_frames_accounted`, for a leak report: (database, per-hart caches, kernel stacks, heap).
@@ -33,6 +35,10 @@ fn run(image: &[u8], arg: u64) -> Result<i32, String> {
         user::start(image, arg).map_err(|e| format!("could not start the program: {e:?}"))?;
     Ok(user::finish(pid, tid))
 }
+
+/// How long a failed `no_process_or_vmo_survives_init` goes on watching the survivors before it says what is left (T278: slow or stuck),
+/// in ticks (milliseconds). Spent only on a failure.
+const LEAK_RESAMPLE_TICKS: u64 = 5000;
 
 /// The kernel's end of init's bootstrap channel, for the helper thread.
 static mut HELPER_END: Option<user::KernelEnd> = None;
@@ -199,6 +205,9 @@ pub fn run_all() -> Report {
     let frames_terms = frame_terms();
     let vmos_before = crate::irq::without(|| kmem::get().vmos.count());
     let threads_before = thread::thread_count();
+    let tids_before = thread::tids();
+    // (T278: whether a failing leak check below has printed the leak report already)
+    let mut leak_reported = false;
     let code = (|| -> Result<i32, String> {
         let (pid, tid) = user::start(
             user::SUITE_ELF,
@@ -269,18 +278,50 @@ pub fn run_all() -> Report {
             && crate::fp::entry_count() == 0
             && crate::irq::without(|| kmem::get().vmos.count()) == vmos_before
             && user::job_ledger() == (1, 0, 0, 0, 0, 0)
+            // (IOMMU6) no device domain, no I/O-mapped page and no leaked mapping record is left
+            && (159..=161).all(|w| crate::iommu::stat(w) == 0)
+            // (IOMMU7) no live vector and none leaked
+            && crate::aia::stat(146) == 0
+            && crate::aia::stat(149) == 0
         {
             Ok(())
         } else {
-            Err(format!(
+            // (T278: the survivors name themselves, and each thread says where it waits, before the summary)
+            user::report_processes();
+            thread::report_threads(&tids_before);
+            leak_reported = true;
+            let summary = format!(
                 "{} processes and {} VMOs left (wanted 0 and {vmos_before}), {} futex sleepers, {} pager waiters or pagers; (jobs, \
-                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0)",
+                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0); device domains, I/O-mapped pages, leaked holds {:?}; vectors live and                  leaked {:?}",
                 user::process_count(),
                 crate::irq::without(|| kmem::get().vmos.count()),
                 user::futex_sleepers(),
                 user::pager_leftovers(),
-                user::job_ledger()
-            ))
+                user::job_ledger(),
+                [159, 160, 161].map(crate::iommu::stat),
+                [146, 149].map(crate::aia::stat)
+            );
+            // (T278: then wait a few seconds more and say what is left, so a teardown that is only slow is told from one that is stuck;
+            // the check has failed already, on the counts above)
+            let t0 = thread::ticks();
+            while user::process_count() != 0
+                && thread::ticks().wrapping_sub(t0) < LEAK_RESAMPLE_TICKS
+            {
+                thread::sleep_ticks(10);
+            }
+            let _ = core::fmt::Write::write_fmt(
+                &mut crate::console::Console,
+                format_args!(
+                    "leak: {} ms later: {} processes, {} kernel threads, (jobs, processes, threads) {:?}, {} objects, {} free frames\n",
+                    thread::ticks().wrapping_sub(t0),
+                    user::process_count(),
+                    thread::thread_count(),
+                    user::job_ledger(),
+                    user::live_objects(),
+                    free_frames()
+                ),
+            );
+            Err(summary)
         },
     );
     thread::sleep_ticks(3); // detached user threads and their stacks are freed as the hart switches away from them
@@ -289,6 +330,9 @@ pub fn run_all() -> Report {
         if thread::thread_count() == threads_before {
             Ok(())
         } else {
+            if !leak_reported {
+                thread::report_threads(&tids_before);
+            }
             Err(format!(
                 "kernel threads {} -> {}",
                 threads_before,
@@ -325,6 +369,9 @@ pub fn run_all() -> Report {
         if user::live_objects() == 0 {
             Ok(())
         } else {
+            if !leak_reported {
+                user::report_processes(); // (T278: the live objects by kind, and what holds them)
+            }
             Err(format!(
                 "{} kernel objects left alive after init exited",
                 user::live_objects()

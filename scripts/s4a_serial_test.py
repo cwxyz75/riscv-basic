@@ -32,7 +32,7 @@ class Session:
     EXTRA_ARGS = []
 
     def __init__(self, kernel):
-        cmd = ["qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt,aia=aplic-imsic"),
+        cmd = ["qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt,aia=aplic-imsic,iommu-sys=on"),
                "-bios", "default", "-m", "256M", "-display", "none", "-serial", "stdio",
                "-monitor", "none", "-kernel", kernel]
         cmd[1:1] = ["-cpu", os.environ.get("OS_CPU", "rva23s64")]  # PL1: the profile CPU is the only test CPU

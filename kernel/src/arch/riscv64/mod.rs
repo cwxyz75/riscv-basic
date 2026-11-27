@@ -6,6 +6,7 @@ pub mod boot;
 pub mod cpu;
 pub mod finisher;
 pub mod fp;
+pub mod iommu;
 pub mod irq;
 pub mod sbi;
 pub mod switch;

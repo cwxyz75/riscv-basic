@@ -144,6 +144,63 @@ pub enum RegionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmoGone;
 
+/// Why `Vmos::retain_for_io` took no hold (IOMMU-SPEC 4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoHoldError {
+    /// The id is not a live VMO.
+    Gone,
+    /// Not a DMA VMO: plain, device, pager-backed and copy-on-write VMOs are never mapped for a device (WRONG_TYPE).
+    NotDma,
+    /// No pages, or a range that is not inside the VMO (INVALID_ARGS).
+    OutOfRange,
+    /// The frame list could not be allocated.
+    NoMemory,
+}
+
+/// A DMA VMO being made (`Vmos::dma_begin`): its frames are taken and zeroed a step at a time, under `FRAME` only, while no handle
+/// names it; `Vmos::dma_finish` makes it a VMO, `Vmos::dma_abort` undoes it.
+#[must_use = "a DMA build holds its frames and its charge: finish or abort it"]
+pub struct DmaBuild {
+    job: JobId,
+    pages: u64,
+    leaf_bytes: u64,
+    committed: PageMap,
+    done: u64,
+}
+
+impl DmaBuild {
+    /// Take and zero the next `RANGE_STEP` frames (under `FRAME`; the index's leaves come from the heap). `Ok(true)` when every frame is
+    /// taken; `NoMemory` if a frame or a leaf cannot be had (then `Vmos::dma_abort`).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: done <= pages
+    pub fn step<M: PhysMem>(&mut self, mm: &mut Mm<M>) -> Result<bool, VmoError> {
+        self.step_with(&mut mm.db, &mut mm.mem)
+    }
+
+    /// `step` over the frame database and its memory borrowed apart.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: done <= pages
+    pub fn step_with<M: PhysMem>(
+        &mut self,
+        db: &mut crate::frame::FrameDb,
+        mem: &mut M,
+    ) -> Result<bool, VmoError> {
+        let end = self.pages.min(self.done + RANGE_STEP as u64);
+        while self.done < end {
+            let pfn = db.alloc().ok_or(VmoError::NoMemory)?;
+            mem.zero_frame(pfn);
+            if self.committed.insert(self.done, pfn).is_err() {
+                let _ = db.dec(pfn);
+                return Err(VmoError::NoMemory);
+            }
+            self.done += 1;
+        }
+        Ok(self.done == self.pages)
+    }
+
+    pub fn pages(&self) -> u64 {
+        self.pages
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmoError {
     Gone,
@@ -207,7 +264,10 @@ pub enum VmoKind {
     /// Device memory (MMIO): fixed frames the frame database does not manage; never freed, never
     /// read or written through the kernel, never charged as pages.
     Device,
-    /// Physically contiguous RAM committed at creation, whose address a DMA-right holder may learn.
+    /// RAM committed, zeroed and pinned at creation, whose frames never change for the VMO's life (no decommit, resize, child or pager):
+    /// what a device may be given. Made contiguous by `create_dma` (the old call, whose address a DMA-right holder may learn until
+    /// IOMMU12) or from the ordinary allocator by `create_dma_in` (IOMMU-SPEC 4.7: a device sees it through its domain). Only this
+    /// kind is ever mapped for a device (`retain_for_io`, IO4).
     Dma,
 }
 
@@ -241,6 +301,8 @@ struct Vmo {
     committed: PageMap,
     /// Made with the RESIZABLE flag: `set_size` may change `pages` (MM6).
     resizable: bool,
+    /// A DMA VMO of the old call (`create_dma`), whose frames are one contiguous run: the only kind with a physical address (D2).
+    contiguous: bool,
     /// The node this one inherits from (MM8): a page it has not committed itself is found there, window `offset`.
     parent: Option<Link>,
     /// Nodes that have this one as their parent (a hidden node has two or more: with one left it is merged into it).
@@ -348,6 +410,8 @@ struct DyingVmo {
     job: JobId,
     committed: PageMap,
     charged: bool,
+    /// A DMA VMO's: its frames leave the DMA backstop (`Vmos::dma_pages`) as they are freed, not before.
+    dma: bool,
     /// The slot's generation was exhausted: it is retired, not reused (CNT1).
     retire: bool,
 }
@@ -674,6 +738,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
+            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -698,6 +763,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
+            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -756,6 +822,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
+            contiguous: true,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -772,10 +839,200 @@ impl Vmos {
         self.vmo(id).map(|v| v.kind)
     }
 
-    /// The physical address of a DMA VMO (its first byte).
+    /// The physical address of a DMA VMO (its first byte), for the old call: only for one whose frames are contiguous (`create_dma`'s,
+    /// at most `MAX_DMA_PAGES`); a `create_dma_in` VMO's frames are not promised contiguous, so a first address would be a lie.
     pub fn phys_addr(&self, id: u64) -> Option<u64> {
-        let v = self.vmo(id).filter(|v| v.kind == VmoKind::Dma)?;
-        v.committed.get(0).map(|pfn| pfn << 12)
+        let v = self
+            .vmo(id)
+            .filter(|v| v.kind == VmoKind::Dma && v.contiguous)?;
+        Some(v.committed.get(0)? << 12)
+    }
+
+    /// A DMA VMO for `vmo_create_dma_in` (IOMMU-SPEC 4.7; OD162 point 3, OD166 point 9): `pages` zeroed frames from the ordinary allocator
+    /// (**not** promised contiguous: a device sees them through its domain, so no request fails for want of an aligned block), committed
+    /// and charged to `job` now (the pages, and the page index as kernel bytes), pinned and fixed for the VMO's life (the kind refuses a
+    /// decommit, a resize, a child and a pager). No per-object limit. `OutOfRange` for 0 pages or more than the whole system backstop
+    /// (INVALID_ARGS); `NoMemory` for the job's limits, the backstop's remaining room or the frames. On any failure nothing is left behind.
+    ///
+    /// Every step of [`Vmos::dma_begin`], [`DmaBuild::step`] and [`Vmos::dma_finish`] in one call (the host tests; the kernel takes the
+    /// locks per step: IOMMU-SPEC amendment 2026-11-26 part 1 point 5).
+    pub fn create_dma_in<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        pages: u64,
+        job: JobId,
+    ) -> Result<u64, VmoError> {
+        let mut b = self.dma_begin(jobs, pages, job)?;
+        loop {
+            match b.step(mm) {
+                Ok(false) => {}
+                Ok(true) => return self.dma_finish(mm, jobs, b),
+                Err(e) => {
+                    self.dma_abort(mm, jobs, b);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// `create_dma_in`'s first step (under `VMO` and `JOBS`): the checks, the backstop's room taken and the charge made, all or nothing.
+    /// No frame is taken yet and no VMO exists: the frames are allocated and zeroed by [`DmaBuild::step`], under `FRAME` only, while no
+    /// handle can name the VMO.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pages <= dma_total_cap - dma_pages, checked first, so the sum does not overflow
+    pub fn dma_begin(
+        &mut self,
+        jobs: &mut Jobs,
+        pages: u64,
+        job: JobId,
+    ) -> Result<DmaBuild, VmoError> {
+        if pages == 0 || pages > self.dma_total_cap {
+            return Err(VmoError::OutOfRange);
+        }
+        if pages > self.dma_total_cap.saturating_sub(self.dma_pages) {
+            return Err(VmoError::NoMemory);
+        }
+        jobs.charge(job, Resource::Pages, pages)
+            .map_err(|_| VmoError::NoMemory)?;
+        // (the index: one leaf for every 64 pages, all of them full)
+        let leaf_bytes = pages
+            .div_ceil(64)
+            .saturating_mul(crate::pagemap::LEAF_BYTES);
+        if jobs.charge(job, Resource::KernelBytes, leaf_bytes).is_err() {
+            jobs.credit(job, Resource::Pages, pages);
+            return Err(VmoError::NoMemory);
+        }
+        self.dma_pages += pages;
+        Ok(DmaBuild {
+            job,
+            pages,
+            leaf_bytes,
+            committed: PageMap::new(),
+            done: 0,
+        })
+    }
+
+    /// The last step (under `VMO` and `JOBS`, with `FRAME`): the VMO is made and named, holding a use of its job. A store that has no room
+    /// for one more VMO undoes the build (`NoMemory`).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the backstop count holds this build's pages
+    pub fn dma_finish<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        b: DmaBuild,
+    ) -> Result<u64, VmoError> {
+        debug_assert_eq!(b.done, b.pages, "dma_finish after every step");
+        if self.reserve_one().is_err() {
+            self.dma_abort(mm, jobs, b);
+            return Err(VmoError::NoMemory);
+        }
+        jobs.retain(b.job);
+        Ok(self.place(Vmo {
+            kind: VmoKind::Dma,
+            job: b.job,
+            pages: b.pages,
+            refs: 1,
+            committed: b.committed,
+            resizable: false,
+            contiguous: false,
+            parent: None,
+            children: alloc::vec::Vec::new(),
+            hidden: false,
+            had_parent: false,
+            maps: crate::fmap::FMap::new(),
+            busy: None,
+            restore: None,
+            pager: None,
+            inherit: 0,
+        }))
+    }
+
+    /// Undo a build (under `VMO`, `JOBS` and `FRAME`): its frames back, its charge and the backstop's room returned. Allocates nothing.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the backstop count holds this build's pages
+    pub fn dma_abort<M: PhysMem>(&mut self, mm: &mut Mm<M>, jobs: &mut Jobs, mut b: DmaBuild) {
+        b.committed.drain_pfns(|pfn| {
+            let dropped = mm.db.dec(pfn);
+            debug_assert!(dropped.is_ok(), "a frame this build took");
+        });
+        jobs.credit(b.job, Resource::KernelBytes, b.leaf_bytes);
+        jobs.credit(b.job, Resource::Pages, b.pages);
+        self.dma_pages -= b.pages;
+    }
+
+    /// Take a device mapping's hold on a DMA VMO (as `retain_for_io`, without the frame list: the caller reads the frames a step at a
+    /// time with [`Vmos::io_frames`], which stays true for as long as the hold). On any error nothing is held.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a VMO's reference count is bounded by its holders, each limited far below u32::MAX
+    pub fn hold_for_io(&mut self, id: u64, first: u64, pages: u64) -> Result<(), IoHoldError> {
+        let v = self.vmo(id).ok_or(IoHoldError::Gone)?;
+        if v.kind != VmoKind::Dma {
+            return Err(IoHoldError::NotDma);
+        }
+        let end = first.checked_add(pages).ok_or(IoHoldError::OutOfRange)?;
+        if pages == 0 || end > v.pages {
+            return Err(IoHoldError::OutOfRange);
+        }
+        let v = Self::vmo_in(&mut self.slots, id).ok_or(IoHoldError::Gone)?;
+        v.refs += 1;
+        Ok(())
+    }
+
+    /// The frames of a DMA VMO's pages `first ..` into `out` (as many as `out` holds); false if the VMO is not a DMA VMO or the range
+    /// is not inside it. For a holder of the VMO (`hold_for_io`): its frames never change.
+    pub fn io_frames(&self, id: u64, first: u64, out: &mut [Pfn]) -> bool {
+        let Some(v) = self.vmo(id).filter(|v| v.kind == VmoKind::Dma) else {
+            return false;
+        };
+        let mut page = first;
+        for slot in out.iter_mut() {
+            match v.committed.get(page) {
+                Some(pfn) => *slot = pfn,
+                None => return false,
+            }
+            page = page.saturating_add(1);
+        }
+        true
+    }
+
+    /// Take a device mapping's hold on a DMA VMO (IOMMU-SPEC 5.1; M8's third kind of holder, counted in the same reference count as a
+    /// handle's and a region's) and copy the frames of its pages `first .. first + pages` into `out`. Only a DMA VMO: its frames are
+    /// fixed for its life, so the list stays true for as long as the hold. The hold is dropped with `release`, after the fence of the
+    /// mapping's removal. On any error nothing is held and `out` is empty.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a VMO's reference count is bounded by its holders (handles, regions, mappings), each limited far below u32::MAX
+    pub fn retain_for_io(
+        &mut self,
+        id: u64,
+        first: u64,
+        pages: u64,
+        out: &mut alloc::vec::Vec<Pfn>,
+    ) -> Result<(), IoHoldError> {
+        out.clear();
+        let v = self.vmo(id).ok_or(IoHoldError::Gone)?;
+        if v.kind != VmoKind::Dma {
+            return Err(IoHoldError::NotDma);
+        }
+        let end = first.checked_add(pages).ok_or(IoHoldError::OutOfRange)?;
+        if pages == 0 || end > v.pages {
+            return Err(IoHoldError::OutOfRange);
+        }
+        let n = usize::try_from(pages).map_err(|_| IoHoldError::NoMemory)?;
+        out.try_reserve_exact(n)
+            .map_err(|_| IoHoldError::NoMemory)?;
+        for i in first..end {
+            match v.committed.get(i) {
+                Some(pfn) => out.push(pfn),
+                None => {
+                    // (not reached: a DMA VMO has every page committed for its life)
+                    out.clear();
+                    return Err(IoHoldError::OutOfRange);
+                }
+            }
+        }
+        let Some(v) = Self::vmo_in(&mut self.slots, id) else {
+            out.clear();
+            return Err(IoHoldError::Gone);
+        };
+        v.refs += 1;
+        Ok(())
     }
 
     /// How many VMOs exist (a leak counter for tests).
@@ -1229,6 +1486,7 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
+            contiguous: false,
             parent: None,
             children: stash,
             hidden: false,
@@ -1300,6 +1558,7 @@ impl Vmos {
                         refs: 2,
                         committed,
                         resizable: false,
+                        contiguous: false,
                         parent: old_parent,
                         children: kids,
                         hidden: true,
@@ -1567,14 +1826,20 @@ impl Vmos {
                 self.free_slot(slot_i, retire);
                 return Ok(());
             }
-            if vmo.kind == VmoKind::Dma {
-                self.dma_pages -= vmo.pages;
-            }
             debug_assert!(
                 vmo.maps.is_empty(),
                 "ML1: a VMO went with a region still listed on it"
             );
-            if vmo.committed.len() > crate::aspace::RANGE_STEP {
+            let batched = vmo.committed.len() > crate::aspace::RANGE_STEP;
+            // A DMA VMO, decided here and not by the size test (IOMMU3): its last holder has gone (a handle, a region, or a device
+            // mapping whose fence has completed), so neither a hart nor a device can reach its frames. It used to take the path below
+            // only because `MAX_DMA_PAGES` equals `RANGE_STEP`; `create_dma_in` has no per-object limit, so a large one goes back in
+            // batches like any other VMO, and its pages leave the DMA backstop as `drain_dying` frees them; a small one, at once.
+            let dma = vmo.kind == VmoKind::Dma;
+            if dma && !batched {
+                self.dma_pages -= vmo.pages;
+            }
+            if batched {
                 // a big one: its pages go back in batches (`drain_dying`), with the credits; nothing of it is reachable by id any more
                 self.stash_dying(
                     slot_i,
@@ -1582,6 +1847,7 @@ impl Vmos {
                     vmo.job,
                     vmo.committed,
                     vmo.kind != VmoKind::Device,
+                    dma,
                 );
             } else {
                 jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
@@ -1624,6 +1890,7 @@ impl Vmos {
         job: JobId,
         committed: PageMap,
         charged: bool,
+        dma: bool,
     ) {
         let head = self.dying_head;
         let slot = &mut self.slots[slot_i];
@@ -1631,6 +1898,7 @@ impl Vmos {
             job,
             committed,
             charged,
+            dma,
             retire,
         });
         slot.dying_next = head;
@@ -1677,6 +1945,10 @@ impl Vmos {
             n += 1;
         }
         jobs.credit(d.job, Resource::Pages, freed);
+        if d.dma {
+            // (its frames leave the DMA backstop as they go back: D4)
+            self.dma_pages -= freed;
+        }
         if d.charged {
             jobs.credit(
                 d.job,

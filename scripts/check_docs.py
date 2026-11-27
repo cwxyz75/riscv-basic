@@ -28,6 +28,9 @@ STALE = [
 
 
 GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of ci.yml may take at most this long (the jobs run side by side)
+# TESTING.md, "Budgets": the one exception, the tool-build job (CI's QEMU into the cache: seconds when warm, a build when cold). It runs no
+# make target, starts nothing, and only calls the install action in `mode: fill`; every job that uses CI's QEMU needs it.
+TOOL_BUILD_JOB, TOOL_BUILD_BUDGET_MINUTES = "qemu", 20
 # Soak targets that CI runs split into smaller jobs: the soak workflow may name the parts instead.
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
 # Targets besides the smoke ones that ci.yml may run: parts of a smoke target that CI runs as their own jobs.
@@ -75,6 +78,26 @@ def boots(rules, target, seen=None):
     return bool(BOOTS_RE.search(recipe)) or any(boots(rules, d, seen) for d in deps)
 
 
+def check_ci_qemu(wf, text, rules):
+    """CI's QEMU (TEST-TOOLS.md): a job that boots gets QEMU only from the install action (never `qemu: 'false'`, never apt), and a job
+    that uses CI's QEMU needs the tool-build job that fills the cache, so it cannot start before the entry exists."""
+    out = []
+    for job in re.split(r"^  (?=[a-z][\w-]*:\s*$)", text.split("\njobs:\n", 1)[-1], flags=re.M):
+        name = job.split(":", 1)[0].strip()
+        if name == TOOL_BUILD_JOB:
+            continue
+        targets = " ".join(re.findall(r"^\s*(?:- )?run: make (.*)$", job, re.M)).split()
+        targets += re.findall(r"^\s+(?:[A-Z_]+=\S+ )*make ([a-z][\w-]*)", job, re.M)
+        uses = "uses: ./.github/actions/install-qemu" in job and "qemu: 'false'" not in job
+        if (any(boots(rules, t) for t in targets if "$" not in t) or BOOTS_RE.search(job)) and not uses:
+            out.append(f"{wf}: job {name} boots but does not install CI's QEMU (the install action, without `qemu: 'false'`)")
+        if uses:
+            needs = re.search(r"^    needs:\s*(.*)$", job, re.M)
+            if not needs or not re.search(rf"(?<![\w-]){TOOL_BUILD_JOB}(?![\w-])", needs.group(1)):
+                out.append(f"{wf}: job {name} uses CI's QEMU but does not need the job `{TOOL_BUILD_JOB}` that fills the cache")
+    return out
+
+
 def check_tiers():
     """The testing tiers (OD83, OD144, TESTING.md) are enforced mechanically, so they cannot drift back: the feature gate
     starts no emulator; the epic gate (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget;
@@ -112,9 +135,17 @@ def check_tiers():
         cond = re.search(r"^    if:\s*(.*)$", job, re.M)
         if starts and not (cond and SMOKE_IF in cond.group(1)):
             out.append(f"ci.yml: job {name} starts QEMU but is not limited to the epic gate (its `if:` needs `{SMOKE_IF}`)")
-    for n in re.findall(r"timeout-minutes:\s*(\d+)", ci):
-        if int(n) > GATE_BUDGET_MINUTES:
-            out.append(f"ci.yml: a gate job's timeout is {n} minutes; the budget is {GATE_BUDGET_MINUTES} (TESTING.md)")
+        tool = name == TOOL_BUILD_JOB
+        if tool and (targets or starts or "mode: fill" not in job or re.search(r"^\s*(?:- )?run:", job, re.M)):
+            out.append(f"ci.yml: job {name} is the tool-build job: it may only call the install action in `mode: fill` (no run step, no make, no boot)")
+        if tool and not (cond and SMOKE_IF in cond.group(1)):
+            out.append(f"ci.yml: the tool-build job {name} runs only for the epic gate (its `if:` needs `{SMOKE_IF}`)")
+        budget = TOOL_BUILD_BUDGET_MINUTES if tool else GATE_BUDGET_MINUTES
+        for n in re.findall(r"timeout-minutes:\s*(\d+)", job):
+            if int(n) > budget:
+                out.append(f"ci.yml: job {name}'s timeout is {n} minutes; its budget is {budget} (TESTING.md, \"Budgets\")")
+    for wf in ("ci.yml", "soak.yml", "overnight.yml"):
+        out += check_ci_qemu(wf, read(f".github/workflows/{wf}"), rules)
     if "matrix:" in ci:
         out.append("ci.yml: the merge gate has a build matrix; that belongs in soak.yml")
     # the commit hook: format, docs check, clippy; never a test or a boot
@@ -178,6 +209,7 @@ ATOMICS = {
     "kcore/src/jobsched.rs": (9, "per-job CPU and real-time accounting (SCHED-SMP-SPEC 4.10, L8): each hart charges the running thread's job with no lock, one atomic for the CPU total and one that packs the real-time window with its used time so a boundary is one compare-and-swap; tested under real threads in `kcore/tests/jobsched.rs`"),
     "kcore/src/asid.rs": (3, "the allocator's current generation, published for a return to user mode that holds no big lock (L19): written under the big lock when the generation turns, read with acquire"),
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
+    "kcore/src/msiid.rs": (3, "`IdSet`, the identities a hart claimed from its IMSIC file and has not yet delivered: kept in the hart's own record (not on the trap stack, KT13), written by that hart's trap and emptied by its delivery under the lock; atomic only so a shared `PerHart` can hold it, never touched by another hart"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
@@ -190,8 +222,9 @@ ATOMICS = {
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/user/lifecycle.rs": (4, "the number of threads with suspend state (EX1): a copy of the table's size, read with no lock by `thread::block` so that a kernel thread that blocks holding a lock the big lock must not be taken under pays one load; the table itself is under the big lock"),
     "kernel/src/smp.rs": (12, "hart bring-up and IPI flags, and the two counters of instruction-cache synchronisations (PL7)"),
-    "kernel/src/arch/riscv64/aia.rs": (14, "interrupt controller statistics and masks, and the per-source aimed-hart table sized at boot (PL5c)"),
-    "kernel/src/thread.rs": (36, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread); and the count of donations the graph refused (L22)"),
+    "kernel/src/arch/riscv64/iommu.rs": (22, "the IOMMU's on flag (set once at boot after the directory denies every device, read by `build_windows`) and its counters (IOMMU-SPEC 7.3: faults, dropped lines, overflows, the last fault, fence timeouts; the commands are the store's, under the lock; statistics read by `debug_stat` 150 to 157); `Direct` reads and writes the directory and the tables as `AtomicU64` words because the IOMMU reads them while the kernel writes them; the queues and the directory themselves are under the IOMMU lock (class Iommu); `UNFINISHED` (IOMMU6), a destruction begun and not ended as last seen by the store: written only under the IOMMU lock (by a last-handle close, and by `drain` after it settled the destructions), read with no lock by `drain`'s fast path; a stale true costs one settle, and a close's own write of true cannot be overtaken by a stale false because both writes are made under the lock"),
+    "kernel/src/arch/riscv64/aia.rs": (34, "interrupt controller statistics (taken, misrouted, no route, the top identity, moves, and IOMMU7's vector notices taken and fired), IOMMU7's flag that a vector has work for the next lock-free drain (a charge due or an entry to rewrite), the per-file work flags and the file-to-hart and hart-to-file maps sized at boot (IOMMU4: written once by `init_hart`, read on the claim path without the lock), and the debug flag that catches a nested open of the route table; the route table itself is under the object lock"),
+    "kernel/src/thread.rs": (38, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread); and the count of donations the graph refused (L22); and the flag that lets one `hart_set_online` call run at a time (IOMMU4)"),
     "kernel/src/arch/riscv64/timer.rs": (6, "the clock's zero (the counter value at the first tick), and the counter's frequency and fixed-point multiplier (PL4b), set once at boot and read by `now_ns`"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
     "kernel/src/user/mod.rs": (7, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot); `STATE_OPEN` (debug builds: the open-closure flag of T239); `USER_READY`: the user state exists, read by the commit-on-drop of `irq::without` before it touches the state (L20)"),

@@ -109,16 +109,32 @@ pub(super) fn object_wait(a: [u64; 6]) -> Reply {
         // (anything a kernel thread touched without committing goes first: a thread must not sleep
         // while a change it should have seen is still in the log)
         commit_wake();
+        // The signal word that ended the wait, read under the lock in the same step that decided it: another thread may clear the signal
+        // (an `interrupt_ack`, a read) once the lock is let go, and a wait whose condition held must not then report TIMED_OUT before
+        // its deadline (SYSCALLS.md: TIMED_OUT only when the deadline arrived first).
+        let mut met: Option<u32> = None;
         thread::wait_deadline_registered(
             || {
-                killed_now().is_some()
-                    || interrupted_now()
-                    || signals_now(h).map_or(true, |s| s & mask != 0)
+                met = None;
+                if killed_now().is_some() || interrupted_now() {
+                    return true;
+                }
+                match signals_now(h) {
+                    Ok(s) if s & mask != 0 => {
+                        met = Some(s);
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => true,
+                }
             },
             || register_wait(me, h, mask),
             deadline,
         );
         locked_state(|s| s.waits.forget(me));
+        if let Some(s) = met {
+            return ksys::object_wait_report(Ok(s), &w, take_interrupt);
+        }
     }
     // The handle may have gone while we slept: BAD_HANDLE, not a wait that quietly times out.
     let seen = irq::without(|| signals_now(h));
