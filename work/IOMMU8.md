@@ -7,7 +7,6 @@ horizon: long
 complexity: H
 change_risk: M
 epic: iommu-drivers
-blocked_by: [IOMMU7]
 refs: [T42, OD148, OD164, OD166, IOMMU-SPEC, X-BUS, X-DRIVER-MODEL, T262, T276, S6-SPEC, Q-IOMMU-IRQ, Q-IOMMU-MSI]
 ---
 
