@@ -19,8 +19,8 @@
 //! It never hands out configuration space. It maps each function's MSI-X table BAR (and pending-bit BAR) privately. It prints one
 //! line per function, `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable msix=<entries>[ table-with-registers] |
 //! not-claimable <why> | refused <why>>`, then `## devmgr: pci functions=<n>`, which the boot script checks against the devices it
-//! put on the command line (`table-with-registers`: the MSI-X table shares the BAR the driver is handed, so the manager cannot keep
-//! it from the driver; the IOMMU confines the device either way, IOMMU-SPEC 9).
+//! put on the command line (`table-with-registers`: the MSI-X table or its pending bits share the BAR the driver is handed, so the
+//! manager cannot keep them from the driver; the IOMMU confines the device either way, IOMMU-SPEC 9).
 //!
 //! **The class plan** (`pcicore::claim`, a table in the source): block, the configuration change and one queue; network, the
 //! configuration change, receive and transmit; entropy, its one queue. Entry 0 of the MSI-X table is the configuration change and
@@ -709,7 +709,6 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
         let mut want: Vec<u8> = Vec::new();
         want.extend(f.virtio.map(|(_, l)| l.bar));
         want.extend(f.msix.iter().flat_map(|m| [m.table_bar, m.pba_bar]));
-        want.dedup();
         for idx in want {
             if d.maps.iter().any(|m| m.0 == idx) {
                 continue;
@@ -763,7 +762,10 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
             (Ok(f), Ok(_)) => {
                 let m = f.msix.map_or(0, |m| m.table_size);
                 line.push_str(&alloc::format!("claimable msix={m}"));
-                if f.msix.map(|m| m.table_bar) == f.virtio.map(|(_, l)| l.bar) {
+                let regs = f.virtio.map(|(_, l)| l.bar);
+                if f.msix
+                    .is_some_and(|m| Some(m.table_bar) == regs || Some(m.pba_bar) == regs)
+                {
                     line.push_str(" table-with-registers");
                 }
             }

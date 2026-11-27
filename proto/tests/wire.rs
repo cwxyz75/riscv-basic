@@ -1238,6 +1238,30 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
         "an interrupt count that disagrees with the length"
     );
     let mut lying = r.clone();
+    lying[72] = 5;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "an interrupt at an entry its meaning does not have"
+    );
+    let mut lying = r.clone();
+    lying[76..80].copy_from_slice(&[0, 0, 0xff, 0xff]);
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "two interrupts with the same meaning"
+    );
+    for bad in [
+        vec![PciIrq { entry: 0, what: 0 }],
+        vec![PciIrq { entry: 1, what: 0 }, PciIrq { entry: 1, what: 0 }],
+    ] {
+        let bad = PciClaim {
+            irqs: bad,
+            ..c.clone()
+        };
+        assert_eq!(encode_claim_pci_reply(9, &bad), None, "{:?}", bad.irqs);
+    }
+    let mut lying = r.clone();
     lying[56] = 9;
     assert_eq!(
         decode_claim_pci_reply(&lying),
@@ -1274,7 +1298,12 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
     };
     assert_eq!(encode_claim_pci_reply(9, &many), None);
     let many = PciClaim {
-        irqs: vec![PciIrq { entry: 1, what: 0 }; MAX_CLAIM_IRQS + 1],
+        irqs: (0..=MAX_CLAIM_IRQS as u16)
+            .map(|q| PciIrq {
+                entry: q + 1,
+                what: q,
+            })
+            .collect(),
         ..c
     };
     assert_eq!(encode_claim_pci_reply(9, &many), None);

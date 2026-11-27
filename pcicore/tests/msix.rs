@@ -153,6 +153,13 @@ impl MsixAccess for Function {
                     self.ctl & RESERVED_CTL,
                     "message control's reserved bits are preserved"
                 );
+                if v & ENABLE != 0 && self.ctl & ENABLE == 0 {
+                    assert_ne!(
+                        self.command & INTX_DISABLE,
+                        0,
+                        "INTx is disabled before MSI-X is enabled (IOMMU-SPEC 9 step 4)"
+                    );
+                }
                 // (the table size is read-only: a write does not change it)
                 self.ctl = (v & (ENABLE | FMASK | RESERVED_CTL)) | (self.ctl & 0x7ff);
             }

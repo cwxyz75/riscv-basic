@@ -230,6 +230,14 @@ pub fn irq_entry(what: u16) -> u16 {
     }
 }
 
+/// Interrupt records as `devmgr` makes them: each at the entry its meaning has ([`irq_entry`]), no meaning twice. Both directions
+/// refuse anything else.
+fn irqs_consistent(irqs: &[PciIrq]) -> bool {
+    irqs.iter()
+        .enumerate()
+        .all(|(i, r)| r.entry == irq_entry(r.what) && !irqs[..i].iter().any(|o| o.what == r.what))
+}
+
 /// What a driver is handed with its handles (IOMMU-SPEC 9). Offsets are inside the BAR VMO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PciClaim {
@@ -265,7 +273,10 @@ impl PciClaim {
 
 /// `None` if the claim names more than [`MAX_CLAIM_DMA`] DMA VMOs or [`MAX_CLAIM_IRQS`] interrupts.
 pub fn encode_claim_pci_reply(txid: u32, c: &PciClaim) -> Option<Vec<u8>> {
-    if c.dma_pages.len() > MAX_CLAIM_DMA || c.irqs.len() > MAX_CLAIM_IRQS {
+    if c.dma_pages.len() > MAX_CLAIM_DMA
+        || c.irqs.len() > MAX_CLAIM_IRQS
+        || !irqs_consistent(&c.irqs)
+    {
         return None;
     }
     let mut b =
@@ -323,6 +334,9 @@ pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>
             entry: rd_u16(b, at)?,
             what: rd_u16(b, at + 2)?,
         });
+    }
+    if !irqs_consistent(&irqs) {
+        return None;
     }
     let status = Status::from_i32(rd_u32(b, 4)? as i32)?;
     if status != Status::Ok {

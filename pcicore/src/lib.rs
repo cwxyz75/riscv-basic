@@ -910,8 +910,8 @@ fn entry_mask(
 /// 2. every entry of the table masked, and its address and data written: those of `entries`, zero for every other entry (an entry the
 ///    caller did not name is left masked with no address, so a device pointed at it sends nothing);
 /// 3. the entries of `entries` that are not `masked` unmasked;
-/// 4. MSI-X enabled, the function still masked;
-/// 5. INTx disabled in the command register (IOMMU-SPEC 8.6);
+/// 4. INTx disabled in the command register (IOMMU-SPEC 8.6; section 9 step 4 names it before the enable);
+/// 5. MSI-X enabled, the function still masked;
 /// 6. the function unmasked.
 ///
 /// Before any access the table is checked to lie inside its BAR ([`check_msix`]) and every index to be inside the table and named
@@ -958,10 +958,10 @@ pub fn msix_enable(
             entry_mask(m, bars, a, i, false)?;
         }
     }
-    let cur = a.cfg_read16(ctl);
-    a.cfg_write16(ctl, msix_control(cur, true, true));
     let cmd = a.cfg_read16(reg::COMMAND);
     a.cfg_write16(reg::COMMAND, cmd | command::INTX_DISABLE);
+    let cur = a.cfg_read16(ctl);
+    a.cfg_write16(ctl, msix_control(cur, true, true));
     let cur = a.cfg_read16(ctl);
     a.cfg_write16(ctl, msix_control(cur, true, false));
     Ok(())
@@ -1141,7 +1141,7 @@ pub mod claim {
     /// The claim, steps 2 to 4 of IOMMU-SPEC 9: finite limits of both kinds on the driver's job (the plan's pages with the margin,
     /// and exactly its vectors), the domain, the DMA VMOs, every vector of the plan granted, then the table programmed with the pairs
     /// the kernel returned (`msi_data` is the ABI's constant) with the function masked, INTx disabled and MSI-X enabled
-    /// ([`msix_enable`]). All or nothing: on a failure at any step MSI-X is turned off again and the domain destroyed (which revokes
+    /// ([`msix_enable`]). All or nothing: on a failure at any step the domain is destroyed (which revokes
     /// every vector granted so far), and every handle made is closed.
     pub fn claim(
         plan: &Plan,
@@ -1188,7 +1188,10 @@ pub mod claim {
         match r {
             Ok(()) => Ok(c),
             Err(e) => {
-                let _ = msix_disable(m, bars, a);
+                // (a failure before the table was touched leaves it as it was: only the table's own failure turns MSI-X off)
+                if matches!(e, Failed::Msix(_)) {
+                    let _ = msix_disable(m, bars, a);
+                }
                 release(c, k);
                 Err(e)
             }

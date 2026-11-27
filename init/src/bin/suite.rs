@@ -8208,19 +8208,29 @@ fn fetch_the_fuzzer_image() -> Outcome {
 /// by chance), killing the job must bring the job's counters and the kernel heap back to where they began, and the kernel must still be running (a panic is
 /// the boot test's `##PANIC`).
 ///
-/// Each seed runs twice and only the second run is measured. The kernel's object tables keep the room they grew to (the VMO table is a slab of
+/// Each seed runs once unmeasured, then is measured. The kernel's object tables keep the room they grew to (the VMO table is a slab of
 /// 376-byte slots that doubles when it fills: from 256 slots to 512, with its free list, is 97,280 bytes, kept for the next VMOs and held by
 /// nobody), and whether a sequence is the one that pushes a table past its size depends on how many objects the rest of the system has at that
-/// moment. The first run brings the tables to what the sequence needs; the second, the same sequence again, must give back everything it took.
+/// moment. The first run brings the tables to what the sequence needs; the same sequence again must give back everything it took. A table
+/// grows once and keeps its room, so a measured run that kept bytes is repeated, up to three in all: one that gives everything back passes,
+/// and a leak, which takes its bytes on every run, fails all three (T277: the second run alone failed at two harts when the system's VMO
+/// count sat just below a doubling).
 fn the_guest_fuzzer_leaves_nothing_behind() -> Outcome {
     const SEEDS: u64 = 4;
     let root = root_job()?;
     for seed in 1..=SEEDS {
         guest_fuzzer_run(root, seed)?;
-        let held = guest_fuzzer_run(root, seed)?;
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let h = guest_fuzzer_run(root, seed)?;
+            held.push(h);
+            if h <= 64 * 1024 {
+                break;
+            }
+        }
         ensure!(
-            held <= 64 * 1024,
-            "seed {seed}: {held} kernel heap bytes stayed behind"
+            held.last().is_some_and(|&h| h <= 64 * 1024),
+            "seed {seed}: kernel heap bytes stayed behind in each of three runs: {held:?}"
         );
     }
     sys::handle_close(root);
@@ -12562,6 +12572,45 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
         let (s, _, _) = pci_claim(mine, 9, 0x20, Some(send))?;
         ensure_eq!(s, D::Busy, "a second function for the same driver job");
+        // the network class, on its own job: the configuration change, receive and transmit, and both limits from its plan
+        let (nj, send) = driver_job()?;
+        held.push(nj);
+        let (s, net, nhs) = pci_claim(c2, 12, 0x38, Some(send))?;
+        held.extend(&nhs);
+        ensure_eq!(s, D::Ok, "the network function is claimed");
+        let net = net.ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(
+            (net.dma_pages.clone(), net.irqs.clone()),
+            (
+                vec![2, 64, 64],
+                vec![
+                    dm::PciIrq {
+                        entry: 0,
+                        what: dm::IRQ_CONFIG
+                    },
+                    dm::PciIrq { entry: 1, what: 0 },
+                    dm::PciIrq { entry: 2, what: 1 }
+                ]
+            ),
+            "the network class: the rings and two buffer pools; the configuration change, receive and transmit"
+        );
+        ensure_eq!(
+            (net.handles(), nhs.len()),
+            (8, 8),
+            "the BAR, the domain, three DMA VMOs, three interrupts"
+        );
+        ensure!(
+            nhs[5..].iter().all(|&h| vector_route(h) != u64::MAX),
+            "three live vectors"
+        );
+        ensure_eq!(
+            (
+                sys::job_info(nj, 12).a2 as u64,
+                sys::job_info(nj, 13).a2 as u64
+            ),
+            (132, 3),
+            "the network driver's job: its 130 DMA pages and the margin of two, and its three vectors"
+        );
         // a read through the claim, as a driver does it: the BAR here, the rings and the data mapped by the driver
         let me = ok(sys::process_self(), "process_self")?.a1 as u64;
         let m = sys::process_map(me, bar, PCI_BAR_VA, 0, c.bar_bytes, PF_R | PF_W);
@@ -16233,9 +16282,7 @@ fn msi_granted_vector_is_delivered() -> Outcome {
         ok(sys::interrupt_deliver_here(irq), "interrupt_deliver_here")?;
         let here = vector_route(irq);
         ensure!(here != u64::MAX, "placed (debug_stat 148)");
-        if here >> 16 != 0 {
-            vector_moves_off_an_offline_hart(f, d, irq, address, here)?;
-        }
+        vector_moves_off_an_offline_hart(f, d, irq, address, here)?;
         msi_send(f, d, address, 1)?;
         ensure_eq!(
             st(sys::object_wait(
@@ -16323,7 +16370,9 @@ fn vector_calls_check_handles_rights_and_arguments() -> Outcome {
 }
 
 /// The hart vector `irq` is placed on (`here`, from debug_stat 148) goes offline: the vector moves to another hart and is still
-/// delivered; the hart comes back.
+/// delivered; the hart comes back. `debug_stat` 148 names the interrupt file, and files follow the hart ids, not the logical harts
+/// (hart 0 is the boot hart, whichever id that is), so the hart is found by taking the others offline one at a time until the route
+/// leaves `here`. A route on hart 0, which never goes offline, moves for none of them: nothing to check.
 fn vector_moves_off_an_offline_hart(
     f: &PciFn,
     d: &Domain,
@@ -16331,34 +16380,46 @@ fn vector_moves_off_an_offline_hart(
     address: u64,
     here: u64,
 ) -> Outcome {
-    let hart = here >> 16;
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let off = sys::hart_set_online(res, hart, 0);
-    let r = (|| {
-        ensure_eq!(st(off), Some(S::Ok), "hart {hart} offline");
-        let moved = vector_route(irq);
-        ensure!(
-            moved != u64::MAX && moved >> 16 != hart,
-            "the vector moved off hart {hart} ({here:#x} to {moved:#x})"
-        );
-        msi_send(f, d, address, 1)?;
-        ensure_eq!(
-            st(sys::object_wait(
-                irq,
-                sig::INTERRUPT,
-                sys::clock_get() + 2000
-            )),
-            Some(S::Ok),
-            "delivered after the move"
-        );
-        ok(sys::interrupt_ack(irq), "acknowledge after the move")?;
-        Ok(())
-    })();
-    let back = sys::hart_set_online(res, hart, 1);
+    let harts = hart_count(res);
+    let mut r = Ok(());
+    for hart in 1..harts {
+        let off = sys::hart_set_online(res, hart, 0);
+        let mut moved_here = false;
+        r = (|| {
+            ensure_eq!(st(off), Some(S::Ok), "hart {hart} offline");
+            let moved = vector_route(irq);
+            if moved == here {
+                return Ok(());
+            }
+            moved_here = true;
+            ensure!(
+                moved != u64::MAX && moved >> 16 != here >> 16,
+                "the vector moved off hart {hart}'s file ({here:#x} to {moved:#x})"
+            );
+            msi_send(f, d, address, 1)?;
+            ensure_eq!(
+                st(sys::object_wait(
+                    irq,
+                    sig::INTERRUPT,
+                    sys::clock_get() + 2000
+                )),
+                Some(S::Ok),
+                "delivered after the move"
+            );
+            ok(sys::interrupt_ack(irq), "acknowledge after the move")?;
+            Ok(())
+        })();
+        let back = sys::hart_set_online(res, hart, 1);
+        if r.is_ok() && st(back) != Some(S::Ok) {
+            r = Err(msg_at(line!()));
+        }
+        if r.is_err() || moved_here {
+            break;
+        }
+    }
     sys::handle_close(res);
-    r?;
-    ensure_eq!(st(back), Some(S::Ok), "hart {hart} online again");
-    Ok(())
+    r
 }
 
 /// IOMMU-SPEC 8.4, first row: a message to a page of the window whose vector is not granted is an IOMMU fault (MSI entry not valid)
@@ -16854,6 +16915,16 @@ fn claimed_used_reaches(b: &Claimed, n: u16) -> Outcome {
     Ok(())
 }
 
+/// `interrupt_deliver_here` from a thread of its own (`place_here`'s status, u64::MAX until it ran).
+static PLACE_RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
+extern "C" fn place_here(irq: usize) -> ! {
+    PLACE_RESULT.store(
+        sys::interrupt_deliver_here(irq as u64).status as u64,
+        Ordering::SeqCst,
+    );
+    sys::thread_exit(0)
+}
+
 /// The disk patterns of the two PCI block functions (`pci_disk` in the script).
 const BLK1_PATTERN: (u64, u64) = (13, 1);
 const BLK2_PATTERN: (u64, u64) = (7, 3);
@@ -16944,7 +17015,9 @@ fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
                 Some(S::TimedOut),
                 "armed, nothing pending"
             );
-            // placed on the hart that asks: with the other harts offline the asking thread runs on hart 0
+            // placed on the hart that asks: with the other harts offline the asking thread runs on hart 0, whose interrupt file is
+            // then the route's (`debug_stat` 148 names the file, and file numbers follow the hart ids, not the logical harts: hart 0 is
+            // the boot hart, whichever id that is)
             let harts = hart_count(res);
             let mut off = Vec::new();
             let placed = (|| {
@@ -16959,14 +17032,16 @@ fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
                 ok(sys::interrupt_deliver_here(q), "interrupt_deliver_here")?;
                 Ok(vector_route(q))
             })();
+            let mut back = Ok(());
             for &h in &off {
-                let _ = sys::hart_set_online(res, h, 1);
+                if st(sys::hart_set_online(res, h, 1)) != Some(S::Ok) && back.is_ok() {
+                    back = Err(msg_at(line!()));
+                }
             }
             let route = placed?;
-            ensure!(
-                route != u64::MAX && route >> 16 == 0,
-                "placed on hart 0, which asked ({route:#x})"
-            );
+            back?;
+            ensure!(route != u64::MAX, "placed on hart 0, which asked");
+            let file0 = route >> 16;
             let head = claimed_blk_submit(&mut b)?;
             ensure_eq!(
                 st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
@@ -16979,7 +17054,43 @@ fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
                 route,
                 "it stays where it was asked to be (no automatic follow)"
             );
-            ok(sys::interrupt_ack(q), "the last acknowledgement")?;
+            ok(sys::interrupt_ack(q), "acknowledge")?;
+            // and with more harts, the call moves it: a thread that runs elsewhere (the asking thread spins here meanwhile) asks
+            // for it, and the route leaves hart 0's file for the file of the hart that asked; a request is delivered there
+            if harts > 1 {
+                let mut moved = None;
+                for _ in 0..50 {
+                    PLACE_RESULT.store(u64::MAX, Ordering::SeqCst);
+                    let t = new_thread(place_here, q as usize)?;
+                    let t0 = sys::clock_get();
+                    while sys::object_signals(t).a1 as u32 & sig::TERMINATED == 0
+                        && sys::clock_get() < t0 + 2000
+                    {
+                        core::hint::spin_loop();
+                    }
+                    sys::handle_close(t);
+                    ensure_eq!(
+                        PLACE_RESULT.load(Ordering::SeqCst),
+                        0,
+                        "interrupt_deliver_here from another thread"
+                    );
+                    let r = vector_route(q);
+                    if r != u64::MAX && r >> 16 != file0 {
+                        moved = Some(r);
+                        break;
+                    }
+                }
+                let moved = moved.ok_or_else(|| msg_at(line!()))?;
+                let head = claimed_blk_submit(&mut b)?;
+                ensure_eq!(
+                    st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                    Some(S::Ok),
+                    "delivered on the hart that asked ({moved:#x})"
+                );
+                claimed_blk_done(&mut b, head, BLK1_PATTERN)?;
+                ensure_eq!(vector_route(q), moved, "and it stays there");
+                ok(sys::interrupt_ack(q), "acknowledge")?;
+            }
             msi_settle();
             ensure_eq!(
                 st(sys::object_wait(cfg, sig::INTERRUPT, sys::clock_get() + 1)),
@@ -17096,11 +17207,17 @@ fn pci_two_devices_do_not_share() -> Outcome {
 /// IOMMU9 (IOMMU-SPEC 8.4, 8.7, 9): what a driver is handed cannot reach past its device. The entropy function is claimed through
 /// `devmgr` (its class has one vector, queue 0 on entry 1; entry 0 of its two is left masked and cleared). The suite then uses only
 /// the claim's handles, as a driver would: the BAR VMO is the virtio structures' BAR, not the MSI-X table's (which the configuration
-/// space, read here through the root resource as an observer, puts in another BAR), so there is no handle to reach the table or the
-/// configuration space with; the domain handle cannot grant a vector, destroy the domain, read its faults or be duplicated; the
-/// interrupt handle cannot be duplicated or grant. The driver then points `queue_msix_vector` at entry 0, which `devmgr` did not
-/// program: the device's message for the queue is not sent (or, were it sent, would fault in the IOMMU with cause 262), and nobody is
-/// interrupted. Pointed at its own entry 1, the same request interrupts (the negative is not vacuous).
+/// space, read here through the root resource as an observer, puts in another BAR), and the entry `devmgr` programmed, read by the
+/// observer, appears nowhere in what the BAR VMO maps; the domain handle cannot grant a vector, destroy the domain, read its faults or
+/// be duplicated; the interrupt handle cannot be duplicated or grant. The driver then points `queue_msix_vector` at entry 0, which
+/// `devmgr` did not program: the device's message for the queue is not sent (or, were it sent, would fault in the IOMMU with cause
+/// 262), and nobody is interrupted. Pointed at its own entry 1, the same request interrupts (the negative is not vacuous).
+///
+/// What this does not show, by construction: the test runs in the suite's process, which also holds the root resource (it is the
+/// observer above), so "a driver has no handle for the configuration space or the table" rests on the claim's handle list (five
+/// handles, each checked by type and rights here), not on a process that holds nothing else. And because entry 0 is masked and
+/// cleared, QEMU does not send the message at all: this proves the table's mask, not the IOMMU's refusal of an ungranted vector,
+/// which `msi_forgery_faults` (IOMMU7) proves with a message actually sent.
 fn pci_driver_cannot_forge_through_devmgr() -> Outcome {
     with_devmgr(|res, mgr| {
         let mut x = claim_and_bring_up(
@@ -17161,14 +17278,52 @@ fn pci_driver_cannot_forge_through_devmgr() -> Outcome {
                 msix.table_bar
             );
             ensure_eq!(
-                sys::vmo_get_size(x.hs[0]).a1 as u64,
-                x.c.bar_bytes,
-                "the BAR VMO is the virtio structures' BAR and nothing more"
-            );
-            ensure_eq!(
                 msix.table_size,
                 2,
                 "QEMU's entropy function has two entries"
+            );
+            // the table's entry 1 as the observer reads it (devmgr's grant: an address in the MRIF window, the ABI's data), and
+            // nowhere in what the driver can read through its BAR VMO: the driver's mapping does not contain the table
+            let bar_reg = |i: u8| {
+                let at = 0x10 + 4 * usize::from(i);
+                let w = |o: usize| u32::from_le_bytes([cfg[o], cfg[o + 1], cfg[o + 2], cfg[o + 3]]);
+                let lo = w(at);
+                let hi = if lo & 0x6 == 0x4 { w(at + 4) } else { 0 };
+                (u64::from(hi) << 32) | u64::from(lo & !0xf)
+            };
+            let entry1 = bar_reg(msix.table_bar) + u64::from(msix.table_offset) + 16;
+            let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+            let tv = ok(
+                sys::vmo_create_physical(res, entry1 & !0xfff, 4096),
+                "the table's page",
+            )?
+            .a1 as u64;
+            let m = sys::process_map(me, tv, PCI_CFG_VA, 0, 4096, PF_R);
+            sys::handle_close(tv);
+            sys::handle_close(me);
+            ensure_eq!(st(m), Some(S::Ok), "map the table's page read-only");
+            let e = PCI_CFG_VA + (entry1 & 0xfff);
+            let (lo, hi, data) = (mmio_rd32(e), mmio_rd32(e + 4), mmio_rd32(e + 8));
+            unmap_here(PCI_CFG_VA);
+            let granted = (u64::from(hi) << 32) | u64::from(lo);
+            ensure!(
+                granted != 0 && u64::from(data) == rt::abi::iodomain::MSI_DATA,
+                "devmgr programmed entry 1 ({granted:#x}, data {data})"
+            );
+            let isr = u64::from(x.c.isr.0)..u64::from(x.c.isr.0) + u64::from(x.c.isr.1).max(4);
+            let seen = (0..x.c.bar_bytes / 4)
+                .map(|i| 4 * i)
+                .filter(|o| !isr.contains(o))
+                .find(|&o| {
+                    o + 8 < x.c.bar_bytes
+                        && mmio_rd32(x.base + o) == lo
+                        && mmio_rd32(x.base + o + 4) == hi
+                        && mmio_rd32(x.base + o + 8) == data
+                });
+            ensure_eq!(
+                seen,
+                None,
+                "the granted entry is not readable through the driver's BAR VMO"
             );
             // the domain handle maps and unmaps; the interrupt handle waits and acknowledges
             for (r, what) in [

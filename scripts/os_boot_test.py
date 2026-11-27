@@ -146,10 +146,11 @@ PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
 PCI_BLK_DEV = "00:05.0"
 # `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable | not-claimable <why> | refused <why>>`, then
 # `## devmgr: pci functions=<n>` (one enumeration), and `## devmgr: pci <bb:dd.f> reset failed <what>` (a reset that did not complete)
-# or `teardown failed <what>` (a domain that could not be destroyed).
+# or `teardown failed <what>` (a domain that could not be destroyed), or `claim failed <what>` (a claim refused or undone: allowed only for
+# a function PCI_DEVICES says is not claimable, which the suite's refusal checks ask for).
 # A process's `##` line reaches the console as `user: ##...` (the kernel's prefix, so that no program can forge a kernel line).
 DEVMGR_PCI = re.compile(r"^user: ## devmgr: pci (?:([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) (?:([0-9a-f]{4}:[0-9a-f]{4}) class=([0-9a-f]{6}) "
-                        r"(claimable|not-claimable|refused)(?: (.+))?|(?:reset|teardown) failed (.+))|functions=(\d+))$")
+                        r"(claimable|not-claimable|refused)(?: (.+))?|(reset|teardown|claim) failed (.+))|functions=(\d+))$")
 LAST_DEVMGR_PCI = []
 
 
@@ -200,9 +201,9 @@ def devmgr_pci_problems():
         want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _, _ in PCI_DEVICES})
         claimable = {f"00:{slot:02x}.0" for slot, _, _, _, c in PCI_DEVICES if c}
     for m in LAST_DEVMGR_PCI:
-        if m[6] is not None:  # an enumeration's last line
+        if m[7] is not None:  # an enumeration's last line
             got = {bdf: ids for bdf, ids, _, _, _ in current}
-            if got != want or len(current) != int(m[6]):
+            if got != want or len(current) != int(m[7]):
                 found.append(f"devmgr listed {sorted(got.items())}, the command line has {sorted(want.items())}")
             for bdf, ids, _, verdict, why in current:
                 if bdf in claimable:
@@ -213,8 +214,11 @@ def devmgr_pci_problems():
                 elif bdf != PCI_HOST_BRIDGE[0] and (verdict, why) != ("not-claimable", "no MSI-X capability"):
                     found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: a function without MSI-X is not claimable")
             current = []
+        elif m[5] == "claim":
+            if m[0] in claimable:
+                found.append(f"devmgr: a claim of {m[0]} failed: {m[6]}")
         elif m[5] is not None:
-            found.append(f"devmgr: {m[0]} reset or teardown failed: {m[5]}")
+            found.append(f"devmgr: {m[0]} {m[5]} failed: {m[6]}")
         else:
             current.append((m[0], m[1], m[2], m[3], m[4]))
     if current:
