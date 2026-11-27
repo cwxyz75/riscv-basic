@@ -20023,16 +20023,71 @@ extern "C" fn rt_hog(_: usize) -> ! {
     sys::thread_exit(0)
 }
 
+/// T284: windows of the probe taken again because a pause of the host covered them, the worst such pause (as `debug_stat` 216 packs
+/// it), and the pause that covered the third window in a row when the probe gave up (0: it did not).
+static RT_RETAKEN: AtomicU64 = AtomicU64::new(0);
+static RT_WORST_PAUSE: AtomicU64 = AtomicU64::new(0);
+static RT_GAVE_UP: AtomicU64 = AtomicU64::new(0);
+/// The probe's bound in microseconds: a window that a pause later than this covered says nothing about the scheduler.
+const RT_BOUND_US: u64 = 4_000;
+
+/// The pause detector (T284, `debug_stat` 216): the worst timer interrupt of any hart taken late since `since_ns` (the `clock_ns` clock), as
+/// (hart, microseconds late), or None.
+fn host_pause_since(since_ns: u64) -> Option<(u64, u64)> {
+    let r = rt::syscall(nr_debug_stat(), [rt::debug::handle() as usize, 216, since_ns as usize, 0, 0, 0]);
+    let v = if r.status == 0 { r.a1 as u64 } else { 0 };
+    (v != 0).then_some((v >> 48, v & ((1 << 48) - 1)))
+}
+
+/// How long the harts were not taking their timer interrupts since `since_ns`, summed over the harts, in microseconds (`debug_stat` 217).
+fn host_paused_us_since(since_ns: u64) -> u64 {
+    let r = rt::syscall(nr_debug_stat(), [rt::debug::handle() as usize, 217, since_ns as usize, 0, 0, 0]);
+    if r.status == 0 {
+        r.a1 as u64
+    } else {
+        0
+    }
+}
+
+fn nr_debug_stat() -> usize {
+    rt::abi::syscall::DEBUG_STAT
+}
+
+/// `##PAUSE <test> hart <h> late <us> us`: a window of `test` that a pause of the host covered (the harness keeps the line in the log).
+fn pause_line(test: &str, hart: u64, late_us: u64) {
+    println!("##PAUSE {test} hart {hart} late {late_us} us");
+}
+
 extern "C" fn rt_probe(_: usize) -> ! {
     sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
     let gate = sys::event_create().a1 as u64;
     let (mut worst, mut second) = (0u64, 0u64);
-    for _ in 0..30 {
+    let (mut kept, mut in_a_row, mut retaken, mut worst_pause) = (0, 0, 0u64, 0u64);
+    let name = "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not";
+    // (T284: a wait that a pause of the host covered, a timer interrupt of any hart more than the bound late inside it, is taken
+    // again, at most three in a row: the third fails the test, since a host that does not run the hart is a failure too)
+    while kept < 30 {
+        let start = sys::clock_ns();
         let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
         sys::object_wait(gate, 1 << 24, target);
         // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
         let late = sys::clock_ns().saturating_sub(target * 1_000_000);
         let late = late / 1000; // microseconds
+        if let Some((h, us)) = host_pause_since(start).filter(|&(_, us)| us > RT_BOUND_US) {
+            pause_line(name, h, us);
+            in_a_row += 1;
+            if worst_pause & ((1 << 48) - 1) < us {
+                worst_pause = (h << 48) | us;
+            }
+            if in_a_row == 3 {
+                RT_GAVE_UP.store((h << 48) | us, Ordering::SeqCst);
+                break;
+            }
+            retaken += 1;
+            continue;
+        }
+        in_a_row = 0;
+        kept += 1;
         if late > worst {
             second = worst;
             worst = late;
@@ -20040,10 +20095,26 @@ extern "C" fn rt_probe(_: usize) -> ! {
             second = second.max(late);
         }
     }
+    RT_RETAKEN.store(retaken, Ordering::SeqCst);
+    RT_WORST_PAUSE.store(worst_pause, Ordering::SeqCst);
     RT_SECOND_LATE_US.store(second, Ordering::SeqCst);
     RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
     sys::handle_close(gate);
     sys::thread_exit(0)
+}
+
+/// What the probe's re-sampling did, for a failure message: "" when no window was taken again.
+fn rt_pauses_said() -> alloc::string::String {
+    let p = RT_WORST_PAUSE.load(Ordering::SeqCst);
+    if p == 0 {
+        return alloc::string::String::new();
+    }
+    alloc::format!(
+        "; {} windows taken again for a host pause, the worst {} us on hart {}",
+        RT_RETAKEN.load(Ordering::SeqCst),
+        p & ((1 << 48) - 1),
+        p >> 48
+    )
 }
 
 /// The probe's worst and second-worst lateness (microseconds) at `prio` with a hog on every hart.
@@ -20052,6 +20123,7 @@ fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     RT_STOP.store(0, Ordering::SeqCst);
     RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
     RT_WORST_LATE_US.store(u64::MAX, Ordering::SeqCst);
+    RT_GAVE_UP.store(0, Ordering::SeqCst);
     let mut hogs = Vec::new();
     for _ in 0..harts {
         hogs.push(new_thread(rt_hog, 0)?);
@@ -20066,6 +20138,13 @@ fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     }
     sys::handle_close(probe);
     ensure_eq!(w.status, 0, "the probe finished");
+    let gave_up = RT_GAVE_UP.load(Ordering::SeqCst);
+    ensure!(
+        gave_up == 0,
+        "host pause: three windows in a row were covered by a pause (the last: a timer interrupt {} us late on hart {}), so the probe could not measure the scheduler",
+        gave_up & ((1 << 48) - 1),
+        gave_up >> 48
+    );
     Ok((
         RT_WORST_LATE_US.load(Ordering::SeqCst),
         RT_SECOND_LATE_US.load(Ordering::SeqCst),
@@ -20078,14 +20157,16 @@ fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not(
     // (QEMU on a loaded host delivers a timer interrupt up to a few ms late, and a pause of the host delays one wake: the bound is on the second-worst of
     // the 30 samples, which a scheduler that delays every wake still fails, and the worst only has to stay within a hundredth of a second: T219)
     ensure!(
-        second <= 4_000 && rt <= 30_000,
-        "a real-time thread woke {rt} us late (second worst {second} us) with a hog on every hart (bound 4 ms, worst 30 ms)"
+        second <= RT_BOUND_US && rt <= 30_000,
+        "a real-time thread woke {rt} us late (second worst {second} us) with a hog on every hart (bound 4 ms, worst 30 ms){}",
+        rt_pauses_said()
     );
     // the negative control: at the hogs' priority the wake waits for a slice to end
     let (normal, _) = worst_lateness_us(10)?;
     ensure!(
         normal > 6_000,
-        "an equal-priority probe was only {normal} us late: the hogs are not loading the harts"
+        "an equal-priority probe was only {normal} us late: the hogs are not loading the harts{}",
+        rt_pauses_said()
     );
     Ok(())
 }
@@ -20657,15 +20738,26 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     for &h in &hogs {
         ok(sys::thread_set_sched(h, 40, 0), "a hog turns real-time")?;
     }
+    // (the worst of (billed, what host pauses explain) over the readings: the job's real-time time in the current 100 ms window,
+    // less what the harts were billed while the host did not run them)
     let mut worst_rt = 0u64;
-    let mut trace: Vec<(u64, u64)> = Vec::new(); // (ms into the 100 ms window, RT ms billed so far)
+    let mut worst_paused = 0u64;
+    let mut trace: Vec<(u64, u64, u64)> = Vec::new(); // (ms into the 100 ms window, RT ms billed so far, ms of host pause in it)
     let mut naps_done = 0;
     let until = sys::clock_get() + 20_000;
     while naps_done < 30 && sys::clock_get() < until {
         nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
         let used = job_use(root, 9)?.0;
-        worst_rt = worst_rt.max(used);
-        trace.push((sys::clock_get() % 100, used / 1_000_000));
+        // T284: the scheduler bills a thread by the clock, so a hart the host did not run for 20 ms bills its hog 20 ms it never
+        // ran (the host-stall injector shows it: 254 ms billed in one window with one stall of 20 to 30 ms on all four harts). What
+        // the pause detector saw in this budget window (since its start on the same clock) is allowed for, hart by hart; a
+        // scheduler that overruns the budget by itself still fails.
+        let now = sys::clock_ns();
+        let paused_ns = host_paused_us_since(now - now % 100_000_000) * 1000;
+        if used.saturating_sub(paused_ns) > worst_rt.saturating_sub(worst_paused) {
+            (worst_rt, worst_paused) = (used, paused_ns);
+        }
+        trace.push((sys::clock_get() % 100, used / 1_000_000, paused_ns / 1_000_000));
         naps_done += 1;
     }
     RT_STOP.store(1, Ordering::SeqCst);
@@ -20677,8 +20769,8 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     ensure_eq!(naps_done, 30, "thirty naps finished while the hogs ran");
     // (without the budget the job's real-time time in a window would be about `harts` windows long; allow a tick or two of overshoot)
     ensure!(
-        worst_rt <= 100_000_000 + harts * 20_000_000,
-        "the job was billed {worst_rt} ns of real-time time in one 100 ms window (budget 100 ms, {harts} harts); (ms into window, RT ms): {trace:?}"
+        worst_rt.saturating_sub(worst_paused) <= 100_000_000 + harts * 20_000_000,
+        "the job was billed {worst_rt} ns of real-time time in one 100 ms window, {worst_paused} ns of it while the host did not run the harts (budget 100 ms, {harts} harts); (ms into window, RT ms, host pause ms): {trace:?}"
     );
     Ok(())
 }

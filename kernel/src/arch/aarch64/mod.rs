@@ -254,6 +254,12 @@ pub mod timer {
     pub fn now() -> u64 {
         unimplemented!()
     }
+    pub fn ns_from_cycles(cycles: u64) -> u64 {
+        unimplemented!()
+    }
+    pub fn ns_at(cycles: u64) -> u64 {
+        unimplemented!()
+    }
     pub fn start() {
         unimplemented!()
     }

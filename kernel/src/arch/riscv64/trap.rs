@@ -537,6 +537,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        crate::pause::timer_taken(); // (T284: how late this hart took its timer, measured before any lock is waited for)
         // L12b: a tick that interrupted user mode takes the big lock only when something needs it: the user's FP registers are dirty
         // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
         // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
@@ -635,6 +636,7 @@ fn window_trap(frame: &mut TrapFrame, cause: u64) {
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, Ordering::SeqCst);
+        crate::pause::timer_taken();
         if crate::thread::timer_interrupt() {
             crate::percpu::this()
                 .need_resched

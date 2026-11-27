@@ -27,6 +27,7 @@ mod interactive;
 mod kmem;
 mod kstack;
 mod latency;
+mod pause;
 mod percpu;
 mod report;
 #[cfg(not(feature = "release"))]
@@ -208,6 +209,14 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         &alloc::format!("scheduler_class_is_{}", class.replace('-', "_")),
         Ok(()),
     );
+    // (T284: the injector's self-test, only when the harness stops the emulator on purpose and says so on the kernel line)
+    #[cfg(not(feature = "release"))]
+    if dtb::boot_arg_value("hoststall=").is_some() {
+        match sched_tests::a_host_stall_is_seen_by_the_guest() {
+            Ok(()) => tally.record("a_host_stall_is_seen_by_the_guest", Ok(())),
+            Err(detail) => tally.record("a_host_stall_is_seen_by_the_guest", Err(&detail)),
+        }
+    }
     #[cfg(not(feature = "release"))]
     for (name, test) in sched_tests::TESTS.iter().chain(sched_tests::PRIORITY_TESTS) {
         match test() {

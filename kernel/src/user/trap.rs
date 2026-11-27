@@ -507,6 +507,23 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
             return Ok((Some(at.unwrap_or(u64::MAX)), None));
         }
+        // 216 and 217 (T284, test kernels): the pause detector since `a2` (nanoseconds on the clock `clock_ns` reads) up to now. 216: the worst
+        // timer interrupt of any hart taken late inside that window, as (hart << 48) | microseconds late, 0 for none; 217: how long the harts were
+        // not taking their timer interrupts inside it, summed over the harts (microseconds). A release kernel answers 0 to both.
+        if a[1] == 216 || a[1] == 217 {
+            #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+            {
+                let now = crate::timer::now_ns();
+                let v = if a[1] == 216 {
+                    kcore::pause::encode(crate::pause::worst_in(a[2], now))
+                } else {
+                    crate::pause::paused_in(a[2], now)
+                };
+                return Ok((Some(v), None));
+            }
+            #[cfg(all(feature = "release", not(feature = "release-suite")))]
+            return Ok((Some(0), None));
+        }
         // 132 (T243, debug builds): print every hart's scheduler state, the record of every thread that is not idle and the processes that are not
         // finished, for a test that failed; the user state is the one this closure holds (`dump_state` opening it again would be two live `&mut`, T239)
         if a[1] == 132 {

@@ -67,6 +67,39 @@ fn clean(body: impl FnOnce() -> Outcome) -> Outcome {
     )
 }
 
+/// T284, the host-stall injector's self-test, run only when the harness stops the emulator on purpose (`hoststall=<ms>:<period>` on
+/// the kernel line, from `OS_HOST_STALL`): the guest must see a stall land. It sleeps 1 ms at a time; a sleep across which the `time`
+/// counter jumped by at least the stall is one the host did not run, and the pause detector must have seen it there (a timer interrupt
+/// of this hart at least half the stall late). It gives up after four periods and a second.
+pub fn a_host_stall_is_seen_by_the_guest() -> Outcome {
+    let Some((ms, period)) =
+        crate::dtb::boot_arg_value("hoststall=").and_then(|v| kcore::pause::parse_stall_arg(&v))
+    else {
+        return Err(String::from("the kernel line's hoststall= is not <ms>:<period ms>"));
+    };
+    let stall_ns = ms * 1_000_000;
+    let give_up = thread::now_ns() + (4 * period + 1000) * 1_000_000;
+    let (mut jumps, mut best) = (0u32, 0u64);
+    while thread::now_ns() < give_up {
+        let start = thread::now_ns();
+        thread::sleep_ticks(1);
+        let end = thread::now_ns();
+        if end - start < stall_ns {
+            continue;
+        }
+        jumps += 1;
+        let (hart, seen) = crate::pause::worst_in(start, end).unwrap_or((0, 0));
+        best = best.max(seen);
+        if seen * 1000 * 2 >= stall_ns {
+            crate::pause::report("a_host_stall_is_seen_by_the_guest", hart, seen);
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "no stall of {ms} ms was seen with the detector: {jumps} sleeps of 1 ms took at least {ms} ms, and the detector's worst inside them was {best} us"
+    ))
+}
+
 fn timer_ticks_advance() -> Outcome {
     let start = thread::ticks();
     let mut spins = 0u64;
@@ -608,26 +641,73 @@ mod priority {
     static MAX_LATE: AtomicU64 = AtomicU64::new(0);
     static P99_LATE: AtomicU64 = AtomicU64::new(0);
     static LATE_DONE: AtomicBool = AtomicBool::new(false);
+    /// T284: the probe's windows taken again because a pause of the host covered them, the worst such pause
+    /// (`kcore::pause::encode`), and whether three in a row were covered (the probe gave up).
+    static RETAKEN: AtomicU64 = AtomicU64::new(0);
+    static WORST_PAUSE: AtomicU64 = AtomicU64::new(0);
+    static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+    /// The probe's bound (4 ms): a window that a pause later than this covered says nothing about the scheduler.
+    const PROBE_BOUND_US: u64 = 4_000;
+    /// Which test the probe is measuring for (its `##PAUSE` lines name it).
+    static PROBE_FOR: AtomicUsize = AtomicUsize::new(0);
+    const PROBE_NAMES: [&str; 2] = [
+        "realtime_thread_stays_responsive_under_load",
+        "the_latency_test_can_fail",
+    ];
 
-    /// The latency probe: sleep 3 ticks 50 times, recording how late each wake was.
+    /// The latency probe: sleep 3 ticks until 50 wakes are measured, recording how late each was. A sleep that a pause of the host
+    /// covered (T284: a timer interrupt of any hart taken more than the bound late inside it) is taken again, at most three in a row.
     fn probe(_: usize) {
+        use kcore::pause::{Resampler, Verdict};
         let mut late = alloc::vec::Vec::new();
-        for _ in 0..50 {
+        let mut rs = Resampler::new();
+        let name = PROBE_NAMES[PROBE_FOR.load(SeqCst) % PROBE_NAMES.len()];
+        while late.len() < 50 {
             // (nanoseconds on the real clock: there is no tick to round to)
-            let target = thread::now_ns() + 3_000_000;
+            let start = thread::now_ns();
+            let target = start + 3_000_000;
             thread::sleep_ticks(3);
-            late.push(thread::now_ns().saturating_sub(target));
+            let end = thread::now_ns();
+            match rs.judge(crate::pause::worst_in(start, end), PROBE_BOUND_US) {
+                Verdict::Keep => late.push(end.saturating_sub(target)),
+                Verdict::Retake { hart, late_us } => crate::pause::report(name, hart, late_us),
+                Verdict::GiveUp { hart, late_us } => {
+                    crate::pause::report(name, hart, late_us);
+                    GAVE_UP.store(kcore::pause::encode(Some((hart, late_us))), SeqCst);
+                    break;
+                }
+            }
         }
+        RETAKEN.store(u64::from(rs.retaken), SeqCst);
+        WORST_PAUSE.store(kcore::pause::encode(rs.worst), SeqCst);
         late.sort_unstable();
-        MAX_LATE.store(late[late.len() - 1], SeqCst);
-        P99_LATE.store(late[late.len() * 99 / 100], SeqCst);
+        MAX_LATE.store(late.last().copied().unwrap_or(0), SeqCst);
+        // (the next to worst of the 50: `len * 99 / 100` was index 49, the worst itself, so the "99th" bound was on the worst sample
+        // and one pause of the host failed it, T178; found by T284)
+        P99_LATE.store(late.get(late.len().saturating_sub(2)).copied().unwrap_or(0), SeqCst);
         LATE_DONE.store(true, SeqCst);
     }
 
-    /// Worst lateness of the probe at `prio` while three hogs run at normal priority.
+    /// What the probe's re-sampling did, for a failure message: "" when no window was taken again.
+    fn pauses_said() -> String {
+        match kcore::pause::decode(WORST_PAUSE.load(SeqCst)) {
+            None => String::new(),
+            Some((h, us)) => format!(
+                "; {} windows taken again for a host pause, the worst {us} us on hart {h}",
+                RETAKEN.load(SeqCst)
+            ),
+        }
+    }
+
+    /// Worst lateness of the probe at `prio` while three hogs run at normal priority (an error when three windows in a row were
+    /// covered by a pause of the host: a host that does not run the hart is a failure too).
     fn lateness_under_load(prio: u8) -> Result<u64, String> {
         STOP.store(false, SeqCst);
         LATE_DONE.store(false, SeqCst);
+        RETAKEN.store(0, SeqCst);
+        WORST_PAUSE.store(0, SeqCst);
+        GAVE_UP.store(0, SeqCst);
+        PROBE_FOR.store(usize::from(prio == NORMAL), SeqCst);
         let hogs: Vec<_> = (0..3)
             .map(|_| {
                 thread::spawn(
@@ -649,6 +729,12 @@ mod priority {
             thread::join(h);
         }
         ensure(LATE_DONE.load(SeqCst), "the probe did not finish")?;
+        if let Some((h, us)) = kcore::pause::decode(GAVE_UP.load(SeqCst)) {
+            return Err(format!(
+                "host pause: three windows in a row were covered by a pause (the last: a timer interrupt {us} us late on hart {h}), so \
+                 the probe could not measure the scheduler"
+            ));
+        }
         Ok(MAX_LATE.load(SeqCst))
     }
 
@@ -667,9 +753,11 @@ mod priority {
                 // own priority is held for whole slices, 10 ms, which is what the negative control checks)
                 // (a pause of the host delays one wake of the 50: the bound is on the 99th, the next to worst, and the worst only has to stay within 30 ms; T178)
                 P99_LATE.load(SeqCst) <= 4_000_000 && late <= 30_000_000,
+                // (T284: a window that a pause of the host covered was taken again, so what is judged here was measured with the host running)
                 &format!(
-                    "a real-time thread woke {late} ns late (99th {} ns) with three hogs running (bound: 4 ms, worst 30 ms)",
-                    P99_LATE.load(SeqCst)
+                    "a real-time thread woke {late} ns late (99th {} ns) with three hogs running (bound: 4 ms, worst 30 ms){}",
+                    P99_LATE.load(SeqCst),
+                    pauses_said()
                 ),
             )
         })
@@ -683,7 +771,8 @@ mod priority {
             ensure(
                 late > 6_000_000,
                 &format!(
-                    "an equal-priority probe was only {late} ns late: the load is not loading"
+                    "an equal-priority probe was only {late} ns late: the load is not loading{}",
+                    pauses_said()
                 ),
             )
         })

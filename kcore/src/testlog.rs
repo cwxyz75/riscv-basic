@@ -35,6 +35,13 @@ pub fn done(out: &mut impl Write, pass: u32, fail: u32) -> fmt::Result {
     writeln!(out, "##DONE pass={pass} fail={fail}")
 }
 
+/// `##PAUSE <test> hart <h> late <us> us` (T284): a window of a timing test that a pause of the host covered (a timer interrupt of
+/// hart `h` taken `us` microseconds late inside it), so the window is taken again or, the third in a row, the test fails.
+pub fn pause(out: &mut impl Write, test: &str, hart: usize, late_us: u64) -> fmt::Result {
+    debug_assert!(!test.is_empty() && !test.contains(char::is_whitespace));
+    writeln!(out, "##PAUSE {test} hart {hart} late {late_us} us")
+}
+
 fn one_line(out: &mut impl Write, text: &str) -> fmt::Result {
     for c in text.chars() {
         out.write_char(if c == '\n' || c == '\r' { ' ' } else { c })?;

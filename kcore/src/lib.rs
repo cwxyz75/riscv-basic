@@ -57,6 +57,7 @@ pub mod pagemap;
 pub mod pager;
 pub mod pagetable;
 pub mod park;
+pub mod pause;
 pub mod pifutex;
 pub mod powerseq;
 pub mod sched;
