@@ -77,6 +77,11 @@ fn write_stimecmp(value: u64) {
     unsafe { asm!("csrw 0x14d, {}", in(reg) value) };
 }
 
+/// Write `stimecmp` with no bookkeeping: the pause detector's sentinel (`pause::timer_taken`), which the handler's own re-arm replaces.
+pub fn write_raw(cycles: u64) {
+    write_stimecmp(cycles);
+}
+
 /// Read `stimecmp` back (the boot probe).
 fn read_stimecmp() -> u64 {
     let v: u64;

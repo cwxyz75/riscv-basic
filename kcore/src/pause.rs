@@ -16,7 +16,7 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Samples kept per hart: the newest win.
-pub const RING: usize = 64;
+pub const RING: usize = 128;
 /// Latenesses below this (microseconds) are not kept: they are the emulator's ordinary jitter, far below any test's bound, and
 /// keeping them would push the pauses out of the ring.
 pub const FLOOR_US: u64 = 200;
@@ -100,6 +100,24 @@ impl HartRing {
             .map(|(_, late)| late)
             .max()
             .unwrap_or(0)
+    }
+}
+
+/// A hart writes `new` to `stimecmp` at counter value `now` (all in counter cycles; `u64::MAX`: nothing armed), and `old` was what it
+/// had armed and not yet taken. Returns (when the interrupt it now waits for is due, how long the old one is overdue if this write
+/// cancels it). A future value is due then. A value already past raises the interrupt at once, so the hardware is late only from
+/// `now`, the moment it was written; but if the old interrupt was already due and is still pending, it has been due since `old`, and
+/// a re-arm must not hide that (a hart back from a pause re-arms the deadline it missed before it takes the interrupt). A write that
+/// moves a due interrupt into the future, or turns it off, cancels it: the hart never took it, and it is overdue by `now - old` (the
+/// pause detector keeps that as a sample, like an interrupt taken that late).
+pub fn rearm(old: u64, new: u64, now: u64) -> (u64, u64) {
+    let pending = old != u64::MAX && old <= now;
+    if new == u64::MAX || new > now {
+        (new, if pending { now.saturating_sub(old) } else { 0 })
+    } else if pending {
+        (old, 0)
+    } else {
+        (now, 0)
     }
 }
 

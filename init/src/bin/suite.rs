@@ -20082,6 +20082,14 @@ fn host_paused_us_since(since_ns: u64) -> u64 {
     }
 }
 
+/// For the next `ms` milliseconds (0: stop) every hart keeps a timer deadline at most 1 ms ahead (`debug_stat` 218).
+fn host_pause_watch(ms: u64) {
+    rt::syscall(
+        nr_debug_stat(),
+        [rt::debug::handle() as usize, 218, ms as usize, 0, 0, 0],
+    );
+}
+
 fn nr_debug_stat() -> usize {
     rt::abi::syscall::DEBUG_STAT
 }
@@ -20167,8 +20175,11 @@ fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
         hogs.push(new_thread(rt_hog, 0)?);
     }
     nap_ticks(5); // the hogs are running, one per hart
+                  // (T284: every hart keeps a timer deadline near while the probe measures, so a pause of the host makes one late wherever it lands)
+    host_pause_watch(20_000);
     let probe = new_thread(rt_probe, 0)?;
     let w = sys::object_wait(probe, sig::TERMINATED, sys::clock_get() + 20_000);
+    host_pause_watch(0);
     RT_STOP.store(1, Ordering::SeqCst);
     for h in hogs {
         sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);

@@ -260,6 +260,9 @@ pub mod timer {
     pub fn ns_at(cycles: u64) -> u64 {
         unimplemented!()
     }
+    pub fn write_raw(cycles: u64) {
+        unimplemented!()
+    }
     pub fn start() {
         unimplemented!()
     }

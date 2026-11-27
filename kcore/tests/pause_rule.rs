@@ -5,7 +5,7 @@
 //! it, and the third such window in a row fails the test; a window with no such pause is always kept, however late its own sample.
 
 use kcore::pause::{
-    covers, decode, encode, overlap, pack, parse_stall_arg, paused_total, unpack, worst_of,
+    covers, decode, encode, overlap, pack, parse_stall_arg, paused_total, rearm, unpack, worst_of,
     HartRing, Resampler, Verdict, FLOOR_US, MAX_COVERED_IN_A_ROW, RING,
 };
 
@@ -291,5 +291,47 @@ fn the_pause_line_is_written_and_recognised() {
         "##PAUSE x hart 2 late 5 us\n##DONE pass=1 fail=0",
     ] {
         assert!(!kcore::testlog::is_pause_line(bad), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_re_arm_does_not_hide_an_interrupt_already_due() {
+    const NONE: u64 = u64::MAX;
+    // a future value is due when it says; nothing was pending
+    assert_eq!(rearm(NONE, 500, 100), (500, 0));
+    assert_eq!(rearm(300, 500, 100), (500, 0));
+    // a past value written when nothing was pending: due from the write (the scheduler's lagging clock is not the hardware's lateness)
+    assert_eq!(rearm(NONE, 40, 100), (100, 0));
+    assert_eq!(rearm(300, 40, 100), (100, 0));
+    // a past value written while an interrupt was already pending: still due from then (a hart back from a pause re-arms its deadline)
+    assert_eq!(rearm(60, 60, 100), (60, 0));
+    assert_eq!(rearm(60, 90, 100), (60, 0));
+    // a write that moves a pending interrupt to the future, or turns the timer off, cancels it: overdue by now - old
+    assert_eq!(rearm(60, 500, 100), (500, 40));
+    assert_eq!(rearm(60, NONE, 100), (NONE, 40));
+    assert_eq!(rearm(100, NONE, 100), (NONE, 0));
+    // the model, over random cases
+    let mut r = Rng(5);
+    for _ in 0..100_000 {
+        let now = 1_000 + r.below(1_000);
+        let old = if r.below(4) == 0 {
+            NONE
+        } else {
+            r.below(3_000)
+        };
+        let new = if r.below(8) == 0 {
+            NONE
+        } else {
+            r.below(3_000)
+        };
+        let (due, missed) = rearm(old, new, now);
+        let pending = old != NONE && old <= now;
+        if new == NONE || new > now {
+            assert_eq!(due, new);
+            assert_eq!(missed, if pending { now - old } else { 0 });
+        } else {
+            assert_eq!(missed, 0);
+            assert_eq!(due, if pending { old } else { now });
+        }
     }
 }

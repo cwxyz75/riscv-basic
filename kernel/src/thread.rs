@@ -1081,6 +1081,7 @@ pub fn program_timer() -> Option<u64> {
             .saturating_add(WATCHDOG_PERIOD);
         ev = Some(ev.map_or(at, |e| e.min(at)));
     }
+    let ev = crate::pause::cap(ev); // (T284: a heartbeat while a timing test watches for pauses of the host)
     crate::timer::program(ev);
     ev
 }

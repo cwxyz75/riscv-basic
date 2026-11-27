@@ -729,8 +729,11 @@ mod priority {
                 )
             })
             .collect();
+        // (T284: every hart keeps a deadline near while the probe measures, so a pause of the host makes one late wherever it lands)
+        crate::pause::watch(30_000_000_000);
         let p = thread::spawn("probe", prio, probe, 0);
         thread::join(p);
+        crate::pause::watch(0);
         STOP.store(true, SeqCst);
         for h in hogs {
             thread::join(h);

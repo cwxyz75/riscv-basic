@@ -300,9 +300,13 @@ physical address, IOMMU-SPEC amendment 2026-11-27 part 2);
 a release kernel answers all ones (the translate path is not compiled into it), so no frame's physical address is learnable through a call on a release build (INVARIANTS D2). Like every
 selector it needs the debug resource with INSPECT.
 
-`which` 216 and 217 (T284, test kernels only: a release kernel answers 0) read the **pause detector**: each hart records how late it took
-its own timer interrupt against what it programmed into `stimecmp` (the later of the value and the moment it was written), keeping the
-newest 64 that were at least 200 us late (`kcore::pause`). `a2` is the start of a window in nanoseconds on the clock `clock_ns` reads; the
+`which` 216 to 218 (T284, test kernels only: a release kernel answers 0 and does nothing) are the **pause detector**: each hart records
+how late it took its own timer interrupt against what it programmed into `stimecmp` (`kcore::pause::rearm`: a value already past is
+due from the moment it was written, unless an interrupt still pending was due earlier; a re-arm that cancels an interrupt already due
+counts as that interrupt, late by as much), keeping the newest 128 that were at least 200 us late. After taking a timer interrupt the hart
+arms a sentinel 1 ms ahead until the handler arms its next event. 218 is the one selector with an effect: for the next `a2` milliseconds
+(at most 60 s; 0 stops it) every hart keeps its timer deadline at most 1 ms ahead, so that a hart the host stops is late for an
+interrupt whatever it was running (a timing test turns it on while it measures, and off after). `a2` is the start of a window in nanoseconds on the clock `clock_ns` reads; the
 window ends now. 216 returns the worst such interrupt of any hart whose late span (from its due time to when it was taken) meets the
 window, as (hart << 48) | microseconds late, or 0 for none; 217 returns how long the harts were not taking their timer interrupts inside
 the window, summed over the harts, in microseconds. An interrupt taken late means the emulator did not run the hart (a pause of the host)

@@ -509,15 +509,20 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
         }
         // 216 and 217 (T284, test kernels): the pause detector since `a2` (nanoseconds on the clock `clock_ns` reads) up to now. 216: the worst
         // timer interrupt of any hart taken late inside that window, as (hart << 48) | microseconds late, 0 for none; 217: how long the harts were
-        // not taking their timer interrupts inside it, summed over the harts (microseconds). A release kernel answers 0 to both.
-        if a[1] == 216 || a[1] == 217 {
+        // not taking their timer interrupts inside it, summed over the harts (microseconds). A release kernel answers 0 to all three.
+        // 218 (T284, test kernels): for the next `a2` milliseconds (0: stop now) every hart keeps a timer deadline at most 1 ms ahead, so that
+        // a pause of the host makes an interrupt late wherever it lands (a timing test's measurement; the only selector with an effect)
+        if a[1] == 216 || a[1] == 217 || a[1] == 218 {
             #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
             {
                 let now = crate::timer::now_ns();
-                let v = if a[1] == 216 {
-                    kcore::pause::encode(crate::pause::worst_in(a[2], now))
-                } else {
-                    crate::pause::paused_in(a[2], now)
+                let v = match a[1] {
+                    216 => kcore::pause::encode(crate::pause::worst_in(a[2], now)),
+                    217 => crate::pause::paused_in(a[2], now),
+                    _ => {
+                        crate::pause::watch(a[2].min(60_000).saturating_mul(1_000_000));
+                        0
+                    }
                 };
                 return Ok((Some(v), None));
             }
