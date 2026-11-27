@@ -12321,6 +12321,21 @@ fn pci_claim(
         claim.as_ref().map_or(0, |c| c.handles()),
         "the handles the reply says"
     );
+    if status == proto::devmgr::Status::Ok {
+        // the second message: bus mastering is on, the device may be started
+        ensure_eq!(
+            st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+            Some(S::Ok),
+            "the manager says the device may start"
+        );
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+        ensure_eq!(st(r), Some(S::Ok), "read the second message");
+        ensure_eq!(
+            proto::devmgr::decode_claim_pci_started(&buf[..r.a1]),
+            Some(txid),
+            "the claim's second message"
+        );
+    }
     Ok((status, claim, hs))
 }
 
@@ -12365,6 +12380,9 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
     use proto::devmgr::Status as D;
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let (mine, mgr, mj) = start_devmgr_in_job(res)?;
+    // every handle the test may still hold when a check fails is closed on the way out (a claim left open would keep its domain
+    // alive into later tests of the same boot)
+    let mut held: Vec<u64> = Vec::new();
     let r = (|| {
         // the list: the host bridge and the two functions of the harness, nothing else, in requester-id order
         let list = pci_list(mine, 1)?;
@@ -12398,6 +12416,7 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         }
         // a second client, whose connection will hold the claim
         let (c2, c2_theirs) = channel()?;
+        held.push(c2);
         let req = dm::encode_connect(2);
         let hs = [c2_theirs];
         ensure_eq!(
@@ -12427,6 +12446,7 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         let (s, _, _) = pci_claim(c2, 3, 0x28, None)?;
         ensure_eq!(s, D::BadRequest, "a claim without the driver's job");
         let (dj, send) = driver_job()?;
+        held.push(dj);
         let (s, _, _) = pci_claim(c2, 4, 0, Some(send))?;
         ensure_eq!(s, D::Refused, "the host bridge");
         let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
@@ -12439,6 +12459,7 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         // the claim
         let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
         let (s, claim, hs) = pci_claim(c2, 6, 0x28, Some(send))?;
+        held.extend(&hs);
         ensure_eq!(s, D::Ok, "the block function is claimed");
         let c = claim.ok_or_else(|| msg_at(line!()))?;
         ensure_eq!((c.vendor, c.device), (0x1af4, 0x1042), "the claim's ids");
@@ -12448,124 +12469,142 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
             "the block class's DMA VMOs: the rings and the data pages"
         );
         let (bar, dom, rings, data) = (hs[0], hs[1], hs[2], hs[3]);
-        let r = (|| {
-            ensure_eq!(
-                sys::vmo_get_size(bar).a1 as u64,
-                c.bar_bytes,
-                "the BAR VMO's size"
-            );
-            ensure_eq!(
-                (
-                    sys::job_info(dj, 12).a2 as u64,
-                    sys::job_info(dj, 13).a2 as u64
-                ),
-                (5, 2),
-                "the driver's job is limited to its DMA pages and its MSI-X vectors"
-            );
-            // the domain handle maps and unmaps, nothing more
-            ensure_eq!(
-                st(sys::iodomain_destroy(dom)),
-                Some(S::AccessDenied),
-                "the driver's domain handle cannot destroy"
-            );
-            ensure_eq!(
-                st(sys::iodomain_fault_read(dom)),
-                Some(S::AccessDenied),
-                "nor read faults"
-            );
-            ensure!(
-                blk_bus_master(res)?,
-                "bus mastering is on once the claim was sent"
-            );
-            ensure_eq!(
-                pci_list(c2, 7)?
-                    .iter()
-                    .find(|e| e.rid == 0x28)
-                    .map(|e| e.flags & dm::PCI_CLAIMED),
-                Some(dm::PCI_CLAIMED),
-                "listed as claimed"
-            );
-            let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
-            let (s, _, _) = pci_claim(mine, 8, 0x28, Some(send))?;
-            ensure_eq!(s, D::Busy, "a second claim");
-            // a read through the claim, as a driver does it: the BAR here, the rings and the data mapped by the driver
-            let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-            let m = sys::process_map(me, bar, PCI_BAR_VA, 0, c.bar_bytes, PF_R | PF_W);
-            sys::handle_close(me);
-            ensure_eq!(st(m), Some(S::Ok), "map the BAR VMO");
-            let r = (|| {
-                map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
-                map_here(data, BUF_VA, 1, PF_R | PF_W)?;
-                let rings_io =
-                    ok(sys::iodomain_map(dom, rings, 0, 1, 3), "map the rings")?.a1 as u64;
-                let data_io =
-                    ok(sys::iodomain_map(dom, data, 0, 1, 3), "map a data page")?.a1 as u64;
-                for i in 0..512 {
-                    wr64(BUF_VA + 8 * i, 0);
-                }
-                let f = PciFn {
-                    common: PCI_BAR_VA + u64::from(c.common.0),
-                    notify: PCI_BAR_VA + u64::from(c.notify.0),
-                    notify_multiplier: c.notify_multiplier,
-                    isr: PCI_BAR_VA + u64::from(c.isr.0),
-                    device: PCI_BAR_VA + u64::from(c.device_cfg.0),
-                    msix_cap: 0,
-                    msix_table: 0,
-                };
-                let used = pci_blk_read_sector0(
-                    &f,
-                    rings_io,
-                    (data_io + BLK_HDR, data_io + BLK_DATA, data_io + BLK_STATUS),
-                    2000,
-                )?;
-                ensure!(
-                    used.is_some(),
-                    "the claimed device did not return the request"
-                );
-                ensure_eq!(
-                    rd8_dma(BUF_VA + BLK_STATUS),
-                    virtio::blk::S_OK,
-                    "the status"
-                );
-                ensure_eq!(blk_pattern_wrong(), None, "sector 0 through the claim");
-                Ok(())
-            })();
-            unmap_here(BUF_VA);
-            unmap_here(RINGS_VA);
-            unmap_here(PCI_BAR_VA);
-            r
-        })();
-        // the claimant goes: the claim is released
-        sys::handle_close(c2);
-        let t0 = sys::clock_get();
-        while blk_bus_master(res)? && sys::clock_get() < t0 + 3000 {
-            let _ = sys::object_wait(mine, 1 << 24, sys::clock_get() + 5);
-        }
-        let released = !blk_bus_master(res)?;
-        let dead = st(sys::iodomain_map(dom, rings, 0, 1, 3));
-        for h in hs {
-            sys::handle_close(h);
-        }
-        r?;
-        ensure!(
-            released,
-            "bus mastering is off once the claimant's connection closed"
+        ensure_eq!(
+            sys::vmo_get_size(bar).a1 as u64,
+            c.bar_bytes,
+            "the BAR VMO's size"
         );
         ensure_eq!(
-            dead,
+            (
+                sys::job_info(dj, 12).a2 as u64,
+                sys::job_info(dj, 13).a2 as u64
+            ),
+            (5, 2),
+            "the driver's job is limited to its DMA pages and its MSI-X vectors (one queue: two)"
+        );
+        // the domain handle maps and unmaps, nothing more
+        for (r, what) in [
+            (sys::iodomain_destroy(dom), "destroy"),
+            (sys::iodomain_fault_read(dom), "read faults"),
+            (sys::iodomain_grant_vector(dom, 0), "grant a vector"),
+            (sys::handle_duplicate(dom, Rights::IO_MAP.0), "duplicate it"),
+        ] {
+            ensure_eq!(
+                st(r),
+                Some(S::AccessDenied),
+                "the driver's domain handle cannot {what}"
+            );
+        }
+        // the second message said bus mastering is on
+        ensure!(
+            blk_bus_master(res)?,
+            "bus mastering is on once the claim's second message came"
+        );
+        ensure_eq!(
+            pci_list(c2, 7)?
+                .iter()
+                .find(|e| e.rid == 0x28)
+                .map(|e| e.flags & dm::PCI_CLAIMED),
+            Some(dm::PCI_CLAIMED),
+            "listed as claimed"
+        );
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, _) = pci_claim(mine, 8, 0x28, Some(send))?;
+        ensure_eq!(s, D::Busy, "a second claim of the function");
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, _) = pci_claim(mine, 9, 0x20, Some(send))?;
+        ensure_eq!(s, D::Busy, "a second function for the same driver job");
+        // a read through the claim, as a driver does it: the BAR here, the rings and the data mapped by the driver
+        let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+        let m = sys::process_map(me, bar, PCI_BAR_VA, 0, c.bar_bytes, PF_R | PF_W);
+        sys::handle_close(me);
+        ensure_eq!(st(m), Some(S::Ok), "map the BAR VMO");
+        let r = (|| {
+            map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
+            map_here(data, BUF_VA, 1, PF_R | PF_W)?;
+            let rings_io = ok(sys::iodomain_map(dom, rings, 0, 1, 3), "map the rings")?.a1 as u64;
+            let data_io = ok(sys::iodomain_map(dom, data, 0, 1, 3), "map a data page")?.a1 as u64;
+            for i in 0..512 {
+                wr64(BUF_VA + 8 * i, 0);
+            }
+            let f = PciFn {
+                common: PCI_BAR_VA + u64::from(c.common.0),
+                notify: PCI_BAR_VA + u64::from(c.notify.0),
+                notify_len: u64::from(c.notify.1),
+                notify_multiplier: c.notify_multiplier,
+                isr: PCI_BAR_VA + u64::from(c.isr.0),
+                device: (c.device_cfg.1 != 0).then(|| {
+                    (
+                        PCI_BAR_VA + u64::from(c.device_cfg.0),
+                        u64::from(c.device_cfg.1),
+                    )
+                }),
+                msix_cap: 0,
+                msix_table: 0,
+            };
+            let used = pci_blk_read_sector0(
+                &f,
+                rings_io,
+                (data_io + BLK_HDR, data_io + BLK_DATA, data_io + BLK_STATUS),
+                2000,
+            )?;
+            ensure!(
+                used.is_some(),
+                "the claimed device did not return the request"
+            );
+            ensure_eq!(
+                rd8_dma(BUF_VA + BLK_STATUS),
+                virtio::blk::S_OK,
+                "the status"
+            );
+            ensure_eq!(blk_pattern_wrong(), None, "sector 0 through the claim");
+            Ok(())
+        })();
+        unmap_here(BUF_VA);
+        unmap_here(RINGS_VA);
+        unmap_here(PCI_BAR_VA);
+        r?;
+        // the claimant goes: the claim is released. The manager is one thread, so a list that no longer says CLAIMED was answered
+        // after the whole release (bus mastering off, the reset, the domain destroyed).
+        held.retain(|&h| h != c2);
+        sys::handle_close(c2);
+        let t0 = sys::clock_get();
+        loop {
+            let e = pci_list(mine, 10)?;
+            if e.iter()
+                .any(|e| e.rid == 0x28 && e.flags & dm::PCI_CLAIMED == 0)
+            {
+                break;
+            }
+            ensure!(
+                sys::clock_get() < t0 + 5000,
+                "the claim was not released when its connection closed"
+            );
+            let _ = sys::object_wait(mine, 1 << 24, sys::clock_get() + 5);
+        }
+        ensure!(
+            !blk_bus_master(res)?,
+            "bus mastering is off once the claim was released"
+        );
+        ensure_eq!(
+            st(sys::iodomain_map(dom, rings, 0, 1, 3)),
             Some(S::BadState),
             "the domain was destroyed with the claim"
         );
-        // and it can be claimed again
-        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
-        let (s, _, hs) = pci_claim(mine, 9, 0x28, Some(send))?;
         for h in hs {
+            held.retain(|&x| x != h);
             sys::handle_close(h);
         }
-        sys::handle_close(dj);
+        // and it can be claimed again, by the same job now that it holds nothing
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, hs) = pci_claim(mine, 11, 0x28, Some(send))?;
+        held.extend(&hs);
         ensure_eq!(s, D::Ok, "claimed again after the release");
         Ok(())
     })();
+    for h in held {
+        sys::handle_close(h);
+    }
     sys::handle_close(mine);
     let end = wait_ended(mgr, 5000);
     sys::handle_close(mgr);
@@ -14394,9 +14433,11 @@ fn iommu_wait_faults(before: u64) -> Option<u64> {
 struct PciFn {
     common: u64,
     notify: u64,
+    notify_len: u64,
     notify_multiplier: u32,
     isr: u64,
-    device: u64,
+    /// The device configuration (address, length), if the function has one.
+    device: Option<(u64, u64)>,
     msix_cap: u64,
     msix_table: u64,
 }
@@ -14593,7 +14634,7 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
     // the capability list: the virtio structures (vendor capability 9) and MSI-X (17)
     ensure!(cfg_rd16(6) & (1 << 4) != 0, "a capability list");
     let (mut common, mut notify, mut msix_cap, mut msix_table) = (0, 0, 0, 0);
-    let (mut isr, mut device, mut notify_multiplier) = (0, 0, 0);
+    let (mut isr, mut device, mut notify_multiplier, mut notify_len) = (0, None, 0, 0);
     let mut p = u64::from(cfg_rd8(0x34) & !3);
     let mut hops = 0;
     while p != 0 && hops < 48 {
@@ -14604,11 +14645,14 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
                     1 if common == 0 => common = va(bar, off),
                     2 if notify == 0 => {
                         notify_multiplier = cfg_rd32(p + 16);
+                        notify_len = u64::from(cfg_rd32(p + 12));
                         ensure_eq!(notify_multiplier, 4, "the notify multiplier QEMU uses");
                         notify = va(bar, off);
                     }
                     3 if isr == 0 => isr = va(bar, off),
-                    4 if device == 0 => device = va(bar, off),
+                    4 if device.is_none() => {
+                        device = Some((va(bar, off), u64::from(cfg_rd32(p + 12))))
+                    }
                     _ => {}
                 }
             }
@@ -14630,6 +14674,7 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
     Ok(PciFn {
         common,
         notify,
+        notify_len,
         notify_multiplier,
         isr,
         device,
@@ -15090,9 +15135,10 @@ fn pci_blk_read_sector0(
         virtio::PciLocations {
             common: f.common,
             notify: f.notify,
+            notify_len: f.notify_len,
             notify_multiplier: f.notify_multiplier,
             isr: f.isr,
-            device: (f.device != 0).then_some(f.device),
+            device: f.device,
         },
     );
     let t0 = sys::clock_get();

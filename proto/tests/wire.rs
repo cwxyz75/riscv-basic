@@ -1105,6 +1105,18 @@ fn devmgr_list_pci_golden_bytes_and_errors() {
         Some((9, Status::Failed, vec![]))
     );
     assert_eq!(
+        decode_list_pci_reply(&encode_reply(9, Status::Ok)),
+        None,
+        "an Ok is always the long form"
+    );
+    let mut not_ok = r.clone();
+    not_ok[4] = 5;
+    assert_eq!(
+        decode_list_pci_reply(&not_ok),
+        None,
+        "a long reply that is not Ok"
+    );
+    assert_eq!(
         encode_list_pci_reply(1, &vec![e[0]; MAX_PCI_ENTRIES + 1]),
         None
     );
@@ -1177,6 +1189,19 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
         decode_claim_pci_reply(&encode_reply(9, Status::Refused)),
         Some((9, Status::Refused, None))
     );
+    // the second message, once bus mastering is on: the plain Ok, which is never a claim reply
+    let started = encode_reply(9, Status::Ok);
+    assert_eq!(started, [9, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(decode_claim_pci_reply(&started), None);
+    assert_eq!(decode_claim_pci_started(&started), Some(9));
+    assert_eq!(
+        decode_claim_pci_started(&encode_reply(9, Status::Refused)),
+        None
+    );
+    assert_eq!(
+        decode_claim_pci_started(&encode_claim_pci_reply(9, &c).unwrap()),
+        None
+    );
     let many = PciClaim {
         dma_pages: vec![1; MAX_CLAIM_DMA + 1],
         ..c
@@ -1188,6 +1213,7 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
         let n = r.below(120) as usize;
         let b: Vec<u8> = (0..n).map(|_| r.next() as u8).collect();
         let _ = decode_claim_pci_reply(&b);
+        let _ = decode_claim_pci_started(&b);
         let _ = decode_list_pci_reply(&b);
         let _ = decode_claim_pci(&b);
         let _ = decode_list_pci(&b);

@@ -128,20 +128,22 @@ IOMMU_TEST_DEV = "00:04.0"
 # (slot, QEMU device, vendor:device, what `pci_device` adds). PCI slots are stable, unlike the virtio-mmio order: the suite names the
 # same slots (`IOMMU_TEST_SLOT`, `PCI_BLK_SLOT`). Every one goes through `pci_device`, which adds `iommu_platform=on` (without it QEMU's
 # virtio device bypasses the IOMMU: IOMMU-SPEC 15.1 L1) and `disable-legacy=on`, and never `vectors=0` (a function without MSI-X is
-# not claimable: Q-IOMMU-MSI 5).
+# not claimable: Q-IOMMU-MSI 5). The block function is pinned to one queue: QEMU gives virtio-blk-pci one queue per hart by default
+# and one MSI-X vector more, so its table (and the vector limit `devmgr` sets) would otherwise change with OS_SMP.
 PCI_DEVICES = [
     (4, "virtio-rng-pci", "1af4:1044", ""),
-    (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0"),
+    (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0,num-queues=1"),
 ]
 # The host bridge QEMU puts at 00:00.0, which `devmgr` lists too (not claimable).
 PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
 # The bus address of the block function (`pci_virtio_*` tests).
 PCI_BLK_DEV = "00:05.0"
 # `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable | not-claimable <why> | refused <why>>`, then
-# `## devmgr: pci functions=<n>` (one enumeration), and `## devmgr: pci <bb:dd.f> reset failed <what>` (a reset that did not complete).
+# `## devmgr: pci functions=<n>` (one enumeration), and `## devmgr: pci <bb:dd.f> reset failed <what>` (a reset that did not complete)
+# or `teardown failed <what>` (a domain that could not be destroyed).
 # A process's `##` line reaches the console as `user: ##...` (the kernel's prefix, so that no program can forge a kernel line).
 DEVMGR_PCI = re.compile(r"^user: ## devmgr: pci (?:([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) (?:([0-9a-f]{4}:[0-9a-f]{4}) class=([0-9a-f]{6}) "
-                        r"(claimable|not-claimable|refused)(?: (.+))?|reset failed (.+))|functions=(\d+))$")
+                        r"(claimable|not-claimable|refused)(?: (.+))?|(?:reset|teardown) failed (.+))|functions=(\d+))$")
 LAST_DEVMGR_PCI = []
 
 
@@ -193,7 +195,7 @@ def devmgr_pci_problems():
                     found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: every test function is claimable")
             current = []
         elif m[5] is not None:
-            found.append(f"devmgr: {m[0]} reset failed {m[5]}")
+            found.append(f"devmgr: {m[0]} reset or teardown failed: {m[5]}")
         else:
             current.append((m[0], m[1], m[2], m[3], m[4]))
     if current:

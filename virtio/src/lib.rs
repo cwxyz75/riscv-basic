@@ -104,8 +104,9 @@ pub enum Error {
     NoRoom,
     /// The device returned a used element whose id is not a chain in flight (hostile, or a bug).
     BadUsed(u32),
-    /// The device has stopped (it set `DEVICE_NEEDS_RESET`).
-    NeedsReset,
+    /// The queue's notification address (`queue_notify_off` times the multiplier, which the device chooses) is outside the
+    /// notification structure.
+    NotifyOutside(u16),
 }
 
 /// The transport: what a driver does to a virtio device, whatever the bus. One implementation here, [`PciTransport`].
@@ -124,9 +125,15 @@ pub trait Transport {
     fn setup_queue(&mut self, q: u16, size: u16, addrs: (u64, u64, u64)) -> Result<(), Error>;
     /// Tell the device queue `q` has new buffers.
     fn notify(&mut self, q: u16);
-    /// The device-specific configuration's byte `off` (0 if the device has none).
-    fn config_read8(&self, off: u64) -> u8;
-    fn config_read32(&self, off: u64) -> u32;
+    /// The device-specific configuration's byte at `off`; `None` if the device has none or `off` is outside it.
+    fn config_read8(&self, off: u64) -> Option<u8>;
+    /// The aligned 32-bit field at `off` of the device-specific configuration, as `config_read8`.
+    fn config_read32(&self, off: u64) -> Option<u32>;
+    /// Whether the device has stopped and asks for a reset (`DEVICE_NEEDS_RESET`, VIRTIO 1.x 2.1.2): a polling driver checks it
+    /// so that a broken device ends its wait.
+    fn needs_reset(&self) -> bool {
+        self.status() & status::DEVICE_NEEDS_RESET != 0
+    }
 
     /// Device initialisation up to `FEATURES_OK` (VIRTIO 1.x, 3.1.1, steps 1 to 6), from a device just reset: acknowledge, read
     /// the offered features, require [`feature::REQUIRED`], accept `offered & (wanted | REQUIRED)`, set `FEATURES_OK` and check
@@ -137,7 +144,9 @@ pub trait Transport {
         let offered = self.device_features();
         for bit in [feature::VERSION_1, feature::ACCESS_PLATFORM] {
             if offered & bit == 0 {
-                self.set_status(status::FAILED);
+                // (a driver never clears a status bit: 2.1.2)
+                let s = self.status();
+                self.set_status(s | status::FAILED);
                 return Err(Error::MissingFeature(bit));
             }
         }
@@ -146,7 +155,8 @@ pub trait Transport {
         let s = status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK;
         self.set_status(s);
         if self.status() & status::FEATURES_OK == 0 {
-            self.set_status(status::FAILED);
+            let s = self.status();
+            self.set_status(s | status::FAILED);
             return Err(Error::FeaturesRefused);
         }
         Ok(accepted)
@@ -164,9 +174,12 @@ pub trait Transport {
 pub struct PciLocations {
     pub common: u64,
     pub notify: u64,
+    /// The notification structure's length: every queue's notification address is checked against it.
+    pub notify_len: u64,
     pub notify_multiplier: u32,
     pub isr: u64,
-    pub device: Option<u64>,
+    /// The device configuration: (offset, length); every read is checked against it.
+    pub device: Option<(u64, u64)>,
 }
 
 /// The modern virtio-pci transport over one BAR's registers.
@@ -269,6 +282,13 @@ impl<R: Regs> Transport for PciTransport<R> {
         }
         let off = u64::from(self.regs.read16(self.c(common::QUEUE_NOTIFY_OFF)))
             .wrapping_mul(u64::from(self.at.notify_multiplier));
+        // the device chose `queue_notify_off`: the 16-bit notification must land inside the structure (4.1.4.4)
+        if off
+            .checked_add(2)
+            .is_none_or(|end| end > self.at.notify_len)
+        {
+            return Err(Error::NotifyOutside(q));
+        }
         self.notify_off.retain(|(n, _)| *n != q);
         self.notify_off.push((q, off));
         self.regs.write16(self.c(common::QUEUE_ENABLE), 1);
@@ -281,16 +301,15 @@ impl<R: Regs> Transport for PciTransport<R> {
         }
     }
 
-    fn config_read8(&self, off: u64) -> u8 {
-        self.at
-            .device
-            .map_or(0, |d| self.regs.read8(d.wrapping_add(off)))
+    fn config_read8(&self, off: u64) -> Option<u8> {
+        let (at, len) = self.at.device?;
+        (off.checked_add(1)? <= len).then(|| self.regs.read8(at.wrapping_add(off)))
     }
 
-    fn config_read32(&self, off: u64) -> u32 {
-        self.at
-            .device
-            .map_or(0, |d| self.regs.read32(d.wrapping_add(off)))
+    fn config_read32(&self, off: u64) -> Option<u32> {
+        let (at, len) = self.at.device?;
+        (off.is_multiple_of(4) && off.checked_add(4)? <= len)
+            .then(|| self.regs.read32(at.wrapping_add(off)))
     }
 }
 

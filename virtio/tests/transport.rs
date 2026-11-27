@@ -47,6 +47,9 @@ const COMMON: u64 = 0;
 const ISR: u64 = 0x1000;
 const DEVCFG: u64 = 0x2000;
 const NOTIFY: u64 = 0x3000;
+/// The lengths the transport is told (a notification structure for queues 0 to 3 at multiplier 4; 8 bytes of configuration).
+const NOTIFY_LEN: u64 = 16;
+const DEVCFG_LEN: u64 = 8;
 
 impl Device {
     fn new(offered: u64, queues: &[u16]) -> Device {
@@ -206,9 +209,10 @@ fn transport(d: Device) -> PciTransport<Bar> {
         PciLocations {
             common: COMMON,
             notify: NOTIFY,
+            notify_len: NOTIFY_LEN,
             notify_multiplier: 4,
             isr: ISR,
-            device: Some(DEVCFG),
+            device: Some((DEVCFG, DEVCFG_LEN)),
         },
     )
 }
@@ -290,7 +294,11 @@ fn a_device_without_access_platform_fails_the_bring_up() {
     t.regs.0.borrow_mut().platform = false;
     t.reset(&mut || true).unwrap();
     assert_eq!(t.negotiate(0), Err(Error::MissingFeature(1 << 33)));
-    assert_eq!(t.regs.0.borrow().status, status::FAILED);
+    assert_eq!(
+        t.regs.0.borrow().status,
+        status::ACKNOWLEDGE | status::DRIVER | status::FAILED,
+        "FAILED added, no bit cleared (2.1.2)"
+    );
     // nor without VERSION_1
     let mut t = transport(Device::new(1 << 33, &[8]));
     assert_eq!(t.negotiate(0), Err(Error::MissingFeature(1 << 32)));
@@ -302,7 +310,13 @@ fn a_device_that_drops_features_ok_fails_the_bring_up() {
     d.refuse = true;
     let mut t = transport(d);
     assert_eq!(t.negotiate(0), Err(Error::FeaturesRefused));
-    assert_eq!(t.regs.0.borrow().status, status::FAILED);
+    let st = t.regs.0.borrow().status;
+    assert_eq!(st & status::FAILED, status::FAILED);
+    assert_eq!(
+        st & (status::ACKNOWLEDGE | status::DRIVER),
+        status::ACKNOWLEDGE | status::DRIVER,
+        "no bit cleared (2.1.2)"
+    );
 }
 
 #[test]
@@ -384,8 +398,50 @@ fn queue_setup_programs_addresses_and_notifies_at_offset_times_multiplier() {
     assert_eq!(t.isr(), 1);
     t.regs.0.borrow_mut().config.insert(0, 0x10);
     t.regs.0.borrow_mut().config.insert(1, 0x02);
-    assert_eq!(t.config_read8(0), 0x10);
-    assert_eq!(t.config_read32(0), 0x210);
+    assert_eq!(t.config_read8(0), Some(0x10));
+    assert_eq!(t.config_read32(0), Some(0x210));
+    // never outside the device configuration's length, never misaligned
+    assert_eq!(t.config_read8(DEVCFG_LEN - 1), Some(0));
+    assert_eq!(t.config_read8(DEVCFG_LEN), None);
+    assert_eq!(t.config_read32(DEVCFG_LEN - 4), Some(0));
+    assert_eq!(t.config_read32(DEVCFG_LEN - 2), None);
+    assert_eq!(t.config_read32(2), None);
+    assert_eq!(t.config_read8(u64::MAX), None);
+    assert_eq!(t.config_read32(u64::MAX - 3), None);
+    assert!(!t.needs_reset());
+    t.regs.0.borrow_mut().status |= status::DEVICE_NEEDS_RESET;
+    assert!(t.needs_reset());
+}
+
+#[test]
+fn a_notify_offset_outside_the_structure_is_refused() {
+    // queue 3: offset 3 * 4 = 12, the last 16-bit slot that fits in 16 bytes; queue 4's would end at 18
+    let mut t = transport(Device::new((1 << 33) | (1 << 32), &[8, 8, 8, 8, 8]));
+    t.negotiate(0).unwrap();
+    t.setup_queue(3, 8, (0, 0, 0)).unwrap();
+    assert_eq!(t.notify_address(3), Some(NOTIFY + 12));
+    assert_eq!(t.setup_queue(4, 8, (0, 0, 0)), Err(Error::NotifyOutside(4)));
+    assert_eq!(t.notify_address(4), None);
+    t.notify(4);
+    assert!(
+        t.regs.0.borrow().notified.borrow().is_empty(),
+        "nothing written outside the structure"
+    );
+    // a hostile multiplier: the product overflows nothing and is refused
+    let mut t = PciTransport::new(
+        Bar(RefCell::new(Device::new((1 << 33) | (1 << 32), &[8, 8]))),
+        PciLocations {
+            common: COMMON,
+            notify: NOTIFY,
+            notify_len: NOTIFY_LEN,
+            notify_multiplier: u32::MAX,
+            isr: ISR,
+            device: None,
+        },
+    );
+    t.negotiate(0).unwrap();
+    assert_eq!(t.setup_queue(1, 8, (0, 0, 0)), Err(Error::NotifyOutside(1)));
+    assert_eq!(t.config_read8(0), None, "no device configuration");
 }
 
 #[test]

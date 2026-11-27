@@ -23,20 +23,22 @@
 //! **The claim**, in the specification's order, each step a precondition of the next (`ClaimPci`, which carries the driver's job):
 //! 1. refuse, loudly, a function without MSI-X (8.6), a virtio function that does not offer `VIRTIO_F_ACCESS_PLATFORM` (15.1 L1),
 //!    one whose configuration space `pcicore` refused, or one of a class this manager has no plan for; bus mastering stays off;
-//! 2. set finite limits on the driver's job (`job_set_io_limits`: the I/O-mapped pages of the class's DMA plan, and the
+//!    and refuse (`Busy`) a function already claimed, or a driver job that already holds a claim (one function per job);
+//! 2. reset the device (10.4: it may have been left running; loud if it does not complete), set finite limits on the driver's job (`job_set_io_limits`: the I/O-mapped pages of the class's DMA plan, and the
 //!    function's MSI-X table size in vectors), then `iodomain_create` for the function's requester id, naming that job;
 //! 3. create the driver's DMA VMOs (`vmo_create_dma_in`, charged to the driver's job);
 //! 4. (the vectors, MSI-X programmed with the function masked, INTx disabled, MSI-X enabled: IOMMU9);
 //! 5. hand the driver its authority: a VMO over the BAR with the virtio structures, its **duplicate of the domain handle with
 //!    IO_MAP and IO_UNMAP only** (and TRANSFER), and its DMA VMOs; no I/O address travels (the driver maps its buffers itself);
-//! 6. **bus mastering last**, once the reply is sent.
+//! 6. **bus mastering last**, once the reply is sent; then a second message (`txid | Ok`) tells the driver it may start the device.
 //!
 //! The manager keeps the domain's control handle and maps nothing into the domain.
 //!
 //! **Teardown** when the claimant's connection closes (its driver exited or was killed: 10.1, 10.2): bus mastering off, MSI-X
 //! masked and disabled, the device reset (virtio status 0, read back) and a function-level reset where the function advertises
 //! one (waited for, and the BARs programmed again), then `iodomain_destroy`, which removes every mapping the driver made. A reset
-//! that does not complete is said on the console (`## devmgr: pci <bb:dd.f> reset failed <what>`), never passed over. Nothing is
+//! that does not complete, or a domain that cannot be destroyed, is said on the console (`## devmgr: pci <bb:dd.f> reset failed
+//! <what>`, `## devmgr: pci <bb:dd.f> teardown failed <what>`), never passed over. Nothing is
 //! kept for the next driver: a re-claim makes a new domain (10.4, OD166 point 2). None of this is a safety property (the kernel's
 //! ordering is, IOMMU-SPEC 6.3); it keeps the device working and the fault log quiet.
 #![no_std]
@@ -302,40 +304,65 @@ fn read_cfg(va: u64) -> [u8; pcicore::CFG_BYTES] {
     cfg
 }
 
-/// A BAR mapped in this process: the virtio structures' registers, for `virtio::PciTransport`.
-struct BarRegs(u64);
+/// A BAR mapped in this process (its address and its span): the virtio structures' registers, for `virtio::PciTransport`. An
+/// access that would not lie wholly inside the span, or is not aligned to its width, is not made (a read gives all ones).
+struct BarRegs {
+    va: u64,
+    span: u64,
+}
 
-impl virtio::Regs for BarRegs {
-    fn read8(&self, off: u64) -> u8 {
-        // SAFETY: `self.0` maps a whole BAR (its span) read-write in this process, and every offset the transport uses lies inside
-        // a structure `pcicore::virtio_layout` checked is inside the BAR.
-        unsafe { core::ptr::read_volatile((self.0 + off) as *const u8) }
-    }
-    fn read16(&self, off: u64) -> u16 {
-        // SAFETY: as `read8`.
-        unsafe { core::ptr::read_volatile((self.0 + off) as *const u16) }
-    }
-    fn read32(&self, off: u64) -> u32 {
-        // SAFETY: as `read8`.
-        unsafe { core::ptr::read_volatile((self.0 + off) as *const u32) }
-    }
-    fn write8(&mut self, off: u64, v: u8) {
-        // SAFETY: as `read8`.
-        unsafe { core::ptr::write_volatile((self.0 + off) as *mut u8, v) }
-    }
-    fn write16(&mut self, off: u64, v: u16) {
-        // SAFETY: as `read8`.
-        unsafe { core::ptr::write_volatile((self.0 + off) as *mut u16, v) }
-    }
-    fn write32(&mut self, off: u64, v: u32) {
-        // SAFETY: as `read8`.
-        unsafe { core::ptr::write_volatile((self.0 + off) as *mut u32, v) }
+impl BarRegs {
+    /// The address of the `width`-byte register at `off`, if it is aligned and inside the mapping.
+    fn at(&self, off: u64, width: u64) -> Option<u64> {
+        (off.is_multiple_of(width) && off.checked_add(width)? <= self.span).then_some(self.va + off)
     }
 }
 
-/// A live claim: the claimant's connection, and the domain's control handle (kept by the manager: destroy, grant, faults).
+impl virtio::Regs for BarRegs {
+    fn read8(&self, off: u64) -> u8 {
+        // SAFETY: `va` maps the whole BAR (`span` bytes) read-write in this process for as long as the manager runs, and `at` gives an
+        // address only when the access lies inside it and is aligned.
+        self.at(off, 1).map_or(u8::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u8)
+        })
+    }
+    fn read16(&self, off: u64) -> u16 {
+        // SAFETY: as `read8`.
+        self.at(off, 2).map_or(u16::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u16)
+        })
+    }
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: as `read8`.
+        self.at(off, 4).map_or(u32::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u32)
+        })
+    }
+    fn write8(&mut self, off: u64, v: u8) {
+        if let Some(a) = self.at(off, 1) {
+            // SAFETY: as `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u8, v) }
+        }
+    }
+    fn write16(&mut self, off: u64, v: u16) {
+        if let Some(a) = self.at(off, 2) {
+            // SAFETY: as `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u16, v) }
+        }
+    }
+    fn write32(&mut self, off: u64, v: u32) {
+        if let Some(a) = self.at(off, 4) {
+            // SAFETY: as `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u32, v) }
+        }
+    }
+}
+
+/// A live claim: the claimant's connection, the driver's job (its koid: one function per job), and the domain's control handle
+/// (kept by the manager: destroy, grant, faults).
 struct PciClaimed {
     key: u64,
+    job: u64,
     domain: u64,
 }
 
@@ -350,8 +377,8 @@ struct PciDev {
     /// What `pcicore` made of it, or why it was refused.
     desc: Result<Function, pcicore::Error>,
     bars: Vec<Assignment>,
-    /// For a virtio function: its virtio BAR mapped here (address), and whether it offers ACCESS_PLATFORM.
-    regs: Option<u64>,
+    /// For a virtio function: its virtio BAR mapped here (address, span), and whether it offers ACCESS_PLATFORM.
+    regs: Option<(u64, u64)>,
     access_platform: bool,
     claim: Option<PciClaimed>,
 }
@@ -442,13 +469,17 @@ impl PciDev {
     fn transport(&self) -> Option<virtio::PciTransport<BarRegs>> {
         let (_, l) = self.desc.as_ref().ok()?.virtio?;
         Some(virtio::PciTransport::new(
-            BarRegs(self.regs?),
+            BarRegs {
+                va: self.regs?.0,
+                span: self.regs?.1,
+            },
             virtio::PciLocations {
                 common: l.common.offset,
                 notify: l.notify.offset,
+                notify_len: l.notify.len,
                 notify_multiplier: l.notify_multiplier,
                 isr: l.isr.offset,
-                device: l.device.map(|d| d.offset),
+                device: l.device.map(|d| (d.offset, d.len)),
             },
         ))
     }
@@ -593,7 +624,7 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
         if !ok {
             continue;
         }
-        d.regs = Some(next_va);
+        d.regs = Some((next_va, bar.span));
         next_va += bar.span;
         if let Some(mut t) = d.transport() {
             if virtio_reset(&mut t).is_ok() {
@@ -690,7 +721,16 @@ impl Pci {
             // the reset cleared the BARs and the command register: program them again (bus mastering stays off)
             d.program();
         }
-        sys::iodomain_destroy(c.domain);
+        let st = sys::iodomain_destroy(c.domain).status;
+        if st != 0 {
+            sys::debug_write(
+                alloc::format!(
+                    "## devmgr: pci {} teardown failed iodomain_destroy status {st}\n",
+                    d.bdf
+                )
+                .as_bytes(),
+            );
+        }
         sys::handle_close(c.domain);
     }
 }
@@ -982,7 +1022,7 @@ impl DevMgr {
             Err(st) => self.reply(key, txid, st, None),
             Ok((i, reply, handles)) => {
                 if let rt::service::Sent::Sent = self.core.send_handles(key, reply, handles) {
-                    // 6. bus mastering last
+                    // 6. bus mastering last, then the driver is told it may start the device
                     if let Some(d) = self.pci.as_ref().and_then(|p| p.devs.get(i)) {
                         let cmd = cfg_rd16(d.cfg, pcicore::reg::COMMAND);
                         cfg_wr16(
@@ -991,6 +1031,7 @@ impl DevMgr {
                             cmd | pcicore::command::BUS_MASTER | pcicore::command::INTX_DISABLE,
                         );
                     }
+                    self.reply(key, txid, Status::Ok, None);
                 }
                 // (not sent: the connection is closed, and `closed` releases the claim)
             }
@@ -1019,13 +1060,35 @@ impl DevMgr {
         if d.claim.is_some() {
             return Err(Status::Busy);
         }
+        // one function per driver job: its limits are this function's (`job_set_io_limits` replaces them)
+        let job_koid = sys::object_info(job);
+        if job_koid.status != 0 {
+            return Err(Status::BadRequest);
+        }
+        let job_koid = job_koid.a1 as u64;
+        if pci
+            .devs
+            .iter()
+            .any(|o| o.claim.as_ref().is_some_and(|c| c.job == job_koid))
+        {
+            return Err(Status::Busy);
+        }
+        let d = pci.devs.get_mut(i).ok_or(Status::NoDevice)?;
         let (Ok(f), Some(&bar)) = (&d.desc, d.virtio_bar()) else {
             return Err(Status::Refused);
         };
         let (Some(m), Some((_, l))) = (f.msix, f.virtio) else {
             return Err(Status::Refused);
         };
-        // 2. finite limits on the driver's job, then the domain for the function, charged to that job
+        // 2. the device reset (it may have been left running: 10.4), finite limits on the driver's job, then the domain for the
+        // function, charged to that job
+        let Some(mut t) = d.transport() else {
+            return Err(Status::Refused);
+        };
+        if virtio_reset(&mut t).is_err() {
+            print_reset_failed(d.bdf, "virtio status did not read back 0");
+            return Err(Status::Failed);
+        }
         let io_pages: u64 = plan.iter().map(|&p| u64::from(p)).sum();
         if sys::job_set_io_limits(job, io_pages, u64::from(m.table_size)).status != 0 {
             return Err(Status::Failed);
@@ -1080,7 +1143,11 @@ impl DevMgr {
         let Some(reply) = devmgr::encode_claim_pci_reply(txid, &claim) else {
             return fail(&give, Status::Failed);
         };
-        d.claim = Some(PciClaimed { key, domain: dom });
+        d.claim = Some(PciClaimed {
+            key,
+            job: job_koid,
+            domain: dom,
+        });
         Ok((i, reply, give))
     }
 

@@ -37,13 +37,17 @@ pub const OP_CLAIM_RTC: u16 = 5;
 /// `txid u32 | status i32 | count u32` and `count` [`PciEntry`] records of [`PCI_ENTRY_LEN`] bytes, in requester-id order.
 pub const OP_LIST_PCI: u16 = 6;
 /// Claim the PCI function with requester id `rid` (IOMMU8; IOMMU-SPEC 9): request `txid u32 | op u16 | rid u16`, carrying exactly
-/// one handle: the **driver's job** (a job handle with MANAGE), which the manager limits (`job_set_io_limits`) and charges for the
-/// device's domain and its DMA VMOs. The reply is a [`PciClaim`] carrying, in order: a VMO over the BAR that holds the virtio
+/// one handle: the **driver's job** (a job handle with MANAGE and SET_LIMITS), which the manager limits (`job_set_io_limits`, set to
+/// this function's needs) and charges for the device's domain and its DMA VMOs: **one function per driver job**, so a job that holds
+/// a live claim is refused (`Busy`). The reply is a [`PciClaim`] carrying, in order: a VMO over the BAR that holds the virtio
 /// structures (never the MSI-X table's BAR when the table has a BAR of its own), the driver's duplicate of the device's domain
 /// handle with IO_MAP and IO_UNMAP only (and TRANSFER, so a supervisor can pass it on), and one DMA VMO per entry of
 /// `dma_pages`, each with the `DMA` right. No I/O address travels: the driver maps its buffers itself with `iodomain_map`. The
-/// manager enables bus mastering only after the reply is sent, and releases the claim (bus mastering off, the device reset, the
-/// domain destroyed) when the claimant's connection closes. The interrupt handles are added with MSI-X (IOMMU9).
+/// manager enables bus mastering only after the reply is sent (IOMMU-SPEC 9, step 6), then sends a second message, the plain reply
+/// `txid | Ok` ([`decode_claim_pci_started`]): the driver waits for it before its device's first DMA (a virtio-pci device does not
+/// fetch from a queue while bus mastering is off, and nothing fetches again when it comes on). The claim is released (bus mastering
+/// off, the device reset, the domain destroyed) when the claimant's connection closes. The interrupt handles are added with MSI-X
+/// (IOMMU9).
 pub const OP_CLAIM_PCI: u16 = 7;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
@@ -144,11 +148,11 @@ pub fn encode_list_pci_reply(txid: u32, entries: &[PciEntry]) -> Option<Vec<u8>>
     Some(b)
 }
 
-/// A `ListPci` reply, or the plain error reply (with no entries).
+/// A `ListPci` reply, or the plain error reply (with no entries): an `Ok` is always the long form, an error always the short one.
 pub fn decode_list_pci_reply(b: &[u8]) -> Option<(u32, Status, Vec<PciEntry>)> {
     if b.len() == REPLY_LEN {
         let (t, s) = decode_reply(b)?;
-        return Some((t, s, Vec::new()));
+        return (s != Status::Ok).then(|| (t, s, Vec::new()));
     }
     let n = rd_u32(b, 8)? as usize;
     if n > MAX_PCI_ENTRIES || b.len() != 12 + PCI_ENTRY_LEN * n {
@@ -165,7 +169,11 @@ pub fn decode_list_pci_reply(b: &[u8]) -> Option<(u32, Status, Vec<PciEntry>)> {
             class: rd_u32(b, at + 8)?,
         });
     }
-    Some((rd_u32(b, 0)?, Status::from_i32(rd_u32(b, 4)? as i32)?, out))
+    let status = Status::from_i32(rd_u32(b, 4)? as i32)?;
+    if status != Status::Ok {
+        return None;
+    }
+    Some((rd_u32(b, 0)?, status, out))
 }
 
 pub fn encode_claim_pci(txid: u32, rid: u16) -> Vec<u8> {
@@ -245,11 +253,11 @@ pub fn encode_claim_pci_reply(txid: u32, c: &PciClaim) -> Option<Vec<u8>> {
     Some(b)
 }
 
-/// A `ClaimPci` reply, or the plain error reply (`None` claim).
+/// A `ClaimPci` reply, or the plain error reply (`None` claim): an `Ok` is always the long form, an error always the short one.
 pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>)> {
     if b.len() == REPLY_LEN {
         let (t, s) = decode_reply(b)?;
-        return Some((t, s, None));
+        return (s != Status::Ok).then_some((t, s, None));
     }
     let n = rd_u32(b, 56)? as usize;
     if n > MAX_CLAIM_DMA || b.len() != PCI_CLAIM_FIXED_LEN + 4 * n {
@@ -279,6 +287,14 @@ pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>
             dma_pages,
         }),
     ))
+}
+
+/// The message that follows a successful `ClaimPci` reply once bus mastering is on: its `txid`, or `None` if `b` is not that.
+pub fn decode_claim_pci_started(b: &[u8]) -> Option<u32> {
+    match decode_reply(b)? {
+        (t, Status::Ok) if b.len() == REPLY_LEN => Some(t),
+        _ => None,
+    }
 }
 
 /// Ask for the first block device.
