@@ -135,6 +135,13 @@ thread, and `stalled hart` means it took no interrupt for 10 s.
 first (T278): the live kernel objects by kind, every process left (its state, threads, handles by kind, job), and every thread that was not
 there before init started, with its scheduler state and the kernel-text words on its stack as `[stack ...]` in **link** addresses (KASLR's
 slide taken off), so `resolve_trace.py <ELF> 0x...` names them directly. `OS_SHOW=leak:` prints such lines from a passing run too.
+`leak: dying <pid>` lines (T265) name every process on its way out, in the table or already out of it (a process the job still counts after
+`teardown_take`): its stage (ending, closing handles, draining devices, freeing memory), the thread that noted it, and how long it has
+been ending and out of the table (`kernel/src/user/dying.rs`). When `process_teardown_returns_every_frame` fails, it prints the per-hart
+frame-cache fill, a frame the heap's pool has in hand, the live kernel stacks, the exited threads not yet reaped, the FP and vector
+records, and the **walk oracle** for the kernel-stack and heap windows: what a walk of the kernel's page table finds under each window
+(`PageTable::frames_in_range`) against what the leak oracle's formula counts (`kcore::kwindow`, proved by Kani; the boot self-test
+`kernel_windows_hold_what_their_formulas_say` and its twin after init check that the two agree).
 
 **The harness can see a failure.** `make os-boot-test-fail-demo` boots a kernel built with a deliberate fault and
 requires the harness to fail it; CI runs it when the harness or the Makefile changed.
