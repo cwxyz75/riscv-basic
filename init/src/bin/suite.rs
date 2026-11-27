@@ -2090,7 +2090,12 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
     let mut covered = 0;
     loop {
         let since = sys::clock_ns();
-        let _watch = PauseWatch::start(ticks.saturating_add(100));
+        // (a timing test that already keeps the heartbeat on keeps it: this wait neither replaces its deadline nor turns it off)
+        let _watch = if WATCH_ON.load(Ordering::SeqCst) {
+            None
+        } else {
+            PauseWatch::start(ticks.saturating_add(100))
+        };
         let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
         if r.status == S::TimedOut.code() {
             if let Some((h, us)) = host_pause_since(since, 2_000) {
@@ -20129,14 +20134,22 @@ fn host_pause_watch(ms: u64) -> bool {
 /// check must not leave every hart taking an interrupt a millisecond for the tests after it).
 struct PauseWatch;
 
+/// Whether a [`PauseWatch`] is alive (the kernel's heartbeat is one switch, not a count: an inner watch must not end an outer one).
+static WATCH_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 impl PauseWatch {
     fn start(ms: u64) -> Option<PauseWatch> {
-        host_pause_watch(ms).then_some(PauseWatch)
+        let w = host_pause_watch(ms).then_some(PauseWatch);
+        if w.is_some() {
+            WATCH_ON.store(true, Ordering::SeqCst);
+        }
+        w
     }
 }
 
 impl Drop for PauseWatch {
     fn drop(&mut self) {
+        WATCH_ON.store(false, Ordering::SeqCst);
         let _ = host_pause_watch(0);
     }
 }

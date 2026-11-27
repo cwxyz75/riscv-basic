@@ -1,7 +1,8 @@
 //! How many frames a window of the kernel's page table holds (T227): the formulas the leak oracle adds to the free count, for the kernel-stack
 //! window (slots made and kept, each with its stack pages at the top of the slot) and the grown heap (pages mapped from the window's base
-//! up). Pure arithmetic, proved by Kani against a page-by-page count of the tables those mappings need (`cargo kani -p kcore`, by hand:
-//! OD177, OD182), and checked in the kernel against a walk of the real table (`PageTable::frames_in_range`).
+//! up). Pure arithmetic, proved by Kani against a page-by-page count of the tables those mappings need, for every value up to a bound (160
+//! slots, 1100 pages: every case of the rounding; the formulas are linear past it) (`cargo kani -p kcore`, by hand: OD177, OD182), and
+//! checked in the kernel, at the real values, against a walk of the real table (`PageTable::frames_in_range`).
 
 /// Bytes a level-0 table spans (512 pages of 4 KiB).
 const SPAN0: u64 = 2 * 1024 * 1024;

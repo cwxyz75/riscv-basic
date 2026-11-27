@@ -174,13 +174,13 @@ pub(super) fn teardown(pid: u64) -> i32 {
         return i32::MIN;
     };
     dying::note(pid, dying::Stage::Taken);
-    crate::chaos::point(crate::chaos::Point::Teardown);
     // A process that vanished without a recorded code is not mistaken for `exit(-1)`.
     let code = process.exit_code.or(process.killed).unwrap_or(i32::MIN);
     // The process is private to this thread now: let the big lock go **completely** for the two long steps. A thread that comes here from a trap holds it at
     // depth 1 (and a nested critical section is at depth 2, which never reaches a switch point), so without this the slices below would be slices of
     // one hold. The slices take it themselves, one at a time (`irq::without` ends in a switch point at depth 1); nothing here holds a borrow of the state.
     let depth = crate::bkl::release_all();
+    crate::chaos::point(crate::chaos::Point::Teardown);
     teardown_objects(&mut process, code);
     // (IOMMU6, IOMMU-SPEC 10.2) the device domains whose last handle was the process's are detached and emptied now, before its memory
     // goes: the cleanup begins each destruction under the object lock, the drain completes it with no lock held

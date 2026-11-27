@@ -1065,9 +1065,11 @@ fn process_churn(_: usize) {
             Err(_) => i32::MIN,
         };
         if code != want {
+            // (mode 0xff: the process could not be started at all)
+            let m = if code == i32::MIN { 0xff } else { mode };
             let _ = PROC_CHURN_BAD.compare_exchange(
                 0,
-                ((round + 1) << 40) | (mode << 32) | u64::from(code as u32),
+                ((round + 1) << 40) | (m << 32) | u64::from(code as u32),
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
@@ -1119,7 +1121,7 @@ fn smp_churn_stress() -> Result<(), String> {
                 String::from("all good")
             } else {
                 let (round, mode, code) = (churn_bad >> 40, (churn_bad >> 32) & 0xff, churn_bad as u32 as i32);
-                format!("round {round} (mode {mode}) ended with {code}")
+                format!("round {round} (counted from 1; mode {mode}, 255: the start was refused) ended with {code}")
             }
         ));
     }

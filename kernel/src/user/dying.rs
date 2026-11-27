@@ -67,14 +67,14 @@ pub(crate) fn note(pid: u64, stage: Stage) {
         .iter()
         .find(|s| s.pid.load(Ordering::Acquire) == pid)
         .or_else(|| {
+            // (a free slot's other fields were cleared by `done` before it was freed; only a slot that reads free is tried)
             RECORD.iter().find(|s| {
-                s.pid
-                    .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+                s.pid.load(Ordering::Acquire) == 0
+                    && s.pid
+                        .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
                     && {
                         s.since.store(now, Ordering::Release);
-                        s.taken.store(0, Ordering::Release);
-                        s.stage.store(0, Ordering::Release);
                         true
                     }
             })
@@ -104,6 +104,9 @@ pub(crate) fn note(pid: u64, stage: Stage) {
 pub(crate) fn done(pid: u64) {
     for s in &RECORD {
         if s.pid.load(Ordering::Acquire) == pid {
+            s.since.store(0, Ordering::Release);
+            s.taken.store(0, Ordering::Release);
+            s.stage.store(0, Ordering::Release);
             s.pid.store(0, Ordering::Release);
         }
     }
@@ -125,6 +128,9 @@ pub(crate) fn report(in_table: impl Fn(u64) -> bool) -> alloc::vec::Vec<alloc::s
             s.taken.load(Ordering::Acquire),
             s.stage.load(Ordering::Acquire),
         );
+        if since == 0 {
+            continue; // (being claimed or freed this instant)
+        }
         out.push(alloc::format!(
             "leak: dying {pid}: {} (in the table: {}), noted by thread {}, ending for {} ms, out of the table for {}",
             Stage::name(stage & 0xff),
@@ -148,6 +154,7 @@ pub(crate) fn report(in_table: impl Fn(u64) -> bool) -> alloc::vec::Vec<alloc::s
 }
 
 /// How many processes are on their way out (for the line a failed leak check prints after its wait).
+#[cfg(any(not(feature = "release"), feature = "release-suite"))] // (the leak checks of `user_tests`)
 pub(crate) fn count() -> usize {
     RECORD
         .iter()
