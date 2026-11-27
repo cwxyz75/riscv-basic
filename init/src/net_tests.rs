@@ -66,14 +66,26 @@ fn spawn_prog_env(
     })
 }
 
-/// Start the device manager and `netsup` (stackless: the test is the stack). `Ok(None)`: no network device on this machine.
-fn start_stack() -> Result<Option<Net>, Detail> {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let bi = boot_image_vmo()?;
-    let root = root_job()?;
-    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
-    let sj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
-    sys::handle_close(root);
+/// The job a device's supervisor (`netsup`) or driver (`rngd`) makes the device's job under (IOMMU11: that job pays for the
+/// device's domain and its DMA VMOs): a duplicate of `j` that can make children and be inspected, nothing more.
+fn parent_job(j: u64) -> Result<u64, Detail> {
+    Ok(ok(
+        sys::handle_duplicate(
+            j,
+            Rights::MANAGE
+                .union(Rights::INSPECT)
+                .union(Rights::DUPLICATE)
+                .union(Rights::TRANSFER)
+                .0,
+        ),
+        "a job to make the device's job under",
+    )?
+    .a1 as u64)
+}
+
+/// Start the device manager in job `mj`: (its process, our connection, a second connection for `netsup`: a claim lives as long as its
+/// connection).
+fn start_mgr(res: u64, bi: u64, mj: u64) -> Result<(u64, u64, u64), Detail> {
     // the device manager, and a second connection for `netsup` (a claim lives as long as its connection)
     let (mine, theirs) = channel()?;
     let res_dup = ok(sys::handle_duplicate(res, Rights::SAME.0), "dup resource")?.a1 as u64;
@@ -117,6 +129,18 @@ fn start_stack() -> Result<Option<Net>, Detail> {
     ensure_eq!(st(w), Some(S::Ok), "the manager answers the connect");
     let mut rb = [0u8; 16];
     sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    Ok((mgr, mine, sup_end))
+}
+
+/// Start the device manager and `netsup` (stackless: the test is the stack). `Ok(None)`: no network device on this machine.
+fn start_stack() -> Result<Option<Net>, Detail> {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let bi = boot_image_vmo()?;
+    let root = root_job()?;
+    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let sj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    let (mgr, mine, sup_end) = start_mgr(res, bi, mj)?;
     let (parent, parent_theirs) = channel()?;
     let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
     let sup = spawn_prog(
@@ -127,8 +151,9 @@ fn start_stack() -> Result<Option<Net>, Detail> {
             (Role::ServiceDevmgr, 0),
             (Role::BootImage, 1),
             (Role::ServiceInit, 2),
+            (Role::Job, 3),
         ],
-        &[sup_end, bi2, parent_theirs],
+        &[sup_end, bi2, parent_theirs, parent_job(sj)?],
         sj,
     )?;
     // the stack's handles arrive in one message
@@ -437,10 +462,20 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
             Some(S::AccessDenied),
             "the receive pool cannot be mapped writable from the stack's handle"
         );
-        let p = sys::vmo_phys_addr(n.rx);
-        ensure!(
-            p.status != 0,
-            "the stack's pool handle has no physical address to give"
+        // NET2 (IOMMU11): neither of the stack's pool handles gives a physical address (no process learns one: the driver's are
+        // checked in `net_device_cannot_write_the_transmit_pool`)
+        for h in [n.rx, n.tx] {
+            ensure_eq!(
+                st(sys::vmo_phys_addr(h)),
+                Some(S::AccessDenied),
+                "the stack's pool handle has no physical address to give (no DMA right)"
+            );
+        }
+        // every completion came by its vector: none was found only by the driver's safety poll
+        ensure_eq!(
+            n.stat(stat::POLL_FOUND),
+            0,
+            "device work found only by the safety poll"
         );
         Ok(())
     })();
@@ -579,8 +614,12 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
         bi,
         b"bin/rngd",
         &[b"rngd"],
-        vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
-        &[rng_dm, rng_pub.ch],
+        vec![
+            (Role::ServiceDevmgr, 0),
+            (Role::ServiceRegistry, 1),
+            (Role::Job, 2),
+        ],
+        &[rng_dm, rng_pub.ch, parent_job(sj)?],
         sj,
     )?;
     let (ctl, ctl_theirs) = channel()?;
@@ -601,9 +640,10 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
             (Role::BootImage, 1),
             (Role::ServiceInit, 2),
             (Role::ServiceRegistry, 3),
+            (Role::Job, 4),
         ],
         fault_env,
-        &[sup_dm, bi2, ctl_theirs, publish_conn.ch],
+        &[sup_dm, bi2, ctl_theirs, publish_conn.ch, parent_job(sj)?],
         sj,
     )?;
     // a machine without a network device: netsup ends with 13 (NoDevice) before saying anything
@@ -916,6 +956,301 @@ pub fn net_dhcp_configures_the_interface() -> Outcome {
     r
 }
 
+/// IOMMU11 (IOMMU-SPEC 4.1 and 9, NET-DESIGN's 2026-11-25 amendment): the transmit pool is read-only for the network device, and no
+/// process learns a physical address. `netsup` in its `stackless rig` mode claims the function for a job of the test's (which pays for
+/// the 130 pages of the pools and the queue memory) and hands the test exactly the handles a driver gets; the test is that driver,
+/// with no stack behind it. The driver cannot map the transmit pool read-write for the device, nor map the stack's pool views into the
+/// domain at all, nor read the domain's faults; then it posts a transmit slot's I/O address as a receive buffer, sends an ARP request
+/// for slirp's gateway, and the device's write of the answer faults: the slot's bytes stay as they were, and the one fault names the
+/// network function and reaches `netsup` (the domain's control handle).
+pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
+    use virtio::Transport;
+    const BAR_VA: u64 = RING_VA + 0x40_0000;
+    const Q_VA: u64 = RING_VA + 0x50_0000;
+    const NET_RID: u64 = 0x38;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let bi = boot_image_vmo()?;
+    let root = root_job()?;
+    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let sj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let cj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    let (mgr, mine, sup_end) = start_mgr(res, bi, mj)?;
+    let mgr_pages0 = job_use(mj, 2)?.0;
+    let (parent, parent_theirs) = channel()?;
+    let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
+    let sup = spawn_prog(
+        bi,
+        b"bin/netsup",
+        &[b"netsup", b"stackless", b"rig"],
+        vec![
+            (Role::ServiceDevmgr, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceInit, 2),
+            (Role::Job, 3),
+        ],
+        &[sup_end, bi2, parent_theirs, parent_job(cj)?],
+        sj,
+    )?;
+    let mut hs = [0u64; 10];
+    let mut held: Vec<u64> = Vec::new();
+    let me = me()?;
+    let r = (|| -> Outcome {
+        let w = sys::object_wait(
+            parent,
+            sig::READABLE | sig::PEER_CLOSED,
+            sys::clock_get() + 5000,
+        );
+        ensure_eq!(st(w), Some(S::Ok), "netsup answers");
+        let mut b = vec![0u8; 512];
+        let r = sys::channel_read(parent, b.as_mut_ptr(), b.len(), hs.as_mut_ptr(), 10);
+        ensure_eq!(st(r), Some(S::Ok), "netsup hands over the driver's handles");
+        held.extend_from_slice(&hs[..r.a2]);
+        ensure_eq!(
+            r.a2,
+            10,
+            "the driver's eight handles and the stack's two pool views"
+        );
+        let (_, status, c) =
+            proto::devmgr::decode_claim_pci_reply(&b[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(status, proto::devmgr::Status::Ok, "the claim");
+        let c = c.ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(
+            (c.vendor, c.device, c.dma_pages.clone()),
+            (0x1af4, 0x1041, vec![2, 64, 64]),
+            "virtio-net-pci, with its queue memory and two pools"
+        );
+        let [bar, dom, q, rx, tx, _, _, _, srx, stx] = hs;
+        // the charge: the claimant's job pays for the pools and the queue memory, the manager's does not
+        let (cj_pages, _) = job_use(cj, 2)?;
+        ensure!(
+            cj_pages >= 130,
+            "the claimant's job pays for the 130 pages of DMA memory (it holds {cj_pages})"
+        );
+        let mgr_grew = job_use(mj, 2)?.0.saturating_sub(mgr_pages0);
+        ensure!(
+            mgr_grew < 130,
+            "the manager's job does not pay for the claim (it grew by {mgr_grew} pages)"
+        );
+        // NET2: no handle to the pools or the queue memory gives a physical address: the driver's have the DMA right, but the VMOs
+        // are the manager's `vmo_create_dma_in` ones (no single address: WRONG_TYPE); the stack's have no DMA right
+        for h in [q, rx, tx] {
+            ensure_eq!(
+                st(sys::vmo_phys_addr(h)),
+                Some(S::WrongType),
+                "the driver's DMA handle has no physical address to give"
+            );
+        }
+        for h in [srx, stx] {
+            ensure_eq!(
+                st(sys::vmo_phys_addr(h)),
+                Some(S::AccessDenied),
+                "the stack's pool view has no physical address to give"
+            );
+        }
+        // the stack's views cannot be mapped into the domain, and the driver's pools cannot be mapped into a process
+        for h in [srx, stx] {
+            ensure_eq!(
+                st(sys::iodomain_map(dom, h, 0, 64, 1)),
+                Some(S::AccessDenied),
+                "iodomain_map with the stack's pool handle"
+            );
+        }
+        for h in [rx, tx] {
+            ensure_eq!(
+                st(sys::process_map(me, h, RX_VA, 0, 4096, PF_R)),
+                Some(S::AccessDenied),
+                "process_map of the driver's pool handle"
+            );
+        }
+        // the driver's domain handle maps and unmaps, nothing more: the faults are the supervisor's to read
+        ensure_eq!(
+            st(sys::iodomain_fault_read(dom)),
+            Some(S::AccessDenied),
+            "the driver reads the domain's faults"
+        );
+        ensure_eq!(
+            st(sys::iodomain_grant_vector(dom, 0)),
+            Some(S::AccessDenied),
+            "the driver grants a vector"
+        );
+        ensure_eq!(
+            st(sys::iodomain_destroy(dom)),
+            Some(S::AccessDenied),
+            "the driver destroys the domain"
+        );
+        // IO4: the transmit pool is read-only for the device
+        ensure_eq!(
+            st(sys::iodomain_map(dom, tx, 0, 64, 3)),
+            Some(S::AccessDenied),
+            "the transmit pool mapped read-write for the device"
+        );
+        let tx_io = ok(
+            sys::iodomain_map(dom, tx, 0, 64, 1),
+            "map the transmit pool read-only",
+        )?
+        .a1 as u64;
+        let q_io = ok(sys::iodomain_map(dom, q, 0, 2, 3), "map the queue memory")?.a1 as u64;
+        let m = sys::process_map(me, bar, BAR_VA, 0, c.bar_bytes, PF_R | PF_W);
+        ensure_eq!(st(m), Some(S::Ok), "map the BAR VMO");
+        map_here(q, Q_VA, 2, PF_R | PF_W)?;
+        map_here(srx, RX_VA, 64, PF_R)?;
+        map_here(stx, TX_VA, 64, PF_R | PF_W)?;
+        for i in 0..1024 {
+            wr64(Q_VA + 8 * i, 0);
+        }
+        // slot 3: a pattern; slot 5: the frame to send (the 12-byte virtio-net header, all zero, then an ARP request)
+        let slot = |k: u64| TX_VA + k * 2048;
+        for i in 0..2048u64 {
+            // SAFETY: TX_VA maps the transmit pool read-write here (64 pages), and slot 3 is inside it.
+            unsafe { core::ptr::write_volatile((slot(3) + i) as *mut u8, (i * 13 + 7) as u8) };
+        }
+        let frame = arp_request_frame([10, 0, 2, 2]);
+        let mut sent = vec![0u8; 12];
+        sent.extend_from_slice(&frame);
+        for (i, &v) in sent.iter().enumerate() {
+            // SAFETY: as above, slot 5.
+            unsafe { core::ptr::write_volatile((slot(5) + i as u64) as *mut u8, v) };
+        }
+        let mut t = virtio::PciTransport::new(
+            VaRegs,
+            virtio::PciLocations {
+                common: BAR_VA + u64::from(c.common.0),
+                notify: BAR_VA + u64::from(c.notify.0),
+                notify_len: u64::from(c.notify.1),
+                notify_multiplier: c.notify_multiplier,
+                isr: BAR_VA + u64::from(c.isr.0),
+                device: (c.device_cfg.1 != 0).then(|| {
+                    (
+                        BAR_VA + u64::from(c.device_cfg.0),
+                        u64::from(c.device_cfg.1),
+                    )
+                }),
+            },
+        );
+        let entry = |what: u16| c.irq(what).map(|(_, e)| e).ok_or_else(|| msg_at(line!()));
+        let t0 = sys::clock_get();
+        vio(t.reset(&mut || sys::clock_get() < t0 + 1000), "reset")?;
+        vio(t.negotiate(virtio::feature::REQUIRED), "negotiate")?;
+        vio(
+            t.set_config_vector(entry(proto::devmgr::IRQ_CONFIG)?),
+            "the configuration vector",
+        )?;
+        let mut rxq = vio(virtio::SplitQueue::new(8, q_io, 4096), "the receive queue")?;
+        let mut txq = vio(
+            virtio::SplitQueue::new(8, q_io + 4096, 4096),
+            "the transmit queue",
+        )?;
+        vio(t.setup_queue(0, 8, rxq.addresses(), entry(0)?), "queue 0")?;
+        vio(t.setup_queue(1, 8, txq.addresses(), entry(1)?), "queue 1")?;
+        t.driver_ok();
+        let faults0 = sys::debug_stat(150);
+        let mut rx_mem = PageMem(Q_VA);
+        let mut tx_mem = PageMem(Q_VA + 4096);
+        let rx_buf = tx_io + 3 * 2048;
+        // the frame first (the device reads it from the read-only pool), so nothing unsolicited can fault the device before it sends
+        let head = vio(
+            txq.add(
+                &mut tx_mem,
+                &[virtio::Buf {
+                    addr: tx_io + 5 * 2048,
+                    len: sent.len() as u32,
+                    device_writes: false,
+                }],
+                true,
+            ),
+            "post the frame",
+        )?;
+        t.notify(1);
+        let until = sys::clock_get() + 3000;
+        loop {
+            if let Some((id, _)) = vio(txq.take_used(&tx_mem), "the transmit used ring")? {
+                ensure_eq!(id, head, "the device sent the frame");
+                break;
+            }
+            ensure!(
+                sys::clock_get() < until,
+                "the device never sent the frame (it reads the read-only pool)"
+            );
+            rt::io::nap(2);
+        }
+        // then a transmit slot's I/O address as a receive buffer: the device may read it, never write it (QEMU holds slirp's answer
+        // until a receive buffer exists)
+        vio(
+            rxq.add(
+                &mut rx_mem,
+                &[virtio::Buf {
+                    addr: rx_buf,
+                    len: 2048,
+                    device_writes: true,
+                }],
+                true,
+            ),
+            "post the receive buffer",
+        )?;
+        t.notify(0);
+        // slirp answers; the device's write of the answer into the read-only slot faults, and the supervisor reads the record
+        let w = sys::object_wait(parent, sig::READABLE, sys::clock_get() + 3000);
+        ensure_eq!(
+            st(w),
+            Some(S::Ok),
+            "netsup reports a fault on the network's domain"
+        );
+        let mut fb = [0u8; 32];
+        let r = sys::channel_read(parent, fb.as_mut_ptr(), 32, core::ptr::null_mut(), 0);
+        ensure_eq!(st(r), Some(S::Ok), "read the fault report");
+        ensure!(
+            r.a1 == 21 && &fb[..5] == b"fault",
+            "a fault report ({} bytes)",
+            r.a1
+        );
+        let word = u64::from_le_bytes(fb[5..13].try_into().map_err(|_| msg_at(line!()))?);
+        let iova = u64::from_le_bytes(fb[13..21].try_into().map_err(|_| msg_at(line!()))?);
+        ensure_eq!((word >> 16) & 0xffff, 2, "the fault is a device write");
+        ensure_eq!(
+            iova & !0xfff,
+            rx_buf & !0xfff,
+            "the fault is at the transmit slot posted as a receive buffer"
+        );
+        ensure!(
+            sys::debug_stat(150) > faults0,
+            "the kernel counted the fault"
+        );
+        ensure_eq!(
+            sys::debug_stat(153),
+            NET_RID,
+            "the fault names the network function (00:07.0)"
+        );
+        // the slot's bytes are as they were (QEMU may still complete the receive: its write went through a bounce buffer whose
+        // write-back the IOMMU refused, so the fault and the bytes are the proof, not the used ring)
+        for i in 0..2048u64 {
+            // SAFETY: as above.
+            let v = unsafe { core::ptr::read_volatile((slot(3) + i) as *const u8) };
+            ensure_eq!(v, (i * 13 + 7) as u8, "byte {i} of the transmit slot");
+        }
+        t.set_status(0);
+        Ok(())
+    })();
+    for va in [BAR_VA, Q_VA, RX_VA, TX_VA] {
+        sys::process_unmap(me, va);
+    }
+    for h in held {
+        sys::handle_close(h);
+    }
+    // the supervisor ends when we go; the claim is dropped with its connection, and the charge comes back
+    sys::handle_close(parent);
+    let ended = wait_ended(sup, 3000);
+    let settled = job_use_settles(cj, 2, 0, 3000);
+    sys::process_kill(mgr, -1);
+    let _ = sys::object_wait(mgr, sig::TERMINATED, sys::clock_get() + 3000);
+    for h in [sup, mgr, mine, me, mj, sj, cj, res] {
+        sys::handle_close(h);
+    }
+    r?;
+    ended?;
+    settled
+}
+
 // ---- confinement and supervision ----
 
 /// `netsup`'s control channel: `Status` as `(running, restarts, last_exit)` for the driver, the stack and the DHCP client, then whether
@@ -929,8 +1264,8 @@ fn sup_status(f: &Full) -> Option<SupStatus> {
     if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
         return None;
     }
-    let mut b = [0u8; 64];
-    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 64, core::ptr::null_mut(), 0);
+    let mut b = [0u8; 96];
+    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 96, core::ptr::null_mut(), 0);
     if r.status != 0 || r.a1 < 8 + 27 + 9 {
         return None;
     }
@@ -948,6 +1283,39 @@ fn sup_status(f: &Full) -> Option<SupStatus> {
         b[35] != 0,
         u64::from_le_bytes(b[36..44].try_into().ok()?),
     ))
+}
+
+/// The device side of `netsup`'s `Status` (IOMMU11): the re-claims it made, the driver job's I/O-mapped pages just after the last
+/// one (before the new driver mapped anything), its I/O-mapped pages and vectors now, and the device work only the driver's safety
+/// poll found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupDevice {
+    reclaims: u32,
+    io_pages_after_reclaim: u64,
+    io_pages: u64,
+    vectors: u64,
+    poll_found: u64,
+}
+
+fn sup_device(f: &Full) -> Option<SupDevice> {
+    let req = [3, 0, 0, 0, 1, 0, 0, 0];
+    sys::channel_write(f.ctl, req.as_ptr(), req.len(), core::ptr::null(), 0);
+    if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
+        return None;
+    }
+    let mut b = [0u8; 96];
+    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 96, core::ptr::null_mut(), 0);
+    if r.status != 0 || r.a1 < 44 + 36 {
+        return None;
+    }
+    let u64_at = |o: usize| Some(u64::from_le_bytes(b[o..o + 8].try_into().ok()?));
+    Some(SupDevice {
+        reclaims: u32::from_le_bytes(b[44..48].try_into().ok()?),
+        io_pages_after_reclaim: u64_at(48)?,
+        io_pages: u64_at(56)?,
+        vectors: u64_at(64)?,
+        poll_found: u64_at(72)?,
+    })
 }
 
 /// Ask `netsup` to kill and restart a child (0 driver, 1 stack, 2 DHCP client).
@@ -1220,6 +1588,15 @@ pub fn net_children_restart() -> Outcome {
         );
         let (_, down, gen0) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
         ensure!(!down && gen0 >= 1, "the supervisor is up");
+        // the device side before the driver's death (IOMMU11): the network's domain is one of the live ones, its driver mapped the
+        // 130 pages of the three pools and queue memory, and it has its three vectors
+        let dev0 = sup_device(&f).ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(
+            (dev0.reclaims, dev0.io_pages, dev0.vectors),
+            (0, 130, 3),
+            "the first driver's claim, mappings and vectors"
+        );
+        let (domains0, io_pages0) = (sys::debug_stat(159), sys::debug_stat(160));
         // Q11: kill the driver under a ping loop: pings resume within three seconds, the generation is one higher, the endpoint
         // that was open before still works
         sup_restart(&f, 0);
@@ -1241,6 +1618,31 @@ pub fn net_children_restart() -> Outcome {
         ensure_eq!(gen1, gen0 + 1, "the generation is one higher");
         ensure!(kids[0].0 && !down, "the driver runs again");
         ensure_eq!(kids[0].1, 1, "one restart of the driver");
+        // the device side (IOMMU-SPEC 10.2, 10.4; OD166 point 2): the function was re-claimed once; the old domain was destroyed with
+        // the dead driver's mappings (its job held no I/O-mapped page just after), a new one exists in its place (as many live
+        // domains and I/O-mapped pages as before), the new driver mapped the same pools afresh, and its vectors were granted anew
+        let dev1 = sup_device(&f).ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(dev1.reclaims, 1, "one re-claim for the new driver");
+        ensure_eq!(
+            dev1.io_pages_after_reclaim,
+            0,
+            "the dead driver's I/O-mapped pages went with its domain"
+        );
+        ensure_eq!(
+            (dev1.io_pages, dev1.vectors),
+            (130, 3),
+            "the new driver mapped the pools afresh, with vectors granted afresh"
+        );
+        ensure_eq!(
+            (sys::debug_stat(159), sys::debug_stat(160)),
+            (domains0, io_pages0),
+            "one domain destroyed and one made: as many live domains and I/O-mapped pages as before"
+        );
+        ensure_eq!(
+            dev1.poll_found,
+            0,
+            "traffic flowed by interrupt: nothing was found only by the safety poll"
+        );
         // Q13: kill the DHCP client: the address stays (it was applied already) and a new client resumes from the lease
         sup_restart(&f, 2);
         nap(1500)?;
@@ -2232,6 +2634,136 @@ pub fn random_service_gives_seeded_distinct_bytes() -> Outcome {
     })();
     f.close();
     r
+}
+
+/// IOMMU11: `rngd` seeds the random service from virtio-rng-pci (00:04.0) behind the IOMMU. It claims the function for a job of its
+/// own made under the one it is given, which pays for the two pages of queue memory and data and holds the domain's mappings and its
+/// one vector; the service serves seeded bytes; when `rngd` dies the claim goes with its connection, and the mappings with the
+/// domain. Needs no network device (a Kernel test: shard k, the entropy boot).
+pub fn rng_seeds_through_the_iommu() -> Outcome {
+    const RNG_RID: u16 = 0x20;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let bi = boot_image_vmo()?;
+    let root_j = root_job()?;
+    let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    let sj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    let rj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root_j);
+    let (mgr, mine, rng_dm) = start_mgr(res, bi, mj)?;
+    let mut procs = vec![mgr];
+    let mut reg_ch = 0;
+    let r = (|| -> Outcome {
+        let (off, len) = image_entry(bi, b"bin/registryd")?;
+        let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+        let (reg_mine, reg_theirs) = channel()?;
+        reg_ch = reg_mine;
+        let s = Startup {
+            args: vec![b"registryd".to_vec()],
+            roles: vec![(Role::ServiceRegistry, 0)],
+            ..Startup::default()
+        };
+        let reg = rt::spawn::spawn_in(
+            &image,
+            &s.encode().map_err(|_| msg_at(line!()))?,
+            &[reg_theirs],
+            rj,
+        )
+        .map_err(|_| msg_at(line!()))?;
+        procs.push(reg);
+        let mut root = Fs::new(reg_mine);
+        let rng_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+        let rng = spawn_prog(
+            bi,
+            b"bin/rngd",
+            &[b"rngd"],
+            vec![
+                (Role::ServiceDevmgr, 0),
+                (Role::ServiceRegistry, 1),
+                (Role::Job, 2),
+            ],
+            &[rng_dm, rng_pub.ch, parent_job(sj)?],
+            sj,
+        )?;
+        procs.push(rng);
+        let t = |n: u64| sys::clock_get() + n;
+        let mut v = root
+            .view(&[b"random"], prt::READ | prt::ENUMERATE)
+            .map_err(|e| msg_e(e, line!()))?;
+        let mut rs = rt::random::Random::connect(&mut v, t(8000)).map_err(|_| msg_at(line!()))?;
+        let mut a = [0u8; 256];
+        match rs.fill(&mut a, t(5000)) {
+            Ok(()) => {}
+            Err(rt::random::RandomError::NotSeeded) => {
+                return Err(msg_at(line!()));
+            }
+            Err(_) => return Err(msg_at(line!())),
+        }
+        ensure!(
+            a.iter().any(|&x| x != a[0]),
+            "seeded bytes are not constant"
+        );
+        // the function is claimed, and the claim is the job's: its domain's two pages of mappings and its one vector
+        let e = pci_list(mine, 7)?;
+        let f = e
+            .iter()
+            .find(|e| e.rid == RNG_RID)
+            .ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(
+            (
+                f.vendor,
+                f.device,
+                f.flags & proto::devmgr::PCI_CLAIMED != 0
+            ),
+            (0x1af4, 0x1044, true),
+            "virtio-rng-pci at 00:04.0, claimed"
+        );
+        ensure_eq!(
+            (job_use(sj, 12)?.0, job_use(sj, 13)?.0),
+            (2, 1),
+            "the entropy driver's job holds the domain's two mapped pages and its one vector"
+        );
+        ensure!(
+            job_use(mj, 12)?.0 == 0,
+            "the manager's job holds no I/O-mapped page"
+        );
+        // its death drops the claim with its connection, and the mappings with the domain
+        sys::process_kill(rng, -1);
+        wait_ended(rng, 3000)?;
+        let until = sys::clock_get() + 3000;
+        loop {
+            let e = pci_list(mine, 8)?;
+            let f = e
+                .iter()
+                .find(|e| e.rid == RNG_RID)
+                .ok_or_else(|| msg_at(line!()))?;
+            if f.flags & proto::devmgr::PCI_CLAIMED == 0 {
+                break;
+            }
+            ensure!(
+                sys::clock_get() < until,
+                "the function stayed claimed after rngd died"
+            );
+            rt::io::nap(5);
+        }
+        job_use_settles(sj, 12, 0, 3000)?;
+        job_use_settles(sj, 13, 0, 3000)?;
+        sys::debug_write(b"entropy: rngd seeded from the PCI device through the IOMMU\n");
+        Ok(())
+    })();
+    for &p in &procs {
+        sys::process_kill(p, -1);
+        let _ = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 3000);
+        sys::handle_close(p);
+    }
+    for h in [mine, reg_ch, res] {
+        sys::handle_close(h);
+    }
+    let settled = [mj, sj, rj].map(|j| job_use_settles(j, 2, 0, 1500));
+    for j in [mj, sj, rj] {
+        sys::handle_close(j);
+    }
+    r?;
+    settled.into_iter().collect()
 }
 
 /// S9 step 6, Q28: a C program using BSD sockets (`ctest sockets`, `libc/tests/c/sockets.c`) over loopback and the stack:

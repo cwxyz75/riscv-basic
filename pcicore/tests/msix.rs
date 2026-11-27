@@ -672,6 +672,97 @@ fn claims_get_every_vector_of_their_class_or_fail_whole_and_leak_nothing() {
     assert!(ok > 100, "{ok} claims succeeded");
 }
 
+/// IOMMU11: a re-claim after a release makes a new domain and grants every vector afresh with the same limits, and makes no DMA VMO:
+/// the claimant kept the first claim's, still charged to its job, and nothing of the old domain is live.
+#[test]
+fn a_reclaim_grants_afresh_on_a_new_domain_and_makes_no_dma() {
+    for plan in [&claim::NET, &claim::ENTROPY, &claim::BLOCK] {
+        let mut r = Rng(11);
+        let mut f = Function::new(&mut r, 4, 4);
+        f.pba_bar = 1;
+        f.pba_offset = 0x800;
+        let mut w = World::default();
+        let mut d = Dev {
+            f,
+            plan,
+            job: 1,
+            claim: None,
+        };
+        do_claim(&mut w, &mut d, 0).unwrap();
+        // the claimant takes the DMA VMOs (devmgr moves them into the reply): they are no longer the claim's
+        let kept = core::mem::take(&mut d.claim.as_mut().unwrap().dma);
+        assert_eq!(kept.len(), plan.dma_pages.len());
+        let old = d.claim.as_ref().unwrap().domain;
+        do_release(&mut w, &mut d, 0);
+        assert!(d.f.live().is_empty(), "released: nothing can send");
+        let (m, bars) = (d.f.msix(), d.f.bars());
+        let dmas = |w: &World| {
+            w.handles
+                .values()
+                .filter(|o| matches!(o, Obj::Dma { .. }))
+                .count()
+        };
+        let dmas_before = dmas(&w);
+        let mut k = ForClaim {
+            w: &mut w,
+            dev: 0,
+            job: 1,
+        };
+        let c = claim::reclaim(plan, &m, &bars, MSI_DATA, &mut k, &mut d.f).unwrap();
+        assert!(c.dma.is_empty(), "a re-claim makes no DMA VMO");
+        assert_eq!(
+            dmas(&w),
+            dmas_before,
+            "the claimant's DMA VMOs are the only ones"
+        );
+        assert_ne!(c.domain, old, "a new domain");
+        assert!(matches!(
+            w.handles.get(&c.domain),
+            Some(Obj::Domain { live: true, .. })
+        ));
+        assert_eq!(
+            w.limits[&1],
+            (plan.io_pages(), plan.vectors()),
+            "the same limits"
+        );
+        let got: Vec<Irq> = c.irqs.iter().map(|x| x.0).collect();
+        assert_eq!(got, plan.irqs, "every vector granted afresh");
+        assert!(c
+            .irqs
+            .iter()
+            .all(|&(q, _)| w.granted.contains(&(c.domain, q.entry()))));
+        assert_eq!(
+            d.f.live().len(),
+            plan.irqs.len(),
+            "the table programmed again"
+        );
+        // a re-claim that fails part way leaves nothing behind but the claimant's DMA VMOs
+        msix_disable(&m, &bars, &mut d.f).unwrap();
+        let mut k = ForClaim {
+            w: &mut w,
+            dev: 0,
+            job: 1,
+        };
+        assert!(claim::release(c, &mut k));
+        w.fail_in = Some(2);
+        let mut k = ForClaim {
+            w: &mut w,
+            dev: 0,
+            job: 1,
+        };
+        assert!(claim::reclaim(plan, &m, &bars, MSI_DATA, &mut k, &mut d.f).is_err());
+        w.fail_in = None;
+        assert_eq!(
+            w.handles.len(),
+            dmas_before,
+            "only the claimant's DMA VMOs are left"
+        );
+        for h in kept {
+            w.handles.remove(&h);
+        }
+    }
+}
+
 #[test]
 fn a_vector_limit_below_the_class_fails_the_claim_at_the_grant() {
     let mut r = Rng(7);

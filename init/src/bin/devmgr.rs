@@ -18,12 +18,16 @@
 //! ending its drivers first (each killed and waited for; one that does not end is said on the console, and its claim is released
 //! anyway: the destroyed domain leaves the device nothing to reach).
 //!
-//! The network and entropy devices are still virtio-mmio slots (until IOMMU11): the manager keeps its own handle to each slot and
-//! resets the device when its claimant's connection closes; a reset that does not complete is said on the console (`## devmgr: mmio
-//! <address> reset failed`).
+//! **The network and entropy devices (IOMMU11; NET-SPEC amendment 2026-11-25).** They are PCI functions behind the IOMMU like the
+//! disks; no DMA device of the system is on virtio-mmio any more, and the manager has no virtio-mmio code (the real-time clock, which
+//! does no DMA, is the one device it hands out as a page of device memory). `ClaimNet` is the claim of the network **supervisor**
+//! (`netsup`): the claim below for the job it names, the three DMA VMOs charged to that job, and handles fit for a supervisor (the
+//! domain's control handle, interrupts it can duplicate for its driver); after a driver's death `ReclaimNet` tears that claim down
+//! and claims the function afresh for the same job (a new domain, new grants, no new DMA VMO: the pools are the supervisor's).
+//! `ClaimRng` is the entropy driver's own claim (`rngd`), exactly `ClaimPci`'s. The manager stays their supervisor for what only
+//! it can do (configuration space: MSI-X, bus mastering, the reset), and releases each claim when its connection closes.
 //!
-//! **PCI (IOMMU8; IOMMU-SPEC sections 9 and 10).** Beside the virtio-mmio table (kept for the unconverted drivers until IOMMU11),
-//! the manager enumerates bus 0 of the ECAM host the device tree names (`resource_dtb`, `kcore::iommutree`), with `pcicore` for
+//! **PCI (IOMMU8; IOMMU-SPEC sections 9 and 10).** The manager enumerates bus 0 of the ECAM host the device tree names (`resource_dtb`, `kcore::iommutree`), with `pcicore` for
 //! every byte it reads: it sizes and assigns every function's memory BARs in the host's 32-bit window (no firmware does it on
 //! QEMU `virt`), turns memory decoding on, **disables INTx in every function's command register** and leaves bus mastering off.
 //! It never hands out configuration space. It maps each function's MSI-X table BAR (and pending-bit BAR) privately. It prints one
@@ -88,59 +92,8 @@ use rt::sys;
 
 const PF_R: u64 = 1;
 const PF_RW: u64 = 3;
-/// Where the device tree and the probed slot are mapped in this process.
+/// Where the device tree is mapped in this process (while it is read).
 const DTB_VA: u64 = 0x300_0000;
-/// Where device `i`'s register page stays mapped in this process (for the reset): one page each.
-const MMIO_VA: u64 = 0x600_0000;
-
-fn mmio_va(i: usize) -> u64 {
-    MMIO_VA + (i as u64) * 4096
-}
-
-const STATUS: usize = 0x070;
-const INTERRUPT_STATUS: usize = 0x060;
-const INTERRUPT_ACK: usize = 0x064;
-const MAGIC: usize = 0x000;
-const DEVICE_ID: usize = 0x008;
-const ID_NET: u32 = 1;
-const ID_RNG: u32 = 4;
-/// The entropy device's DMA: one page for the queue and one for the bytes it fills.
-const RNG_DMA_PAGES: u64 = 2;
-/// The network device's DMA (NET-SPEC 4.3, 5.1): two 64-page packet pools and a two-page virtqueue area.
-const NET_RX_PAGES: u64 = 64;
-const NET_TX_PAGES: u64 = 64;
-const NET_QUEUE_PAGES: u64 = 2;
-
-fn rd(va: u64, off: usize) -> u32 {
-    // SAFETY: `va` maps a virtio-mmio device's 4 KiB register page in this process.
-    unsafe { core::ptr::read_volatile((va as usize + off) as *const u32) }
-}
-
-fn wr(va: u64, off: usize, v: u32) {
-    // SAFETY: as in `rd`.
-    unsafe { core::ptr::write_volatile((va as usize + off) as *mut u32, v) }
-}
-
-/// Put a virtio-mmio device back to its reset state and quiet its interrupt line. A device whose status does not read back 0 within
-/// a second is said on the console: it may still be running (T42 hole (c): the reset used to give up silently).
-fn reset(va: u64, base: u64) {
-    wr(va, STATUS, 0);
-    let until = sys::clock_get() + RESET_MS;
-    while rd(va, STATUS) != 0 {
-        if sys::clock_get() >= until {
-            sys::debug_write(
-                alloc::format!(
-                    "## devmgr: mmio {base:#x} reset failed status did not read back 0\n"
-                )
-                .as_bytes(),
-            );
-            return;
-        }
-        sys::thread_yield();
-    }
-    wr(va, INTERRUPT_ACK, rd(va, INTERRUPT_STATUS));
-}
-
 fn read_dtb(res: u64, me: u64) -> Option<Vec<u8>> {
     let r = sys::resource_dtb(res);
     if r.status != 0 {
@@ -157,65 +110,6 @@ fn read_dtb(res: u64, me: u64) -> Option<Vec<u8>> {
     let blob = unsafe { core::slice::from_raw_parts(DTB_VA as *const u8, len) }.to_vec();
     sys::process_unmap(me, DTB_VA);
     Some(blob)
-}
-
-/// Is the slot at `pa` a virtio device of `want` (a device id)? If so its page stays mapped at `va`.
-fn probe(res: u64, me: u64, pa: u64, va: u64, want: u32) -> Option<u64> {
-    let vmo = sys::vmo_create_physical(res, pa, 4096);
-    if vmo.status != 0 {
-        return None;
-    }
-    let vmo = vmo.a1 as u64;
-    let mapped = sys::process_map(me, vmo, va, 0, 4096, PF_RW).status == 0;
-    let found = mapped && rd(va, MAGIC) == 0x7472_6976 && rd(va, DEVICE_ID) == want;
-    if mapped && !found {
-        sys::process_unmap(me, va);
-    }
-    if found {
-        Some(vmo) // stays mapped at `va`
-    } else {
-        sys::handle_close(vmo);
-        None
-    }
-}
-
-/// A virtio network device, claimable by one client at a time (S8). The DMA memory exists only while it is claimed.
-struct Net {
-    va: u64,
-    /// The slot's physical address (for the console).
-    base: u64,
-    mmio: u64,
-    irq: Option<u64>,
-    /// While claimed: the claimant's connection key and the manager's own handles to the three DMA VMOs.
-    claim: Option<(u64, [u64; 3])>,
-}
-
-impl Net {
-    fn release(&mut self) {
-        if let Some((_, dmas)) = self.claim.take() {
-            // the claimant is gone: quiet the device before its memory can be freed or handed out again (T42)
-            reset(self.va, self.base);
-            for h in dmas {
-                sys::handle_close(h);
-            }
-        }
-    }
-}
-
-struct Rng {
-    va: u64,
-    base: u64,
-    mmio: u64,
-    claim: Option<(u64, u64)>,
-}
-
-impl Rng {
-    fn release(&mut self) {
-        if let Some((_, dma)) = self.claim.take() {
-            reset(self.va, self.base);
-            sys::handle_close(dma);
-        }
-    }
 }
 
 fn blkd_image(bi: u64) -> Option<Vec<u8>> {
@@ -337,6 +231,47 @@ struct PciClaimed {
 enum Owner {
     Conn(u64),
     Driver { process: u64, job: u64 },
+}
+
+/// Who a claim's handles are for (IOMMU-SPEC 4.1, 9; IOMMU11): the **driver** itself (`ClaimPci`, `ClaimRng`, `OpenBlock`'s
+/// `blkd`) gets a domain handle that maps and unmaps only, and interrupts it can wait on and acknowledge; a **supervisor** that starts
+/// its own driver (`ClaimNet`: `netsup`) gets the domain's control (map, unmap, destroy, its faults; never a grant, which stays here
+/// with the MSI-X table) and interrupts it can duplicate for its driver.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claimant {
+    Driver,
+    Supervisor,
+}
+
+impl Claimant {
+    fn domain_rights(self) -> Rights {
+        let driver = Rights::IO_MAP
+            .union(Rights::IO_UNMAP)
+            .union(Rights::TRANSFER);
+        match self {
+            Claimant::Driver => driver,
+            Claimant::Supervisor => driver
+                .union(Rights::IO_DESTROY)
+                .union(Rights::WAIT)
+                .union(Rights::INSPECT)
+                .union(Rights::DUPLICATE),
+        }
+    }
+    fn irq_rights(self) -> Rights {
+        let driver = Rights::WAIT.union(Rights::MANAGE).union(Rights::TRANSFER);
+        match self {
+            Claimant::Driver => driver,
+            Claimant::Supervisor => driver.union(Rights::DUPLICATE),
+        }
+    }
+}
+
+/// The claims made by a device class's index rather than a requester id (IOMMU11).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByClass {
+    ClaimNet,
+    ClaimRng,
+    ReclaimNet,
 }
 
 /// The port key of the driver of function `i` (top bit set: the runtime's connection keys count up from 1).
@@ -823,14 +758,14 @@ impl Pci {
         }
     }
 
-    /// The functions `OpenBlock` serves, in slot order: the claimable block functions.
-    fn disks(&self) -> Vec<usize> {
+    /// The claimable functions of a driver class, in requester-id order (the enumeration's): `OpenBlock` serves the block ones,
+    /// `ClaimNet` and `ClaimRng` count the network and entropy ones.
+    fn of_class(&self, class: &pcicore::claim::Plan) -> Vec<usize> {
         (0..self.devs.len())
             .filter(|&i| {
-                self.devs.get(i).is_some_and(|d| {
-                    d.plan()
-                        .is_ok_and(|p| p.class == pcicore::claim::BLOCK.class)
-                })
+                self.devs
+                    .get(i)
+                    .is_some_and(|d| d.plan().is_ok_and(|p| p.class == class.class))
             })
             .collect()
     }
@@ -855,8 +790,6 @@ struct DevMgr {
     res: u64,
     /// The job each driver's job is made under.
     drivers: u64,
-    nets: Vec<Net>,
-    rngs: Vec<Rng>,
     /// The real-time clocks: one VMO of each register page (claimed read-only, by any number of clients).
     rtcs: Vec<u64>,
     image: Option<Vec<u8>>,
@@ -929,6 +862,29 @@ impl Service for DevMgr {
                 }
             };
         }
+        // ClaimNet, ClaimRng and ReclaimNet carry exactly one handle too: the job that pays (IOMMU11)
+        let by_class = match devmgr::op_of(msg) {
+            Some(devmgr::OP_CLAIM_NET) => Some((devmgr::decode_claim_net(msg), ByClass::ClaimNet)),
+            Some(devmgr::OP_CLAIM_RNG) => Some((devmgr::decode_claim_rng(msg), ByClass::ClaimRng)),
+            Some(devmgr::OP_RECLAIM_NET) => {
+                Some((devmgr::decode_reclaim_net(msg), ByClass::ReclaimNet))
+            }
+            _ => None,
+        };
+        if let Some((r, what)) = by_class {
+            return match (r, hs) {
+                (Ok((txid, index)), &[job]) => self.claim_by_class(key, txid, index, job, what),
+                (r, _) => {
+                    for &h in hs {
+                        sys::handle_close(h);
+                    }
+                    match r {
+                        Ok((t, _)) | Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
+                        Err(None) => {}
+                    }
+                }
+            };
+        }
         for &h in hs {
             sys::handle_close(h);
         }
@@ -981,20 +937,6 @@ impl Service for DevMgr {
                 Err(None) => {}
             };
         }
-        if devmgr::op_of(msg) == Some(devmgr::OP_CLAIM_RNG) {
-            return match devmgr::decode_claim_rng(msg) {
-                Ok((txid, index)) => self.claim_rng(key, txid, index),
-                Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
-                Err(None) => {}
-            };
-        }
-        if devmgr::op_of(msg) == Some(devmgr::OP_CLAIM_NET) {
-            return match devmgr::decode_claim_net(msg) {
-                Ok((txid, index)) => self.claim_net(key, txid, index),
-                Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
-                Err(None) => {}
-            };
-        }
         match devmgr::decode_request(msg) {
             Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
             Err(None) => {}
@@ -1030,107 +972,6 @@ impl Service for DevMgr {
 }
 
 impl DevMgr {
-    /// `ClaimNet`: hand the claimant the device and its DMA memory (NET-SPEC 4.3). The DMA VMOs are made here (only the
-    /// root resource can) and are charged to this manager (work item T84).
-    fn claim_net(&mut self, key: u64, txid: u32, index: u16) {
-        let fail = |this: &mut DevMgr, st: Status| {
-            let _ = this.core.send(key, devmgr::encode_reply(txid, st), None);
-        };
-        let res = self.res;
-        let Some(n) = self.nets.get_mut(usize::from(index)) else {
-            return fail(self, Status::NoDevice);
-        };
-        if n.claim.is_some() {
-            return fail(self, Status::Busy);
-        }
-        let mk = |pages: u64| {
-            let r = sys::vmo_create_dma(res, pages);
-            (r.status == 0).then_some(r.a1 as u64)
-        };
-        let (rx, tx, q) = (mk(NET_RX_PAGES), mk(NET_TX_PAGES), mk(NET_QUEUE_PAGES));
-        let (Some(rx), Some(tx), Some(q)) = (rx, tx, q) else {
-            for h in [rx, tx, q].into_iter().flatten() {
-                sys::handle_close(h);
-            }
-            return fail(self, Status::Failed);
-        };
-        reset(n.va, n.base);
-        let dup = |h: u64| {
-            let r = sys::handle_duplicate(h, Rights::SAME.0);
-            (r.status == 0).then_some(r.a1 as u64)
-        };
-        let mut give: Vec<u64> = Vec::new();
-        let mut ok = true;
-        for h in [n.mmio, rx, tx, q].into_iter().chain(n.irq) {
-            match dup(h) {
-                Some(d) => give.push(d),
-                None => ok = false,
-            }
-        }
-        if !ok {
-            for h in give.into_iter().chain([rx, tx, q]) {
-                sys::handle_close(h);
-            }
-            return fail(self, Status::Failed);
-        }
-        let flags = if n.irq.is_some() {
-            devmgr::NET_FLAG_IRQ
-        } else {
-            0
-        };
-        n.claim = Some((key, [rx, tx, q]));
-        let reply = devmgr::encode_claim_net_reply(
-            txid,
-            Status::Ok,
-            &devmgr::NetClaim {
-                flags,
-                rx_pages: NET_RX_PAGES as u32,
-                tx_pages: NET_TX_PAGES as u32,
-                queue_pages: NET_QUEUE_PAGES as u32,
-            },
-        );
-        // (the handles travel in one message: the channel carries up to MAX_MSG_HANDLES)
-        let _ = self.core.send_handles(key, reply, give);
-    }
-
-    /// `ClaimRng`: hand the claimant the entropy device and two pages of DMA (S9 step 5).
-    fn claim_rng(&mut self, key: u64, txid: u32, index: u16) {
-        let fail = |this: &mut DevMgr, st: Status| {
-            let _ = this.core.send(key, devmgr::encode_reply(txid, st), None);
-        };
-        let res = self.res;
-        let Some(r) = self.rngs.get_mut(usize::from(index)) else {
-            return fail(self, Status::NoDevice);
-        };
-        if r.claim.is_some() {
-            return fail(self, Status::Busy);
-        }
-        let dma = sys::vmo_create_dma(res, RNG_DMA_PAGES);
-        if dma.status != 0 {
-            return fail(self, Status::Failed);
-        }
-        let dma = dma.a1 as u64;
-        reset(r.va, r.base);
-        let dup = |h: u64| {
-            let d = sys::handle_duplicate(h, Rights::SAME.0);
-            (d.status == 0).then_some(d.a1 as u64)
-        };
-        let (Some(m), Some(d)) = (dup(r.mmio), dup(dma)) else {
-            sys::handle_close(dma);
-            return fail(self, Status::Failed);
-        };
-        r.claim = Some((key, dma));
-        let reply = devmgr::encode_claim_rng_reply(
-            txid,
-            Status::Ok,
-            &devmgr::RngClaim {
-                flags: 0,
-                dma_pages: RNG_DMA_PAGES as u32,
-            },
-        );
-        let _ = self.core.send_handles(key, reply, alloc::vec![m, d]);
-    }
-
     /// `ClaimPci` (IOMMU-SPEC 9; the order is the header comment's). `job` is the driver's job, which is closed here whatever
     /// happens (the domain and the DMA VMOs hold what they need of it).
     fn claim_pci(&mut self, key: u64, txid: u32, rid: u16, job: u64) {
@@ -1140,23 +981,75 @@ impl DevMgr {
             .and_then(|p| p.devs.iter().position(|d| d.bdf.rid() == rid))
             .ok_or(Status::NoDevice)
             .and_then(|i| {
-                self.claim_function(i, job, Owner::Conn(key))
+                self.claim_function(i, job, Owner::Conn(key), Claimant::Driver, false)
                     .map(|c| (i, c))
             });
         sys::handle_close(job);
+        self.send_claim(key, txid, r);
+    }
+
+    /// Answer a claim: the reply with its handles, then (step 6) bus mastering on and the second message that says the device may
+    /// start; or the status of a claim that failed.
+    fn send_claim(
+        &mut self,
+        key: u64,
+        txid: u32,
+        r: Result<(usize, (devmgr::PciClaim, Vec<u64>)), Status>,
+    ) {
         match r {
             Err(st) => self.reply(key, txid, st, None),
             Ok((i, (claim, handles))) => {
                 // (`claim_function` checked that the reply encodes)
                 let reply = devmgr::encode_claim_pci_reply(txid, &claim).unwrap_or_default();
                 if let rt::service::Sent::Sent = self.core.send_handles(key, reply, handles) {
-                    // 6. bus mastering last, then the driver is told it may start the device
+                    // 6. bus mastering last, then the claimant is told the device may start
                     self.bus_master(i);
                     self.reply(key, txid, Status::Ok, None);
                 }
                 // (not sent: the connection is closed, and `closed` releases the claim)
             }
         }
+    }
+
+    /// `ClaimNet`, `ClaimRng` and `ReclaimNet` (IOMMU11): function number `index` of the class, for the job that pays (closed here
+    /// whatever happens). A network claim is the supervisor's (`netsup`): the domain's control handle and duplicable interrupts. An
+    /// entropy claim is the driver's own (`rngd`), as `ClaimPci`. A re-claim is allowed only on the connection that holds the
+    /// network function's claim and with the claim's own job: the old claim is released (the release's order: MSI-X off, bus
+    /// mastering off, the device reset, the domain destroyed) and the function claimed afresh with no DMA VMO made.
+    fn claim_by_class(&mut self, key: u64, txid: u32, index: u16, job: u64, what: ByClass) {
+        let res = self.res;
+        let plan = match what {
+            ByClass::ClaimRng => &pcicore::claim::ENTROPY,
+            ByClass::ClaimNet | ByClass::ReclaimNet => &pcicore::claim::NET,
+        };
+        let r = (|| {
+            let pci = self.pci.as_mut().ok_or(Status::NoDevice)?;
+            let &i = pci
+                .of_class(plan)
+                .get(usize::from(index))
+                .ok_or(Status::NoDevice)?;
+            if what == ByClass::ReclaimNet {
+                let koid = sys::object_info(job);
+                let held = pci.devs.get(i).and_then(|d| d.claim.as_ref());
+                if koid.status != 0
+                    || !held.is_some_and(|c| {
+                        matches!(c.owner, Owner::Conn(k) if k == key) && c.job == koid.a1 as u64
+                    })
+                {
+                    return Err(Status::BadRequest);
+                }
+                // the old claim goes first, in the release's order: nothing of it is kept (OD166 point 2)
+                pci.release(i, res);
+            }
+            let who = match what {
+                ByClass::ClaimRng => Claimant::Driver,
+                ByClass::ClaimNet | ByClass::ReclaimNet => Claimant::Supervisor,
+            };
+            self.claim_function(i, job, Owner::Conn(key), who, what == ByClass::ReclaimNet)
+                .map(|c| (i, c))
+        })();
+        sys::handle_close(job);
+        self.send_claim(key, txid, r);
     }
 
     /// Turn bus mastering on for function `i` (step 6 of the claim), INTx staying disabled.
@@ -1179,6 +1072,8 @@ impl DevMgr {
         i: usize,
         job: u64,
         owner: Owner,
+        who: Claimant,
+        reclaim: bool,
     ) -> Result<(devmgr::PciClaim, Vec<u64>), Status> {
         let res = self.res;
         let pci = self.pci.as_mut().ok_or(Status::NoDevice)?;
@@ -1229,7 +1124,12 @@ impl DevMgr {
             cfg: d.cfg,
             maps: &d.maps,
         };
-        let mut c = match pcicore::claim::claim(
+        let claim_or_reclaim = if reclaim {
+            pcicore::claim::reclaim
+        } else {
+            pcicore::claim::claim
+        };
+        let mut c = match claim_or_reclaim(
             plan,
             &m,
             &f.bars,
@@ -1252,19 +1152,13 @@ impl DevMgr {
                 return Err("the BAR VMO");
             }
             give.push(bar_vmo.a1 as u64);
-            let drv = sys::handle_duplicate(
-                c.domain,
-                Rights::IO_MAP.0 | Rights::IO_UNMAP.0 | Rights::TRANSFER.0,
-            );
+            let drv = sys::handle_duplicate(c.domain, who.domain_rights().0);
             if drv.status != 0 {
-                return Err("the driver's domain handle");
+                return Err("the claimant's domain handle");
             }
             give.push(drv.a1 as u64);
             for &(_, h) in &c.irqs {
-                let r = sys::handle_duplicate(
-                    h,
-                    Rights::WAIT.0 | Rights::MANAGE.0 | Rights::TRANSFER.0,
-                );
+                let r = sys::handle_duplicate(h, who.irq_rights().0);
                 if r.status != 0 {
                     return Err("an interrupt handle");
                 }
@@ -1281,7 +1175,11 @@ impl DevMgr {
             notify_multiplier: l.notify_multiplier,
             isr: (l.isr.offset as u32, l.isr.len as u32),
             device_cfg: l.device.map_or((0, 0), |r| (r.offset as u32, r.len as u32)),
-            dma_pages: plan.dma_pages.to_vec(),
+            dma_pages: if reclaim {
+                Vec::new()
+            } else {
+                plan.dma_pages.to_vec()
+            },
             irqs: c
                 .irqs
                 .iter()
@@ -1322,7 +1220,11 @@ impl DevMgr {
     /// `OpenBlock` of disk `index` (IOMMU10): claim the function for a new driver job, bus mastering on, and `blkd` started in the
     /// job with the claim's handles; the client's end of its service channel, or the status to answer.
     fn open_block(&mut self, index: u16) -> Result<u64, Status> {
-        let disks = self.pci.as_ref().map(Pci::disks).unwrap_or_default();
+        let disks = self
+            .pci
+            .as_ref()
+            .map(|p| p.of_class(&pcicore::claim::BLOCK))
+            .unwrap_or_default();
         let &i = disks.get(usize::from(index)).ok_or(Status::NoDevice)?;
         if self
             .pci
@@ -1340,8 +1242,13 @@ impl DevMgr {
             return Err(Status::Failed);
         }
         let job = job.a1 as u64;
-        let (claim, handles) = match self.claim_function(i, job, Owner::Driver { process: 0, job })
-        {
+        let (claim, handles) = match self.claim_function(
+            i,
+            job,
+            Owner::Driver { process: 0, job },
+            Claimant::Driver,
+            false,
+        ) {
             Ok(c) => c,
             Err(st) => {
                 sys::handle_close(job);
@@ -1451,16 +1358,6 @@ impl DevMgr {
                 }
             }
         }
-        for r in &mut self.rngs {
-            if r.claim.as_ref().is_some_and(|(k, _)| *k == key) {
-                r.release();
-            }
-        }
-        for n in &mut self.nets {
-            if n.claim.as_ref().is_some_and(|(k, _)| *k == key) {
-                n.release();
-            }
-        }
     }
 
     /// The manager is ending: each driver it started is killed and waited for (one that does not end in two seconds is said on the
@@ -1513,39 +1410,6 @@ pub fn app_main() -> i32 {
     let Ok(nodes) = kcore::fdt::parse(&blob) else {
         return 5;
     };
-    // the virtio-mmio slots that are a network or an entropy device (until IOMMU11), lowest address first (the device tree lists
-    // the slots in no promised order); a disk is a PCI function (IOMMU10), and a block device in a virtio-mmio slot is not served
-    let mut nets: Vec<Net> = Vec::new();
-    let mut rngs: Vec<Rng> = Vec::new();
-    let mut slots = kcore::fdt::virtio_mmio(&nodes);
-    slots.sort_by_key(|s| s.base);
-    for slot in slots {
-        if slot.size != 4096 {
-            continue;
-        }
-        let va = mmio_va(nets.len() + rngs.len());
-        // the device's interrupt (the AIA is required, PL6); a source the kernel will not give (taken already) leaves the device without one
-        let irq_of = || {
-            let i = sys::interrupt_create(res, slot.irq);
-            (i.status == 0).then_some(i.a1 as u64)
-        };
-        if let Some(mmio) = probe(res, me, slot.base, va, ID_NET) {
-            nets.push(Net {
-                va,
-                base: slot.base,
-                mmio,
-                irq: irq_of(),
-                claim: None,
-            });
-        } else if let Some(mmio) = probe(res, me, slot.base, va, ID_RNG) {
-            rngs.push(Rng {
-                va,
-                base: slot.base,
-                mmio,
-                claim: None,
-            });
-        }
-    }
     // the real-time clocks (a goldfish RTC on QEMU `virt`): a VMO of each one's register page, kept for claims
     let mut rtcs: Vec<u64> = Vec::new();
     for n in nodes
@@ -1581,8 +1445,6 @@ pub fn app_main() -> i32 {
         ),
         res,
         drivers,
-        nets,
-        rngs,
         rtcs,
         image,
         pci,
@@ -1596,12 +1458,6 @@ pub fn app_main() -> i32 {
         None => return 3,
     }
     let code = service::run(&mut mgr);
-    for n in &mut mgr.nets {
-        n.release();
-    }
-    for r in &mut mgr.rngs {
-        r.release();
-    }
     // the last client is gone (or the manager failed): the drivers end first, then every claim is released
     mgr.end_drivers();
     code

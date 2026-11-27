@@ -7,6 +7,10 @@
 //! message carries one handle: the client's end of the block protocol channel (`proto::blk`). For each open the manager claims the
 //! function afresh (a new domain, new grants) and starts `blkd` in a job of its own; when the driver ends, however it ends, the
 //! claim is released (IOMMU-SPEC 10.1, 10.2), and an open of the device meanwhile is `Busy`.
+//!
+//! Every DMA device is a PCI function behind the IOMMU (IOMMU11: the network and entropy devices too; only the real-time clock, which
+//! does no DMA, is still a page of device memory). Each claim (`ClaimPci`, `ClaimNet`, `ClaimRng`) is IOMMU-SPEC 9's: it carries the
+//! job that pays, its reply names no address, and bus mastering comes on only after it, announced by a second message.
 
 use crate::{rd_u16, rd_u32};
 use alloc::vec::Vec;
@@ -15,22 +19,32 @@ pub const OP_OPEN_BLOCK: u16 = 1;
 /// Connect another client: the request carries one handle, the new client's end of a channel, and the manager
 /// serves it as one more connection (slice DM). Same layout as OpenBlock; `index` must be 0.
 pub const OP_CONNECT: u16 = 2;
-/// Claim virtio network device number `index` (S8, NET-SPEC 4.3): same request layout as `OpenBlock`. The reply is a
-/// [`NetClaim`] and carries the handles in [`NET_CLAIM_HANDLES`] order. Released when the claimant's connection closes.
+/// Claim virtio network function number `index` (S8, NET-SPEC 4.3 as amended 2026-11-25; IOMMU11): `index` counts the claimable
+/// `virtio-net-pci` functions of bus 0 in ascending requester id. Same request layout as `OpenBlock`, carrying exactly one handle:
+/// **the job that pays** (MANAGE and SET_LIMITS), as `ClaimPci`'s driver job: the manager sets its finite I/O limits and charges it
+/// the device's domain and the three DMA VMOs (`vmo_create_dma_in`), and the network driver runs in it. The claim is that of
+/// IOMMU-SPEC 9 with one difference: the claimant is the network **supervisor** (`netsup`), not the driver, so the reply's domain
+/// handle is the **control** handle (IO_MAP, IO_UNMAP, IO_DESTROY, WAIT and INSPECT for its faults, DUPLICATE, TRANSFER: never
+/// IO_GRANT, which stays with the manager that programs the MSI-X table) and the interrupt
+/// handles can be duplicated (the supervisor hands the driver duplicates). The reply is a [`PciClaim`] in `ClaimPci`'s encoding, the
+/// handles in its order: the BAR VMO, the domain, the DMA VMOs in [`NET_DMA_QUEUE`], [`NET_DMA_RX`], [`NET_DMA_TX`] order (each with
+/// every VMO right and `DMA`), one interrupt per vector (the configuration change, receive, transmit). Bus mastering comes on after
+/// the reply, then the manager sends `txid | Ok` ([`decode_claim_pci_started`]). Released (bus mastering off, the device reset, the
+/// domain destroyed) when the claimant's connection closes. A function claimed already is `Busy`, an index past the last
+/// `NoDevice`.
 pub const OP_CLAIM_NET: u16 = 3;
-/// A `ClaimNet` reply: `txid u32 | status i32 | flags u32 | rx_pages u32 | tx_pages u32 | queue_pages u32`.
-pub const NET_CLAIM_REPLY_LEN: usize = 24;
-/// Flag: the last handle is the device's interrupt.
-pub const NET_FLAG_IRQ: u32 = 1;
-/// The handles of a successful claim, in order: the MMIO VMO (read-write), the receive-pool DMA VMO, the
-/// transmit-pool DMA VMO, the virtqueue DMA VMO (each with the DMA right) and, if `NET_FLAG_IRQ`, the interrupt.
-pub const NET_CLAIM_HANDLES: usize = 4;
-/// Claim virtio entropy device number `index` (S9 step 5): same request layout. The reply is a [`RngClaim`] and carries the
-/// handles in [`RNG_CLAIM_HANDLES`] order (the MMIO VMO, then the DMA VMO). Released when the claimant's connection closes.
+/// The DMA VMOs of a network claim, by position in [`PciClaim::dma_pages`] (`pcicore::claim::NET`): the virtqueues (two pages, one
+/// per queue), the receive pool and the transmit pool (64 pages each).
+pub const NET_DMA_QUEUE: usize = 0;
+pub const NET_DMA_RX: usize = 1;
+pub const NET_DMA_TX: usize = 2;
+/// Claim virtio entropy function number `index` (S9 step 5; IOMMU11): `index` counts the claimable `virtio-rng-pci` functions in
+/// ascending requester id. The request carries exactly one handle, the job that pays, as `OpenBlock`'s layout and `ClaimNet`'s job.
+/// The claimant **is** the driver (`rngd`) and the manager its supervisor, so the reply is exactly `ClaimPci`'s: a [`PciClaim`] with the
+/// BAR VMO, the driver's duplicate of the domain with IO_MAP and IO_UNMAP only, the two DMA VMOs (the queue page and the page the
+/// device fills: `pcicore::claim::ENTROPY`) and the interrupt of queue 0; then `txid | Ok` once bus mastering is on. Released when the
+/// claimant's connection closes.
 pub const OP_CLAIM_RNG: u16 = 4;
-/// A `ClaimRng` reply: `txid u32 | status i32 | flags u32 | dma_pages u32`.
-pub const RNG_CLAIM_REPLY_LEN: usize = 16;
-pub const RNG_CLAIM_HANDLES: usize = 2;
 /// Claim the real-time clock device number `index` (the wall clock, FS-SPEC section 7; a `google,goldfish-rtc` on QEMU `virt`):
 /// same request layout. The reply is a plain [`Status`] reply and, for `Ok`, carries one handle: a **read-only** VMO of the
 /// device's register page. Any number of clients may hold one (reading the time changes nothing).
@@ -53,6 +67,21 @@ pub const OP_LIST_PCI: u16 = 6;
 /// fetch from a queue while bus mastering is off, and nothing fetches again when it comes on). The claim is released (bus mastering
 /// off, the device reset, the domain destroyed) when the claimant's connection closes.
 pub const OP_CLAIM_PCI: u16 = 7;
+/// **Re-claim** network function number `index` after its driver died (IOMMU-SPEC 10.2 and 10.4; NET-SPEC amendment 2026-11-25
+/// part 4; OD166 point 2: nothing is mapped once and kept across driver lifetimes). Only on the connection that holds the function's
+/// `ClaimNet`, and carrying exactly one handle: the same job (its koid must be the claim's). The manager tears the old claim down in
+/// the order of a release (MSI-X masked and off, bus mastering off, the device reset, the old domain destroyed: its mappings and its
+/// vectors go with it) and claims the function afresh for the same job: the same finite limits, a **new domain** and **new vector
+/// grants**, the MSI-X table programmed again. It makes **no** DMA VMO: the pools are the supervisor's and survive, and the new driver
+/// maps them into the new domain itself. The reply is a [`PciClaim`] like `ClaimNet`'s with an empty `dma_pages` (handles: the BAR
+/// VMO, the new domain's control handle, the new interrupts), followed by `txid | Ok` once bus mastering is on again. A function the
+/// connection does not hold is `BadRequest`; a re-claim that fails leaves the function released (`Failed`): the supervisor can claim
+/// it again with `ClaimNet`.
+///
+/// (The shape is settled here, IOMMU11: an operation of its own rather than a drop and a `ClaimNet`, because the DMA VMOs, which the
+/// claimant holds across driver lifetimes, are made once by the first claim and must not be made again, and the claim must not be
+/// lost to another client between the drop and the new claim.)
+pub const OP_RECLAIM_NET: u16 = 8;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
 
@@ -452,7 +481,7 @@ pub fn decode_request(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
     }
 }
 
-/// Ask for network device number `index` (lowest slot address first).
+/// Ask for entropy function number `index` (the request carries the paying job: [`OP_CLAIM_RNG`]).
 pub fn encode_claim_rng(txid: u32, index: u16) -> Vec<u8> {
     let mut b = Vec::with_capacity(REQUEST_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
@@ -470,39 +499,6 @@ pub fn decode_claim_rng(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
         (Some(t), Some(i)) => Ok((t, i)),
         _ => Err(None),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RngClaim {
-    pub flags: u32,
-    pub dma_pages: u32,
-}
-
-pub fn encode_claim_rng_reply(txid: u32, status: Status, c: &RngClaim) -> Vec<u8> {
-    let mut b = Vec::with_capacity(RNG_CLAIM_REPLY_LEN);
-    b.extend_from_slice(&txid.to_le_bytes());
-    b.extend_from_slice(&(status as i32).to_le_bytes());
-    b.extend_from_slice(&c.flags.to_le_bytes());
-    b.extend_from_slice(&c.dma_pages.to_le_bytes());
-    b
-}
-
-pub fn decode_claim_rng_reply(b: &[u8]) -> Option<(u32, Status, Option<RngClaim>)> {
-    if b.len() == REPLY_LEN {
-        let (t, s) = decode_reply(b)?;
-        return Some((t, s, None));
-    }
-    if b.len() != RNG_CLAIM_REPLY_LEN {
-        return None;
-    }
-    Some((
-        rd_u32(b, 0)?,
-        Status::from_i32(rd_u32(b, 4)? as i32)?,
-        Some(RngClaim {
-            flags: rd_u32(b, 8)?,
-            dma_pages: rd_u32(b, 12)?,
-        }),
-    ))
 }
 
 pub fn encode_claim_rtc(txid: u32, index: u16) -> Vec<u8> {
@@ -524,6 +520,7 @@ pub fn decode_claim_rtc(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
     }
 }
 
+/// Ask for network function number `index` (the request carries the paying job: [`OP_CLAIM_NET`]).
 pub fn encode_claim_net(txid: u32, index: u16) -> Vec<u8> {
     let mut b = Vec::with_capacity(REQUEST_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
@@ -544,44 +541,25 @@ pub fn decode_claim_net(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
     }
 }
 
-/// The sizes a claim reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NetClaim {
-    pub flags: u32,
-    pub rx_pages: u32,
-    pub tx_pages: u32,
-    pub queue_pages: u32,
-}
-
-pub fn encode_claim_net_reply(txid: u32, status: Status, c: &NetClaim) -> Vec<u8> {
-    let mut b = Vec::with_capacity(NET_CLAIM_REPLY_LEN);
+/// Re-claim network function number `index` ([`OP_RECLAIM_NET`]; the request carries the claim's job).
+pub fn encode_reclaim_net(txid: u32, index: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
-    b.extend_from_slice(&(status as i32).to_le_bytes());
-    for v in [c.flags, c.rx_pages, c.tx_pages, c.queue_pages] {
-        b.extend_from_slice(&v.to_le_bytes());
-    }
+    b.extend_from_slice(&OP_RECLAIM_NET.to_le_bytes());
+    b.extend_from_slice(&index.to_le_bytes());
     b
 }
 
-/// A `ClaimNet` reply, or the plain 8-byte error reply (`Err` carries it).
-pub fn decode_claim_net_reply(b: &[u8]) -> Option<(u32, Status, Option<NetClaim>)> {
-    if b.len() == REPLY_LEN {
-        let (t, s) = decode_reply(b)?;
-        return Some((t, s, None));
+/// `Ok((txid, index))` for a well-formed `ReclaimNet` request; `Err(txid if there was one)` otherwise.
+pub fn decode_reclaim_net(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_RECLAIM_NET) {
+        return Err(txid);
     }
-    if b.len() != NET_CLAIM_REPLY_LEN {
-        return None;
+    match (txid, rd_u16(b, 6)) {
+        (Some(t), Some(i)) => Ok((t, i)),
+        _ => Err(None),
     }
-    Some((
-        rd_u32(b, 0)?,
-        Status::from_i32(rd_u32(b, 4)? as i32)?,
-        Some(NetClaim {
-            flags: rd_u32(b, 8)?,
-            rx_pages: rd_u32(b, 12)?,
-            tx_pages: rd_u32(b, 16)?,
-            queue_pages: rd_u32(b, 20)?,
-        }),
-    ))
 }
 
 pub fn encode_reply(txid: u32, status: Status) -> Vec<u8> {
@@ -632,22 +610,10 @@ mod tests {
         assert_eq!(decode_claim_rng(&encode_claim_net(7, 1)), Err(Some(7)));
         assert_eq!(decode_claim_net(&encode_claim_rng(7, 1)), Err(Some(7)));
         assert_eq!(decode_claim_rng(&[1, 2]), Err(None));
-        let c = RngClaim {
-            flags: 0,
-            dma_pages: 2,
-        };
-        let r = encode_claim_rng_reply(9, Status::Ok, &c);
-        assert_eq!(r.len(), RNG_CLAIM_REPLY_LEN);
-        assert_eq!(decode_claim_rng_reply(&r), Some((9, Status::Ok, Some(c))));
-        assert_eq!(
-            decode_claim_rng_reply(&encode_reply(9, Status::NoDevice)),
-            Some((9, Status::NoDevice, None))
-        );
-        assert_eq!(decode_claim_rng_reply(&r[..15]), None);
     }
 
     #[test]
-    fn claim_net_golden_and_round_trip() {
+    fn claim_net_and_reclaim_golden_and_round_trip() {
         assert_eq!(encode_claim_net(7, 1), [7, 0, 0, 0, 3, 0, 1, 0]);
         assert_eq!(decode_claim_net(&encode_claim_net(7, 1)), Ok((7, 1)));
         assert_eq!(
@@ -662,22 +628,43 @@ mod tests {
         );
         assert_eq!(decode_claim_net(&[1, 2]), Err(None));
         assert_eq!(decode_claim_net(&[5, 0, 0, 0, 3, 0, 0, 0, 0]), Err(Some(5)));
-        let c = NetClaim {
-            flags: NET_FLAG_IRQ,
-            rx_pages: 64,
-            tx_pages: 64,
-            queue_pages: 2,
+        assert_eq!(encode_reclaim_net(9, 0), [9, 0, 0, 0, 8, 0, 0, 0]);
+        assert_eq!(decode_reclaim_net(&encode_reclaim_net(9, 2)), Ok((9, 2)));
+        assert_eq!(decode_reclaim_net(&encode_claim_net(9, 2)), Err(Some(9)));
+        assert_eq!(decode_claim_net(&encode_reclaim_net(9, 2)), Err(Some(9)));
+        assert_eq!(decode_reclaim_net(&[9, 0, 0, 0, 8, 0, 0]), Err(Some(9)));
+        assert_eq!(decode_reclaim_net(&[9, 0]), Err(None));
+        // the reply of a re-claim is a claim with no DMA VMO: the BAR, the domain and the interrupts
+        let c = PciClaim {
+            vendor: 0x1af4,
+            device: 0x1041,
+            bar_bytes: 0x4000,
+            common: (0, 0x38),
+            notify: (0x3000, 0x1000),
+            notify_multiplier: 4,
+            isr: (0x1000, 1),
+            device_cfg: (0x2000, 0x20),
+            dma_pages: alloc::vec![],
+            irqs: alloc::vec![
+                PciIrq {
+                    entry: 0,
+                    what: IRQ_CONFIG
+                },
+                PciIrq { entry: 1, what: 0 },
+                PciIrq { entry: 2, what: 1 },
+            ],
         };
-        let r = encode_claim_net_reply(9, Status::Ok, &c);
-        assert_eq!(r.len(), NET_CLAIM_REPLY_LEN);
-        assert_eq!(decode_claim_net_reply(&r), Some((9, Status::Ok, Some(c))));
+        let r = encode_claim_pci_reply(9, &c).unwrap();
         assert_eq!(
-            decode_claim_net_reply(&encode_reply(9, Status::NoDevice)),
-            Some((9, Status::NoDevice, None)),
-            "an error is the short reply"
+            decode_claim_pci_reply(&r),
+            Some((9, Status::Ok, Some(c.clone())))
         );
-        assert_eq!(decode_claim_net_reply(&[0; 12]), None);
-        assert_eq!(decode_claim_net_reply(&r[..23]), None);
+        assert_eq!(c.handles(), 5);
+        assert_eq!(
+            c.irq(1),
+            Some((4, 2)),
+            "the transmit interrupt follows the domain"
+        );
     }
 
     #[test]
