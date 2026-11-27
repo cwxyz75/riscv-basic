@@ -2755,15 +2755,47 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
             proto::devmgr::Status::BadRequest,
             "ClaimRng on a connection bound to no job"
         );
-        let side = job(sj, u64::MAX, u64::MAX, u64::MAX)?;
-        let req = proto::devmgr::encode_claim_rng(4, 0);
-        sys::channel_write(mine, req.as_ptr(), req.len(), &side, 1);
-        ensure_eq!(
-            devmgr_status(mine, 4)?,
-            proto::devmgr::Status::BadRequest,
-            "ClaimRng naming a job"
-        );
-        let (gj, rng_dm) = rngd_job_and_conn(sj, mine, 5)?;
+        // and on a bound connection a claim that names a job, of either kind, is refused too
+        let (scratch, bound) = rngd_job_and_conn(sj, mine, 4)?;
+        let refused = (|| -> Outcome {
+            for (txid, req) in [
+                (1u32, proto::devmgr::encode_claim_rng(1, 0)),
+                (2, proto::devmgr::encode_claim_pci(2, RNG_RID)),
+            ] {
+                let side = job(sj, u64::MAX, u64::MAX, u64::MAX)?;
+                if sys::channel_write(bound, req.as_ptr(), req.len(), &side, 1).status != 0 {
+                    sys::handle_close(side);
+                    return Err(msg_at(line!()));
+                }
+                ensure_eq!(
+                    devmgr_status(bound, txid)?,
+                    proto::devmgr::Status::BadRequest,
+                    "a claim naming a job on a bound connection"
+                );
+            }
+            Ok(())
+        })();
+        sys::handle_close(bound);
+        sys::handle_close(scratch);
+        refused?;
+        // Connect with three handles, or with a second that is not a job, is refused
+        for (txid, with_job) in [(5u32, true), (6, false)] {
+            let (a, b) = channel()?;
+            let mut hs = vec![b];
+            if with_job {
+                hs.push(job(sj, u64::MAX, u64::MAX, u64::MAX)?);
+            }
+            hs.push(ok(sys::event_create(), "an event")?.a1 as u64);
+            let status = connect_with(mine, txid, &hs)?;
+            sys::handle_close(a);
+            ensure_eq!(
+                status,
+                proto::devmgr::Status::BadRequest,
+                "Connect with {} handles",
+                hs.len()
+            );
+        }
+        let (gj, rng_dm) = rngd_job_and_conn(sj, mine, 9)?;
         gj_ch = gj;
         let rng = spawn_prog(
             bi,

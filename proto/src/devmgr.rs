@@ -24,7 +24,10 @@ pub const OP_OPEN_BLOCK: u16 = 1;
 /// DUPLICATE), binds the new connection to it. The one who connects (the driver's starter) has made that job for the driver and
 /// starts the driver in it; the driver gets only the connection, never a handle to its own job. A bound connection's claims carry
 /// no handle and are made for the bound job, so the manager's finite limits and the charge fall on the job the driver runs in, and
-/// a driver cannot name a side job of its own making instead. The manager keeps the job handle as long as the connection.
+/// a driver cannot name a side job of its own making instead; a claim that names a job (`ClaimPci`, `ClaimNet`, `ReclaimNet`) is
+/// refused on a bound connection. The manager keeps the job handle as long as the connection. A claim that carries its job is
+/// made by a supervisor trusted with that job (`netsup` for the network driver, which runs in it and holds no job handle); a driver
+/// that claims for itself gets a bound connection, never a job handle.
 pub const OP_CONNECT: u16 = 2;
 /// Claim virtio network function number `index` (S8, NET-SPEC 4.3 as amended 2026-11-25; IOMMU11): `index` counts the claimable
 /// `virtio-net-pci` functions of bus 0 in ascending requester id. Same request layout as `OpenBlock`, carrying exactly one handle:

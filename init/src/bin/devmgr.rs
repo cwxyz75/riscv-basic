@@ -820,8 +820,8 @@ impl Service for DevMgr {
             m.get(..4)
                 .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
-        // Connect carries exactly one handle (the new client's end); OpenBlock carries none. Anything else
-        // is refused, and whatever came is closed (authority we did not ask for).
+        // Connect carries the new client's end and, to bind the new connection to a driver's job, that job (IOMMU11); OpenBlock and
+        // ClaimRng carry none. Anything else is refused, and whatever came is closed (authority we did not ask for).
         if devmgr::op_of(msg) == Some(devmgr::OP_CONNECT) {
             let Ok(txid) = devmgr::decode_connect(msg) else {
                 for &h in hs {
@@ -829,8 +829,15 @@ impl Service for DevMgr {
                 }
                 return self.reply(key, txid_of(msg), Status::BadRequest, None);
             };
-            // (a second handle binds the new connection to a driver's job: it must be a job we can limit and charge)
-            let job_ok = |j: u64| sys::job_info(j, 12).status == 0;
+            // (a second handle binds the new connection to a driver's job: it must be a job, which we inspect and duplicate for each
+            // claim; MANAGE and SET_LIMITS are checked by the claim itself, which fails cleanly without them)
+            let job_ok = |j: u64| {
+                let d = sys::handle_duplicate(j, Rights::SAME.0);
+                if d.status == 0 {
+                    sys::handle_close(d.a1 as u64);
+                }
+                sys::job_info(j, 12).status == 0 && d.status == 0
+            };
             if hs.is_empty() || hs.len() > 2 || (hs.len() == 2 && !job_ok(hs[1])) {
                 for &h in hs {
                     sys::handle_close(h);
@@ -856,10 +863,12 @@ impl Service for DevMgr {
                 }
             };
         }
+        // a connection bound to a driver's job claims only for that job: a claim that names a job there is refused (IOMMU11)
+        let bound_here = self.bound.iter().any(|b| b.0 == key);
         // ClaimPci carries exactly one handle: the driver's job
         if devmgr::op_of(msg) == Some(devmgr::OP_CLAIM_PCI) {
             return match (devmgr::decode_claim_pci(msg), hs) {
-                (Ok((txid, rid)), &[job]) => self.claim_pci(key, txid, rid, job),
+                (Ok((txid, rid)), &[job]) if !bound_here => self.claim_pci(key, txid, rid, job),
                 (r, _) => {
                     for &h in hs {
                         sys::handle_close(h);
@@ -871,7 +880,7 @@ impl Service for DevMgr {
                 }
             };
         }
-        // ClaimNet, ClaimRng and ReclaimNet carry exactly one handle too: the job that pays (IOMMU11)
+        // ClaimNet and ReclaimNet carry exactly one handle too: the job that pays (IOMMU11); ClaimRng none (the bound job)
         let by_class = match devmgr::op_of(msg) {
             Some(devmgr::OP_CLAIM_NET) => Some((devmgr::decode_claim_net(msg), ByClass::ClaimNet)),
             Some(devmgr::OP_CLAIM_RNG) => Some((devmgr::decode_claim_rng(msg), ByClass::ClaimRng)),
@@ -904,7 +913,9 @@ impl Service for DevMgr {
         }
         if let Some((r, what)) = by_class {
             return match (r, hs) {
-                (Ok((txid, index)), &[job]) => self.claim_by_class(key, txid, index, job, what),
+                (Ok((txid, index)), &[job]) if !bound_here => {
+                    self.claim_by_class(key, txid, index, job, what)
+                }
                 (r, _) => {
                     for &h in hs {
                         sys::handle_close(h);
