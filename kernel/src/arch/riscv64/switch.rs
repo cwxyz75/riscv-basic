@@ -77,6 +77,11 @@ impl Context {
         }
         ctx
     }
+
+    /// The return address and stack pointer this context was saved with (a report of where a switched-out thread waits).
+    pub fn saved(&self) -> (u64, u64) {
+        (self.ra, self.sp)
+    }
 }
 
 /// Save the current state in `old` and continue from `new`.

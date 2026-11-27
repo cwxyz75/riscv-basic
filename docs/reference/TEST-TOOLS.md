@@ -81,6 +81,11 @@ kernel stack that point into the kernel's code, innermost first (the panic handl
 here, among a few stale ones). `python3 scripts/resolve_trace.py <kernel ELF> <log file>` names the symbol nearest each address (it needs only
 `nm`); `llvm-addr2line -e <ELF> <addr>` gives the line. It is how a panic whose location is the standard library's (T233) is traced to its caller.
 
+**What outlived init.** When `no_process_or_vmo_survives_init` or `no_kernel_thread_survives_init` fails, the kernel prints `leak:` lines
+first (T278): the live kernel objects by kind, every process left (its state, threads, handles by kind, job), and every thread that was not
+there before init started, with its scheduler state and the kernel-text words on its stack as `[stack ...]` in **link** addresses (KASLR's
+slide taken off), so `resolve_trace.py <ELF> 0x...` names them directly. `OS_SHOW=leak:` prints such lines from a passing run too.
+
 **The harness can see a failure.** `make os-boot-test-fail-demo` boots a kernel built with a deliberate fault and
 requires the harness to fail it; CI runs it when the harness or the Makefile changed.
 

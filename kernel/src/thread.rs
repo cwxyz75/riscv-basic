@@ -1856,6 +1856,117 @@ pub fn thread_count() -> usize {
     irq::off(|| kernel().threads.len())
 }
 
+/// The ids of every thread in the table (a leak test's snapshot, for [`report_threads`]).
+pub fn tids() -> Vec<Tid> {
+    irq::off(|| kernel().threads.keys().copied().collect())
+}
+
+/// How many words of a stack [`report_threads`] prints that look like kernel return addresses.
+const REPORT_TEXT_WORDS: usize = 24;
+
+/// How many threads [`report_threads`] describes (the rest are counted): the scan runs with the thread table held and interrupts off,
+/// so a mass leak must not hold it for long.
+const REPORT_THREADS: usize = 32;
+
+/// One thread, as a leak report shows it: its id, name, process, scheduler state, saved return address, whether it is running on a
+/// hart or in transit (switched away from, its context not yet saved), and the words on its stack that are addresses in the kernel's
+/// text (the callers of where it waits). They are printed as linked (KASLR's slide taken off), so `llvm-addr2line -e <kernel ELF>` or
+/// `scripts/resolve_trace.py` names them as they are.
+struct ThreadReport {
+    tid: Tid,
+    name: &'static str,
+    pid: Option<u64>,
+    state: Option<State>,
+    ra: u64,
+    on_hart: bool,
+    in_transit: bool,
+    text: Vec<u64>,
+}
+
+/// Print every thread not in `skip` (a leak test's failure report, T278: a thread that survived names itself and where it waits), at
+/// most [`REPORT_THREADS`] of them. A thread running on a hart or in transit is named but its stack is not read (its saved context is
+/// stale or half written).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: addresses inside one kernel stack, read a word at a time; counts far below usize::MAX
+#[allow(clippy::large_stack_frames)] // KT13: audited, a failure-only report of the leak checks, run once on the boot thread's stack after init has ended
+pub fn report_threads(skip: &[Tid]) {
+    use core::fmt::Write as _;
+    let (text_lo, text_hi) = crate::kmem::sections().text;
+    let (reports, more): (Vec<ThreadReport>, usize) = irq::off(|| {
+        let sc = sched();
+        let k = kernel();
+        // (read under the thread table: a hart sets its `running` word as it dispatches, under this lock, so the two agree)
+        let running: Vec<Tid> = (0..crate::smp::started())
+            .map(|h| crate::percpu::hart(h).running.load(Ordering::Acquire))
+            .collect();
+        let mut out = Vec::new();
+        let mut more = 0usize;
+        for (&tid, t) in k.threads.iter() {
+            if skip.contains(&tid) {
+                continue;
+            }
+            if out.len() >= REPORT_THREADS {
+                more += 1;
+                continue;
+            }
+            let on_hart = running.contains(&tid);
+            let in_transit = sc.is_in_transit(tid);
+            let (ra, sp) = t.ctx.saved();
+            let mut text = Vec::new();
+            if let (false, false, Some(stack)) = (on_hart, in_transit, t.stack.as_ref()) {
+                let (bottom, top) = (stack.bottom() as u64, stack.top() as u64);
+                let mut a = sp & !7;
+                if a < bottom {
+                    a = bottom;
+                }
+                while a < top && text.len() < REPORT_TEXT_WORDS {
+                    // SAFETY: `a` is word-aligned and inside `[bottom, top)` of a kernel-stack slot, whose pages are mapped read-write for as
+                    // long as the kernel runs (slots are never unmapped, `kstack.rs`), so the read is valid whatever the thread does. If the
+                    // thread was dispatched since the checks above, a concurrent write only makes the word stale, which the report prints as it
+                    // is; the aliasing caveat of reading a live stack is the one `kstack.rs` records under T242.
+                    let w = unsafe { core::ptr::read_volatile(a as *const u64) };
+                    if (text_lo..text_hi).contains(&w) {
+                        text.push(w);
+                    }
+                    a += 8;
+                }
+            }
+            out.push(ThreadReport {
+                tid,
+                name: t.name,
+                pid: t.user.map(|u| u.pid),
+                state: sc.state(tid),
+                ra,
+                on_hart,
+                in_transit,
+                text,
+            });
+        }
+        (out, more)
+    });
+    let slide = crate::arch::slide();
+    let mut con = crate::console::Console;
+    for r in reports {
+        // (one line, one print: the console lock is per print, and another hart's output must not land inside it)
+        let mut line = alloc::format!(
+            "leak: thread {} {:?} pid {:?} state {:?} on a hart {} in transit {} ra {:#x} [stack",
+            r.tid,
+            r.name,
+            r.pid,
+            r.state,
+            r.on_hart,
+            r.in_transit,
+            r.ra.wrapping_sub(slide)
+        );
+        for w in r.text {
+            let _ = write!(line, " {:#x}", w.wrapping_sub(slide));
+        }
+        let _ = writeln!(con, "{line}]");
+    }
+    if more > 0 {
+        let _ = writeln!(con, "leak: and {more} more threads");
+    }
+}
+
 /// How many threads the scheduler core tracks (must equal `thread_count`).
 pub fn sched_thread_count() -> usize {
     irq::off(|| sched().thread_count())
