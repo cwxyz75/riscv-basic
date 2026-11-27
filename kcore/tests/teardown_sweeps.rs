@@ -61,6 +61,23 @@ fn run(seed: u64, n: usize, shared: bool) -> u64 {
             turns < 1_000_000,
             "seed {seed}: the teardowns did not finish"
         );
+        // the living process works meanwhile: it makes objects (born marked while a sweep runs) and moves a handle through a channel
+        // (shaded by the barrier when it lands), so the shared sweeps run against a changing graph
+        match rng.below(8) {
+            0 => {
+                let _ = event_create(&mut reg, &mut living);
+            }
+            1 => {
+                if let Ok((x, y)) = channel_create(&mut reg, &mut living) {
+                    let other = living.handle_values().find(|&h| h != x && h != y);
+                    if let Some(h) = other {
+                        let _ = channel_write(&mut reg, &mut living, x, b"", &[h]);
+                    }
+                    let _ = kcore::ipc::channel_read(&mut reg, &mut living, y, 8, 4);
+                }
+            }
+            _ => {}
+        }
         let i = rng.below(n as u64) as usize;
         if actors[i].done {
             continue;
@@ -116,9 +133,17 @@ fn run(seed: u64, n: usize, shared: bool) -> u64 {
                 actors[i].began = true;
             }
         }
-        // the living table's objects are never freed
-        for id in living.objects() {
-            assert!(reg.get(id).is_some(), "{ctx}: a living object was freed");
+        // nothing the living table reaches is ever freed (its objects, and what they hold in their queues)
+        let mut work: Vec<ObjId> = living.objects().collect();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let obj = reg
+                .get(id)
+                .unwrap_or_else(|| panic!("{ctx}: a living object {id:?} was freed"));
+            kcore::object::Object::held(obj, &mut work);
         }
     }
     reg.sweep_epoch() - start

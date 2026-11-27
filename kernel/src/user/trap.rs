@@ -480,6 +480,13 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             202 => return Ok((Some(crate::heap::faultalloc::count()), None)),
             // 205: run a whole reachability sweep now (a destruction that found no memory leaks its objects until one runs: KT9)
             205 => {
+                // (a sweep already running began before what the caller just dropped: it is finished first, then a fresh one runs, T265)
+                while s.objs.sweep_active()
+                    && !matches!(
+                        s.sweep_slice(SWEEP_SLICE_BUDGET),
+                        kcore::object::SweepStep::Done(_)
+                    )
+                {}
                 s.sweep_start();
                 while s.objs.sweep_active()
                     && !matches!(

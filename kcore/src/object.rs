@@ -186,7 +186,8 @@ enum Phase {
 /// same critical section that finished the drain; `epoch` and `active` are read now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectStep {
-    /// A sweep that began after the drain has finished: the teardown's garbage is gone (or was never there).
+    /// A sweep that began after the drain has ended: it freed the teardown's garbage, unless it ran short of memory (T177: marking
+    /// incomplete, or freeing abandoned), when the garbage floats to the next sweep, as it did before T265 for a teardown's own sweep.
     Covered,
     /// A sweep is running: do a slice of it (one that began after the drain covers this teardown when it ends; an older one must end before
     /// a new one can begin).
