@@ -9,8 +9,9 @@
 //! claim is released (IOMMU-SPEC 10.1, 10.2), and an open of the device meanwhile is `Busy`.
 //!
 //! Every DMA device is a PCI function behind the IOMMU (IOMMU11: the network and entropy devices too; only the real-time clock, which
-//! does no DMA, is still a page of device memory). Each claim (`ClaimPci`, `ClaimNet`, `ClaimRng`) is IOMMU-SPEC 9's: it carries the
-//! job that pays, its reply names no address, and bus mastering comes on only after it, announced by a second message.
+//! does no DMA, is still a page of device memory). Each claim (`ClaimPci`, `ClaimNet`, `ClaimRng`) is IOMMU-SPEC 9's: it names the
+//! job that pays (carried with the request, or, for `ClaimRng`, the job the connection is bound to), its reply names no address, and
+//! bus mastering comes on only after it, announced by a second message.
 
 use crate::{rd_u16, rd_u32};
 use alloc::vec::Vec;
@@ -18,6 +19,15 @@ use alloc::vec::Vec;
 pub const OP_OPEN_BLOCK: u16 = 1;
 /// Connect another client: the request carries one handle, the new client's end of a channel, and the manager
 /// serves it as one more connection (slice DM). Same layout as OpenBlock; `index` must be 0.
+///
+/// **A connection bound to a driver's job** (IOMMU11; IOMMU-SPEC 9 step 2): a second handle, a job (MANAGE, SET_LIMITS, INSPECT,
+/// DUPLICATE), binds the new connection to it. The one who connects (the driver's starter) has made that job for the driver and
+/// starts the driver in it; the driver gets only the connection, never a handle to its own job. A bound connection's claims carry
+/// no handle and are made for the bound job, so the manager's finite limits and the charge fall on the job the driver runs in, and
+/// a driver cannot name a side job of its own making instead; a claim that names a job (`ClaimPci`, `ClaimNet`, `ReclaimNet`) is
+/// refused on a bound connection. The manager keeps the job handle as long as the connection. A claim that carries its job is
+/// made by a supervisor trusted with that job (`netsup` for the network driver, which runs in it and holds no job handle); a driver
+/// that claims for itself gets a bound connection, never a job handle.
 pub const OP_CONNECT: u16 = 2;
 /// Claim virtio network function number `index` (S8, NET-SPEC 4.3 as amended 2026-11-25; IOMMU11): `index` counts the claimable
 /// `virtio-net-pci` functions of bus 0 in ascending requester id. Same request layout as `OpenBlock`, carrying exactly one handle:
@@ -39,7 +49,8 @@ pub const NET_DMA_QUEUE: usize = 0;
 pub const NET_DMA_RX: usize = 1;
 pub const NET_DMA_TX: usize = 2;
 /// Claim virtio entropy function number `index` (S9 step 5; IOMMU11): `index` counts the claimable `virtio-rng-pci` functions in
-/// ascending requester id. The request carries exactly one handle, the job that pays, as `OpenBlock`'s layout and `ClaimNet`'s job.
+/// ascending requester id. `OpenBlock`'s layout, **only on a connection bound to the driver's job** ([`OP_CONNECT`]) and carrying no
+/// handle: the claim is made for the bound job, the one the driver runs in (anything else is `BadRequest`).
 /// The claimant **is** the driver (`rngd`) and the manager its supervisor, so the reply is exactly `ClaimPci`'s: a [`PciClaim`] with the
 /// BAR VMO, the driver's duplicate of the domain with IO_MAP and IO_UNMAP only, the two DMA VMOs (the queue page and the page the
 /// device fills: `pcicore::claim::ENTROPY`) and the interrupt of queue 0; then `txid | Ok` once bus mastering is on. Released when the

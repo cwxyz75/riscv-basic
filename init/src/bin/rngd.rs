@@ -3,15 +3,17 @@
 //! `/svc/random` (`proto::random`). Until it has 32 bytes from the device it answers `NOT_SEEDED`: it never makes bytes up.
 //!
 //! **The device (IOMMU11; IOMMU-SPEC 9).** It is a `virtio-rng-pci` function behind the IOMMU, and `rngd` is its driver: `ClaimRng`
-//! claims it for a job of its own (a child of `Job`, which pays for the domain and the two DMA pages and carries the finite limits the
-//! manager sets), and hands over a VMO over the BAR with the virtio structures, the domain with IO_MAP and IO_UNMAP only, the queue
+//! claims it for **the job `rngd` runs in**: its starter makes that job for `rngd` alone, starts it there, and connects it to the
+//! manager with the connection bound to that job (`Connect` with a job, `proto::devmgr`), so the claim names no job and cannot name
+//! another. That job pays for the domain and the two DMA pages, and the manager sets its finite limits on I/O-mapped pages and
+//! vectors, so they bind the driver itself; `rngd` holds no handle to any job and cannot loosen them. The claim hands over a VMO over the BAR with the virtio structures, the domain with IO_MAP and IO_UNMAP only, the queue
 //! page and the page the device fills (DMA VMOs), and the interrupt of its one queue. `rngd` maps the two pages **into the device's
 //! domain itself**, read-write for the device, and programs the queue with the I/O addresses that came back; it never learns a
 //! physical address. A read completes by the queue's interrupt. The manager is the device's supervisor: it keeps the domain's control
 //! handle, and when `rngd`'s connection closes it turns bus mastering off, resets the function and destroys the domain.
 //!
-//! Handles: `ServiceDevmgr` (to claim the device), `Job` (MANAGE: the job it makes the device's job under), `ServiceRegistry` (a
-//! connection with PUBLISH, to publish `random`).
+//! Handles: `ServiceDevmgr` (a connection bound to the job `rngd` runs in, to claim the device), `ServiceRegistry` (a connection with
+//! PUBLISH, to publish `random`).
 #![no_std]
 #![no_main]
 
@@ -330,15 +332,14 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
-    let (Some(devmgr_ch), Some(job), Some(registry)) = (
+    let (Some(devmgr_ch), Some(registry)) = (
         env.handle(Role::ServiceDevmgr),
-        env.handle(Role::Job),
         env.handle(Role::ServiceRegistry),
     ) else {
         return 3;
     };
     // claim the entropy device (none: the service still runs and answers NOT_SEEDED)
-    let dev = claim_device(devmgr_ch, job);
+    let dev = claim_device(devmgr_ch);
     let p = sys::port_create();
     if p.status != 0 {
         return 5;
@@ -385,17 +386,11 @@ pub fn app_main() -> i32 {
     service::run(&mut d)
 }
 
-/// Claim the entropy device for a job of our own (a child of `job`) and bring it up; `None` if there is none or it does not work.
-fn claim_device(devmgr_ch: u64, job: u64) -> Option<Device> {
-    let dj = sys::job_create(job, &sys::NO_LIMITS);
-    if dj.status != 0 {
-        return None;
-    }
-    let dj = dj.a1 as u64;
+/// Claim the entropy device on our bound connection (for the job we run in) and bring it up; `None` if there is none or it does not
+/// work.
+fn claim_device(devmgr_ch: u64) -> Option<Device> {
     let req = devmgr::encode_claim_rng(1, 0);
-    let sent = sys::channel_write(devmgr_ch, req.as_ptr(), req.len(), &dj, 1).status == 0;
-    if !sent {
-        sys::handle_close(dj);
+    if sys::channel_write(devmgr_ch, req.as_ptr(), req.len(), core::ptr::null(), 0).status != 0 {
         return None;
     }
     let read = |b: &mut [u8], hs: &mut [u64]| {
