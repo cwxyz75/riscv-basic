@@ -2082,10 +2082,46 @@ fn launch_image_with(
 }
 
 fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
-    let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
-    ensure_eq!(r.status, 0, "the process ended");
-    ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
-    Ok(())
+    // (T265: a deadline that a pause of the host covered says nothing about the teardown: a stop of the emulator longer than the wait
+    // times it out however promptly the kernel works, as the host-stall injector shows. A window the pause detector says a pause covered
+    // is waited again, at most three times in a row; a timeout with no pause in its window fails, and says what the detector saw.)
+    // (every hart keeps a deadline near while it waits, so that a stop of the emulator makes two harts late wherever it lands, which is
+    // the detector's rule for a pause: without it an idle hart has no deadline to be late for. A wait that ends at once costs nothing.)
+    let mut covered = 0;
+    loop {
+        let since = sys::clock_ns();
+        // (a timing test that already keeps the heartbeat on keeps it: this wait neither replaces its deadline nor turns it off)
+        let _watch = if WATCH_ON.load(Ordering::SeqCst) {
+            None
+        } else {
+            PauseWatch::start(ticks.saturating_add(100))
+        };
+        let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
+        if r.status == S::TimedOut.code() {
+            if let Some((h, us)) = host_pause_since(since, 2_000) {
+                pause_line("wait_ended", h, us);
+                covered += 1;
+                if covered < 3 {
+                    continue;
+                }
+            }
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut d,
+                format_args!(
+                    "the process ended: got {} (timed out after {ticks} ms; {covered} windows before it covered by a host pause; the \
+                     harts were stopped {} us in this one, summed; signals {:#x})",
+                    r.status,
+                    host_paused_us_since(since),
+                    sys::object_signals(proc).a1
+                ),
+            );
+            return Err(d);
+        }
+        ensure_eq!(r.status, 0, "the process ended");
+        ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
+        return Ok(());
+    }
 }
 
 /// Wait until a thread that a child program started has run its start-up and gone to sleep (its CPU time stops moving). The child's threads all
@@ -20098,14 +20134,22 @@ fn host_pause_watch(ms: u64) -> bool {
 /// check must not leave every hart taking an interrupt a millisecond for the tests after it).
 struct PauseWatch;
 
+/// Whether a [`PauseWatch`] is alive (the kernel's heartbeat is one switch, not a count: an inner watch must not end an outer one).
+static WATCH_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 impl PauseWatch {
     fn start(ms: u64) -> Option<PauseWatch> {
-        host_pause_watch(ms).then_some(PauseWatch)
+        let w = host_pause_watch(ms).then_some(PauseWatch);
+        if w.is_some() {
+            WATCH_ON.store(true, Ordering::SeqCst);
+        }
+        w
     }
 }
 
 impl Drop for PauseWatch {
     fn drop(&mut self) {
+        WATCH_ON.store(false, Ordering::SeqCst);
         let _ = host_pause_watch(0);
     }
 }
@@ -21183,8 +21227,12 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
 
 fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
     let root = root_job()?;
-    let (base, _) = job_use(root, 0)?;
-    let j = job(root, 4, u64::MAX, u64::MAX)?;
+    // (T265: the credit to the ancestors is checked on a parent job of this test's own, not on the root: the root also counts processes
+    // of earlier tests that are still being torn down, and one whose teardown finished during this test made the root's count one lower
+    // than it was at the start, "got 5, want 6", once under a planted pause)
+    let parent = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let (base, _) = job_use(parent, 0)?;
+    let j = job(parent, 4, u64::MAX, u64::MAX)?;
     // the child is one process of the four and makes the other three, then is refused
     let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 32, j)?;
     wait_ended(p, 2000)?;
@@ -21196,9 +21244,9 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
     // everything it made dies with it (never started: closing their last handles ends them)
     job_use_settles(j, 0, 0, 500)?;
     ensure_eq!(
-        job_use(root, 0)?.0,
+        job_use(parent, 0)?.0,
         base,
-        "the root job's count is back where it was"
+        "the parent job's count is back where it was"
     );
     // set_limits works on a live job: raise it and a parent can make processes again
     ok(
@@ -21224,6 +21272,7 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
     ok(sys::process_create_in(j), "room again once usage fell")?;
     sys::handle_close(p);
     sys::handle_close(j);
+    sys::handle_close(parent);
     sys::handle_close(root);
     Ok(())
 }
@@ -21797,7 +21846,32 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         return Err(d);
     }
     // ending the process credits the stack back (everything settles to zero)
-    ensure_eq!(st(sys::process_kill(p, 3)), Some(S::Ok), "kill");
+    let k = sys::process_kill(p, 3);
+    if k.status != 0 {
+        // (T270: BAD_STATE once, before the child was stopped here: say whether it had ended by itself and how)
+        let info = sys::process_info(p);
+        let ti = sys::thread_info(t);
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "kill: status {}, want 0; process_info status {} a1 (exit code) {} a2 {:#x}; process signals {:#x}; thread signals {:#x}, \
+                 thread_info status {} a1 {:#x} a2 {:#x}; pages {} threads {}",
+                k.status,
+                info.status,
+                info.a1 as i64,
+                info.a2,
+                sys::object_signals(p).a1,
+                sys::object_signals(t).a1,
+                ti.status,
+                ti.a1,
+                ti.a2,
+                job_use(j, 2)?.0,
+                job_use(j, 1)?.0
+            ),
+        );
+        return Err(d);
+    }
     wait_ended(p, 1000)?;
     sys::handle_close(t);
     sys::handle_close(p);

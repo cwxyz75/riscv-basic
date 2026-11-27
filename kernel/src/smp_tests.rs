@@ -1033,6 +1033,51 @@ fn churn_thread(_: usize) {
     HI_DONE.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Rounds of [`process_churn`].
+const PROC_CHURN_WANT: u64 = 24;
+/// Rounds [`process_churn`] has finished.
+static PROC_CHURN_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first bad round of [`process_churn`]: `(round + 1) << 40 | mode << 32 | exit code`, 0 while all are good.
+static PROC_CHURN_BAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// T265 (T40's missing process churn): start a `crash` process and end it one of four ways, round after round: it exits (mode 8: 42),
+/// faults (mode 7: a null load), or is killed while it spins (15) or blocks (16), after zero to two ticks, so some kills land before the
+/// process has run. Each round's exit code is checked; the first bad one is kept for the test.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: round < PROC_CHURN_WANT; the packed code fits its fields
+fn process_churn(_: usize) {
+    use crate::user;
+    use abi::arch::fault::{exit_code, PAGE_FAULT};
+    for round in 0..PROC_CHURN_WANT {
+        let (mode, want) = match round % 4 {
+            0 => (8u64, 42),
+            1 => (7, exit_code(PAGE_FAULT)),
+            2 => (15, -3),
+            _ => (16, -4),
+        };
+        let code = match user::start(user::CRASH_ELF, mode) {
+            Ok((pid, tid)) => {
+                if want < 0 && want > -100 {
+                    thread::sleep_ticks(round % 3);
+                    user::end_process(pid, want);
+                }
+                user::finish(pid, tid)
+            }
+            Err(_) => i32::MIN,
+        };
+        if code != want {
+            // (mode 0xff: the process could not be started at all)
+            let m = if code == i32::MIN { 0xff } else { mode };
+            let _ = PROC_CHURN_BAD.compare_exchange(
+                0,
+                ((round + 1) << 40) | (m << 32) | u64::from(code as u32),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        PROC_CHURN_ROUNDS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Several processes churn objects, memory, mappings and threads at once on different harts,
 /// while the boot hart spawns and joins free kernel threads; then every leak oracle must be clean.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
@@ -1046,7 +1091,11 @@ fn smp_churn_stress() -> Result<(), String> {
     for seed in 1..=6u64 {
         procs.push(user::start(user::CRASH_ELF, (seed << 8) | 42).map_err(|e| format!("{e:?}"))?);
     }
-    // meanwhile: kernel-thread churn on free threads
+    // meanwhile: process churn from the kernel (T265: processes that exit, fault, or are killed running or before they ran, while the six
+    // churn their own jobs and never-started processes), and kernel-thread churn on free threads
+    PROC_CHURN_ROUNDS.store(0, Ordering::SeqCst);
+    PROC_CHURN_BAD.store(0, Ordering::SeqCst);
+    let churner = thread::spawn_free("proc churn", 5, process_churn, 0);
     HI_DONE.store(0, Ordering::SeqCst);
     let mut spawned = 0;
     for _ in 0..300 {
@@ -1054,11 +1103,30 @@ fn smp_churn_stress() -> Result<(), String> {
         thread::join(t);
         spawned += 1;
     }
+    thread::join(churner);
+    // (T251: every process is finished and every code reported, so one bad exit does not leave five processes behind to fail the checks after it)
+    let mut bad = alloc::vec::Vec::new();
     for (i, (pid, tid)) in procs.into_iter().enumerate() {
         let code = user::finish(pid, tid);
         if code != 0 {
-            return Err(format!("churn process {} ended with {code}", i + 1));
+            bad.push((i + 1, code));
         }
+    }
+    let churn_bad = PROC_CHURN_BAD.load(Ordering::SeqCst);
+    if !bad.is_empty() || churn_bad != 0 {
+        return Err(format!(
+            "churn processes (number, exit code) {bad:?} ended badly (0 is the only good code; 1100 + s: a map refused with status -s, \
+             1700s: the job churn); the kernel's process churn: {}",
+            if churn_bad == 0 {
+                String::from("all good")
+            } else {
+                let (round, mode, code) = (churn_bad >> 40, (churn_bad >> 32) & 0xff, churn_bad as u32 as i32);
+                format!("round {round} (counted from 1; mode {mode}, 255: the start was refused) ended with {code}")
+            }
+        ));
+    }
+    if PROC_CHURN_ROUNDS.load(Ordering::SeqCst) != PROC_CHURN_WANT {
+        return Err(String::from("the kernel's process churn stopped early"));
     }
     if HI_DONE.load(Ordering::SeqCst) != spawned {
         return Err(String::from("a churn thread was lost"));

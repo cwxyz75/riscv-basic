@@ -45,4 +45,4 @@ shuttle = "0.8"
 iommucore = { path = "../iommucore", features = ["sim"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(kani)"] }

@@ -180,10 +180,38 @@ pub fn init() {
 }
 
 /// Frames held by slots (made and kept): leak checks add this to the free count.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: made is the slot count, at most the window's slots
 pub fn frames_held() -> usize {
-    let made = slots().next as usize;
-    // the stack pages, plus the page-table frames under them: one level-1 table for the window and one
-    // level-0 table per 64 slots (2 MiB of window)
-    made * PAGES as usize + if made == 0 { 0 } else { 1 + made.div_ceil(64) }
+    formula(slots().next as usize)
+}
+
+/// The frames `made` slots hold: the stack pages, plus the page-table frames under them: one level-1 table for the window and one level-0
+/// table per 64 slots (2 MiB of window). The arithmetic is `kcore::kwindow::stack_window`, proved by Kani against a page-by-page count.
+fn formula(made: usize) -> usize {
+    usize::try_from(kcore::kwindow::stack_window(
+        made as u64,
+        PAGES,
+        KSTACK_SLOT_BYTES,
+    ))
+    .unwrap_or(usize::MAX)
+}
+
+/// T227's walk oracle for the stack window: `(walked, formula)`, the frames the kernel's table holds under the window (its tables and its
+/// leaves, `PageTable::frames_in_range`) and what [`frames_held`] derives from the slot counter, read under the slot lock and the kernel
+/// table's lock, so no slot is half made. Equal unless a path maps or leaves a frame there that the formula does not count.
+#[cfg(any(not(feature = "release"), feature = "release-suite"))] // (the leak checks of `user_tests` and the boot self-tests)
+pub fn frames_walked() -> (usize, usize) {
+    let s = slots();
+    let _kpt = crate::kmem::KPT.lock();
+    let k = crate::kmem::frames();
+    let walked = crate::kmem::kernel_table()
+        .frames_in_range(
+            k.mm,
+            KSTACK_WINDOW_BASE,
+            KSTACK_WINDOW_BASE.wrapping_add(KSTACK_WINDOW_SIZE),
+        )
+        .total();
+    (
+        usize::try_from(walked).unwrap_or(usize::MAX),
+        formula(s.next as usize),
+    )
 }

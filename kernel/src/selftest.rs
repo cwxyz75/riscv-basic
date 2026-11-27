@@ -850,6 +850,10 @@ pub const TESTS: &[Test] = &[
     ),
     ("heap_works", heap_works),
     ("frame_database_is_sane", frame_database_is_sane),
+    (
+        "kernel_windows_hold_what_their_formulas_say",
+        crate::user_tests::windows_hold_what_their_formulas_say,
+    ),
     ("lazy_commit_on_read", lazy_commit_on_read),
     ("lazy_commit_on_write", lazy_commit_on_write),
     ("unmapped_region_is_gone", unmapped_region_is_gone),

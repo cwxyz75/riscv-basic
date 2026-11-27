@@ -764,17 +764,24 @@ pub fn kernel_half_unchanged() -> bool {
 pub fn free_frames_accounted() -> usize {
     // (the four counts are read one after another, and an idle hart's heap service moves frames between them with no common lock: the sum is read until two
     // reads agree)
+    // (T227: and only a sum read while no frame was in hand between the heap's pool and a hart's cache, with no such move finished during the
+    // read: such a move takes a frame out of one term and puts it in another, and with the terms read at different moments it could be
+    // counted twice or not at all)
     let read = || {
+        let before = crate::heap::pool_moves();
         let free = get().mm.db.free_count(); // (the locks are released before the calls below)
-        free + cached_frames() + crate::kstack::frames_held() + crate::heap::frames_held()
+        let sum =
+            free + cached_frames() + crate::kstack::frames_held() + crate::heap::frames_held();
+        let quiet = before.1 == 0 && crate::heap::pool_moves() == before;
+        (sum, quiet)
     };
     let mut last = read();
     for _ in 0..1000 {
         let now = read();
-        if now == last {
-            return now;
+        if now.1 && now == last {
+            return now.0;
         }
         last = now;
     }
-    last
+    last.0
 }

@@ -267,10 +267,12 @@ fn request_kill_held(pid: u64, code: i32) {
         let r = match s.procs.get_mut(&pid) {
             Some(p) if p.state == ProcState::Created => {
                 p.exit_code = Some(code);
+                super::dying::note(pid, super::dying::Stage::Ending);
                 true
             }
             Some(p) => {
                 p.killed.get_or_insert(code);
+                super::dying::note(pid, super::dying::Stage::Ending);
                 bump_attention();
                 false
             }

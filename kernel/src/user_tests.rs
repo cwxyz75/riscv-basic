@@ -30,6 +30,48 @@ fn frame_terms() -> (usize, usize, usize, usize) {
     )
 }
 
+/// What else a frame leak report says (T227): the per-hart frame-cache fill, a frame the heap's pool has in hand, the kernel stacks in use,
+/// the threads that have exited and still hold a stack, the FP and vector state records, and the walk oracle of both windows
+/// ([`windows_walked`]). Read after the terms, so a moving count is seen as such.
+fn frame_extras() -> String {
+    let fill: alloc::vec::Vec<usize> = (0..crate::smp::started().max(1))
+        .map(|i| crate::percpu::hart(i).frame_cache.len())
+        .collect();
+    let (stacks, heap) = windows_walked();
+    format!(
+        "per-hart frame caches {fill:?}, in transit {}, kernel stacks live {}, exited threads not reaped {}, FP and vector records {}; \
+         walked and formula: stack window {stacks:?}, heap window {heap:?}",
+        crate::heap::in_transit(),
+        crate::kstack::LIVE.load(core::sync::atomic::Ordering::Relaxed),
+        thread::exited_unreaped(),
+        crate::fp::entry_count(),
+    )
+}
+
+/// T227's walk oracle: `(walked, formula)` for the kernel-stack window and the heap window, with interrupts off (`kstack::frames_walked`,
+/// `heap::window_frames_walked`).
+pub fn windows_walked() -> ((usize, usize), (usize, usize)) {
+    crate::irq::without(|| {
+        (
+            crate::kstack::frames_walked(),
+            crate::heap::window_frames_walked(),
+        )
+    })
+}
+
+/// The walk oracle as a check: both windows hold exactly what their formulas say (the leak oracle counts the formulas, so a frame a path
+/// leaves in a window uncounted would read as a leak, or hide one).
+pub fn windows_hold_what_their_formulas_say() -> Outcome {
+    let (stacks, heap) = windows_walked();
+    if stacks.0 == stacks.1 && heap.0 == heap.1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "walked and formula: stack window {stacks:?}, heap window {heap:?}"
+        ))
+    }
+}
+
 fn run(image: &[u8], arg: u64) -> Result<i32, String> {
     let (pid, tid) =
         user::start(image, arg).map_err(|e| format!("could not start the program: {e:?}"))?;
@@ -203,6 +245,7 @@ pub fn run_all() -> Report {
     // The user-level suite, as a process.
     let frames = free_frames();
     let frames_terms = frame_terms();
+    let frames_extras = frame_extras();
     let vmos_before = crate::irq::without(|| kmem::get().vmos.count());
     let threads_before = thread::thread_count();
     let tids_before = thread::tids();
@@ -260,15 +303,22 @@ pub fn run_all() -> Report {
             let pending = kcore::aspace::DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire);
             let at = free_frames();
             crate::user::drain_dying();
+            let terms = frame_terms();
             Err(format!(
-                "free frames {} -> {} (database, caches, stacks, heap: {:?} -> {:?}; a dying VMO still to drain: {pending}; after one more drain: {})",
+                "free frames {} -> {} (database, caches, stacks, heap: {:?} -> {:?}; a dying VMO still to drain: {pending}; after one more drain: {}; \
+                 before init: {frames_extras}; now: {})",
                 frames,
                 at,
                 frames_terms,
-                frame_terms(),
-                free_frames()
+                terms,
+                free_frames(),
+                frame_extras()
             ))
         },
+    );
+    push(
+        "kernel_windows_hold_what_their_formulas_say_after_init",
+        windows_hold_what_their_formulas_say(),
     );
     push(
         "no_process_or_vmo_survives_init",
@@ -304,7 +354,7 @@ pub fn run_all() -> Report {
             // (T278: then wait a few seconds more and say what is left, so a teardown that is only slow is told from one that is stuck;
             // the check has failed already, on the counts above)
             let t0 = thread::ticks();
-            while user::process_count() != 0
+            while (user::process_count() != 0 || user::dying::count() != 0)
                 && thread::ticks().wrapping_sub(t0) < LEAK_RESAMPLE_TICKS
             {
                 thread::sleep_ticks(10);
@@ -312,9 +362,10 @@ pub fn run_all() -> Report {
             let _ = core::fmt::Write::write_fmt(
                 &mut crate::console::Console,
                 format_args!(
-                    "leak: {} ms later: {} processes, {} kernel threads, (jobs, processes, threads) {:?}, {} objects, {} free frames\n",
+                    "leak: {} ms later: {} processes ({} on their way out), {} kernel threads, (jobs, processes, threads) {:?}, {} objects, {} free frames\n",
                     thread::ticks().wrapping_sub(t0),
                     user::process_count(),
+                    user::dying::count(),
                     thread::thread_count(),
                     user::job_ledger(),
                     user::live_objects(),

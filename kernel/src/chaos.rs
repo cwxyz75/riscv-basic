@@ -23,6 +23,10 @@ pub enum Point {
     /// interrupts are on, and a delay here also **yields**, so another thread (of another process, perhaps) runs and returns to user
     /// mode on this hart before the reader copies out.
     CopyOut,
+    /// At the stage boundaries of a process's teardown (T265): after it is taken out of the table, after its handles are closed and its
+    /// objects swept, and before its job is credited (no lock is held at any of them). A delay here widens the windows in which another
+    /// hart kills, closes or counts the same process or its job.
+    Teardown,
 }
 
 #[cfg(not(feature = "chaos"))]
