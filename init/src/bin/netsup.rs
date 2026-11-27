@@ -848,6 +848,12 @@ pub fn app_main() -> i32 {
                                     .load64(ctl::STATS + 8 * netring::stat::POLL_FOUND)
                                     .to_le_bytes(),
                             );
+                            // the driver runs in the job the claim limits and charges (IOMMU-SPEC 9 step 2): its processes, and the
+                            // limits the manager set on I/O-mapped pages and vectors
+                            let info = |which| sys::job_info(held.drv_job, which);
+                            for v in [info(0).a1, info(12).a2, info(13).a2] {
+                                reply.extend_from_slice(&(v as u64).to_le_bytes());
+                            }
                         }
                         2 => {
                             let which = if rd.a1 >= 9 { b[8] } else { 255 };

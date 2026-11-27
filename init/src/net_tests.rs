@@ -66,7 +66,27 @@ fn spawn_prog_env(
     })
 }
 
-/// The job a device's supervisor (`netsup`) or driver (`rngd`) makes the device's job under (IOMMU11: that job pays for the
+/// `rngd`'s own job, made for it alone under `parent` (IOMMU-SPEC 9 step 2: the claim names the job the driver runs in, which pays
+/// and carries the manager's finite limits): ours, and the handle `rngd` gets as `Job` (what the manager needs to limit and charge
+/// it, and no DUPLICATE: it moves to the manager with the claim, so `rngd` keeps none).
+fn rngd_job(parent: u64) -> Result<(u64, u64), Detail> {
+    let j = job(parent, u64::MAX, u64::MAX, u64::MAX)?;
+    let theirs = ok(
+        sys::handle_duplicate(
+            j,
+            Rights::MANAGE
+                .union(Rights::SET_LIMITS)
+                .union(Rights::INSPECT)
+                .union(Rights::TRANSFER)
+                .0,
+        ),
+        "the entropy driver's job for it",
+    )?
+    .a1 as u64;
+    Ok((j, theirs))
+}
+
+/// The job a device's supervisor (`netsup`) makes the driver's job under (IOMMU11: that job pays for the
 /// device's domain and its DMA VMOs): a duplicate of `j` that can make children and be inspected, nothing more.
 fn parent_job(j: u64) -> Result<u64, Detail> {
     Ok(ok(
@@ -610,6 +630,7 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
     );
     sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
     let rng_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    let (gj, gj_theirs) = rngd_job(sj)?;
     let rng = spawn_prog(
         bi,
         b"bin/rngd",
@@ -619,9 +640,10 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
             (Role::ServiceRegistry, 1),
             (Role::Job, 2),
         ],
-        &[rng_dm, rng_pub.ch, parent_job(sj)?],
-        sj,
+        &[rng_dm, rng_pub.ch, gj_theirs],
+        gj,
     )?;
+    sys::handle_close(gj);
     let (ctl, ctl_theirs) = channel()?;
     let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
     let fault_env: Vec<Vec<u8>> = fault
@@ -1264,8 +1286,8 @@ fn sup_status(f: &Full) -> Option<SupStatus> {
     if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
         return None;
     }
-    let mut b = [0u8; 96];
-    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 96, core::ptr::null_mut(), 0);
+    let mut b = [0u8; 128];
+    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 128, core::ptr::null_mut(), 0);
     if r.status != 0 || r.a1 < 8 + 27 + 9 {
         return None;
     }
@@ -1295,6 +1317,10 @@ struct SupDevice {
     io_pages: u64,
     vectors: u64,
     poll_found: u64,
+    /// The driver job's processes, and the limits the manager set on its I/O-mapped pages and vectors.
+    drv_procs: u64,
+    io_limit: u64,
+    vec_limit: u64,
 }
 
 fn sup_device(f: &Full) -> Option<SupDevice> {
@@ -1303,9 +1329,9 @@ fn sup_device(f: &Full) -> Option<SupDevice> {
     if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
         return None;
     }
-    let mut b = [0u8; 96];
-    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 96, core::ptr::null_mut(), 0);
-    if r.status != 0 || r.a1 < 44 + 36 {
+    let mut b = [0u8; 128];
+    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 128, core::ptr::null_mut(), 0);
+    if r.status != 0 || r.a1 < 44 + 60 {
         return None;
     }
     let u64_at = |o: usize| Some(u64::from_le_bytes(b[o..o + 8].try_into().ok()?));
@@ -1315,6 +1341,9 @@ fn sup_device(f: &Full) -> Option<SupDevice> {
         io_pages: u64_at(56)?,
         vectors: u64_at(64)?,
         poll_found: u64_at(72)?,
+        drv_procs: u64_at(80)?,
+        io_limit: u64_at(88)?,
+        vec_limit: u64_at(96)?,
     })
 }
 
@@ -1627,6 +1656,17 @@ pub fn net_children_restart() -> Outcome {
             dev1.io_pages_after_reclaim,
             0,
             "the dead driver's I/O-mapped pages went with its domain"
+        );
+        // the new driver runs in the job the claim limits and charges (IOMMU-SPEC 9 step 2), under the manager's finite limits
+        ensure_eq!(
+            (dev1.drv_procs, dev1.vec_limit),
+            (1, 3),
+            "the driver alone in the claim's job, with exactly its three vectors"
+        );
+        ensure!(
+            dev1.io_limit >= 130 && dev1.io_limit != u64::MAX,
+            "a finite limit on the driver job's I/O-mapped pages ({})",
+            dev1.io_limit
         );
         ensure_eq!(
             (dev1.io_pages, dev1.vectors),
@@ -2652,6 +2692,7 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
     let (mgr, mine, rng_dm) = start_mgr(res, bi, mj)?;
     let mut procs = vec![mgr];
     let mut reg_ch = 0;
+    let mut gj_ch = 0;
     let r = (|| -> Outcome {
         let (off, len) = image_entry(bi, b"bin/registryd")?;
         let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
@@ -2672,6 +2713,8 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
         procs.push(reg);
         let mut root = Fs::new(reg_mine);
         let rng_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+        let (gj, gj_theirs) = rngd_job(sj)?;
+        gj_ch = gj;
         let rng = spawn_prog(
             bi,
             b"bin/rngd",
@@ -2681,8 +2724,8 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
                 (Role::ServiceRegistry, 1),
                 (Role::Job, 2),
             ],
-            &[rng_dm, rng_pub.ch, parent_job(sj)?],
-            sj,
+            &[rng_dm, rng_pub.ch, gj_theirs],
+            gj,
         )?;
         procs.push(rng);
         let t = |n: u64| sys::clock_get() + n;
@@ -2717,10 +2760,22 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
             (0x1af4, 0x1044, true),
             "virtio-rng-pci at 00:04.0, claimed"
         );
+        // the driver runs in the job the claim limits and charges (IOMMU-SPEC 9 step 2): that job holds rngd, the domain's two
+        // mapped pages, its one vector and the two DMA pages, under finite limits the manager set
+        let gj = gj_ch;
         ensure_eq!(
-            (job_use(sj, 12)?.0, job_use(sj, 13)?.0),
-            (2, 1),
-            "the entropy driver's job holds the domain's two mapped pages and its one vector"
+            (job_use(gj, 0)?.0, job_use(gj, 12)?.0, job_use(gj, 13)?.0),
+            (1, 2, 1),
+            "rngd's own job holds rngd, the domain's two mapped pages and its one vector"
+        );
+        let (io_limit, vec_limit) = (job_use(gj, 12)?.1, job_use(gj, 13)?.1);
+        ensure!(
+            io_limit >= 2 && io_limit != u64::MAX && vec_limit == 1,
+            "the manager set finite limits on rngd's job ({io_limit} I/O pages, {vec_limit} vectors)"
+        );
+        ensure!(
+            job_use(gj, 2)?.0 >= 2,
+            "rngd's job pays for the two DMA pages"
         );
         ensure!(
             job_use(mj, 12)?.0 == 0,
@@ -2745,8 +2800,9 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
             );
             rt::io::nap(5);
         }
-        job_use_settles(sj, 12, 0, 3000)?;
-        job_use_settles(sj, 13, 0, 3000)?;
+        job_use_settles(gj, 12, 0, 3000)?;
+        job_use_settles(gj, 13, 0, 3000)?;
+        job_use_settles(gj, 2, 0, 3000)?;
         sys::debug_write(b"entropy: rngd seeded from the PCI device through the IOMMU\n");
         Ok(())
     })();
@@ -2755,7 +2811,7 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
         let _ = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 3000);
         sys::handle_close(p);
     }
-    for h in [mine, reg_ch, res] {
+    for h in [mine, reg_ch, gj_ch, res] {
         sys::handle_close(h);
     }
     let settled = [mj, sj, rj].map(|j| job_use_settles(j, 2, 0, 1500));
