@@ -795,6 +795,8 @@ struct DevMgr {
     image: Option<Vec<u8>>,
     /// Bus 0 of the PCI host (IOMMU8), if the tree names one.
     pci: Option<Pci>,
+    /// The connections bound to a driver's job (`Connect` with a job, IOMMU11): connection key, the job. Closed with the connection.
+    bound: Vec<(u64, u64)>,
 }
 
 impl DevMgr {
@@ -827,7 +829,9 @@ impl Service for DevMgr {
                 }
                 return self.reply(key, txid_of(msg), Status::BadRequest, None);
             };
-            if hs.len() != 1 {
+            // (a second handle binds the new connection to a driver's job: it must be a job we can limit and charge)
+            let job_ok = |j: u64| sys::job_info(j, 12).status == 0;
+            if hs.is_empty() || hs.len() > 2 || (hs.len() == 2 && !job_ok(hs[1])) {
                 for &h in hs {
                     sys::handle_close(h);
                 }
@@ -839,10 +843,15 @@ impl Service for DevMgr {
                     if let Some(c) = self.core.conn_mut(k) {
                         *c = k;
                     }
+                    if let Some(&j) = hs.get(1) {
+                        self.bound.push((k, j));
+                    }
                     self.reply(key, txid, Status::Ok, None)
                 }
                 None => {
-                    sys::handle_close(hs[0]);
+                    for &h in hs {
+                        sys::handle_close(h);
+                    }
                     self.reply(key, txid, Status::Quota, None)
                 }
             };
@@ -871,6 +880,28 @@ impl Service for DevMgr {
             }
             _ => None,
         };
+        // ClaimRng carries none: it is made for the job its connection is bound to (the job the driver runs in)
+        if let Some((r, ByClass::ClaimRng)) = by_class {
+            let bound = self.bound.iter().find(|b| b.0 == key).map(|b| b.1);
+            let job = bound.and_then(|j| {
+                let d = sys::handle_duplicate(j, Rights::SAME.0);
+                (d.status == 0).then_some(d.a1 as u64)
+            });
+            return match (r, hs, job) {
+                (Ok((txid, index)), &[], Some(job)) => {
+                    self.claim_by_class(key, txid, index, job, ByClass::ClaimRng)
+                }
+                (r, _, job) => {
+                    for &h in hs.iter().chain(job.iter()) {
+                        sys::handle_close(h);
+                    }
+                    match r {
+                        Ok((t, _)) | Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
+                        Err(None) => {}
+                    }
+                }
+            };
+        }
         if let Some((r, what)) = by_class {
             return match (r, hs) {
                 (Ok((txid, index)), &[job]) => self.claim_by_class(key, txid, index, job, what),
@@ -949,6 +980,12 @@ impl Service for DevMgr {
 
     fn closed(&mut self, conn: u64) {
         self.drop_claims_of(conn);
+        self.bound.retain(|&(k, j)| {
+            if k == conn {
+                sys::handle_close(j);
+            }
+            k != conn
+        });
     }
 
     /// A driver's process ended: release its claim at once (IOMMU-SPEC 10.2).
@@ -1445,6 +1482,7 @@ pub fn app_main() -> i32 {
         ),
         res,
         drivers,
+        bound: Vec::new(),
         rtcs,
         image,
         pci,

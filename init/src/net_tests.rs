@@ -67,23 +67,75 @@ fn spawn_prog_env(
 }
 
 /// `rngd`'s own job, made for it alone under `parent` (IOMMU-SPEC 9 step 2: the claim names the job the driver runs in, which pays
-/// and carries the manager's finite limits): ours, and the handle `rngd` gets as `Job` (what the manager needs to limit and charge
-/// it, and no DUPLICATE: it moves to the manager with the claim, so `rngd` keeps none).
-fn rngd_job(parent: u64) -> Result<(u64, u64), Detail> {
+/// and carries the manager's finite limits), and `rngd`'s connection to the manager **bound to it** (`Connect` with the job, made
+/// on our connection `mine`): (the job, rngd's end). `rngd` gets only the connection, never a handle to a job.
+fn rngd_job_and_conn(parent: u64, mine: u64, txid: u32) -> Result<(u64, u64), Detail> {
     let j = job(parent, u64::MAX, u64::MAX, u64::MAX)?;
-    let theirs = ok(
-        sys::handle_duplicate(
-            j,
-            Rights::MANAGE
-                .union(Rights::SET_LIMITS)
-                .union(Rights::INSPECT)
-                .union(Rights::TRANSFER)
-                .0,
-        ),
-        "the entropy driver's job for it",
-    )?
-    .a1 as u64;
-    Ok((j, theirs))
+    let r = (|| {
+        let for_mgr = ok(
+            sys::handle_duplicate(
+                j,
+                Rights::MANAGE
+                    .union(Rights::SET_LIMITS)
+                    .union(Rights::INSPECT)
+                    .union(Rights::DUPLICATE)
+                    .union(Rights::TRANSFER)
+                    .0,
+            ),
+            "the entropy driver's job for the manager",
+        )?
+        .a1 as u64;
+        let (ours, theirs) = channel()?;
+        let status = connect_with(mine, txid, &[theirs, for_mgr])?;
+        if status != proto::devmgr::Status::Ok {
+            sys::handle_close(ours);
+        }
+        ensure_eq!(
+            status,
+            proto::devmgr::Status::Ok,
+            "connect a client bound to the entropy driver's job"
+        );
+        Ok(ours)
+    })();
+    match r {
+        Ok(c) => Ok((j, c)),
+        Err(e) => {
+            sys::handle_close(j);
+            Err(e)
+        }
+    }
+}
+
+/// `Connect` on `mine` with `hs` (the new client's end, and a job to bind it to if any): the manager's answer.
+fn connect_with(mine: u64, txid: u32, hs: &[u64]) -> Result<proto::devmgr::Status, Detail> {
+    let req = proto::devmgr::encode_connect(txid);
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            req.as_ptr(),
+            req.len(),
+            hs.as_ptr(),
+            hs.len()
+        )),
+        Some(S::Ok),
+        "send Connect"
+    );
+    devmgr_status(mine, txid)
+}
+
+/// The manager's `txid | status` answer on `ch`.
+fn devmgr_status(ch: u64, txid: u32) -> Result<proto::devmgr::Status, Detail> {
+    ensure_eq!(
+        st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+        Some(S::Ok),
+        "the manager answers"
+    );
+    let mut rb = [0u8; 16];
+    let r = sys::channel_read(ch, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "read the answer");
+    let (t, status) = proto::devmgr::decode_reply(&rb[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(t, txid, "the answer's txid");
+    Ok(status)
 }
 
 /// The job a device's supervisor (`netsup`) makes the driver's job under (IOMMU11: that job pays for the
@@ -606,41 +658,15 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
     let mut root = Fs::new(reg_mine);
     let publish_conn = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
     // the random service: a second client of the device manager, and a registry connection that can publish `random`
-    let (rng_dm, mgr_end2) = channel()?;
-    let req2 = proto::devmgr::encode_connect(2);
-    ensure_eq!(
-        st(sys::channel_write(
-            mine,
-            req2.as_ptr(),
-            req2.len(),
-            &mgr_end2,
-            1
-        )),
-        Some(S::Ok),
-        "connect a third client"
-    );
-    ensure_eq!(
-        st(sys::object_wait(
-            mine,
-            sig::READABLE,
-            sys::clock_get() + 5000
-        )),
-        Some(S::Ok),
-        "the manager answers the second connect"
-    );
-    sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
     let rng_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
-    let (gj, gj_theirs) = rngd_job(sj)?;
+    // the random service runs in a job of its own, which its claim limits and charges: its connection is bound to it
+    let (gj, rng_dm) = rngd_job_and_conn(sj, mine, 2)?;
     let rng = spawn_prog(
         bi,
         b"bin/rngd",
         &[b"rngd"],
-        vec![
-            (Role::ServiceDevmgr, 0),
-            (Role::ServiceRegistry, 1),
-            (Role::Job, 2),
-        ],
-        &[rng_dm, rng_pub.ch, gj_theirs],
+        vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
+        &[rng_dm, rng_pub.ch],
         gj,
     )?;
     sys::handle_close(gj);
@@ -1658,6 +1684,12 @@ pub fn net_children_restart() -> Outcome {
             "the dead driver's I/O-mapped pages went with its domain"
         );
         // the new driver runs in the job the claim limits and charges (IOMMU-SPEC 9 step 2), under the manager's finite limits
+        let until = sys::clock_get() + 3000;
+        let mut dev1 = dev1;
+        while dev1.drv_procs != 1 && sys::clock_get() < until {
+            rt::io::nap(10);
+            dev1 = sup_device(&f).ok_or_else(|| msg_at(line!()))?;
+        }
         ensure_eq!(
             (dev1.drv_procs, dev1.vec_limit),
             (1, 3),
@@ -2677,8 +2709,8 @@ pub fn random_service_gives_seeded_distinct_bytes() -> Outcome {
 }
 
 /// IOMMU11: `rngd` seeds the random service from virtio-rng-pci (00:04.0) behind the IOMMU. It claims the function for a job of its
-/// own made under the one it is given, which pays for the two pages of queue memory and data and holds the domain's mappings and its
-/// one vector; the service serves seeded bytes; when `rngd` dies the claim goes with its connection, and the mappings with the
+/// own, the one it runs in (its connection to the manager is bound to that job; a claim naming a job is refused), which pays for the
+/// two pages of queue memory and data, holds the domain's mappings and its one vector, and carries the manager's finite limits; the service serves seeded bytes; when `rngd` dies the claim goes with its connection, and the mappings with the
 /// domain. Needs no network device (a Kernel test: shard k, the entropy boot).
 pub fn rng_seeds_through_the_iommu() -> Outcome {
     const RNG_RID: u16 = 0x20;
@@ -2689,7 +2721,8 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
     let sj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
     let rj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
     sys::handle_close(root_j);
-    let (mgr, mine, rng_dm) = start_mgr(res, bi, mj)?;
+    let (mgr, mine, spare) = start_mgr(res, bi, mj)?;
+    sys::handle_close(spare);
     let mut procs = vec![mgr];
     let mut reg_ch = 0;
     let mut gj_ch = 0;
@@ -2713,18 +2746,31 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
         procs.push(reg);
         let mut root = Fs::new(reg_mine);
         let rng_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
-        let (gj, gj_theirs) = rngd_job(sj)?;
+        // ClaimRng is only for a connection bound to the driver's job, and names no job: on our unbound connection it is refused
+        // with no handle and with a job of the claimant's choosing (which is how a driver would name a side job to escape the limits)
+        let req = proto::devmgr::encode_claim_rng(3, 0);
+        sys::channel_write(mine, req.as_ptr(), req.len(), core::ptr::null(), 0);
+        ensure_eq!(
+            devmgr_status(mine, 3)?,
+            proto::devmgr::Status::BadRequest,
+            "ClaimRng on a connection bound to no job"
+        );
+        let side = job(sj, u64::MAX, u64::MAX, u64::MAX)?;
+        let req = proto::devmgr::encode_claim_rng(4, 0);
+        sys::channel_write(mine, req.as_ptr(), req.len(), &side, 1);
+        ensure_eq!(
+            devmgr_status(mine, 4)?,
+            proto::devmgr::Status::BadRequest,
+            "ClaimRng naming a job"
+        );
+        let (gj, rng_dm) = rngd_job_and_conn(sj, mine, 5)?;
         gj_ch = gj;
         let rng = spawn_prog(
             bi,
             b"bin/rngd",
             &[b"rngd"],
-            vec![
-                (Role::ServiceDevmgr, 0),
-                (Role::ServiceRegistry, 1),
-                (Role::Job, 2),
-            ],
-            &[rng_dm, rng_pub.ch, gj_theirs],
+            vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
+            &[rng_dm, rng_pub.ch],
             gj,
         )?;
         procs.push(rng);
@@ -2762,20 +2808,22 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
         );
         // the driver runs in the job the claim limits and charges (IOMMU-SPEC 9 step 2): that job holds rngd, the domain's two
         // mapped pages, its one vector and the two DMA pages, under finite limits the manager set
-        let gj = gj_ch;
         ensure_eq!(
             (job_use(gj, 0)?.0, job_use(gj, 12)?.0, job_use(gj, 13)?.0),
             (1, 2, 1),
             "rngd's own job holds rngd, the domain's two mapped pages and its one vector"
         );
         let (io_limit, vec_limit) = (job_use(gj, 12)?.1, job_use(gj, 13)?.1);
+        // (the limits are effective ones, the smallest along the ancestors: neither `sj` nor the root has any, so these are the ones
+        // the manager set on rngd's own job)
+        ensure_eq!(
+            (job_use(sj, 12)?.1, job_use(sj, 13)?.1),
+            (u64::MAX, u64::MAX),
+            "no I/O limits above rngd's job"
+        );
         ensure!(
             io_limit >= 2 && io_limit != u64::MAX && vec_limit == 1,
             "the manager set finite limits on rngd's job ({io_limit} I/O pages, {vec_limit} vectors)"
-        );
-        ensure!(
-            job_use(gj, 2)?.0 >= 2,
-            "rngd's job pays for the two DMA pages"
         );
         ensure!(
             job_use(mj, 12)?.0 == 0,
