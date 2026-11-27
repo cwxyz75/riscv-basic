@@ -82,6 +82,10 @@ fn run(image: &[u8], arg: u64) -> Result<i32, String> {
 /// in ticks (milliseconds). Spent only on a failure.
 const LEAK_RESAMPLE_TICKS: u64 = 5000;
 
+/// How long the teardowns of the processes left when init ends may take before the boot prints where each one is (T265: about 0.23 s for
+/// some fifty at four harts on a quiet host, 0.3 s before the teardowns shared their sweeps). A diagnostic threshold, not a verdict.
+const SETTLE_BUDGET_TICKS: u64 = 1000;
+
 /// The kernel's end of init's bootstrap channel, for the helper thread.
 static mut HELPER_END: Option<user::KernelEnd> = None;
 
@@ -266,12 +270,32 @@ pub fn run_all() -> Report {
     })();
     // A child that outlived init dies asynchronously (kill flag, then its own exit): give it a
     // bounded time, so one leaking test does not also fail the leak checks below.
-    for _ in 0..200 {
-        if user::process_count() == 0 {
-            break;
-        }
+    // (T265, T278: init's end kills every child it left, some fifty at four harts, and their teardowns run at once; that took about 0.3 s
+    // on a quiet host and longer on a loaded one, past the 0.2 s this wait had, which failed the checks below on processes that were only
+    // slow. The wait is now for every process to be gone from the table and from the record of those on their way out, up to the 5 s of
+    // the leak watch: a stuck teardown still fails, a slow one does not, and how long it took is printed for every boot as one `leak:
+    // settle` line, with how many processes there were and how many sweeps ran meanwhile.)
+    let (t0, left, sweeps0) = (thread::ticks(), user::process_count(), user::sweep_epoch());
+    // (what the wait reads is the ledger: a process counts against the root job until its teardown's last step credits it; the record of
+    // those on their way out is a diagnostic, printed when the storm is slow)
+    while (user::process_count() != 0 || user::job_ledger().1 != 0)
+        && thread::ticks().wrapping_sub(t0) < LEAK_RESAMPLE_TICKS
+    {
         thread::sleep_ticks(1);
     }
+    let took = thread::ticks().wrapping_sub(t0);
+    if took > SETTLE_BUDGET_TICKS {
+        // (slower than a few times what a quiet host takes: say where each process is, so a slow stage names itself before any check fails)
+        user::report_processes();
+    }
+    let _ = core::fmt::Write::write_fmt(
+        &mut crate::console::Console,
+        format_args!(
+            "leak: settle {took} ms: {left} processes in the table when init ended, {} charged to the root job now, {} sweeps begun meanwhile\n",
+            user::job_ledger().1,
+            user::sweep_epoch().wrapping_sub(sweeps0)
+        ),
+    );
     let reported = user::reported();
     push(
         "init_runs_in_user_mode_and_passes",

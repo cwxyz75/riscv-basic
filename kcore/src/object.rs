@@ -181,6 +181,34 @@ enum Phase {
     Freeing,
 }
 
+/// What a teardown does next to have the objects its closed handles left unreachable collected (T265, T278): the sweep that does it
+/// must have **begun after** the handles were drained, so its roots no longer hold them. `mark` is [`Registry::sweep_epoch`] read in the
+/// same critical section that finished the drain; `epoch` and `active` are read now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectStep {
+    /// A sweep that began after the drain has ended: it freed the teardown's garbage, unless it ran short of memory (T177: marking
+    /// incomplete, or freeing abandoned), when the garbage floats to the next sweep, as it did before T265 for a teardown's own sweep.
+    Covered,
+    /// A sweep is running: do a slice of it (one that began after the drain covers this teardown when it ends; an older one must end before
+    /// a new one can begin).
+    Help,
+    /// No sweep runs and none has begun since the drain: begin one.
+    Start,
+}
+
+/// [`CollectStep`] for a teardown whose drain finished at sweep number `mark`, when the last sweep begun is `epoch` and one is running if
+/// `active`. Many teardowns that end at once share the sweeps that begin after their drains, instead of each beginning one of its own
+/// after the others (each a pass over every live object: T278's slow teardowns).
+pub fn collect_step(mark: u64, epoch: u64, active: bool) -> CollectStep {
+    if active {
+        CollectStep::Help
+    } else if epoch > mark {
+        CollectStep::Covered
+    } else {
+        CollectStep::Start
+    }
+}
+
 /// What one slice of a sweep did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SweepStep {
@@ -808,6 +836,11 @@ impl<T: Object> Registry<T> {
     /// Is a sweep in progress (between `sweep_begin` and its last `sweep_step`)?
     pub fn sweep_active(&self) -> bool {
         self.phase != Phase::Idle
+    }
+
+    /// The number of the last sweep begun (0 before the first): with [`collect_step`], what lets several teardowns share one sweep.
+    pub fn sweep_epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Start a sweep in slices (MM10, KERNEL-V1-SPEC 4.6): mark `roots` (the objects of every handle table, as for `sweep`) and return

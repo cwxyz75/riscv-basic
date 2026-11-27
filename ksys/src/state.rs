@@ -142,16 +142,21 @@ impl UserState {
 
     /// Start a sweep with its roots to be shaded a process table per slice (T206; `sweep_slice` does it): false if one runs.
     pub fn sweep_start(&mut self) -> bool {
-        // (T177: the room first; with none, no sweep starts, which is safe: it only means garbage floats until the next one)
-        let mut scan: Vec<u64> = Vec::new();
-        if scan.try_reserve_exact(self.procs.len()).is_err() {
+        // (T177: the room first; with none, no sweep starts, which is safe: it only means garbage floats until the next one. T265: the list
+        // keeps its room between sweeps, so it allocates only when the process table has grown past every earlier sweep's, and a teardown that
+        // must begin a sweep does not fail for want of memory again and again while the table stays the size it was)
+        if self.objs.sweep_active() {
+            return false;
+        }
+        self.root_scan.clear();
+        if self.root_scan.try_reserve_exact(self.procs.len()).is_err() {
             return false;
         }
         if !self.objs.sweep_begin_pending() {
             return false;
         }
-        scan.extend(self.procs.keys().rev().copied());
-        self.root_scan = scan;
+        let procs = &self.procs;
+        self.root_scan.extend(procs.keys().rev().copied());
         self.root_cursor = 0;
         true
     }

@@ -1047,11 +1047,14 @@ static PROC_CHURN_BAD: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 fn process_churn(_: usize) {
     use crate::user;
     use abi::arch::fault::{exit_code, PAGE_FAULT};
+    // (at one hart a spinner at a user priority keeps this thread from ever running to kill it: the boot hung there; it is killed while it
+    // blocks instead, as `kill_a_spinner_on_another_hart` skips one hart)
+    let spin = if crate::smp::started() < 2 { 16 } else { 15 };
     for round in 0..PROC_CHURN_WANT {
         let (mode, want) = match round % 4 {
             0 => (8u64, 42),
             1 => (7, exit_code(PAGE_FAULT)),
-            2 => (15, -3),
+            2 => (spin, -3),
             _ => (16, -4),
         };
         let code = match user::start(user::CRASH_ELF, mode) {
