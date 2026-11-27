@@ -174,12 +174,13 @@ pub fn app_main() -> i32 {
                     // test aid: the boot image handle must be read-only, and stay so when duplicated
                     let w = rt::sys::vmo_write(image_vmo, 0, b"XXXX".as_ptr(), 4);
                     let me = rt::sys::process_self();
-                    let mw =
-                        rt::sys::process_map(me.a1 as u64, image_vmo, 0x9_0000_0000, 0, 4096, 3);
+                    // (above the stack arena, where nothing the kernel places lands: in the mapping arena our image or the library may be, T272)
+                    const AT: u64 = rt::abi::user::STACK_ARENA_END;
+                    let mw = rt::sys::process_map(me.a1 as u64, image_vmo, AT, 0, 4096, 3);
                     let mr =
-                        rt::sys::process_map(me.a1 as u64, image_vmo, 0x9_0001_0000, 0, 4096, 1);
+                        rt::sys::process_map(me.a1 as u64, image_vmo, AT + 0x1_0000, 0, 4096, 1);
                     let mx =
-                        rt::sys::process_map(me.a1 as u64, image_vmo, 0x9_0002_0000, 0, 4096, 5);
+                        rt::sys::process_map(me.a1 as u64, image_vmo, AT + 0x2_0000, 0, 4096, 5);
                     let d = rt::sys::handle_duplicate(image_vmo, 0x7ff);
                     let d2 = rt::sys::handle_duplicate(image_vmo, 1 << 31);
                     let w2 = rt::sys::vmo_write(d2.a1 as u64, 0, b"XXXX".as_ptr(), 4);

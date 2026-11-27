@@ -46,6 +46,70 @@ fn my_stack_top() -> usize {
     (rec[0] + rec[1]) as usize
 }
 
+/// Print the mappings of `process` that overlap `[lo, hi)`, one line each (`process_map_info`): what a refused fixed-address map ran into (T272).
+/// Returns how many there are.
+fn print_mappings(process: u64, lo: u64, hi: u64) -> u64 {
+    let mut at = lo;
+    let mut n = 0;
+    for _ in 0..4096 {
+        let mut rec = [0u64; 6];
+        let r = sys::process_map_info(process, at, rec.as_mut_ptr());
+        if r.status != 0 || rec[1] == 0 || rec[0] >= hi {
+            break;
+        }
+        if rec[0] + rec[1] > lo {
+            println!(
+                "  mapping {:#x}..{:#x} ({} pages) perms {:#b} vmo {} offset {:#x}",
+                rec[0],
+                rec[0] + rec[1],
+                rec[1] / 4096,
+                rec[2],
+                rec[4],
+                rec[5]
+            );
+            n += 1;
+        }
+        if r.a1 == 0 {
+            break;
+        }
+        at = r.a1 as u64;
+    }
+    n
+}
+
+/// Map `length` bytes of `vmo` (from offset 0) into `process` where the kernel chooses (ANYWHERE) and return the address. A test that needs room asks
+/// for it this way and does not name an address in the mapping arena, where the program's image, the system library and every ANYWHERE mapping land
+/// at random (HD2): a fixed 2 GiB there was refused now and then as an overlap (T272). A refusal prints the process's mappings and names the length.
+fn map_anywhere(
+    process: u64,
+    vmo: u64,
+    length: u64,
+    flags: u64,
+    what: &str,
+) -> Result<u64, Detail> {
+    let r = sys::process_map_anywhere(process, vmo, 0, length, flags);
+    if r.status != 0 {
+        println!(
+            "{what}: process_map ANYWHERE of {length:#x} bytes refused, status {}; the mappings:",
+            r.status
+        );
+        print_mappings(process, rt::abi::user::BASE, rt::abi::user::TOP);
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!("{what}: ANYWHERE of {length:#x} bytes: status {}", r.status),
+        );
+        return Err(d);
+    }
+    Ok(r.a1 as u64)
+}
+
+/// Where the suite's fixed-address mappings go: the 32 GiB from the end of the stack arena to the top of the user half. Nothing the kernel places
+/// lands there (ANYWHERE mappings, a program's image and the system library go in the mapping arena, stacks in the stack arena), so a fixed address
+/// here is free unless a test of this suite mapped it (T272). The thread stacks of `own_stack` grow up from its start, the network tests' rings sit
+/// from 28 GiB into it (`net_tests.rs`), and the page below the top is never mapped.
+const FIXED_WINDOW: u64 = rt::abi::user::STACK_ARENA_END;
+
 /// A failure detail with this text.
 fn detail(what: &str) -> Detail {
     let mut d = Detail::new();
@@ -127,7 +191,8 @@ fn debug_write_pointer_rules() -> Outcome {
         "a range that wraps"
     );
     ensure_eq!(
-        bad(0x10_0000_0000, 1),
+        // (the page below the top of the fixed window, which no test maps; in the mapping arena the image or the library may be, T272)
+        bad(rt::abi::user::TOP as usize - 4096, 1),
         Some(S::InvalidArgs),
         "inside the user half but mapped by nothing"
     );
@@ -3059,7 +3124,6 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
 /// bound, applied to the hold), which a kernel built with `latency-trace` reports (`debug_stat` 14, in 100 ns, and starts its window
 /// again; interrupts stay off through a call that nothing else wants the hart for, so the hold is what chunking bounds). Without 3 GiB of RAM it does nothing (the machine cannot hold the VMO).
 fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
-    const BASE: u64 = 0x10_0000_0000;
     const GIB2: u64 = 2 << 30;
     // (slices of 64 pages, not `MAX_COMMIT_PAGES`: a commit zeroes its pages with the big lock held, and 1024 of them is the milliseconds B1 names as its
     // known worst case; this test is about what T207 chunked)
@@ -3102,16 +3166,13 @@ fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
         GIB2 / 4096,
         "all of it is charged"
     );
-    ensure_eq!(
-        st(sys::process_map(me, v, BASE, 0, GIB2, PF_R | PF_W)),
-        Some(S::Ok),
-        "map all of it"
-    );
+    // (where the kernel chooses: a fixed address in the mapping arena may hold the image or the library, T272)
+    let at = map_anywhere(me, v, GIB2, PF_R | PF_W, "map all of it")?;
     for i in 0..GIB2 / (1 << 20) {
-        // SAFETY: BASE..BASE + 2 GiB is mapped read-write in this process.
-        unsafe { core::ptr::write_volatile((BASE + i * (1 << 20)) as *mut u64, i + 1) };
+        // SAFETY: at..at + 2 GiB is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((at + i * (1 << 20)) as *mut u64, i + 1) };
     }
-    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap all");
+    ensure_eq!(st(sys::process_unmap(me, at)), Some(S::Ok), "unmap all");
     check("the unmap")?;
     ensure_eq!(
         st(sys::vmo_decommit(v, 0, GIB2)),
@@ -3123,11 +3184,7 @@ fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
     // the last holder dies: a process that never started maps it, and is killed
     commit_all(v)?;
     let child = proc_create()?;
-    ensure_eq!(
-        st(sys::process_map(child, v, BASE, 0, GIB2, PF_R | PF_W)),
-        Some(S::Ok),
-        "map it into a child"
-    );
+    map_anywhere(child, v, GIB2, PF_R | PF_W, "map it into a child")?;
     sys::handle_close(v);
     ensure_eq!(
         st(sys::process_kill(child, 1)),
@@ -3333,7 +3390,6 @@ fn a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory() -> Outcome {
 /// committed, and a page table each), read back, then decommitted whole in one call; the job's page usage is back where it started, and a page
 /// read afterwards is a fresh zero.
 fn a_two_gib_sparse_vmo_is_mapped_touched_and_given_back() -> Outcome {
-    const BASE: u64 = 0x10_0000_0000;
     const GIB2: u64 = 2 << 30;
     const STEP: u64 = 2 << 20;
     let me = me()?;
@@ -3345,22 +3401,19 @@ fn a_two_gib_sparse_vmo_is_mapped_touched_and_given_back() -> Outcome {
     )?
     .a1 as u64;
     ensure_eq!(sys::vmo_get_size(v).a1 as u64, GIB2, "its size");
-    ensure_eq!(
-        st(sys::process_map(me, v, BASE, 0, GIB2, PF_R | PF_W)),
-        Some(S::Ok),
-        "map all of it"
-    );
+    // (where the kernel chooses: a fixed address in the mapping arena may hold the image or the library, T272)
+    let base = map_anywhere(me, v, GIB2, PF_R | PF_W, "map all of it")?;
     let n = GIB2 / STEP;
     for i in 0..n {
-        // SAFETY: BASE..BASE + 2 GiB is mapped read-write in this process.
-        unsafe { core::ptr::write_volatile((BASE + i * STEP) as *mut u64, i + 1) };
+        // SAFETY: base..base + 2 GiB is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((base + i * STEP) as *mut u64, i + 1) };
     }
     // (the pages, and a page table each: they are charged to this process's job, and the frames to the VMO's)
     let touched = job_use(root, 2)?.0 - before;
     ensure!(touched >= n, "a page per touch is charged");
     for i in 0..n {
         // SAFETY: as above.
-        let got = unsafe { core::ptr::read_volatile((BASE + i * STEP) as *const u64) };
+        let got = unsafe { core::ptr::read_volatile((base + i * STEP) as *const u64) };
         ensure_eq!(got, i + 1, "page {i} reads back");
     }
     ensure_eq!(
@@ -3374,14 +3427,14 @@ fn a_two_gib_sparse_vmo_is_mapped_touched_and_given_back() -> Outcome {
         "the frames are credited back (the tables stay while the mapping does)"
     );
     // SAFETY: as above (a decommitted page faults in again, as zeros).
-    let got = unsafe { core::ptr::read_volatile((BASE + 5 * STEP) as *const u64) };
+    let got = unsafe { core::ptr::read_volatile((base + 5 * STEP) as *const u64) };
     ensure_eq!(got, 0, "a decommitted page reads zero");
     ensure_eq!(
         st(sys::vmo_set_size(v, STEP)),
         Some(S::Ok),
         "shrink to 2 MiB (the tail goes in batches)"
     );
-    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap");
+    ensure_eq!(st(sys::process_unmap(me, base)), Some(S::Ok), "unmap");
     job_use_settles(root, 2, before + 1, 20_000)
         .or_else(|_| job_use_settles(root, 2, before, 20_000))?;
     ensure_eq!(
@@ -5234,8 +5287,8 @@ fn many_children_do_not_leak() -> Outcome {
 
 // --- Threads (S3c-2b) -----------------------------------------------------------------------
 
-// (below the stack arena, which `thread_spawn` hands out: 0x30_0000_0000 and up)
-static NEXT_STACK: AtomicU64 = AtomicU64::new(0x28_0000_0000);
+// (in the fixed window above the stack arena, where nothing the kernel places lands: T272)
+static NEXT_STACK: AtomicU64 = AtomicU64::new(FIXED_WINDOW);
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 static WOKEN_AT: AtomicU64 = AtomicU64::new(0);
 static WOKEN_STATUS: AtomicU32 = AtomicU32::new(99);
@@ -7836,7 +7889,7 @@ fn reserved_abi_space_is_refused() -> Outcome {
     use rt::abi::{map_flags, start_features, syscall as nr, thread_state};
     let p = proc_create()?;
     let v = vmo(1)?;
-    let at = 0x10_0000_0000u64;
+    let at = FIXED_WINDOW; // (a fresh child maps only the library, in the mapping arena: this is free)
     for flag in [
         map_flags::SHADOW_STACK,
         map_flags::RESERVED_9,
@@ -7910,7 +7963,7 @@ fn mappings_per_process_are_bounded() -> Outcome {
     // regions one by one costs a shootdown each)
     let p = proc_create()?;
     let v = vmo(1)?;
-    let base = 0x10_0000_0000u64;
+    let base = FIXED_WINDOW; // (free in a fresh child, T272)
     let mut n = 0u64;
     let mut refused = None;
     while n < 20_000 {

@@ -37,9 +37,9 @@ pub fn app_main() -> i32 {
             unsafe { asm!("csrr t0, sstatus") };
         }
         6 => {
-            // jump to an address nothing maps
+            // jump to an address nothing maps (the last page of the user half: above the stack arena nothing is placed, T272)
             // SAFETY: as above.
-            unsafe { asm!("jr {}", in(reg) 0x30_0000_0000usize) };
+            unsafe { asm!("jr {}", in(reg) rt::abi::user::TOP as usize - 4096) };
         }
         7 => {
             // load through the null pointer
@@ -755,8 +755,8 @@ extern "C" fn exit_eight_late(_: usize) -> ! {
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Where the changing mapping lives.
-const X: u64 = 0x30_0000_0000;
+/// Where the changing mapping lives: above the stack arena, where nothing the kernel places lands (in the stack arena a thread stack may be, T272).
+const X: u64 = rt::abi::user::STACK_ARENA_END;
 const ROUNDS: u64 = 300;
 const READ: u64 = 1;
 const IDLE: u64 = 2;
@@ -1133,7 +1133,7 @@ fn churn(seed: u64) -> i32 {
                 if rt::sys::vmo_write(vmo, 0, buf.as_ptr(), 4096).status != 0 {
                     return 111;
                 }
-                let at = 0x31_0000_0000 + rnd(8) * 0x2_0000;
+                let at = rt::abi::user::STACK_ARENA_END + 0x1_0000_0000 + rnd(8) * 0x2_0000;
                 let m = rt::sys::process_map(me, vmo, at, 0, 4 * 4096, 3);
                 if m.status != 0 {
                     // (the status is in the code: a failure seen once in CI, T251)
