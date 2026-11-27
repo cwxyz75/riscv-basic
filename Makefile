@@ -526,6 +526,8 @@ libc-gap: fetch-third-party
 docs-check:
 	python3 scripts/check_docs.py
 	python3 scripts/bench_compare.py --self-test
+	# IOMMU-SPEC amendment 2026-11-27 part 2 (L7, OD175): the boot harness refuses a device that reads memory at a physical address
+	python3 scripts/refused_devices.py --self-test
 	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-probe.pcap --self-test
 	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-tcp-probe.pcap --self-test
 

@@ -31,6 +31,9 @@ import tempfile
 import time
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import refused_devices  # noqa: E402  (IOMMU-SPEC amendment 2026-11-27 part 2, L7: the devices no test machine carries)
+
 # The machine the OS track runs on (OD75): AIA (APLIC + IMSIC), required since PL6 (inter-hart interrupts are IMSIC messages).
 DEFAULT_MACHINE = "virt,aia=aplic-imsic,iommu-sys=on"
 # A boot is judged on progress, not on total time (T157, OD140): it fails when the guest prints nothing for STALL seconds (a hang),
@@ -130,9 +133,10 @@ IOMMU_TEST_DEV = "00:04.0"
 # which adds `iommu_platform=on` (without it QEMU's virtio device bypasses the IOMMU: IOMMU-SPEC 15.1 L1) and `disable-legacy=on`, and
 # never `vectors=0`: QEMU's defaults give each its MSI-X table (IOMMU0 item 13). The block functions are pinned to one queue: QEMU
 # gives virtio-blk-pci one queue per hart by default and one MSI-X vector more, so its table would otherwise change with OS_SMP.
-# The five devices on one machine (IOMMU9, the bus move): two disks, the network, the entropy source (also the IOMMU tests' function)
-# and `iommu-testdev`, which has no MSI-X capability and so is listed and never claimable (IOMMU-SPEC 8.6, Q-IOMMU-MSI 5). The network
-# function is `netdrv`'s (IOMMU11); it is on QEMU's user network when the boot has the network (`pci_devices`), else it has no
+# The four devices on one machine (IOMMU9, the bus move): two disks, the network and the entropy source (also the IOMMU tests'
+# function), every one a virtio function behind the IOMMU. No device that reads or reports memory at a physical address is put on a
+# test machine (IOMMU-SPEC amendment 2026-11-27 part 2, L7; OD175): `refused_devices.refuse` turns away a command line that names one. The
+# network function is `netdrv`'s (IOMMU11); it is on QEMU's user network when the boot has the network (`pci_devices`), else it has no
 # backend (the suite's PCI tests still list and claim it). The disks (IOMMU10) are the scratch disk and the
 # second disk, writable, which `blkd` drives through `devmgr`'s claim; OS_DISK=0 leaves both off (`pci_devices`).
 PCI_DEVICES = [
@@ -140,7 +144,6 @@ PCI_DEVICES = [
     (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0,num-queues=1", True),
     (6, "virtio-blk-pci", "1af4:1042", ",drive=pd1,num-queues=1", True),
     (7, "virtio-net-pci", "1af4:1041", ",mac=52:54:00:12:34:57,romfile=", True),
-    (8, "iommu-testdev", "1b36:0005", None, False),
 ]
 PCI_DISK_SLOTS = (5, 6)
 
@@ -182,10 +185,7 @@ LAST_DEVMGR_PCI = []
 
 
 def pci_device(slot, model, extra):
-    """The one way a PCI function gets on the command line (see PCI_DEVICES): a virtio function behind the IOMMU, or (`extra`
-    None) a device that is not virtio, with no property added."""
-    if extra is None:
-        return ["-device", f"{model},addr={slot:#x}"]
+    """The one way a PCI function gets on the command line (see PCI_DEVICES): a virtio function behind the IOMMU."""
     return ["-device", f"{model},iommu_platform=on,disable-legacy=on,addr={slot:#x}{extra}"]
 
 
@@ -208,8 +208,8 @@ def pci_args():
 
 def devmgr_pci_problems():
     """Every enumeration `devmgr` printed lists exactly the functions the command line put on bus 0 (and the host bridge); each
-    function PCI_DEVICES says is claimable is, and reported its MSI-X table (`msix=<entries>`, at least one); the test device is not
-    claimable for want of MSI-X; no reset or teardown failed."""
+    function PCI_DEVICES says is claimable is, and reported its MSI-X table (`msix=<entries>`, at least one); a function PCI_DEVICES
+    says is not claimable is listed so for want of MSI-X; no reset or teardown failed."""
     found, current = [], []
     want = {PCI_HOST_BRIDGE[0]: PCI_HOST_BRIDGE[1]}
     claimable = set()
@@ -1267,6 +1267,8 @@ def elf_load_address(kernel: str) -> int:
 
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
+    # (first, before anything reads the kernel: the parts of the command line a caller or the environment chooses)
+    refused_devices.refuse([os.environ.get("OS_MACHINE", ""), os.environ.get("OS_BOOT_ARGS", ""), *pci_args(), *extra])
     if os.environ.get("OS_LOAD") and int(os.environ["OS_LOAD"], 16) != elf_load_address(kernel):
         raise SystemExit(f"{kernel} is linked to load at {elf_load_address(kernel):#x}, not at OS_LOAD={os.environ['OS_LOAD']}: the load-address build did not take")
     cmd = [
@@ -1283,8 +1285,8 @@ def run(kernel: str, extra=()):
         # IOMMU5, IOMMU8, IOMMU9: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and the functions of
         # PCI_DEVICES sit behind it (`iommu_platform=on`: their DMA and their MSI-X messages go through the IOMMU): the entropy function
         # at 00:04.0, which the suite's `iommu_*`, `iodomain_*` and `msi_*` tests program by hand, the block functions at 00:05.0 and
-        # 00:06.0, which the `pci_*` tests drive (by hand, and through `devmgr`'s claim), the network function at 00:07.0, and
-        # `iommu-testdev` at 00:08.0. `devmgr` enumerates them all.
+        # 00:06.0, which the `pci_*` tests drive (by hand, and through `devmgr`'s claim), and the network function at 00:07.0; the
+        # hostile-driver matrix drives the entropy function and the scratch disk by hand. `devmgr` enumerates them all.
         *pci_args(),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
         # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off OS_DISK=0
@@ -1311,6 +1313,7 @@ def run(kernel: str, extra=()):
         *(net_args() if net_on() else []),
         *extra, "-kernel", kernel,
     ]
+    refused_devices.refuse(cmd)
     if os.environ.get("OS_PROFILE"):
         out, status, timed_out = run_profiled(cmd, kernel)
     else:

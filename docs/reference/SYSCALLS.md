@@ -294,7 +294,9 @@ a device's message at an identity the kernel gave an interrupt object, to see th
 
 `which` 164 (IOMMU12, test builds only) takes a user virtual address of the caller's own space in `a2` and returns the physical address it
 is mapped to, or all ones when nothing is mapped there (read under the address-space lock). It is the suite's oracle for the frames a
-device must not reach (the hostile-driver matrix aims a device at them) and for a test device that reads memory back by physical address;
+device must not reach (the hostile-driver matrix and `iodomain_maps_exactly_what_was_granted` aim a hand-driven virtio-pci function
+at them, and show the refusal by the fault record and the frame left intact: no device of a test machine reads memory back by
+physical address, IOMMU-SPEC amendment 2026-11-27 part 2);
 a release kernel answers all ones (the translate path is not compiled into it), so no frame's physical address is learnable through a call on a release build (INVARIANTS D2). Like every
 selector it needs the debug resource with INSPECT.
 
