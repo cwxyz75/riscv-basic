@@ -85,9 +85,19 @@ fn start_stack() -> Result<Option<Net>, Detail> {
         vec![
             (Role::Resource, 0),
             (Role::BootImage, 1),
-            (Role::ServiceDevmgr, 2),
+            (Role::Job, 2),
+            (Role::ServiceDevmgr, 3),
         ],
-        &[res_dup, bi_dup, theirs],
+        &[
+            res_dup,
+            bi_dup,
+            ok(
+                sys::handle_duplicate(mj, Rights::SAME.0),
+                "dup the manager's job",
+            )?
+            .a1 as u64,
+            theirs,
+        ],
         mj,
     )?;
     let (sup_end, mgr_end) = channel()?;
@@ -483,9 +493,19 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
         vec![
             (Role::Resource, 0),
             (Role::BootImage, 1),
-            (Role::ServiceDevmgr, 2),
+            (Role::Job, 2),
+            (Role::ServiceDevmgr, 3),
         ],
-        &[res_dup, bi_dup, theirs],
+        &[
+            res_dup,
+            bi_dup,
+            ok(
+                sys::handle_duplicate(mj, Rights::SAME.0),
+                "dup the manager's job",
+            )?
+            .a1 as u64,
+            theirs,
+        ],
         mj,
     )?;
     let (sup_dm, mgr_end) = channel()?;

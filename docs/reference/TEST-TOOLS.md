@@ -38,7 +38,7 @@ the harness checks that each shard reported exactly its own tests.
 |---|---|---|
 | `a` | everything not in `b` | no network device |
 | `b` | the `net_*` tests, the C sockets test, the three heaviest stress tests and their prerequisite | network |
-| `k` | the Kernel tests only (`init/ktests.txt`: a test that starts no server and needs no disk, network or console service) and the kernel's own self-tests | no disk, no network |
+| `k` | the Kernel tests only (`init/ktests.txt`: a test that needs no network or console service; the IOMMU tests among them start `devmgr`, and the block rig `blkd` on the PCI disks) and the kernel's own self-tests | the two PCI disks, no network |
 
 A test that starts children carries its prerequisite along into its shard. `os_boot_test.py --selftest-k` proves the
 harness fails a `k` boot that lacks a Kernel test or ran a System test.
@@ -68,9 +68,15 @@ After a passing boot the harness prints the suite's guest time and the six slowe
 commits from the epic's fork point on `origin/main` to `HEAD`, running one make target per step (default `os-ktest-4`).
 It needs a clean tree and leaves the bisect open; `git bisect reset` returns to the branch.
 
+**IOMMU faults.** The suite prints `iofaults: <test> <n>` for each test during which the IOMMU counted faults
+(`debug_stat` 150) and `iofaults: suite <n>` for the whole test run (from the first test to the last; the kernel's own
+boot self-test is outside it). `os_boot_test.py` fails a boot whose faults fall in a test that is not in its
+`DELIBERATE_FAULT_TESTS`, or whose suite total is not the sum of the tests' (a fault between tests), and puts the total
+on its pass line.
+
 **Record and replay.** `OS_RECORD=<dir>` boots under QEMU's record mode and keeps the recording only when the boot
-fails; `OS_REPLAY=<file>` replays it, and `OS_GDB=1` waits for gdb on :1234. Recording needs a boot with no disk and no
-network device, so use `OS_SHARD=k`. Record mode runs the harts in one TCG thread: a race that needs truly parallel
+fails; `OS_REPLAY=<file>` replays it, and `OS_GDB=1` waits for gdb on :1234. Recording needs a boot with no network
+device, so use `OS_SHARD=k` (the PCI disks go through QEMU's `blkreplay` filter). Record mode runs the harts in one TCG thread: a race that needs truly parallel
 harts may not reproduce under it, and its instruction-counted time changes what timing-dependent tests see.
 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the

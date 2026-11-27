@@ -1319,3 +1319,80 @@ fn devmgr_claim_pci_golden_bytes_and_errors() {
         let _ = decode_list_pci(&b);
     }
 }
+
+/// IOMMU10: a block driver's startup carries its claim as an argument (hexadecimal: an argument holds no NUL), and its roles name the
+/// BAR, the domain handle, the two DMA VMOs and the two interrupts; the old wired-interrupt role (13) is gone.
+#[test]
+fn a_drivers_claim_travels_as_its_startup_argument() {
+    use proto::devmgr::*;
+    let c = PciClaim {
+        vendor: 0x1af4,
+        device: 0x1042,
+        bar_bytes: 0x4000,
+        common: (0, 0x1000),
+        notify: (0x3000, 0x1000),
+        notify_multiplier: 4,
+        isr: (0x1000, 0x1000),
+        device_cfg: (0x2000, 0x1000),
+        dma_pages: vec![1, 4],
+        irqs: vec![
+            PciIrq {
+                entry: 0,
+                what: IRQ_CONFIG,
+            },
+            PciIrq { entry: 1, what: 0 },
+        ],
+    };
+    let a = encode_claim_arg(&c).unwrap();
+    // worked out by hand: the reply's bytes with txid 0, two digits each, lower case
+    assert_eq!(
+        &a[..24],
+        b"0000000000000000f41a4210",
+        "txid 0, Ok, vendor and device"
+    );
+    assert_eq!(a.len(), 2 * (PCI_CLAIM_FIXED_LEN + 4 * 2 + 4 + 4 * 2));
+    assert!(!a.contains(&0));
+    assert_eq!(decode_claim_arg(&a), Some(c.clone()));
+    let s = Startup {
+        args: vec![b"blkd".to_vec(), a.clone()],
+        roles: vec![
+            (Role::BlkMmio, 0),
+            (Role::DeviceDomain, 1),
+            (Role::BlkQueueDma, 2),
+            (Role::BlkDma, 3),
+            (Role::DeviceIrqConfig, 4),
+            (Role::DeviceIrqQueue0, 5),
+            (Role::ServiceBlk, 6),
+        ],
+        ..Startup::default()
+    };
+    assert_eq!(Startup::decode(&s.encode().unwrap(), 7).unwrap(), s);
+    assert_eq!(
+        (Role::DeviceDomain as u32, Role::BlkQueueDma as u32),
+        (53, 54)
+    );
+    assert_eq!(Role::from_u32(53), Some(Role::DeviceDomain));
+    assert_eq!(Role::from_u32(54), Some(Role::BlkQueueDma));
+    assert_eq!(
+        Role::from_u32(13),
+        None,
+        "the wired interrupt's role is retired"
+    );
+    // anything else is refused: an odd length, upper case, a digit that is no digit, a reply with another txid or an error
+    let mut odd = a.clone();
+    odd.pop();
+    assert_eq!(decode_claim_arg(&odd), None);
+    assert_eq!(decode_claim_arg(&a.to_ascii_uppercase()), None);
+    let mut junk = a.clone();
+    junk[30] = b'g';
+    assert_eq!(decode_claim_arg(&junk), None);
+    let mut other = a.clone();
+    other[1] = b'1';
+    assert_eq!(decode_claim_arg(&other), None, "txid 1");
+    assert_eq!(
+        decode_claim_arg(b"0000000003000000"),
+        None,
+        "an error reply"
+    );
+    assert_eq!(decode_claim_arg(b""), None);
+}

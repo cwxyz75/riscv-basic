@@ -31,12 +31,14 @@ pub enum Role {
     Tty = 9,
     /// A job handle: for the launcher, the job it makes each program's job under.
     Job = 10,
-    /// A block driver's device memory: the virtio-mmio slot (S6b).
+    /// A block driver's device memory (IOMMU10): a VMO over the PCI BAR that holds the function's virtio structures (never its MSI-X
+    /// table where the table has a BAR of its own). The layout inside it travels as the driver's second argument
+    /// (`proto::devmgr::encode_claim_arg`).
     BlkMmio = 11,
-    /// A block driver's DMA buffer (a DMA VMO with the DMA right).
+    /// A block driver's data buffer: a DMA VMO with the DMA right (`vmo_create_dma_in`, charged to the driver's job), which the
+    /// driver maps into its device's domain itself. (13, the old wired interrupt of the virtio-mmio disk, is retired: a PCI disk's
+    /// interrupts are `DeviceIrqConfig` and `DeviceIrqQueue0`.)
     BlkDma = 12,
-    /// A block driver's interrupt object (absent where the machine has no PLIC: poll).
-    BlkIrq = 13,
     /// The channel a block driver serves the block protocol on.
     ServiceBlk = 14,
     /// The root resource (the device manager's authority).
@@ -113,6 +115,12 @@ pub enum Role {
     DeviceIrqQueue5 = 50,
     DeviceIrqQueue6 = 51,
     DeviceIrqQueue7 = 52,
+    /// A device driver's handle to its device's domain (IOMMU10; IOMMU-SPEC 9 step 5): IO_MAP and IO_UNMAP only (and TRANSFER), so the
+    /// driver maps its buffers itself and learns their I/O addresses from the call, and can neither destroy the domain, grant a vector
+    /// nor read its faults.
+    DeviceDomain = 53,
+    /// A block driver's queue memory: the DMA VMO its virtqueue lives in (one page, the DMA right), mapped by the driver like `BlkDma`.
+    BlkQueueDma = 54,
 }
 
 /// The queues a driver's startup message can name an interrupt for.
@@ -159,7 +167,6 @@ impl Role {
             10 => Role::Job,
             11 => Role::BlkMmio,
             12 => Role::BlkDma,
-            13 => Role::BlkIrq,
             14 => Role::ServiceBlk,
             15 => Role::Resource,
             16 => Role::ServiceDevmgr,
@@ -199,6 +206,8 @@ impl Role {
             50 => Role::DeviceIrqQueue5,
             51 => Role::DeviceIrqQueue6,
             52 => Role::DeviceIrqQueue7,
+            53 => Role::DeviceDomain,
+            54 => Role::BlkQueueDma,
             _ => return None,
         })
     }
