@@ -381,6 +381,13 @@ def check_unsafe_inventory():
     return unsafe_inventory.problems()
 
 
+def check_kernel_allows():
+    """KT3 (KERNEL-V1-SPEC 7.4; T279): every allow of a panic-finding lint in the kernel crates carries its `// INVARIANT:` reason."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import kernel_allows
+    return ["KT3: " + p for p in kernel_allows.problems()]
+
+
 def check_syscall_tests():
     """Every error SYSCALLS.md lists for a call has a row in docs/reference/syscall-tests.tsv naming a test that covers it (KT4)."""
     import io, contextlib
@@ -509,7 +516,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_kernel_allows() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:
