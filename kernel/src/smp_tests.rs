@@ -253,11 +253,32 @@ fn harts_go_offline_and_come_back() -> Result<(), String> {
                 + percpu::hart(h).idle_suspend.load(Ordering::Relaxed)
         };
         // (for the failure message, T267 part T49: what every hart did in the window, so a stalled vCPU and a misplaced timer can be told apart)
-        let (s0, n0) = (hart_window_snapshot(n), thread::now_ns());
-        let (t0, e0) = (TICKS.load(Ordering::Relaxed), entries(v));
-        thread::sleep_ticks(10);
-        let t1 = TICKS.load(Ordering::Relaxed);
-        let (s1, n1) = (hart_window_snapshot(n), thread::now_ns());
+        // (T284: a window that a pause of the host covered, two harts' timer interrupts more than 2 ms late inside it, is taken again,
+        // at most three in a row: the injector showed a 20 ms stall inside the 10 ms window leave the sleepers 5 wakes of 26. No
+        // heartbeat here: it would wake the offline hart, which is what the test counts.)
+        let e0 = entries(v);
+        let mut rs = kcore::pause::Resampler::new();
+        let (s0, n0, t0, t1, s1, n1) = loop {
+            let (s0, n0) = (hart_window_snapshot(n), thread::now_ns());
+            let t0 = TICKS.load(Ordering::Relaxed);
+            thread::sleep_ticks(10);
+            let t1 = TICKS.load(Ordering::Relaxed);
+            let (s1, n1) = (hart_window_snapshot(n), thread::now_ns());
+            let pause = match crate::pause::covering(n0, n1, 2_000) {
+                kcore::pause::Cover::Pause { hart, late_us } => Some((hart, late_us)),
+                _ => None,
+            };
+            match rs.judge(pause, 2_000) {
+                kcore::pause::Verdict::Keep => break (s0, n0, t0, t1, s1, n1),
+                kcore::pause::Verdict::Retake { hart, late_us } => {
+                    crate::pause::report("harts_go_offline_and_come_back", hart, late_us)
+                }
+                kcore::pause::Verdict::GiveUp { hart, late_us } => {
+                    crate::pause::report("harts_go_offline_and_come_back", hart, late_us);
+                    break (s0, n0, t0, t1, s1, n1); // (judged as it is: a host that never runs the harts is a failure)
+                }
+            }
+        };
         if state(v) != HART_OFFLINE || percpu::hart(v).online.load(Ordering::Acquire) {
             result = Err(format!(
                 "round {round}: hart {v} is not offline (state {})",

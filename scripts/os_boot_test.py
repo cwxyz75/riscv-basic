@@ -34,6 +34,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import refused_devices  # noqa: E402  (IOMMU-SPEC amendment 2026-11-27 part 2, L7: the devices no test machine carries)
 import host_fixtures  # noqa: E402  (T195: the servers the guest connects to, on ports of their own per boot)
+import host_stall  # noqa: E402  (T284: OS_HOST_STALL stops the emulator on purpose, to show what a host pause does)
 from host_fixtures import file21, tcp_pattern  # noqa: E402
 
 # The machine the OS track runs on (OD75): AIA (APLIC + IMSIC), required since PL6 (inter-hart interrupts are IMSIC messages).
@@ -118,6 +119,13 @@ BOOT = re.compile(r"^##BOOT (\S+) (\S+)$")
 # malformed `##` line.
 BENCH = re.compile(r"^##BENCH (\w+) (\d+) ([\w/]+)$")
 LAST_BENCH = []
+# T284: `##HOSTSTALL <t> <ms>`, the harness's own line for each stall of the injector (`OS_HOST_STALL`, scripts/host_stall.py), and
+# `##PAUSE <test> hart <h> late <us> us`, the guest's line for a window of a timing test that a pause covered (re-sampled). A boot with the
+# injector must show at least one stall, and its guest must have seen one (`a_host_stall_is_seen_by_the_guest`).
+HOSTSTALL = re.compile(r"^##HOSTSTALL (\d+\.\d{3}) (\d+\.\d{3})$")
+PAUSE = re.compile(r"^##PAUSE (\w+) hart (\d+) late (\d+) us$")
+LAST_HOSTSTALLS = []
+HOST_STALL_TEST = "a_host_stall_is_seen_by_the_guest"
 # `## iommu: fault cause=<decimal> dev=<bb:dd.f> iova=0x<hex> <read|write|exec|none>` (IOMMU-SPEC 7.2) and `## iommu: fence timeout dev=<bb:dd.f>`
 # (6.4; `dev=none` for a fence of no one device): the IOMMU's console lines. Kept for the checks after the run; any other `## iommu:`
 # line is malformed.
@@ -493,6 +501,7 @@ def run_profiled(cmd, kernel):
     start = time.monotonic()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     stamped = []
+    stall = host_stall.from_env(proc, lambda raw: stamped.append((time.monotonic(), raw)))
     client = []
     tcp_client = []
     http_client = []
@@ -525,6 +534,10 @@ def run_profiled(cmd, kernel):
         proc.kill()
         proc.wait()
         status, timed_out = None, True
+    finally:
+        if stall:
+            stall.stop()
+            print(stall.summary(), file=sys.stderr)
     t.join(timeout=5)
     for c in client + tcp_client + http_client:
         c.join(timeout=60)
@@ -750,6 +763,8 @@ def run_streaming(cmd):
     import time
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     chunks = []
+    # (T284: the injector's `##HOSTSTALL` lines go into the log between the guest's whole lines)
+    stall = host_stall.from_env(proc, chunks.append)
     last_out = [time.monotonic()]
     client = []
     tcp_client = []
@@ -779,6 +794,22 @@ def run_streaming(cmd):
     t.start()
     started = time.monotonic()
     status, timed_out = None, False
+    try:
+        status, timed_out = wait_streaming(proc, started, last_out, chunks)
+    finally:
+        if stall:
+            stall.stop()
+            print(stall.summary(), file=sys.stderr)
+    t.join(timeout=5)
+    for c in client + tcp_client + http_client:
+        c.join(timeout=60)
+    return b"".join(chunks), status, timed_out
+
+
+def wait_streaming(proc, started, last_out, chunks):
+    """Wait for QEMU to exit, or kill it on the run's ceiling or a stall of its output: (status, timed out)."""
+    import time
+    status, timed_out = None, False
     while True:
         try:
             status = proc.wait(timeout=1)
@@ -788,17 +819,15 @@ def run_streaming(cmd):
             if now - started > TIMEOUT:
                 TIMEOUT_REASON[0] = f"timed out after {TIMEOUT} s"
             elif now - last_out[0] > STALL:
-                TIMEOUT_REASON[0] = f"stalled: no output for {STALL} s (the last line: {b''.join(chunks[-1:]).decode(errors='replace').strip()[:100]!r})"
+                guest = [c for c in chunks if not c.startswith(b"##HOSTSTALL ")]  # (the guest's last line, not the injector's)
+                TIMEOUT_REASON[0] = f"stalled: no output for {STALL} s (the last line: {b''.join(guest[-1:]).decode(errors='replace').strip()[:100]!r})"
             else:
                 continue
             proc.kill()
             proc.wait()
             status, timed_out = None, True
             break
-    t.join(timeout=5)
-    for c in client + tcp_client + http_client:
-        c.join(timeout=60)
-    return b"".join(chunks), status, timed_out
+    return status, timed_out
 
 
 # The smoke tier runs the suite as two boots that CI starts as parallel jobs (OS_SHARD=a | b; TESTING.md, OD121): the guest
@@ -824,6 +853,11 @@ if (any(o.strip() in ("sleep=off", "sleep=no", "sleep=false") for o in os.enviro
     # before the host has finished. Guest time bounds no host I/O there, so no test of a disk can pass or fail on its merits: such a
     # boot leaves the disks off (the instruction counts, `make os-count`; the disk path is the other Kernel boots' to prove).
     sys.exit("OS_ICOUNT with sleep=off needs OS_DISK=0: guest time does not bound the host's disk I/O in that mode")
+
+
+def icount_sleep_off():
+    """Whether OS_ICOUNT asks for `sleep=off`: the guest's clock is then its instruction count, which the host cannot pause."""
+    return any(o.strip() in ("sleep=off", "sleep=no", "sleep=false") for o in os.environ.get("OS_ICOUNT", "").split(","))
 
 
 def _read_lines(path):
@@ -1151,6 +1185,9 @@ def run_with(kernel, extra, fixtures):
                                            f"load={elf_load_address(kernel):#x}",
                                            os.environ.get("OS_BOOT_ARGS", ""),
                                            fixtures.boot_arg() if fixtures else "",
+                                           host_stall.boot_arg(),
+                                           # (T21, T284: guest time is the instruction count, so a timing test may hold a bound of the guest's own)
+                                           "guesttime" if icount_sleep_off() and not rr_args() and os.environ.get("OS_SMP", "1") == "1" else "",
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           ),
@@ -1182,6 +1219,7 @@ def parse(lines):
     LAST_IOMMU_FAULTS.clear()
     LAST_IOMMU_FENCES.clear()
     LAST_DEVMGR_PCI.clear()
+    LAST_HOSTSTALLS.clear()
     for line in lines:
         if line.startswith("##FF "):
             LAST_FF.append(line)
@@ -1201,6 +1239,10 @@ def parse(lines):
             LAST_BENCH.append(m.groups())
         elif line.startswith("##PANIC "):
             panics.append(line[8:])
+        elif HOSTSTALL.match(line):
+            LAST_HOSTSTALLS.append(float(HOSTSTALL.match(line)[2]))
+        elif PAUSE.match(line):
+            pass  # (T284: a window of a timing test that a pause of the host covered, re-sampled; it stays in the serial log)
         elif line.startswith("##SCHED "):
             pass  # (T243: the scheduler report a failing test asks for with `debug_stat(132)`; it stays in the serial log)
         else:
@@ -1217,6 +1259,15 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
         found.append("no ##BOOT line")
     if bad:
         found.append(f"malformed ## lines: {bad}")
+    if os.environ.get("OS_HOST_STALL"):
+        # (T284) the injector must have stalled the emulator, and the guest must have seen a stall land (its own self-test, which runs
+        # only when the kernel line says `hoststall=`, and only in a test kernel: the injector is for test kernels)
+        if not LAST_HOSTSTALLS:
+            found.append("OS_HOST_STALL is set but the injector made no stall (no ##HOSTSTALL line)")
+        if HOST_STALL_TEST not in {n for n, _, _ in tests}:
+            found.append(f"OS_HOST_STALL is set but the guest did not report {HOST_STALL_TEST}")
+    elif LAST_HOSTSTALLS:
+        found.append("##HOSTSTALL lines in a boot without OS_HOST_STALL")
     if "ff=" in os.environ.get("OS_BOOT_ARGS", ""):
         # (T189) the run asked for counters near their end: the kernel must say it understood, and every name and value
         if not LAST_FF:
@@ -1309,6 +1360,12 @@ def negative_control(kernel, test):
                   f"{order[:1]}), so the control never reached it", file=sys.stderr)
             return 1
     how = "failed" if test in failed else "crashed or hung the kernel"
+    # (T284: `OS_NEG_DETAIL=<words>` requires the guarded test to have failed with those words, so a control is not passed by a failure
+    # of another kind, such as "host pause" for the planted-delay kernel under the injector)
+    want = os.environ.get("OS_NEG_DETAIL")
+    if want and not any(n == test and not ok and want in d for n, ok, d in tests):
+        print(f"negative control FAILED: {test} did not fail with {want!r} ({[d for n, ok, d in tests if n == test]})", file=sys.stderr)
+        return 1
     # (the guarded test's own words, so a run by hand records how the control was caught: the round of a race, say; T283)
     said = next((d for n, ok, d in tests if n == test and not ok), "")
     print(f"negative control passed: {test} {how} without its mechanism ({kernel})" + (f": {said}" if said else ""))

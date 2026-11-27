@@ -1081,6 +1081,7 @@ pub fn program_timer() -> Option<u64> {
             .saturating_add(WATCHDOG_PERIOD);
         ev = Some(ev.map_or(at, |e| e.min(at)));
     }
+    let ev = crate::pause::cap(ev); // (T284: a heartbeat while a timing test watches for pauses of the host)
     crate::timer::program(ev);
     ev
 }
@@ -1241,6 +1242,26 @@ pub fn sleep_ticks(n: u64) {
             false
         });
         if done {
+            #[cfg(feature = "fault-rt-wake-late")]
+            if priority_of(current()).is_some_and(|p| p > crate::MAIN_PRIO) {
+                // (T284's planted delay: the kernel holds a real-time wake back 5 ms, in steps of 1 ms so that every timer it arms is
+                // near: a timer armed far ahead is one the emulator delivers late on some hosts, which the pause detector would rightly
+                // call the host's)
+                for _ in 0..5 {
+                    sleep_ns(MS);
+                }
+            }
+            #[cfg(feature = "fault-rt-wake-late-irqoff")]
+            if priority_of(current()).is_some_and(|p| p > crate::MAIN_PRIO) {
+                // (the twin: the kernel holds the hart 5 ms with interrupts off at every real-time wake, which delays this hart's timer
+                // interrupts too; seen on one hart only, it is not a pause of the host)
+                irq::off(|| {
+                    let until = now_ns().saturating_add(5 * MS);
+                    while now_ns() < until {
+                        core::hint::spin_loop();
+                    }
+                });
+            }
             return;
         }
     }

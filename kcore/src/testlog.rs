@@ -35,6 +35,40 @@ pub fn done(out: &mut impl Write, pass: u32, fail: u32) -> fmt::Result {
     writeln!(out, "##DONE pass={pass} fail={fail}")
 }
 
+/// `##PAUSE <test> hart <h> late <us> us` (T284): a window of a timing test that a pause of the host covered (a timer interrupt of
+/// hart `h` taken `us` microseconds late inside it), so the window is taken again or, the third in a row, the test fails.
+pub fn pause(out: &mut impl Write, test: &str, hart: usize, late_us: u64) -> fmt::Result {
+    debug_assert!(!test.is_empty() && !test.contains(char::is_whitespace));
+    writeln!(out, "##PAUSE {test} hart {hart} late {late_us} us")
+}
+
+/// Is `text` exactly a [`pause`] line? (The kernel lets a program's well-formed `##PAUSE` line through to the console unprefixed, like
+/// `##BENCH`: a measurement, not a verdict.)
+pub fn is_pause_line(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("##PAUSE ") else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut w = rest.split(' ');
+    match (
+        w.next(),
+        w.next(),
+        w.next(),
+        w.next(),
+        w.next(),
+        w.next(),
+        w.next(),
+    ) {
+        (Some(t), Some("hart"), Some(h), Some("late"), Some(us), Some("us"), None) => {
+            !t.is_empty()
+                && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && digits(h)
+                && digits(us)
+        }
+        _ => false,
+    }
+}
+
 fn one_line(out: &mut impl Write, text: &str) -> fmt::Result {
     for c in text.chars() {
         out.write_char(if c == '\n' || c == '\r' { ' ' } else { c })?;

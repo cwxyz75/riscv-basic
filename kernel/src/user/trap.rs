@@ -507,6 +507,35 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
             return Ok((Some(at.unwrap_or(u64::MAX)), None));
         }
+        // 216 to 218 (T284, test kernels and the release-suite kernel; a release kernel answers 0 and does nothing). 216: whether a pause of
+        // the host covered the window from `a2` (nanoseconds on the clock `clock_ns` reads) to now for a test whose bound is `a3`
+        // microseconds (two harts took a timer interrupt more than `a3` late inside it, `kcore::pause::covering`), as (hart << 48) |
+        // microseconds late of the worst, 0 for none. 217: how long the harts were not taking their timer interrupts inside that window,
+        // summed over the harts, counting samples at least 2 ms late (microseconds). 218 (the one selector with an effect, bounded: the
+        // debug resource is the trusted suite's, HD4): for the next `a2` milliseconds (at most 60 s, so a test that dies with it on does
+        // not leave it on for long; 0 stops it) every hart keeps a timer deadline at most 1 ms ahead.
+        if a[1] == 216 || a[1] == 217 || a[1] == 218 {
+            #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+            {
+                let now = crate::timer::now_ns();
+                let v = match a[1] {
+                    216 => match crate::pause::covering(a[2], now, a[3]) {
+                        kcore::pause::Cover::Pause { hart, late_us } => {
+                            kcore::pause::encode(Some((hart, late_us)))
+                        }
+                        _ => 0,
+                    },
+                    217 => crate::pause::paused_in(a[2], now),
+                    _ => {
+                        crate::pause::watch(a[2].min(60_000).saturating_mul(1_000_000));
+                        0
+                    }
+                };
+                return Ok((Some(v), None));
+            }
+            #[cfg(all(feature = "release", not(feature = "release-suite")))]
+            return Ok((Some(0), None));
+        }
         // 132 (T243, debug builds): print every hart's scheduler state, the record of every thread that is not idle and the processes that are not
         // finished, for a test that failed; the user state is the one this closure holds (`dump_state` opening it again would be two live `&mut`, T239)
         if a[1] == 132 {
@@ -1570,13 +1599,13 @@ fn debug_lines(line: &mut String, bytes: &[u8]) -> alloc::vec::Vec<String> {
     out
 }
 
-/// Show one line, as the console shows a program's output: a well-formed `##BENCH` line and a well-formed `##TEST name PASS|FAIL` result pass through
+/// Show one line, as the console shows a program's output: a well-formed `##BENCH` or `##PAUSE` line and a well-formed `##TEST name PASS|FAIL` result pass through
 /// (the verdicts are counted in `pass` and `fail`), any other line starting `##` is prefixed so user code cannot forge the kernel's verdict lines.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a pair of test counters
 #[inline(never)]
 fn show_debug_line(text: &str, pass: &mut u32, fail: &mut u32) {
     // A well-formed `##BENCH name value unit` line (SCHED-SMP-SPEC 6.1, amends OD28) passes through like a result.
-    if is_bench_line(text) {
+    if is_bench_line(text) || kcore::testlog::is_pause_line(text) {
         let _ = writeln!(Console, "{text}");
         return;
     }

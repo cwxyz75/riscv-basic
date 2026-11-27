@@ -34,6 +34,16 @@ pub fn cycles_from_ns(ns: u64) -> u64 {
     conversion().ns_to_cycles(ns)
 }
 
+/// Nanoseconds in `cycles` of the counter (rounded down): a span, such as how late a timer interrupt was taken.
+pub fn ns_from_cycles(cycles: u64) -> u64 {
+    conversion().cycles_to_ns(cycles)
+}
+
+/// The `now_ns` clock's reading at counter value `cycles` (0 before the clock's zero).
+pub fn ns_at(cycles: u64) -> u64 {
+    conversion().cycles_to_ns(cycles.saturating_sub(BOOT_COUNT.load(Ordering::Relaxed)))
+}
+
 /// The counter value when the first tick was programmed (the clock's zero); 0 until then.
 static BOOT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -67,6 +77,11 @@ fn write_stimecmp(value: u64) {
     unsafe { asm!("csrw 0x14d, {}", in(reg) value) };
 }
 
+/// Write `stimecmp` with no bookkeeping: the pause detector's sentinel (`pause::timer_taken`), which the handler's own re-arm replaces.
+pub fn write_raw(cycles: u64) {
+    write_stimecmp(cycles);
+}
+
 /// Read `stimecmp` back (the boot probe).
 fn read_stimecmp() -> u64 {
     let v: u64;
@@ -85,6 +100,7 @@ pub fn start() {
         read_stimecmp() == 0x5a5a_5a5a_0000_0001,
         "this hart has no Sstc (`stimecmp` is not writable): the kernel requires it (OD127)"
     );
+    crate::pause::armed(u64::MAX);
     write_stimecmp(u64::MAX);
 }
 
@@ -101,5 +117,8 @@ pub fn program(event: Option<u64>) {
             .load(Ordering::Relaxed)
             .saturating_add(cycles_from_ns(ns)),
     };
+    // (T284: the pause detector measures the interrupt this raises against it; recorded first, so an interrupt taken in between is
+    // never measured against an older, earlier value)
+    crate::pause::armed(cycles);
     write_stimecmp(cycles);
 }
