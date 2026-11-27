@@ -232,7 +232,7 @@ fn fault_record_decoding() {
     assert_eq!(r.ttype, TransactionType::UntranslatedWrite);
     assert_eq!(r.ttype.direction(), "write");
     assert_eq!(r.device_id, 0x08);
-    assert_eq!(r.pci_address(), (0, 1, 0)); // IOMMU0 item 1: the testdev is 00:01.0
+    assert_eq!(r.pci_address(), (0, 1, 0)); // IOMMU0 item 1: the probe's device at 00:01.0 (QEMU's test device, on no test machine since OD175)
     assert!(!r.pv);
     assert_eq!(r.iotval, 0x100_0000_1000);
     assert_eq!(r.iotval2, 0x100_0000_1000);
