@@ -168,6 +168,21 @@ pub fn stack_canaries_intact() -> bool {
     (0..started()).all(|i| unsafe { *((stacks + i * STACK_BYTES) as *const u64) } == CANARY)
 }
 
+/// Hart `index`'s boot stack, `[low, high)`, where it starts and its idle thread runs (T266: the panic trace's bounds). The boot hart's
+/// is the linker's; a secondary's is its slot of `BOOT_STACKS` (whose first word is the canary).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: index < MAX_HARTS, so the slot is inside BOOT_STACKS
+pub fn boot_stack(index: usize) -> Option<(u64, u64)> {
+    if index == 0 {
+        return Some(kmem::boot_stack());
+    }
+    if index >= MAX_HARTS {
+        return None;
+    }
+    let stacks = core::ptr::addr_of!(BOOT_STACKS) as u64;
+    let low = stacks + (index * STACK_BYTES) as u64;
+    Some((low, low + STACK_BYTES as u64))
+}
+
 /// How many harts were started (the boot hart included).
 pub fn started() -> usize {
     STARTED.load(Ordering::SeqCst)

@@ -474,7 +474,9 @@ pub fn a_dead_client_frees_everything() -> Outcome {
 
 /// T233: a client writing to a socket is killed at a random moment while the server reads it in big chunks (the copy-out runs after the object lock is let go).
 /// Every read ends Ok (with at most what was written), ShouldWait or PeerClosed: never INVALID_ARGS (a copy-out that was refused for a buffer that is mapped), and the
-/// kernel does not panic. Rounds differ in how many reads happen before the kill and how many bytes the client had queued.
+/// kernel does not panic. Rounds differ in how many reads happen before the kill and how many bytes the client had queued. T266: the client writes the stream
+/// pattern (`stream_byte`) and every byte read must be the pattern at its offset, computed here (an independent oracle: a copy-out into another address space
+/// that succeeds leaves this buffer as it was, and a chunk delivered twice or out of place shows too).
 pub fn a_kill_storm_on_a_stream_loses_no_range() -> Outcome {
     let root = root_job()?;
     let j = ipc_job(root, 1024 * KIB)?;
@@ -492,8 +494,8 @@ pub fn a_kill_storm_on_a_stream_loses_no_range() -> Outcome {
             .handle
             .ok_or_else(|| msg_at(line!()))?;
         let units = 1 + (next() % 16) as u8;
-        // the client writes `units` chunks of 4 KiB in the background while this thread reads
-        hand.send(b'W', units, None)?;
+        // the client writes `units` chunks of 4 KiB of the pattern in the background while this thread reads
+        hand.send(b'P', units, None)?;
         let kill_after = next() % 24;
         let mut reads = 0u64;
         let mut total = 0u64;
@@ -505,10 +507,25 @@ pub fn a_kill_storm_on_a_stream_loses_no_range() -> Outcome {
                 let _ = sys::process_kill(hand.proc, 9);
                 killed = true;
             }
+            buf.fill(0xA5);
             let r = sys::socket_read(end, buf.as_mut_ptr(), buf.len());
             match r.status() {
                 Some(S::Ok) => {
                     ensure!(r.a1 <= buf.len(), "a read returned more than the buffer");
+                    if let Some(k) = (0..r.a1).find(|&k| buf[k] != stream_byte(total + k as u64)) {
+                        let mut d = Detail::new();
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut d,
+                            format_args!(
+                                "round {round}: byte {} of the stream is {:#x}, want {:#x} (a read of {} bytes after {reads} reads)",
+                                total + k as u64,
+                                buf[k],
+                                stream_byte(total + k as u64),
+                                r.a1
+                            ),
+                        );
+                        return Err(d);
+                    }
                     total += r.a1 as u64;
                     reads += 1;
                 }
@@ -554,6 +571,220 @@ pub fn a_kill_storm_on_a_stream_loses_no_range() -> Outcome {
         sys::handle_close(hand.ch);
     }
     job_use_settles(j, 5, 0, 2000)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+/// T266: the byte at `offset` of a pattern-checked stream (`crash.rs`'s socket hand writes it with 'P').
+fn stream_byte(offset: u64) -> u8 {
+    (offset ^ (offset >> 8) ^ (offset >> 16)) as u8
+}
+
+/// T266: the length of message `i` of the channel kill storm (as `crash.rs` computes it): 1 to 64 KiB.
+fn msg_len(i: u32) -> usize {
+    1024 * (1 + (i as usize * 37 + 11) % 64)
+}
+
+/// T266: the byte at `offset` of message `i` (as `crash.rs` computes it).
+fn msg_byte(i: u32, offset: usize) -> u8 {
+    (offset ^ (offset >> 8) ^ (i as usize).wrapping_mul(31)) as u8
+}
+
+/// One message of the channel storm as it came back: `n` bytes in `buf` and `nh` handles in `hs`.
+struct Got<'a> {
+    buf: &'a [u8],
+    n: usize,
+    hs: [u64; 2],
+    nh: usize,
+}
+
+/// Check message `i` of round `round`: its length, its pattern from byte `from` on, and two handles that name live objects; then close them.
+fn check_message(round: u32, i: u32, got: Got, from: usize) -> Outcome {
+    let mut d = Detail::new();
+    let _ = core::fmt::Write::write_fmt(&mut d, format_args!("round {round}, message {i}: "));
+    let w = &mut d;
+    let bad = if got.n != msg_len(i) || got.nh != 2 {
+        core::fmt::Write::write_fmt(
+            w,
+            format_args!(
+                "{} bytes and {} handles, want {} and 2",
+                got.n,
+                got.nh,
+                msg_len(i)
+            ),
+        )
+        .is_ok()
+    } else if let Some(k) = (from..got.n).find(|&k| got.buf[k] != msg_byte(i, k)) {
+        core::fmt::Write::write_fmt(
+            w,
+            format_args!("byte {k} is {:#x}, want {:#x}", got.buf[k], msg_byte(i, k)),
+        )
+        .is_ok()
+    } else if let Some(s) = got
+        .hs
+        .iter()
+        .map(|&h| sys::object_signals(h).status)
+        .find(|&s| s != 0)
+    {
+        core::fmt::Write::write_fmt(
+            w,
+            format_args!("a handle it carried names nothing live (status {s})"),
+        )
+        .is_ok()
+    } else {
+        false
+    };
+    if bad {
+        return Err(d);
+    }
+    for h in got.hs {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// T266 (T233-d): the channel twin of the stream kill storm. A client (the socket hand, behaviours 'M' and 'S') sends messages of 1 to 64 KiB with
+/// two handles each, or answers `channel_call`s with them, and is killed at a random moment while this thread reads or calls (the copy-out of a
+/// message of 1 KiB or more runs after the object lock is let go, T215). Every message that arrives is whole: its length, its pattern (computed here
+/// from its index, not echoed) and two live handles; every other answer is ShouldWait (a read) or PeerClosed. When the rounds are over the job's IPC
+/// bytes and objects are back to zero: nothing a killed client sent outlives the handles that held it.
+pub fn a_kill_storm_on_a_channel_loses_no_message() -> Outcome {
+    let root = root_job()?;
+    let j = ipc_job(root, 1024 * KIB)?;
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    for round in 0..48u32 {
+        let hand = Hand::start(j)?;
+        let ch = hand
+            .cmd(b'K', 0, None)?
+            .handle
+            .ok_or_else(|| msg_at(line!()))?;
+        let mut killed = false;
+        let kill = |killed: &mut bool| {
+            if !*killed {
+                let _ = sys::process_kill(hand.proc, 9);
+                *killed = true;
+            }
+        };
+        if round % 2 == 0 {
+            // reads: the client sends 24 messages (about 750 KiB) while this thread reads them, killed after a random number of reads
+            hand.send(b'M', 24, None)?;
+            let kill_after = next() % 40;
+            let (mut reads, mut got, mut spins) = (0u64, 0u32, 0u32);
+            loop {
+                if reads >= kill_after || got == 24 {
+                    kill(&mut killed);
+                }
+                buf.fill(0xA5);
+                let mut hs = [0u64; 2];
+                let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), 2);
+                reads += 1;
+                match r.status() {
+                    Some(S::Ok) => {
+                        let m = Got {
+                            buf: &buf,
+                            n: r.a1,
+                            hs,
+                            nh: r.a2,
+                        };
+                        check_message(round, got, m, 0)?;
+                        got += 1;
+                    }
+                    Some(S::ShouldWait) => {
+                        spins += 1;
+                        if spins > 200_000 {
+                            return Err(detail("the channel never closed"));
+                        }
+                        let _ = sys::object_wait(
+                            ch,
+                            sig::PEER_CLOSED | sig::READABLE,
+                            sys::clock_get() + 50,
+                        );
+                    }
+                    Some(S::PeerClosed) => break,
+                    other => {
+                        let mut d = Detail::new();
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut d,
+                            format_args!(
+                                "round {round}: a read of a channel whose client is killed returned {other:?} (status {}) after {got} messages",
+                                r.status
+                            ),
+                        );
+                        return Err(d);
+                    }
+                }
+            }
+            ensure!(got <= 24, "more messages than the client sent");
+        } else {
+            // calls: the client answers call i with message i, and is killed before a random call
+            hand.send(b'S', 0, None)?;
+            let kill_before = next() % 12;
+            for i in 0..16u32 {
+                if u64::from(i) >= kill_before {
+                    kill(&mut killed);
+                }
+                let mut req = [0u8; 8];
+                req[..4].copy_from_slice(&(i + 1).to_le_bytes());
+                req[4..].copy_from_slice(&i.to_le_bytes());
+                buf.fill(0xA5);
+                let mut hs = [0u64; 2];
+                let args = CallArgs {
+                    req_bytes: req.as_ptr() as u64,
+                    req_handles: 0,
+                    req_nbytes: 8,
+                    req_nhandles: 0,
+                    rep_bytes: buf.as_mut_ptr() as u64,
+                    rep_handles: hs.as_mut_ptr() as u64,
+                    rep_max_bytes: buf.len() as u32,
+                    rep_max_handles: 2,
+                    deadline: sys::clock_get() + 5000,
+                };
+                let r = sys::channel_call(ch, &args);
+                match r.status() {
+                    Some(S::Ok) => {
+                        ensure_eq!(
+                            &buf[..4],
+                            &(i + 1).to_le_bytes()[..],
+                            "the reply carries the call's txid"
+                        );
+                        let m = Got {
+                            buf: &buf,
+                            n: r.a1,
+                            hs,
+                            nh: r.a2,
+                        };
+                        check_message(round, i, m, 4)?;
+                    }
+                    Some(S::PeerClosed) if killed => break,
+                    other => {
+                        let mut d = Detail::new();
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut d,
+                            format_args!(
+                                "round {round}: call {i} returned {other:?} (status {}; the client killed: {killed})",
+                                r.status
+                            ),
+                        );
+                        return Err(d);
+                    }
+                }
+            }
+            kill(&mut killed);
+        }
+        sys::handle_close(ch);
+        sys::handle_close(hand.proc);
+        sys::handle_close(hand.ch);
+    }
+    job_use_settles(j, 5, 0, 2000)?;
+    job_use_settles(j, 4, 0, 2000)?;
     sys::handle_close(j);
     sys::handle_close(root);
     Ok(())

@@ -331,6 +331,13 @@ extern "C" {
     static __rodata_end: u8;
     static __data_start: u8;
     static __kernel_end: u8;
+    static __stack_bottom: u8;
+    static __stack_top: u8;
+}
+
+/// The boot hart's boot stack, `[low, high)` (the linker's `.stack`; its idle thread runs on it).
+pub fn boot_stack() -> (u64, u64) {
+    (sym(addr_of!(__stack_bottom)), sym(addr_of!(__stack_top)))
 }
 
 fn sym(s: *const u8) -> u64 {

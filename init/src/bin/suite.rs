@@ -6544,7 +6544,8 @@ fn kill_a_process_that_is_creating_threads() -> Outcome {
         let g = event()?;
         sys::object_wait(g, 1 << 24, sys::clock_get() + d % 4 + 1);
         ensure_eq!(st(sys::process_kill(p, 5)), Some(S::Ok), "kill");
-        wait_ended(p, 500)?;
+        // (T266, T197: 5 s, beyond any host pause; a timeout prints the scheduler state. The latency of a kill is T267's)
+        wait_ended_or_say(p, &[], 5000)?;
         ensure_eq!(sys::process_info(p).a1 as i64, 5, "the kill's code");
     }
     Ok(())
@@ -23722,6 +23723,10 @@ pub fn app_main() -> i32 {
         (
             "a_kill_storm_on_a_stream_loses_no_range",
             stream_proto::a_kill_storm_on_a_stream_loses_no_range,
+        ),
+        (
+            "a_kill_storm_on_a_channel_loses_no_message",
+            stream_proto::a_kill_storm_on_a_channel_loses_no_message,
         ),
         (
             "a_jobs_region_quota_bounds_its_processes",

@@ -558,6 +558,9 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
         }
         thread::pi_revoke(me);
     });
+    if deferred.is_some() {
+        crate::chaos::point(crate::chaos::Point::CopyOut); // (as in `trap.rs`: the reply is taken, the copy-out not yet made)
+    }
     super::trap::finish_out(r, deferred)
 }
 

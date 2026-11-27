@@ -249,20 +249,50 @@ pub fn reacquire(depth: u32) {
 }
 
 /// A debug-build deadlock detector: a hart that has spun this long for one lock is stuck, not waiting (a lock is held for
-/// microseconds). It panics with who owns the big lock, so a hang becomes a diagnosable failure.
+/// microseconds). It panics with who owns the big lock, where the owner took it and (T266, T212) whether the owner held it the whole
+/// time: at the first spin of a wait the owner, the owner hart's outermost takes and the clock are recorded, and the report gives the
+/// takes since and the time waited (`kcore::watchdog::spin_verdict`: none is one long section, some is a starved waiter).
 fn spin_watchdog(spins: &mut u64, what: &str) {
     if cfg!(debug_assertions) {
         *spins += 1;
+        let me = percpu::this();
+        let takes_of = |owner: u64| {
+            owner
+                .checked_sub(1)
+                .and_then(|h| usize::try_from(h).ok())
+                .filter(|&h| h < crate::smp::started().min(percpu::MAX_HARTS))
+                .map_or(0, |h| percpu::hart(h).bkl_takes.load(Ordering::Relaxed))
+        };
+        if *spins == 1 {
+            let owner = OWNER.load(Ordering::Relaxed) as u64;
+            me.spin_owner.store(owner, Ordering::Relaxed);
+            me.spin_owner_takes
+                .store(takes_of(owner), Ordering::Relaxed);
+            me.spin_at.store(crate::timer::now_ns(), Ordering::Relaxed);
+        }
         if *spins == 30_000_000 {
             *spins = 0;
+            let start = kcore::watchdog::SpinStart {
+                owner: me.spin_owner.load(Ordering::Relaxed),
+                owner_takes: me.spin_owner_takes.load(Ordering::Relaxed),
+                at_ns: me.spin_at.load(Ordering::Relaxed),
+            };
+            let owner = OWNER.load(Ordering::Relaxed) as u64;
+            let verdict = kcore::watchdog::spin_verdict(
+                start,
+                owner,
+                takes_of(start.owner),
+                crate::timer::now_ns(),
+            );
             panic!(
-                "hart {} has spun for {what} (last class asked for: {}) for 30 million iterations; the big kernel lock is owned by hart+1 = {}, taken at {}",
+                "hart {} has spun for {what} (last class asked for: {}) for 30 million iterations; the big kernel lock is owned by hart+1 = {}, taken at {}; owner at the start: hart+1 = {}, {verdict}",
                 who(),
-                percpu::this().last_class.load(Ordering::Relaxed),
-                OWNER.load(Ordering::Relaxed),
+                me.last_class.load(Ordering::Relaxed),
+                owner,
                 // SAFETY: the pointer is null or a `&'static Location` stored by `lock`.
                 unsafe { OWNER_SITE.load(Ordering::Relaxed).as_ref() }
-                    .map_or("?".into(), |l| alloc::format!("{}:{}", l.file(), l.line()))
+                    .map_or("?".into(), |l| alloc::format!("{}:{}", l.file(), l.line())),
+                start.owner,
             );
         }
     }

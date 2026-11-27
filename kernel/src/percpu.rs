@@ -127,6 +127,11 @@ pub struct PerHart {
     pub vs_buf: AtomicUsize,
     /// Spin iterations in the current wait for a lock (the deadlock detector's counter).
     pub spins: AtomicU64,
+    /// What the deadlock detector saw when the current wait began (T266, T212): the big lock's owner (hart + 1, 0 none), that hart's
+    /// `bkl_takes` and this hart's clock (ns), so the report can say whether the owner held the lock the whole time.
+    pub spin_owner: AtomicU64,
+    pub spin_owner_takes: AtomicU64,
+    pub spin_at: AtomicU64,
     /// The lock class this hart last asked for (diagnostics for the deadlock detector).
     pub last_class: AtomicU32,
     /// This hart's magazines of free slab objects, one per size class (MM4): touched only by this hart with interrupts off.
@@ -301,6 +306,9 @@ impl PerHart {
             fs_buf: AtomicUsize::new(0),
             vs_buf: AtomicUsize::new(0),
             spins: AtomicU64::new(0),
+            spin_owner: AtomicU64::new(0),
+            spin_owner_takes: AtomicU64::new(0),
+            spin_at: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
             magazines: Magazines::new(),
             asid_seen: AtomicU64::new(0),

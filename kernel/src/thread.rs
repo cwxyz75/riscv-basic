@@ -1006,56 +1006,73 @@ pub(crate) fn dump_sched() {
 
 /// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds), now a timer entry (L13): a hart with queued work arms an event every
 /// 100 ms (`program_timer`), and at each timer interrupt after that long a thread queued for more than 500 ms while a hart that may
-/// run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`). The same thread must be found in two
-/// samples in a row: the check reads other harts' idleness from hints at one instant, and a thread preempted after a long run is queued,
-/// "late" and briefly in front of an idle hart that is on its way to pull it (PR 264 review). An idle hart with nothing queued
+/// run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`). The same thread must be found in
+/// three samples in a row: the check reads other harts' idleness from hints at one instant, and a thread preempted after a long run is
+/// queued, "late" and briefly in front of an idle hart that is on its way to pull it (PR 264 review). An idle hart with nothing queued
 /// arms nothing: it takes no timer interrupt.
+///
+/// T266 (T197): a sample counts only when the hart the thread is queued on has taken an interrupt (timer or IPI) since the previous
+/// one that counted (`kcore::watchdog`): a hart the host did not run (an oversubscribed host, the host-stall injector) is not the
+/// scheduler's fault, and the sample is void. A hart that shows no progress for 10 s while the thread waits is reported as stalled.
 #[cfg(debug_assertions)]
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-// INVARIANT: h is a hart index below MAX_HARTS; the panic is the detector's report
+#[allow(clippy::panic, clippy::indexing_slicing)]
+// INVARIANT: the per-hart arrays are indexed `% MAX_HARTS`; the panic is the detector's report
 // KT13: audited, a frame over 1 KiB on a path that ends in a panic (the report holds a thread record)
 #[allow(clippy::large_stack_frames)]
 fn starvation_watchdog(h: usize, now: u64) {
-    static LAST: [core::sync::atomic::AtomicU64; crate::percpu::MAX_HARTS] =
-        [const { core::sync::atomic::AtomicU64::new(0) }; crate::percpu::MAX_HARTS];
-    static REPEATS: [core::sync::atomic::AtomicU32; crate::percpu::MAX_HARTS] =
-        [const { core::sync::atomic::AtomicU32::new(0) }; crate::percpu::MAX_HARTS];
-    if now.saturating_sub(WD_AT[h % crate::percpu::MAX_HARTS].load(Ordering::Relaxed))
-        >= WATCHDOG_PERIOD
-    {
-        WD_AT[h % crate::percpu::MAX_HARTS].store(now, Ordering::Relaxed);
-        let found = sched().starved(now, 500 * MS);
-        let tid = found.map_or(0, |f| f.0);
-        let before = LAST[h % crate::percpu::MAX_HARTS].swap(tid, Ordering::Relaxed);
-        // (the same thread in three samples in a row: on a loaded host the emulated machine is slow, and a thread queued behind a few
-        // thousand others while a hart is between two pulls would trip a shorter rule)
-        let repeats = if before == tid && tid != 0 {
-            REPEATS[h % crate::percpu::MAX_HARTS].fetch_add(1, Ordering::Relaxed) + 1
+    use kcore::watchdog::{Verdict, Watchdog};
+    /// Each sampling hart's `kcore::watchdog::Watchdog`, as its five words; only that hart touches its row (in its timer handler,
+    /// interrupts off).
+    static STATE: [[core::sync::atomic::AtomicU64; 5]; crate::percpu::MAX_HARTS] =
+        [const { [const { core::sync::atomic::AtomicU64::new(0) }; 5] }; crate::percpu::MAX_HARTS];
+    let h = h % crate::percpu::MAX_HARTS;
+    if now.saturating_sub(WD_AT[h].load(Ordering::Relaxed)) < WATCHDOG_PERIOD {
+        return;
+    }
+    WD_AT[h].store(now, Ordering::Relaxed);
+    let found = sched().starved(now, 500 * MS);
+    let row = &STATE[h];
+    let mut w = Watchdog::from_words(core::array::from_fn(|i| row[i].load(Ordering::Relaxed)));
+    let started = crate::smp::started();
+    let verdict = w.sample(now, found, |x| {
+        // (a hart's progress: the interrupts it took, read racily from another hart: a hint, used for this rule only)
+        if x < started.min(crate::percpu::MAX_HARTS) {
+            let p = crate::percpu::hart(x);
+            p.timer_ticks
+                .load(Ordering::Relaxed)
+                .wrapping_add(p.ipis.load(Ordering::Relaxed))
         } else {
-            REPEATS[h % crate::percpu::MAX_HARTS].store(0, Ordering::Relaxed);
             0
-        };
-        if let Some((t, on, idle)) = found {
-            if repeats >= 2 {
-                let sc = sched();
-                let harts: alloc::vec::Vec<_> = (0..crate::smp::started())
-                    .map(|i| {
-                        (
-                            sc.current_on(i),
-                            sc.queued_on(i),
-                            sc.resched_pending(i),
-                            sc.in_transit(i),
-                            sc.next_event_on(i),
-                        )
-                    })
-                    .collect();
-                panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles (per hart: current, queued, marked, in transit, next event: {harts:?}; the thread: {:?})", sc.record(t));
-            }
         }
+    });
+    for (slot, v) in row.iter().zip(w.to_words()) {
+        slot.store(v, Ordering::Relaxed);
+    }
+    let report = |what: core::fmt::Arguments| {
+        let sc = sched();
+        let harts: alloc::vec::Vec<_> = (0..started)
+            .map(|i| {
+                (
+                    sc.current_on(i),
+                    sc.queued_on(i),
+                    sc.resched_pending(i),
+                    sc.in_transit(i),
+                    sc.next_event_on(i),
+                )
+            })
+            .collect();
+        let tid = w.tid;
+        panic!("{what} (per hart: current, queued, marked, in transit, next event: {harts:?}; the thread: {:?})", sc.record(tid));
+    };
+    match verdict {
+        Verdict::Quiet => {}
+        Verdict::Starved { tid, on, idle } => report(format_args!(
+            "starved thread {tid}: queued on hart {on} for more than 500 ms while hart {idle} idles, and hart {on} took interrupts meanwhile"
+        )),
+        Verdict::Stalled { tid, on, quiet_ns } => report(format_args!(
+            "stalled hart {on}: it took no interrupt for {} ms while thread {tid} was queued on it (interrupts off, or a lost poke on a hart with nothing armed)",
+            quiet_ns / MS
+        )),
     }
 }
 
