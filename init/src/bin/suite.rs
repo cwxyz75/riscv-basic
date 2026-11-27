@@ -20478,14 +20478,24 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
 
 static CPU_SPIN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 static CPU_SLEEP_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The spinner's own figure when its window opened, and the clock's length of the window (see `cpu_spinner`).
+static CPU_SPIN_START_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+static CPU_SPIN_WALL_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Spins for 100 ms of the clock and reports the CPU time its own thread was charged (handle 0: the caller).
+/// Spins for 100 ms of the clock and reports the CPU time its own thread was charged (handle 0: the caller): at the window's opening
+/// and at its close, and the window's length by the same clock, read outside both figures (so the figures' difference is charged
+/// within it).
 extern "C" fn cpu_spinner(_: usize) -> ! {
-    let start = sys::clock_ns();
-    while sys::clock_ns() < start + 100_000_000 {
+    let t0 = sys::clock_ns();
+    let c0 = sys::thread_cpu_ns(0).a1 as u64;
+    while sys::clock_ns() < t0 + 100_000_000 {
         core::hint::spin_loop();
     }
-    CPU_SPIN_NS.store(sys::thread_cpu_ns(0).a1 as u64, Ordering::SeqCst);
+    let c1 = sys::thread_cpu_ns(0).a1 as u64;
+    let t1 = sys::clock_ns();
+    CPU_SPIN_START_NS.store(c0, Ordering::SeqCst);
+    CPU_SPIN_WALL_NS.store(t1 - t0, Ordering::SeqCst);
+    CPU_SPIN_NS.store(c1, Ordering::SeqCst);
     sys::thread_exit(0)
 }
 
@@ -20502,6 +20512,8 @@ extern "C" fn cpu_sleeper(_: usize) -> ! {
 fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
     CPU_SPIN_NS.store(u64::MAX, Ordering::SeqCst);
     CPU_SLEEP_NS.store(u64::MAX, Ordering::SeqCst);
+    CPU_SPIN_START_NS.store(u64::MAX, Ordering::SeqCst);
+    CPU_SPIN_WALL_NS.store(u64::MAX, Ordering::SeqCst);
     let me_p = ok(sys::process_self(), "process_self")?.a1 as u64;
     let before = ok(sys::process_cpu_ns(me_p), "process cpu")?.a1 as u64;
     // One after the other: the spinner's 100 ms are of the clock, so at one hart anything else that runs in them (the sleeper's
@@ -20520,10 +20532,25 @@ fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
     );
     let spun = CPU_SPIN_NS.load(Ordering::SeqCst);
     let slept = CPU_SLEEP_NS.load(Ordering::SeqCst);
-    // (the thread's own figure at its end: 5 percent either way; the spec's 2 percent needs a quieter machine than a shared CI runner)
+    let (c0, wall) = (
+        CPU_SPIN_START_NS.load(Ordering::SeqCst),
+        CPU_SPIN_WALL_NS.load(Ordering::SeqCst),
+    );
     ensure!(
-        (95_000_000..=105_000_000).contains(&spun),
-        "a thread that spun for 100 ms was charged {spun} ns"
+        c0 <= spun && (100_000_000..u64::MAX).contains(&wall),
+        "the spinner's figures: {c0} ns at the start, {spun} ns at the end, a window of {wall} ns"
+    );
+    // What was charged inside the window, against the window by the same clock (the scheduler charges by the clock `clock_get` reads).
+    // The thread's whole figure also holds its start-up (entry, stack faults, the first run of its code under emulation, a host that
+    // stalls the hart: milliseconds on a CI runner, T250), which is outside the window, so it is not compared with 100 ms. Not more
+    // than the window: one thread is designated on one hart at a time and charged from its designation, which is made under the lock
+    // of the clock reading it is charged from (AC1; a pull that designated with an older reading billed a stretch on both harts, which
+    // `kcore/tests/charge_migrate_concurrency.rs` pins). Not less than 95 percent of it (the spec's 2 percent needs a quieter machine
+    // than a shared CI runner: interrupts and the suite's other harts' work may take this hart).
+    let win = spun - c0;
+    ensure!(
+        win <= wall && win >= wall / 100 * 95,
+        "a thread that spun for {wall} ns of the clock was charged {win} ns in that time ({c0} ns before it, {spun} ns in all)"
     );
     // (the thread's start-up, its event and its two calls cost a few milliseconds on a loaded CI machine under emulation, 5.5 to 7.9 ms seen (T250): the point
     // is that 50 ms of sleep were not charged, which 25 ms still tells)
