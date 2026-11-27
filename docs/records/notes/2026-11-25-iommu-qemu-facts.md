@@ -210,3 +210,19 @@ CI now builds 11.1.3, the version of this record, from the release tarball (sha2
 every job that boots asserts the version, and `qemu.yml` checks the `iommu-map` above (`docs/reference/TEST-TOOLS.md`, "CI's QEMU").
 The bundled firmware is OpenSBI 1.8.1. A cold build on a hosted runner took 165 to 196 s (`riscv64-softmmu` only); restoring the cached
 install (29 MB without the UEFI images) took about a second.
+
+
+## Correction 2026-11-26 (T279): the `ddtp` read-back of section 4
+
+Section 4 records a read-back of `0x20c00c02` after writing mode 1LVL with PPN `0x83000`. That value does not match its own PPN:
+`ddtp` holds the mode in bits 3:0 and the PPN from bit 10, so PPN `0x83000` in mode 2 is `0x20c00002`, and the extra `0xc00` would be
+PPN `0x83003`. Re-observed on QEMU 11.1.3 (`-M virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -smp 1 -m 512M -bios none`), with a
+probe of a dozen M-mode instructions loaded as `-kernel`: it read `ddtp`, wrote `0x20c00002` (PPN `0x83000`, mode 2 = 1LVL), polled the
+busy bit (4) clear and stored the three values in RAM; the monitor's `xp` read them, and read `ddtp` directly as well.
+
+- `ddtp` at reset: `0x0` (Off) [observed, as section 4 says].
+- written `0x20c00002`, read back **`0x20c00002`** [observed, both through the probe's load and the monitor's `xp /1gx 0x3010010`].
+
+So the IOMMU returns the written PPN unchanged, as `iommucore` (from `riscv-iommu-bits.h`) expects, and the `0x20c00c02` of section 4
+was a slip of the earlier probe or of its transcription (most likely the probe wrote a different PPN): it is not a property of the
+device. Nothing in the kernel depended on it (IOMMU5's bring-up reads back the mode it wrote and works).

@@ -33,6 +33,22 @@ pub const RNG_CLAIM_HANDLES: usize = 2;
 /// same request layout. The reply is a plain [`Status`] reply and, for `Ok`, carries one handle: a **read-only** VMO of the
 /// device's register page. Any number of clients may hold one (reading the time changes nothing).
 pub const OP_CLAIM_RTC: u16 = 5;
+/// List the PCI functions the manager enumerated on bus 0 (IOMMU8): request `txid u32 | op u16 | 0 u16`, no handle. The reply is
+/// `txid u32 | status i32 | count u32` and `count` [`PciEntry`] records of [`PCI_ENTRY_LEN`] bytes, in requester-id order.
+pub const OP_LIST_PCI: u16 = 6;
+/// Claim the PCI function with requester id `rid` (IOMMU8; IOMMU-SPEC 9): request `txid u32 | op u16 | rid u16`, carrying exactly
+/// one handle: the **driver's job** (a job handle with MANAGE and SET_LIMITS), which the manager limits (`job_set_io_limits`, set to
+/// this function's needs) and charges for the device's domain and its DMA VMOs: **one function per driver job**, so a job that holds
+/// a live claim is refused (`Busy`). The reply is a [`PciClaim`] carrying, in order: a VMO over the BAR that holds the virtio
+/// structures (never the MSI-X table's BAR when the table has a BAR of its own), the driver's duplicate of the device's domain
+/// handle with IO_MAP and IO_UNMAP only (and TRANSFER, so a supervisor can pass it on), and one DMA VMO per entry of
+/// `dma_pages`, each with the `DMA` right. No I/O address travels: the driver maps its buffers itself with `iodomain_map`. The
+/// manager enables bus mastering only after the reply is sent (IOMMU-SPEC 9, step 6), then sends a second message, the plain reply
+/// `txid | Ok` ([`decode_claim_pci_started`]): the driver waits for it before its device's first DMA (a virtio-pci device does not
+/// fetch from a queue while bus mastering is off, and nothing fetches again when it comes on). The claim is released (bus mastering
+/// off, the device reset, the domain destroyed) when the claimant's connection closes. The interrupt handles are added with MSI-X
+/// (IOMMU9).
+pub const OP_CLAIM_PCI: u16 = 7;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
 
@@ -50,6 +66,9 @@ pub enum Status {
     BadRequest = 4,
     /// The manager's connection limit is reached (`Connect`).
     Quota = 5,
+    /// The PCI function exists and is never claimable: no MSI-X capability (IOMMU-SPEC 8.6), a virtio device that does not offer
+    /// `VIRTIO_F_ACCESS_PLATFORM` (15.1 L1), no driver class this manager knows, or a configuration space it refused.
+    Refused = 6,
 }
 
 impl Status {
@@ -61,8 +80,220 @@ impl Status {
             3 => Status::Failed,
             4 => Status::BadRequest,
             5 => Status::Quota,
+            6 => Status::Refused,
             _ => return None,
         })
+    }
+}
+
+/// One function of a `ListPci` reply: `rid u16 | vendor u16 | device u16 | flags u16 | class u32` (class code, subclass,
+/// programming interface: `0x00CCSSPP`).
+pub const PCI_ENTRY_LEN: usize = 12;
+/// The most functions on bus 0 (32 devices of 8 functions).
+pub const MAX_PCI_ENTRIES: usize = 256;
+/// `PciEntry::flags`: the function can be claimed.
+pub const PCI_CLAIMABLE: u16 = 1;
+/// It has an MSI-X capability.
+pub const PCI_MSIX: u16 = 2;
+/// It is a modern virtio function.
+pub const PCI_VIRTIO: u16 = 4;
+/// A virtio function that offers `VIRTIO_F_ACCESS_PLATFORM`.
+pub const PCI_ACCESS_PLATFORM: u16 = 8;
+/// Its configuration space was refused (`pcicore` found it malformed): listed, never configured.
+pub const PCI_REFUSED: u16 = 16;
+/// It is claimed now.
+pub const PCI_CLAIMED: u16 = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciEntry {
+    pub rid: u16,
+    pub vendor: u16,
+    pub device: u16,
+    pub flags: u16,
+    pub class: u32,
+}
+
+pub fn encode_list_pci(txid: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&OP_LIST_PCI.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b
+}
+
+/// `Ok(txid)` for a well-formed `ListPci` request.
+pub fn decode_list_pci(b: &[u8]) -> Result<u32, Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_LIST_PCI) || rd_u16(b, 6) != Some(0) {
+        return Err(txid);
+    }
+    txid.ok_or(None)
+}
+
+/// A `ListPci` reply; `None` if there are more than [`MAX_PCI_ENTRIES`].
+pub fn encode_list_pci_reply(txid: u32, entries: &[PciEntry]) -> Option<Vec<u8>> {
+    if entries.len() > MAX_PCI_ENTRIES {
+        return None;
+    }
+    let mut b = Vec::with_capacity(12 + PCI_ENTRY_LEN * entries.len());
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&(Status::Ok as i32).to_le_bytes());
+    b.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        for v in [e.rid, e.vendor, e.device, e.flags] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&e.class.to_le_bytes());
+    }
+    Some(b)
+}
+
+/// A `ListPci` reply, or the plain error reply (with no entries): an `Ok` is always the long form, an error always the short one.
+pub fn decode_list_pci_reply(b: &[u8]) -> Option<(u32, Status, Vec<PciEntry>)> {
+    if b.len() == REPLY_LEN {
+        let (t, s) = decode_reply(b)?;
+        return (s != Status::Ok).then(|| (t, s, Vec::new()));
+    }
+    let n = rd_u32(b, 8)? as usize;
+    if n > MAX_PCI_ENTRIES || b.len() != 12 + PCI_ENTRY_LEN * n {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let at = 12 + PCI_ENTRY_LEN * i;
+        out.push(PciEntry {
+            rid: rd_u16(b, at)?,
+            vendor: rd_u16(b, at + 2)?,
+            device: rd_u16(b, at + 4)?,
+            flags: rd_u16(b, at + 6)?,
+            class: rd_u32(b, at + 8)?,
+        });
+    }
+    let status = Status::from_i32(rd_u32(b, 4)? as i32)?;
+    if status != Status::Ok {
+        return None;
+    }
+    Some((rd_u32(b, 0)?, status, out))
+}
+
+pub fn encode_claim_pci(txid: u32, rid: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&OP_CLAIM_PCI.to_le_bytes());
+    b.extend_from_slice(&rid.to_le_bytes());
+    b
+}
+
+/// `Ok((txid, rid))` for a well-formed `ClaimPci` request.
+pub fn decode_claim_pci(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_CLAIM_PCI) {
+        return Err(txid);
+    }
+    match (txid, rd_u16(b, 6)) {
+        (Some(t), Some(r)) => Ok((t, r)),
+        _ => Err(None),
+    }
+}
+
+/// The most DMA VMOs a claim hands out.
+pub const MAX_CLAIM_DMA: usize = 8;
+/// A `ClaimPci` reply without its DMA list: `txid u32 | status i32 | vendor u16 | device u16 | bar_bytes u64 | common (offset u32,
+/// length u32) | notify (offset u32, length u32) | notify_multiplier u32 | isr (offset u32, length u32) | device configuration
+/// (offset u32, length u32: 0 if none) | dma_count u32`, then `dma_count` page counts (u32), one per DMA VMO in handle order.
+pub const PCI_CLAIM_FIXED_LEN: usize = 60;
+
+/// What a driver is handed with its handles (IOMMU-SPEC 9). Offsets are inside the BAR VMO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PciClaim {
+    pub vendor: u16,
+    pub device: u16,
+    /// The BAR VMO's size in bytes.
+    pub bar_bytes: u64,
+    pub common: (u32, u32),
+    pub notify: (u32, u32),
+    pub notify_multiplier: u32,
+    pub isr: (u32, u32),
+    pub device_cfg: (u32, u32),
+    /// The pages of each DMA VMO, in handle order.
+    pub dma_pages: Vec<u32>,
+}
+
+impl PciClaim {
+    /// The handles the reply carries: the BAR VMO, the domain, the DMA VMOs.
+    pub fn handles(&self) -> usize {
+        2 + self.dma_pages.len()
+    }
+}
+
+/// `None` if the claim names more than [`MAX_CLAIM_DMA`] DMA VMOs.
+pub fn encode_claim_pci_reply(txid: u32, c: &PciClaim) -> Option<Vec<u8>> {
+    if c.dma_pages.len() > MAX_CLAIM_DMA {
+        return None;
+    }
+    let mut b = Vec::with_capacity(PCI_CLAIM_FIXED_LEN + 4 * c.dma_pages.len());
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&(Status::Ok as i32).to_le_bytes());
+    b.extend_from_slice(&c.vendor.to_le_bytes());
+    b.extend_from_slice(&c.device.to_le_bytes());
+    b.extend_from_slice(&c.bar_bytes.to_le_bytes());
+    for (o, l) in [c.common, c.notify] {
+        b.extend_from_slice(&o.to_le_bytes());
+        b.extend_from_slice(&l.to_le_bytes());
+    }
+    b.extend_from_slice(&c.notify_multiplier.to_le_bytes());
+    for (o, l) in [c.isr, c.device_cfg] {
+        b.extend_from_slice(&o.to_le_bytes());
+        b.extend_from_slice(&l.to_le_bytes());
+    }
+    b.extend_from_slice(&(c.dma_pages.len() as u32).to_le_bytes());
+    for p in &c.dma_pages {
+        b.extend_from_slice(&p.to_le_bytes());
+    }
+    Some(b)
+}
+
+/// A `ClaimPci` reply, or the plain error reply (`None` claim): an `Ok` is always the long form, an error always the short one.
+pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>)> {
+    if b.len() == REPLY_LEN {
+        let (t, s) = decode_reply(b)?;
+        return (s != Status::Ok).then_some((t, s, None));
+    }
+    let n = rd_u32(b, 56)? as usize;
+    if n > MAX_CLAIM_DMA || b.len() != PCI_CLAIM_FIXED_LEN + 4 * n {
+        return None;
+    }
+    let pair = |at: usize| Some((rd_u32(b, at)?, rd_u32(b, at + 4)?));
+    let mut dma_pages = Vec::with_capacity(n);
+    for i in 0..n {
+        dma_pages.push(rd_u32(b, PCI_CLAIM_FIXED_LEN + 4 * i)?);
+    }
+    let status = Status::from_i32(rd_u32(b, 4)? as i32)?;
+    if status != Status::Ok {
+        return None;
+    }
+    Some((
+        rd_u32(b, 0)?,
+        status,
+        Some(PciClaim {
+            vendor: rd_u16(b, 8)?,
+            device: rd_u16(b, 10)?,
+            bar_bytes: u64::from(rd_u32(b, 12)?) | (u64::from(rd_u32(b, 16)?) << 32),
+            common: pair(20)?,
+            notify: pair(28)?,
+            notify_multiplier: rd_u32(b, 36)?,
+            isr: pair(40)?,
+            device_cfg: pair(48)?,
+            dma_pages,
+        }),
+    ))
+}
+
+/// The message that follows a successful `ClaimPci` reply once bus mastering is on: its `txid`, or `None` if `b` is not that.
+pub fn decode_claim_pci_started(b: &[u8]) -> Option<u32> {
+    match decode_reply(b)? {
+        (t, Status::Ok) if b.len() == REPLY_LEN => Some(t),
+        _ => None,
     }
 }
 

@@ -12248,6 +12248,372 @@ fn devmgr_starts_blkd_for_the_disk() -> Outcome {
     Ok(())
 }
 
+/// `ListPci` on `ch`: the manager's entries.
+fn pci_list(ch: u64, txid: u32) -> Result<Vec<proto::devmgr::PciEntry>, Detail> {
+    let req = proto::devmgr::encode_list_pci(txid);
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            req.as_ptr(),
+            req.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send ListPci"
+    );
+    ensure_eq!(
+        st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+        Some(S::Ok),
+        "the manager answers ListPci"
+    );
+    let mut buf = vec![0u8; 12 + proto::devmgr::PCI_ENTRY_LEN * proto::devmgr::MAX_PCI_ENTRIES];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "read the list");
+    let (t, status, entries) =
+        proto::devmgr::decode_list_pci_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!((t, status), (txid, proto::devmgr::Status::Ok), "the list");
+    Ok(entries)
+}
+
+/// `ClaimPci` of `rid` on `ch`, carrying `job` if any: (the status, the claim, the handles).
+fn pci_claim(
+    ch: u64,
+    txid: u32,
+    rid: u16,
+    job: Option<u64>,
+) -> Result<
+    (
+        proto::devmgr::Status,
+        Option<proto::devmgr::PciClaim>,
+        Vec<u64>,
+    ),
+    Detail,
+> {
+    let req = proto::devmgr::encode_claim_pci(txid, rid);
+    let hs: Vec<u64> = job.into_iter().collect();
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            req.as_ptr(),
+            req.len(),
+            hs.as_ptr(),
+            hs.len()
+        )),
+        Some(S::Ok),
+        "send ClaimPci"
+    );
+    ensure_eq!(
+        st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+        Some(S::Ok),
+        "the manager answers ClaimPci"
+    );
+    let mut buf = [0u8; 128];
+    let mut got = [0u64; 16];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), got.as_mut_ptr(), got.len());
+    ensure_eq!(st(r), Some(S::Ok), "read the claim's reply");
+    let (t, status, claim) =
+        proto::devmgr::decode_claim_pci_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(t, txid, "the reply answers this transaction");
+    let hs = got[..r.a2].to_vec();
+    ensure_eq!(
+        hs.len(),
+        claim.as_ref().map_or(0, |c| c.handles()),
+        "the handles the reply says"
+    );
+    if status == proto::devmgr::Status::Ok {
+        // the second message: bus mastering is on, the device may be started
+        ensure_eq!(
+            st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+            Some(S::Ok),
+            "the manager says the device may start"
+        );
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+        ensure_eq!(st(r), Some(S::Ok), "read the second message");
+        ensure_eq!(
+            proto::devmgr::decode_claim_pci_started(&buf[..r.a1]),
+            Some(txid),
+            "the claim's second message"
+        );
+    }
+    Ok((status, claim, hs))
+}
+
+/// A child job of the root job for a driver, and a duplicate of it to send (the claim takes the handle it is sent).
+fn driver_job() -> Result<(u64, u64), Detail> {
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, u64::MAX);
+    sys::handle_close(root);
+    let j = j?;
+    let d = ok(
+        sys::handle_duplicate(j, Rights::SAME.0),
+        "dup the driver's job",
+    )?
+    .a1 as u64;
+    Ok((j, d))
+}
+
+/// Whether bus mastering is on for the block function: its command register, read through the root resource.
+fn blk_bus_master(res: u64) -> Result<bool, Detail> {
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let cfg = ok(
+        sys::vmo_create_physical(res, PCI_ECAM + (PCI_BLK_SLOT << 15), 4096),
+        "the block function's configuration page",
+    )?
+    .a1 as u64;
+    let m = sys::process_map(me, cfg, PCI_CFG_VA, 0, 4096, PF_R);
+    sys::handle_close(cfg);
+    ensure_eq!(st(m), Some(S::Ok), "map it");
+    let on = cfg_rd16(4) & (1 << 2) != 0;
+    sys::process_unmap(me, PCI_CFG_VA);
+    sys::handle_close(me);
+    Ok(on)
+}
+
+/// IOMMU8 (IOMMU-SPEC 8, 9): `devmgr` lists bus 0 as the command line built it, and hands a driver a claim: the BAR VMO with the
+/// virtio structures, the domain with IO_MAP and IO_UNMAP only, the DMA VMOs, the driver's job limited; bus mastering on after the
+/// reply. The claim reads the disk through the IOMMU; a second claim is Busy, the host bridge is Refused, a claim without its job is
+/// BadRequest; when the claimant's connection closes the claim is released (bus mastering off, the domain destroyed) and can be
+/// taken again.
+fn pci_devices_are_found_and_claimed() -> Outcome {
+    use proto::devmgr as dm;
+    use proto::devmgr::Status as D;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let (mine, mgr, mj) = start_devmgr_in_job(res)?;
+    // every handle the test may still hold when a check fails is closed on the way out (a claim left open would keep its domain
+    // alive into later tests of the same boot)
+    let mut held: Vec<u64> = Vec::new();
+    let r = (|| {
+        // the list: the host bridge and the two functions of the harness, nothing else, in requester-id order
+        let list = pci_list(mine, 1)?;
+        let rids: Vec<u16> = list.iter().map(|e| e.rid).collect();
+        ensure_eq!(rids, vec![0, 0x20, 0x28], "bus 0: {list:x?}");
+        let want = dm::PCI_CLAIMABLE | dm::PCI_MSIX | dm::PCI_VIRTIO | dm::PCI_ACCESS_PLATFORM;
+        for e in &list {
+            match e.rid {
+                0 => {
+                    ensure_eq!((e.vendor, e.device), (0x1b36, 0x0008), "the host bridge");
+                    ensure_eq!(
+                        e.flags & dm::PCI_CLAIMABLE,
+                        0,
+                        "the host bridge is not claimable"
+                    );
+                }
+                rid => {
+                    let dev = if rid == 0x20 { 0x1044 } else { 0x1042 };
+                    ensure_eq!(
+                        (e.vendor, e.device),
+                        (0x1af4, dev),
+                        "the function at {rid:#x}"
+                    );
+                    ensure_eq!(
+                        e.flags,
+                        want,
+                        "the function at {rid:#x} is claimable, MSI-X, virtio, ACCESS_PLATFORM"
+                    );
+                }
+            }
+        }
+        // a second client, whose connection will hold the claim
+        let (c2, c2_theirs) = channel()?;
+        held.push(c2);
+        let req = dm::encode_connect(2);
+        let hs = [c2_theirs];
+        ensure_eq!(
+            st(sys::channel_write(
+                mine,
+                req.as_ptr(),
+                req.len(),
+                hs.as_ptr(),
+                1
+            )),
+            Some(S::Ok),
+            "send Connect"
+        );
+        ensure_eq!(
+            st(sys::object_wait(
+                mine,
+                sig::READABLE,
+                sys::clock_get() + 5000
+            )),
+            Some(S::Ok),
+            "the manager answers Connect"
+        );
+        let mut rb = [0u8; 16];
+        let r = sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+        ensure_eq!(dm::decode_reply(&rb[..r.a1]), Some((2, D::Ok)), "connected");
+        // refusals: no job, a function that cannot be claimed, a function that is not there
+        let (s, _, _) = pci_claim(c2, 3, 0x28, None)?;
+        ensure_eq!(s, D::BadRequest, "a claim without the driver's job");
+        let (dj, send) = driver_job()?;
+        held.push(dj);
+        let (s, _, _) = pci_claim(c2, 4, 0, Some(send))?;
+        ensure_eq!(s, D::Refused, "the host bridge");
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, _) = pci_claim(c2, 5, 0x30, Some(send))?;
+        ensure_eq!(s, D::NoDevice, "no function at 00:06.0");
+        ensure!(
+            !blk_bus_master(res)?,
+            "bus mastering is off before the claim"
+        );
+        // the claim
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, claim, hs) = pci_claim(c2, 6, 0x28, Some(send))?;
+        held.extend(&hs);
+        ensure_eq!(s, D::Ok, "the block function is claimed");
+        let c = claim.ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!((c.vendor, c.device), (0x1af4, 0x1042), "the claim's ids");
+        ensure_eq!(
+            c.dma_pages,
+            vec![1, 4],
+            "the block class's DMA VMOs: the rings and the data pages"
+        );
+        let (bar, dom, rings, data) = (hs[0], hs[1], hs[2], hs[3]);
+        ensure_eq!(
+            sys::vmo_get_size(bar).a1 as u64,
+            c.bar_bytes,
+            "the BAR VMO's size"
+        );
+        ensure_eq!(
+            (
+                sys::job_info(dj, 12).a2 as u64,
+                sys::job_info(dj, 13).a2 as u64
+            ),
+            (5, 2),
+            "the driver's job is limited to its DMA pages and its MSI-X vectors (one queue: two)"
+        );
+        // the domain handle maps and unmaps, nothing more
+        for (r, what) in [
+            (sys::iodomain_destroy(dom), "destroy"),
+            (sys::iodomain_fault_read(dom), "read faults"),
+            (sys::iodomain_grant_vector(dom, 0), "grant a vector"),
+            (sys::handle_duplicate(dom, Rights::IO_MAP.0), "duplicate it"),
+        ] {
+            ensure_eq!(
+                st(r),
+                Some(S::AccessDenied),
+                "the driver's domain handle cannot {what}"
+            );
+        }
+        // the second message said bus mastering is on
+        ensure!(
+            blk_bus_master(res)?,
+            "bus mastering is on once the claim's second message came"
+        );
+        ensure_eq!(
+            pci_list(c2, 7)?
+                .iter()
+                .find(|e| e.rid == 0x28)
+                .map(|e| e.flags & dm::PCI_CLAIMED),
+            Some(dm::PCI_CLAIMED),
+            "listed as claimed"
+        );
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, _) = pci_claim(mine, 8, 0x28, Some(send))?;
+        ensure_eq!(s, D::Busy, "a second claim of the function");
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, _) = pci_claim(mine, 9, 0x20, Some(send))?;
+        ensure_eq!(s, D::Busy, "a second function for the same driver job");
+        // a read through the claim, as a driver does it: the BAR here, the rings and the data mapped by the driver
+        let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+        let m = sys::process_map(me, bar, PCI_BAR_VA, 0, c.bar_bytes, PF_R | PF_W);
+        sys::handle_close(me);
+        ensure_eq!(st(m), Some(S::Ok), "map the BAR VMO");
+        let r = (|| {
+            map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
+            map_here(data, BUF_VA, 1, PF_R | PF_W)?;
+            let rings_io = ok(sys::iodomain_map(dom, rings, 0, 1, 3), "map the rings")?.a1 as u64;
+            let data_io = ok(sys::iodomain_map(dom, data, 0, 1, 3), "map a data page")?.a1 as u64;
+            for i in 0..512 {
+                wr64(BUF_VA + 8 * i, 0);
+            }
+            let f = PciFn {
+                common: PCI_BAR_VA + u64::from(c.common.0),
+                notify: PCI_BAR_VA + u64::from(c.notify.0),
+                notify_len: u64::from(c.notify.1),
+                notify_multiplier: c.notify_multiplier,
+                isr: PCI_BAR_VA + u64::from(c.isr.0),
+                device: (c.device_cfg.1 != 0).then(|| {
+                    (
+                        PCI_BAR_VA + u64::from(c.device_cfg.0),
+                        u64::from(c.device_cfg.1),
+                    )
+                }),
+                msix_cap: 0,
+                msix_table: 0,
+            };
+            let used = pci_blk_read_sector0(
+                &f,
+                rings_io,
+                (data_io + BLK_HDR, data_io + BLK_DATA, data_io + BLK_STATUS),
+                2000,
+            )?;
+            ensure!(
+                used.is_some(),
+                "the claimed device did not return the request"
+            );
+            ensure_eq!(
+                rd8_dma(BUF_VA + BLK_STATUS),
+                virtio::blk::S_OK,
+                "the status"
+            );
+            ensure_eq!(blk_pattern_wrong(), None, "sector 0 through the claim");
+            Ok(())
+        })();
+        unmap_here(BUF_VA);
+        unmap_here(RINGS_VA);
+        unmap_here(PCI_BAR_VA);
+        r?;
+        // the claimant goes: the claim is released. The manager is one thread, so a list that no longer says CLAIMED was answered
+        // after the whole release (bus mastering off, the reset, the domain destroyed).
+        held.retain(|&h| h != c2);
+        sys::handle_close(c2);
+        let t0 = sys::clock_get();
+        loop {
+            let e = pci_list(mine, 10)?;
+            if e.iter()
+                .any(|e| e.rid == 0x28 && e.flags & dm::PCI_CLAIMED == 0)
+            {
+                break;
+            }
+            ensure!(
+                sys::clock_get() < t0 + 5000,
+                "the claim was not released when its connection closed"
+            );
+            let _ = sys::object_wait(mine, 1 << 24, sys::clock_get() + 5);
+        }
+        ensure!(
+            !blk_bus_master(res)?,
+            "bus mastering is off once the claim was released"
+        );
+        ensure_eq!(
+            st(sys::iodomain_map(dom, rings, 0, 1, 3)),
+            Some(S::BadState),
+            "the domain was destroyed with the claim"
+        );
+        for h in hs {
+            held.retain(|&x| x != h);
+            sys::handle_close(h);
+        }
+        // and it can be claimed again, by the same job now that it holds nothing
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, hs) = pci_claim(mine, 11, 0x28, Some(send))?;
+        held.extend(&hs);
+        ensure_eq!(s, D::Ok, "claimed again after the release");
+        Ok(())
+    })();
+    for h in held {
+        sys::handle_close(h);
+    }
+    sys::handle_close(mine);
+    let end = wait_ended(mgr, 5000);
+    sys::handle_close(mgr);
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    r?;
+    end
+}
+
 // --- The disk filesystem server (FS-SPEC step 5c) ---------------------------------------------
 
 /// A volume identity for the test (the harness formats nothing: the test does it, as setup).
@@ -13357,6 +13723,28 @@ fn device_caps_need_the_resource() -> Outcome {
         Some(S::AccessDenied),
         "no MANAGE"
     );
+    // IOMMU8: the PCI host's configuration space, a BAR in its memory window and a function's domain likewise
+    for (h, want, what) in [
+        (0xdead, S::BadHandle, "bad handle"),
+        (ev, S::WrongType, "an event"),
+        (weak, S::AccessDenied, "no MANAGE"),
+    ] {
+        ensure_eq!(
+            st(sys::vmo_create_physical(h, 0x3000_0000, 4096)),
+            Some(want),
+            "the ECAM window: {what}"
+        );
+        ensure_eq!(
+            st(sys::vmo_create_physical(h, 0x4000_0000, 4096)),
+            Some(want),
+            "a BAR in the 32-bit window: {what}"
+        );
+        ensure_eq!(
+            st(sys::iodomain_create(h, 0x28, 0)),
+            Some(want),
+            "a domain for 00:05.0: {what}"
+        );
+    }
     ensure_eq!(
         st(sys::vmo_create_dma(weak, 1)),
         Some(S::AccessDenied),
@@ -13551,8 +13939,8 @@ fn a_child_has_no_device_authority() -> Outcome {
     wait_ended(p, 2000)?;
     ensure_eq!(
         sys::process_info(p).a1 as i64,
-        7,
-        "the child was refused every device call"
+        15,
+        "the child was refused every device call (bit 3: the PCI host's windows and a domain, IOMMU8)"
     );
     sys::handle_close(p);
     Ok(())
@@ -14045,6 +14433,11 @@ fn iommu_wait_faults(before: u64) -> Option<u64> {
 struct PciFn {
     common: u64,
     notify: u64,
+    notify_len: u64,
+    notify_multiplier: u32,
+    isr: u64,
+    /// The device configuration (address, length), if the function has one.
+    device: Option<(u64, u64)>,
     msix_cap: u64,
     msix_table: u64,
 }
@@ -14052,10 +14445,6 @@ struct PciFn {
 fn cfg_rd32(off: u64) -> u32 {
     // SAFETY: PCI_CFG_VA maps the function's 4 KiB configuration page (`pci_fn_up`); `off` is an aligned register inside it.
     unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u32) }
-}
-fn cfg_wr32(off: u64, v: u32) {
-    // SAFETY: as `cfg_rd32`.
-    unsafe { core::ptr::write_volatile((PCI_CFG_VA + off) as *mut u32, v) }
 }
 fn cfg_rd16(off: u64) -> u16 {
     // SAFETY: as `cfg_rd32`, a 16-bit register.
@@ -14094,11 +14483,110 @@ fn mmio_rd8(va: u64) -> u8 {
     unsafe { core::ptr::read_volatile(va as *const u8) }
 }
 
-/// Map the test function's configuration page, assign its memory BARs in the host's 32-bit window, map them, and find its virtio
-/// structures and MSI-X table. The function is left with memory decoding and bus mastering on and INTx off.
-fn pci_fn_up(res: u64) -> Result<PciFn, Detail> {
+/// Where `pci_bus_program` maps bus 0's configuration space (32 devices of 8 functions of 4 KiB) while it enumerates.
+const PCI_BUS_VA: u64 = 0x7c0_0000;
+const PCI_BUS_BYTES: u64 = 1 << 20;
+/// The length of the host's 32-bit memory window (from the device tree, as `devmgr` reads it).
+const PCI_MEM32_LEN: u64 = 0x4000_0000;
+
+/// Place every memory BAR of bus 0 the way `devmgr` does (IOMMU8: `pcicore::assign` over the whole bus, which is deterministic), so
+/// that a hand-driven function and `devmgr`'s functions never decode overlapping windows: enumerate, size, assign, program every
+/// function's BARs (each function is left with decoding off) and return the assignment.
+fn pci_bus_program(res: u64) -> Result<Vec<pcicore::Assignment>, Detail> {
     let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-    let cfg = sys::vmo_create_physical(res, PCI_ECAM + (IOMMU_TEST_SLOT << 15), 4096);
+    let ecam = sys::vmo_create_physical(res, PCI_ECAM, PCI_BUS_BYTES);
+    if st(ecam) != Some(S::Ok) {
+        sys::handle_close(me);
+        ensure!(
+            false,
+            "bus 0's configuration space is a device window: {:?}",
+            st(ecam)
+        );
+    }
+    let m = sys::process_map(
+        me,
+        ecam.a1 as u64,
+        PCI_BUS_VA,
+        0,
+        PCI_BUS_BYTES,
+        PF_R | PF_W,
+    );
+    sys::handle_close(ecam.a1 as u64);
+    if st(m) != Some(S::Ok) {
+        sys::handle_close(me);
+        ensure!(false, "map bus 0's configuration space: {:?}", st(m));
+    }
+    // SAFETY (the three accessors): PCI_BUS_VA maps bus 0's whole configuration space read-write (just above), and every offset is
+    // an aligned register of one function's 4 KiB page inside it.
+    let rd32 = |va: u64| unsafe { core::ptr::read_volatile(va as *const u32) };
+    let wr32 = |va: u64, v: u32| unsafe { core::ptr::write_volatile(va as *mut u32, v) };
+    let wr16 = |va: u64, v: u16| unsafe { core::ptr::write_volatile(va as *mut u16, v) };
+    let mut bars = Vec::new();
+    for dev in 0..pcicore::DEVICES {
+        for func in 0..pcicore::FUNCTIONS {
+            let Some(bdf) = pcicore::Bdf::new(0, dev, func) else {
+                continue;
+            };
+            let va = PCI_BUS_VA + bdf.ecam_offset();
+            let mut cfg = [0u8; pcicore::CFG_BYTES];
+            for (i, c) in cfg.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *c = rd32(va + 4 * i as u64).to_le_bytes();
+            }
+            let Ok(Some(h)) = pcicore::header(&cfg) else {
+                if func == 0 {
+                    break;
+                }
+                continue;
+            };
+            wr16(
+                va + u64::from(pcicore::reg::COMMAND),
+                pcicore::command_for_sizing(h.command),
+            );
+            let mut masks = [0u32; 6];
+            if h.header_type == 0 {
+                for (i, m) in masks.iter_mut().enumerate() {
+                    let off = va + u64::from(pcicore::reg::BAR0) + 4 * i as u64;
+                    let orig = rd32(off);
+                    wr32(off, pcicore::SIZING_VALUE);
+                    *m = rd32(off);
+                    wr32(off, orig);
+                }
+            }
+            // (a function `describe` refuses is left out, as `devmgr` leaves it out)
+            if let Ok(Some(f)) = pcicore::describe(bdf, &cfg, &masks) {
+                bars.extend(f.bars.iter().map(|b| (bdf, *b)));
+            }
+            if func == 0 && !h.multifunction {
+                break;
+            }
+        }
+    }
+    let r = pcicore::assign((PCI_MEM32, PCI_MEM32_LEN), &bars);
+    if let Ok(assigned) = &r {
+        for a in assigned {
+            for (off, v) in pcicore::bar_writes(a) {
+                wr32(PCI_BUS_VA + a.bdf.ecam_offset() + u64::from(off), v);
+            }
+        }
+    }
+    sys::process_unmap(me, PCI_BUS_VA);
+    sys::handle_close(me);
+    match r {
+        Ok(a) => Ok(a),
+        Err(e) => {
+            ensure!(false, "bus 0's BARs do not fit the 32-bit window: {e:?}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Map the configuration page of the function at `slot` (whose vendor and device ids are `id`), assign every BAR of bus 0 as
+/// `devmgr` would (`pci_bus_program`), map this function's BARs, and find its virtio structures and MSI-X table. The function is
+/// left with memory decoding and bus mastering on and INTx off.
+fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
+    let assigned = pci_bus_program(res)?;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let cfg = sys::vmo_create_physical(res, PCI_ECAM + (slot << 15), 4096);
     ensure_eq!(
         st(cfg),
         Some(S::Ok),
@@ -14110,68 +14598,43 @@ fn pci_fn_up(res: u64) -> Result<PciFn, Detail> {
     ensure_eq!(st(m), Some(S::Ok), "map the configuration page");
     ensure_eq!(
         cfg_rd32(0),
-        0x1044_1af4,
-        "the harness's virtio-rng-pci (modern) at slot {IOMMU_TEST_SLOT}"
+        id,
+        "the harness's function at slot {slot} (scripts/os_boot_test.py, PCI_DEVICES)"
     );
-    cfg_wr16(4, 0); // decoding off while the BARs move
-                    // size and place every memory BAR, each at its natural alignment, upwards from the window's base
-    let mut next = PCI_MEM32;
-    let mut bars = [0u64; 6];
-    let mut i = 0;
-    while i < 6 {
-        let off = 0x10 + 4 * i as u64;
-        let orig = cfg_rd32(off);
-        if orig & 1 != 0 {
-            i += 1;
-            continue; // an I/O BAR: never used
-        }
-        let wide = (orig >> 1) & 3 == 2;
-        cfg_wr32(off, 0xffff_ffff);
-        let lo = cfg_rd32(off) & !0xf;
-        let hi = if wide {
-            cfg_wr32(off + 4, 0xffff_ffff);
-            cfg_rd32(off + 4)
-        } else {
-            0xffff_ffff
-        };
-        let mask = (u64::from(hi) << 32) | u64::from(lo);
-        if lo != 0 || hi != 0xffff_ffff {
-            let size = (!mask).wrapping_add(1);
-            ensure!(
-                size.is_power_of_two() && size <= 1 << 20,
-                "BAR {i} size {size:#x}"
-            );
-            next = next.div_ceil(size) * size;
-            bars[i] = next;
-            cfg_wr32(off, next as u32);
-            if wide {
-                cfg_wr32(off + 4, (next >> 32) as u32);
-            }
-            next += size;
-        } else {
-            cfg_wr32(off, 0);
-        }
-        i += if wide { 2 } else { 1 };
-    }
-    let span = (next - PCI_MEM32).div_ceil(4096) * 4096;
-    let w = sys::vmo_create_physical(res, PCI_MEM32, span);
+    cfg_wr16(4, 0); // decoding off while the BARs are mapped
+    let bdf = pcicore::Bdf::new(0, slot as u8, 0).ok_or_else(|| msg_at(line!()))?;
+    let mine: Vec<pcicore::Assignment> =
+        assigned.iter().filter(|a| a.bdf == bdf).copied().collect();
+    let lo = mine.iter().map(|a| a.addr).min().unwrap_or(PCI_MEM32);
+    let hi = mine
+        .iter()
+        .map(|a| a.addr + a.span)
+        .max()
+        .unwrap_or(PCI_MEM32);
+    ensure!(
+        !mine.is_empty() && hi - lo <= PATTERN_VA - PCI_BAR_VA,
+        "the function's BARs {mine:x?}"
+    );
+    let w = sys::vmo_create_physical(res, lo, hi - lo);
     ensure_eq!(
         st(w),
         Some(S::Ok),
         "the host's 32-bit memory window is a device window"
     );
     let w = w.a1 as u64;
-    let m = sys::process_map(me, w, PCI_BAR_VA, 0, span, PF_R | PF_W);
+    let m = sys::process_map(me, w, PCI_BAR_VA, 0, hi - lo, PF_R | PF_W);
     sys::handle_close(w);
     sys::handle_close(me);
     ensure_eq!(st(m), Some(S::Ok), "map the BARs");
     let va = |bar: u8, off: u32| -> u64 {
-        bars.get(bar as usize)
-            .map_or(0, |&b| PCI_BAR_VA + (b - PCI_MEM32) + u64::from(off))
+        mine.iter()
+            .find(|a| a.index == bar)
+            .map_or(0, |a| PCI_BAR_VA + (a.addr - lo) + u64::from(off))
     };
     // the capability list: the virtio structures (vendor capability 9) and MSI-X (17)
     ensure!(cfg_rd16(6) & (1 << 4) != 0, "a capability list");
     let (mut common, mut notify, mut msix_cap, mut msix_table) = (0, 0, 0, 0);
+    let (mut isr, mut device, mut notify_multiplier, mut notify_len) = (0, None, 0, 0);
     let mut p = u64::from(cfg_rd8(0x34) & !3);
     let mut hops = 0;
     while p != 0 && hops < 48 {
@@ -14179,10 +14642,16 @@ fn pci_fn_up(res: u64) -> Result<PciFn, Detail> {
             9 => {
                 let (kind, bar, off) = (cfg_rd8(p + 3), cfg_rd8(p + 4), cfg_rd32(p + 8));
                 match kind {
-                    1 => common = va(bar, off),
-                    2 => {
-                        ensure_eq!(cfg_rd32(p + 16), 4, "the notify multiplier QEMU uses");
+                    1 if common == 0 => common = va(bar, off),
+                    2 if notify == 0 => {
+                        notify_multiplier = cfg_rd32(p + 16);
+                        notify_len = u64::from(cfg_rd32(p + 12));
+                        ensure_eq!(notify_multiplier, 4, "the notify multiplier QEMU uses");
                         notify = va(bar, off);
+                    }
+                    3 if isr == 0 => isr = va(bar, off),
+                    4 if device.is_none() => {
+                        device = Some((va(bar, off), u64::from(cfg_rd32(p + 12))))
                     }
                     _ => {}
                 }
@@ -14198,13 +14667,17 @@ fn pci_fn_up(res: u64) -> Result<PciFn, Detail> {
         hops += 1;
     }
     ensure!(
-        common != 0 && notify != 0 && msix_cap != 0 && msix_table != 0,
-        "virtio common {common:#x}, notify {notify:#x}, MSI-X {msix_cap:#x} table {msix_table:#x}"
+        common != 0 && notify != 0 && isr != 0 && msix_cap != 0 && msix_table != 0,
+        "virtio common {common:#x}, notify {notify:#x}, isr {isr:#x}, MSI-X {msix_cap:#x} table {msix_table:#x}"
     );
     cfg_wr16(4, (1 << 1) | (1 << 2) | (1 << 10)); // memory decoding, bus mastering, INTx disabled
     Ok(PciFn {
         common,
         notify,
+        notify_len,
+        notify_multiplier,
+        isr,
+        device,
         msix_cap,
         msix_table,
     })
@@ -14320,12 +14793,21 @@ fn pattern_drop(dma: u64) {
     sys::handle_close(dma);
 }
 
+/// The vendor and device ids (configuration dword 0) of the harness's virtio-rng-pci and virtio-blk-pci (modern).
+const PCI_RNG_ID: u32 = 0x1044_1af4;
+const PCI_BLK_ID: u32 = 0x1042_1af4;
+
 /// The root resource, the test function brought up, and a pattern frame; everything undone after `body`, however it ends.
 fn with_test_function(body: impl FnOnce(u64, &PciFn, u64) -> Outcome) -> Outcome {
+    with_function(IOMMU_TEST_SLOT, PCI_RNG_ID, body)
+}
+
+/// `with_test_function` for the function at `slot`, whose ids are `id`.
+fn with_function(slot: u64, id: u32, body: impl FnOnce(u64, &PciFn, u64) -> Outcome) -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let r = (|| {
         let (dma, pa) = pattern_frame(res)?;
-        let r = match pci_fn_up(res) {
+        let r = match pci_fn_up(res, slot, id) {
             Ok(f) => {
                 let r = body(res, &f, pa);
                 pci_fn_down(&f);
@@ -14554,6 +15036,275 @@ fn drain_domain_faults(sup: u64) -> Vec<(u64, u64, u64, u64)> {
         out.push((w & 0xffff, r.a2 as u64, (w >> 16) & 0xffff, w >> 32));
     }
     out
+}
+
+// ---- the PCI block function (IOMMU8; IOMMU-SPEC 15.1 L1) -----------------------------------------------------------------------
+//
+// The harness's virtio-blk-pci at slot `PCI_BLK_SLOT` (`iommu_platform=on`, a read-only disk whose sector 0 holds byte i = (i * 13 +
+// 1) mod 256), driven through the `virtio` crate (the driver's code path: negotiation with VERSION_1 and ACCESS_PLATFORM, a split
+// queue) by polling, with MSI-X and INTx off. Kernel tests: the suite is the supervisor and the driver, as in the IOMMU6 tests.
+
+/// The slot of the harness's block function on bus 0 (`addr=0x5`): device id `0x28`, `00:05.0`.
+const PCI_BLK_SLOT: u64 = 5;
+const PCI_BLK_DID: u64 = PCI_BLK_SLOT << 3;
+/// Where the request's parts are in the data page (mapped at BUF_VA): the header, the sector, the status byte.
+const BLK_HDR: u64 = 0;
+const BLK_DATA: u64 = 0x200;
+const BLK_STATUS: u64 = 0x400;
+
+/// The virtio registers by address: the transport's offsets are the addresses `pci_fn_up` (or a claim's BAR mapping) found, which are
+/// inside the mapped BARs.
+struct VaRegs;
+impl virtio::Regs for VaRegs {
+    fn read8(&self, off: u64) -> u8 {
+        mmio_rd8(off)
+    }
+    fn read16(&self, off: u64) -> u16 {
+        mmio_rd16(off)
+    }
+    fn read32(&self, off: u64) -> u32 {
+        mmio_rd32(off)
+    }
+    fn write8(&mut self, off: u64, v: u8) {
+        mmio_wr8(off, v)
+    }
+    fn write16(&mut self, off: u64, v: u16) {
+        mmio_wr16(off, v)
+    }
+    fn write32(&mut self, off: u64, v: u32) {
+        mmio_wr32(off, v)
+    }
+}
+
+/// The queue memory, mapped read-write at RINGS_VA (one page).
+struct RingsMem;
+impl RingsMem {
+    fn at(off: u64) -> u64 {
+        RINGS_VA + (off & 0xfff)
+    }
+}
+impl virtio::Mem for RingsMem {
+    fn read16(&self, off: u64) -> u16 {
+        rd16(Self::at(off))
+    }
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: `at` keeps the address inside the page mapped read-write at RINGS_VA, and the queue layout aligns it.
+        unsafe { core::ptr::read_volatile(Self::at(off) as *const u32) }
+    }
+    fn write16(&mut self, off: u64, v: u16) {
+        wr16(Self::at(off), v)
+    }
+    fn write32(&mut self, off: u64, v: u32) {
+        // SAFETY: as `read32`.
+        unsafe { core::ptr::write_volatile(Self::at(off) as *mut u32, v) }
+    }
+    fn write64(&mut self, off: u64, v: u64) {
+        wr64(Self::at(off), v)
+    }
+}
+
+fn vio<T>(r: Result<T, virtio::Error>, what: &str) -> Result<T, Detail> {
+    r.map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("{what}: {e:?}"));
+        d
+    })
+}
+
+/// Bring the block function up through the `virtio` crate, with one split queue of 8 at I/O address `rings_io` (the page mapped at
+/// RINGS_VA), and read sector 0: the header at `hdr_io` (the test writes it through BUF_VA + BLK_HDR), the data at `data_io`, the
+/// status byte at `status_io`. Polled, no interrupt asked for. The used element, or None if the device did not return the request
+/// within `wait_ms`.
+fn pci_blk_read_sector0(
+    f: &PciFn,
+    rings_io: u64,
+    (hdr_io, data_io, status_io): (u64, u64, u64),
+    wait_ms: u64,
+) -> Result<Option<(u16, u32)>, Detail> {
+    use virtio::Transport;
+    for i in 0..512 {
+        wr64(RINGS_VA + 8 * i, 0);
+    }
+    let h = virtio::blk::header(virtio::blk::T_IN, 0);
+    for (i, w) in h.as_chunks::<8>().0.iter().enumerate() {
+        wr64(BUF_VA + BLK_HDR + 8 * i as u64, u64::from_le_bytes(*w));
+    }
+    wr64(BUF_VA + BLK_STATUS, 0xff);
+    let mut t = virtio::PciTransport::new(
+        VaRegs,
+        virtio::PciLocations {
+            common: f.common,
+            notify: f.notify,
+            notify_len: f.notify_len,
+            notify_multiplier: f.notify_multiplier,
+            isr: f.isr,
+            device: f.device,
+        },
+    );
+    let t0 = sys::clock_get();
+    vio(t.reset(&mut || sys::clock_get() < t0 + 1000), "reset")?;
+    let got = vio(t.negotiate(virtio::feature::REQUIRED), "negotiate")?;
+    ensure_eq!(
+        got & virtio::feature::REQUIRED,
+        virtio::feature::REQUIRED,
+        "VERSION_1 and ACCESS_PLATFORM accepted"
+    );
+    let mut q = vio(virtio::SplitQueue::new(8, rings_io, 4096), "the queue")?;
+    vio(t.setup_queue(0, 8, q.addresses()), "queue 0")?;
+    t.driver_ok();
+    let chain = [
+        virtio::Buf {
+            addr: hdr_io,
+            len: virtio::blk::HEADER_BYTES,
+            device_writes: false,
+        },
+        virtio::Buf {
+            addr: data_io,
+            len: virtio::blk::SECTOR,
+            device_writes: true,
+        },
+        virtio::Buf {
+            addr: status_io,
+            len: 1,
+            device_writes: true,
+        },
+    ];
+    let head = vio(q.add(&mut RingsMem, &chain, false), "add the request")?;
+    t.notify(0);
+    let t0 = sys::clock_get();
+    while sys::clock_get() < t0 + wait_ms {
+        if let Some(u) = vio(q.take_used(&RingsMem), "the used ring")? {
+            ensure_eq!(u.0, head, "the used element names the request");
+            return Ok(Some(u));
+        }
+        sys::thread_yield();
+    }
+    Ok(None)
+}
+
+/// The byte at `va` of a page this test mapped (BUF_VA's).
+fn rd8_dma(va: u64) -> u8 {
+    (rd64(va & !7) >> (8 * (va & 7))) as u8
+}
+
+/// The first byte of the sector read at BUF_VA + BLK_DATA that is not the disk's pattern.
+fn blk_pattern_wrong() -> Option<u64> {
+    (0..512u64).find(|&i| rd8_dma(BUF_VA + BLK_DATA + i) != ((i * 13 + 1) & 0xff) as u8)
+}
+
+/// The block function with a domain (the suite is the supervisor), the driver's duplicate, and a rings page and a data page mapped
+/// here and in the domain: `body` gets the function, the supervisor's handle, the rings' and the data page's I/O addresses and the
+/// pattern frame's physical address. The device is reset before the domain goes.
+fn with_blk_domain(body: impl FnOnce(&PciFn, u64, u64, u64, u64) -> Outcome) -> Outcome {
+    with_function(PCI_BLK_SLOT, PCI_BLK_ID, |res, f, pa| {
+        let sup = ok(
+            sys::iodomain_create(res, PCI_BLK_DID, 0),
+            "iodomain_create for the block function",
+        )?
+        .a1 as u64;
+        let r = (|| {
+            let drv = ok(
+                sys::handle_duplicate(sup, Rights::IO_MAP.0 | Rights::IO_UNMAP.0),
+                "the driver's duplicate",
+            )?
+            .a1 as u64;
+            let rings = ok(sys::vmo_create_dma_in(res, 1, 0), "the rings' DMA VMO")?.a1 as u64;
+            let data = ok(sys::vmo_create_dma_in(res, 1, 0), "the data page")?.a1 as u64;
+            let r = (|| {
+                map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
+                map_here(data, BUF_VA, 1, PF_R | PF_W)?;
+                let rings_io =
+                    ok(sys::iodomain_map(drv, rings, 0, 1, 3), "map the rings")?.a1 as u64;
+                let data_io =
+                    ok(sys::iodomain_map(drv, data, 0, 1, 3), "map the data page")?.a1 as u64;
+                for i in 0..512 {
+                    wr64(BUF_VA + 8 * i, 0);
+                }
+                body(f, sup, rings_io, data_io, pa)
+            })();
+            mmio_wr8(f.common + 0x14, 0); // the device stops before its memory and its domain go
+            unmap_here(BUF_VA);
+            unmap_here(RINGS_VA);
+            sys::handle_close(data);
+            sys::handle_close(rings);
+            sys::handle_close(drv);
+            r
+        })();
+        sys::handle_close(sup);
+        r
+    })
+}
+
+/// IOMMU8 (IOMMU-SPEC 15.1 L1, 9): a virtio-blk-pci function behind the IOMMU reads sector 0 through a domain, by the `virtio` crate's
+/// negotiation and split queue, polled: every byte is the disk's, the status is OK, the IOMMU took no fault, and MSI-X and INTx stayed
+/// off.
+fn pci_virtio_blk_reads_through_the_iommu() -> Outcome {
+    with_blk_domain(|f, _, rings_io, data_io, _| {
+        let before = iommu_faults();
+        let used = pci_blk_read_sector0(
+            f,
+            rings_io,
+            (data_io + BLK_HDR, data_io + BLK_DATA, data_io + BLK_STATUS),
+            2000,
+        )?;
+        ensure!(
+            used.is_some(),
+            "the device did not return the request (faults {} -> {}, status {:#x})",
+            before,
+            iommu_faults(),
+            rd8_dma(BUF_VA + BLK_STATUS)
+        );
+        ensure_eq!(
+            rd8_dma(BUF_VA + BLK_STATUS),
+            virtio::blk::S_OK,
+            "the request's status"
+        );
+        if let Some(i) = blk_pattern_wrong() {
+            ensure!(
+                false,
+                "sector 0 byte {i} is {:#x}, the disk holds {:#x}",
+                rd8_dma(BUF_VA + BLK_DATA + i),
+                (i * 13 + 1) & 0xff
+            );
+        }
+        ensure_eq!(iommu_faults(), before, "the read took no IOMMU fault");
+        ensure_eq!(
+            cfg_rd16(f.msix_cap + 2) & (1 << 15),
+            0,
+            "MSI-X stayed off (this slice polls)"
+        );
+        ensure!(cfg_rd16(4) & (1 << 10) != 0, "INTx stayed disabled");
+        Ok(())
+    })
+}
+
+/// IOMMU8 (IOMMU-SPEC 15.1 L1, IO1): the same function, told to put the sector in a frame its domain does not map (the pattern
+/// frame, by its physical address): the IOMMU refuses the write and records a fault naming the function, and the frame is unchanged.
+/// (QEMU's virtio moves a buffer it may not write through a bounce buffer, so the request itself may still be returned, as in the
+/// IOMMU6 tests: the refusal shows as memory unchanged and a fault record.)
+fn pci_virtio_outside_its_mapping_faults() -> Outcome {
+    with_blk_domain(|f, sup, rings_io, data_io, pa| {
+        let before = iommu_faults();
+        let _ = pci_blk_read_sector0(
+            f,
+            rings_io,
+            (data_io + BLK_HDR, pa, data_io + BLK_STATUS),
+            500,
+        )?;
+        expect_fault(
+            sup,
+            pa,
+            DIR_WRITE,
+            "a sector read into a frame outside the mapping",
+        )?;
+        ensure!(iommu_faults() > before, "the IOMMU counted the fault");
+        let (did, _, _, _) = iommu_last_fault();
+        ensure_eq!(did, PCI_BLK_DID, "the last fault names the block function");
+        if let Some(i) = pattern_intact() {
+            ensure!(false, "the pattern frame changed at word {i}");
+        }
+        Ok(())
+    })
 }
 
 /// Wait for DEVICE_FAULT on the control handle, then take every record: one at `iova` in direction `dir` must be among them.
@@ -18985,6 +19736,10 @@ pub fn app_main() -> i32 {
             devmgr_starts_blkd_for_the_disk,
         ),
         (
+            "pci_devices_are_found_and_claimed",
+            pci_devices_are_found_and_claimed,
+        ),
+        (
             "a_child_has_no_device_authority",
             a_child_has_no_device_authority,
         ),
@@ -19041,6 +19796,14 @@ pub fn app_main() -> i32 {
         ("msi_forgery_faults", msi_forgery_faults),
         ("msi_revoke_stops_the_vector", msi_revoke_stops_the_vector),
         ("msi_destroy_revokes_every_vector", msi_destroy_revokes_every_vector),
+        (
+            "pci_virtio_blk_reads_through_the_iommu",
+            pci_virtio_blk_reads_through_the_iommu,
+        ),
+        (
+            "pci_virtio_outside_its_mapping_faults",
+            pci_virtio_outside_its_mapping_faults,
+        ),
         (
             "vector_calls_check_handles_rights_and_arguments",
             vector_calls_check_handles_rights_and_arguments,

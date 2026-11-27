@@ -28,7 +28,7 @@ help:
 	@echo "make check      the epic gate (smoke): what CI runs on a pull request into main"
 
 test:
-	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p pcicore -p virtio -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -42,7 +42,7 @@ fmt-check:
 lint: lint-host lint-target
 
 lint-host:
-	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p pcicore -p virtio -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 
 lint-target:
 	cd home/kernel && cargo clippy -- -D warnings
@@ -129,7 +129,7 @@ kernel: kernel-main
 # Host tests of the OS crates: plain, then the same code under the loom and
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
 os-test:
-	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore
+	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p pcicore -p virtio
 	$(MAKE) os-models
 
 # AR1 (OD143): the kernel compiles against the AArch64 stub in kernel/src/arch/aarch64 (no code is built or run for it).
@@ -582,13 +582,15 @@ os-chaos:
 	cd kernel && cargo build --features chaos --target-dir ../target/os-chaos
 	python3 scripts/chaos.py $(OS_CHAOS_ELF) "$(CHAOS_SEEDS)"
 
-# KT10: mutation testing of kcore, klock and iommucore with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
+# KT10: mutation testing of kcore, klock, iommucore, pcicore and virtio with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
 # `make os-mutants` runs the three crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
 # Fails on a surviving mutant that is not in mutants-accepted.txt with a reason. Hours: the owner starts it (OD142).
 os-mutants:
 ifeq ($(PKG),)
 	python3 scripts/mutants.py klock
 	python3 scripts/mutants.py iommucore
+	python3 scripts/mutants.py pcicore
+	python3 scripts/mutants.py virtio
 	python3 scripts/mutants.py kcore
 else
 	python3 scripts/mutants.py $(PKG) $(if $(SHARD),--shard $(SHARD),)

@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "init", "ish", "iommucore", "kcore", "klock", "libc", "libsys", "kernel", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "profile", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "rt", "shell-core", "supervise", "svc",
+    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "init", "ish", "iommucore", "kcore", "klock", "libc", "pcicore", "virtio", "libsys", "kernel", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "profile", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "rt", "shell-core", "supervise", "svc",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
 ]
 # Plain `cargo test` / `cargo build` at the root only touches the host-testable
 # host-testable crates. The two kernels target bare-metal RISC-V and are built from
 # inside kernel/ and home/kernel/ (see Makefile), which pick up their .cargo/config.toml.
 default-members = [
-    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "ish", "iommucore", "kcore", "klock", "libsys", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "shell-core", "supervise", "svc",
+    "abi", "ksys", "kfuzz-gen", "auth", "cfmt", "clockmodel", "data", "dhcp", "doofs", "doofs-tools", "fsfmt", "ish", "iommucore", "kcore", "klock", "libsys", "pcicore", "virtio", "memfs", "mounts", "names", "netcore", "pathres", "pregex", "netring", "netsim", "nettcp", "netwire", "dns", "http1", "rngcore", "sockshim", "proto", "shell-core", "supervise", "svc",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
 ]
 
@@ -38,6 +38,12 @@ opt-level = 2
 debug = 0
 opt-level = 2
 [profile.dev.package.svc]
+debug = 0
+opt-level = 2
+[profile.dev.package.pcicore]
+debug = 0
+opt-level = 2
+[profile.dev.package.virtio]
 debug = 0
 opt-level = 2
 [profile.dev.package.linked_list_allocator]

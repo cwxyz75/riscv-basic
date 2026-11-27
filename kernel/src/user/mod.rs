@@ -115,7 +115,8 @@ struct StateOpen;
 impl StateOpen {
     #[track_caller]
     fn enter() -> StateOpen {
-        #[allow(clippy::panic)] // (the check's report)
+        #[allow(clippy::panic)]
+        // INVARIANT: only a kernel bug reaches it: `with_state` is called by kernel paths alone, none of which calls it again inside its closure whatever a program passes, and the check exists only in debug builds
         if STATE_OPEN.swap(true, Ordering::Relaxed) {
             let at = core::panic::Location::caller();
             let outer = STATE_SITE.load(Ordering::Relaxed);

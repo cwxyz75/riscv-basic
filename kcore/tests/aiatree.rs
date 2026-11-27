@@ -445,3 +445,53 @@ fn the_identities_of_a_file_come_from_num_ids_which_is_required_and_bounded() {
     }
     assert_eq!(with(None), None, "no riscv,num-ids: not used");
 }
+
+/// IOMMU8 (IOMMU-SPEC 8.6; Q-IOMMU-IRQ B): PCI INTx is never admitted. The PCI host's `interrupt-map` is decoded here from the tree's
+/// own cell counts (the host's `#address-cells` and `#interrupt-cells`, then each parent's `#address-cells` and `#interrupt-cells`, as
+/// the device-tree specification lays the property out), not by any code under test: on QEMU `virt` with the IOMMU it names sources
+/// 32 to 35 on the supervisor APLIC (phandle 0x0c, `dtc`'s listing), and none of them may be in the list `interrupt_create` admits.
+#[test]
+fn no_source_of_the_pci_hosts_interrupt_map_is_admitted() {
+    let nodes = fdt::parse(include_bytes!("fixtures/virt-aia-iommu.dtb")).unwrap();
+    let host = nodes
+        .iter()
+        .find(|n| n.is_compatible("pci-host-ecam-generic"))
+        .expect("a PCI host");
+    let map = host.cells("interrupt-map");
+    let child_addr = host.u32_prop("#address-cells").unwrap() as usize;
+    let child_int = host.u32_prop("#interrupt-cells").unwrap() as usize;
+    let mut wired = Vec::new();
+    let mut i = 0;
+    while i < map.len() {
+        i += child_addr + child_int;
+        let phandle = map[i];
+        i += 1;
+        let parent = nodes
+            .iter()
+            .find(|n| n.u32_prop("phandle") == Some(phandle))
+            .expect("the interrupt parent");
+        assert_eq!(
+            phandle, 0x0c,
+            "every INTx line goes to the supervisor APLIC"
+        );
+        i += parent.u32_prop("#address-cells").unwrap_or(0) as usize;
+        wired.push(map[i]);
+        i += parent.u32_prop("#interrupt-cells").unwrap() as usize;
+    }
+    wired.sort_unstable();
+    wired.dedup();
+    assert_eq!(
+        wired,
+        vec![32, 33, 34, 35],
+        "INTA to INTD of the four slot groups"
+    );
+    let a = discover(&nodes).unwrap();
+    for s in &wired {
+        assert!(
+            !a.sources.contains(s),
+            "PCI INTx source {s} is admitted ({:?})",
+            a.sources
+        );
+    }
+    assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+}
