@@ -8,9 +8,10 @@ use netring::{ctl, msg, stat, state, Entry, Pool, Ring, RingId, Slot};
 mod netshm;
 use netshm::Shm;
 
-const RING_VA: u64 = 0x18_0000_0000;
-const RX_VA: u64 = 0x18_0010_0000;
-const TX_VA: u64 = 0x18_0020_0000;
+// (28 GiB into the suite's fixed window, above the thread stacks: nothing the kernel places lands there, T272)
+const RING_VA: u64 = FIXED_RINGS;
+const RX_VA: u64 = RING_VA + 0x10_0000;
+const TX_VA: u64 = RING_VA + 0x20_0000;
 const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 /// The stack side of a running driver, as the tests play it.
@@ -420,7 +421,7 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
         );
         ensure_eq!(n.stat(stat::RING_VIOLATIONS), 0, "no ring violations");
         // the receive pool is read-only here: no write handle exists in this view (Q16)
-        let w = sys::process_map(me()?, n.rx, 0x18_0030_0000, 0, 4096, PF_R | PF_W);
+        let w = sys::process_map(me()?, n.rx, RING_VA + 0x30_0000, 0, 4096, PF_R | PF_W);
         ensure_eq!(
             st(w),
             Some(S::AccessDenied),
