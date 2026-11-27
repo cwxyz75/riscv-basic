@@ -1139,3 +1139,13 @@ is 1 for every vector by construction. It is therefore not returned: the ABI nam
 writes `msi_address` and `MSI_DATA` into the vector's MSI-X table entry. The word could vary only if vectors shared an interrupt
 file or messages were translated without MRIF; both are excluded by 8.2, OD165 and IO11, and either would be a spec revision with
 its own ABI change.
+
+### 6. The debug translation interface works in QEMU (OD173)
+
+Amendment authorized by the owner, 2026-11-26.
+
+The 2026-11-25 amendment, point 8, says of A11 that "the debug translation interface exists, but its use is not established; the
+self-test stays a counted skip until it works". IOMMU5 (#581) established it: on QEMU 11.1.3 a translation requested through
+`tr_req_iova` and `tr_req_ctl` completes, and its response agrees with `iommucore::iopt` for mapped, read-only and unmapped pages.
+**A11 holds as observed.** `iommu_translation_matches_the_tables` is therefore a real check at every kernel-only boot, not a
+counted skip; the skip (which the boot script refuses, section 13) remains only for an IOMMU that does not report the interface.
