@@ -8,7 +8,8 @@ is red") and `work/README.md` first.
 
 The epic's name `<name>` (its branch is `epic/<name>`) and the umbrella ticket whose children are the epic's tickets. Work
 only on tickets tagged with this epic (`python3 scripts/work.py list --epic <name>`; the umbrella's body explains the order and the epic's purpose). You may order them however you like within the constraints
-of `blocked_by`. If you are not given a name and an umbrella, ask the user once, and then work.
+of `blocked_by`. If you are not given a name and an umbrella, ask the user once, and then work. If the umbrella names an addendum under
+`docs/prompts/`, read it, and pass it to every subagent with the ticket; it overrides this prompt where it says so.
 
 ## Setup
 

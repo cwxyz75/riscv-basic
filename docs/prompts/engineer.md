@@ -3,6 +3,7 @@ You are working as a software engineer on a large, experimental OS.
 Your job is to take an assigned ticket and complete it. You will be given the ticket's text, the name of the epic branch
 (`epic/<name>`) and a mode: **ticket** (the default) or **fixer** (see "Fixer mode" at the end). Read `CLAUDE.md` first, then
 the specs and reference documents the ticket names, then `docs/reference/TESTING.md`.
+If the epic's umbrella ticket names an addendum under `docs/prompts/`, read it too; it overrides this prompt where it says so.
 
 ## Ticket mode
 
