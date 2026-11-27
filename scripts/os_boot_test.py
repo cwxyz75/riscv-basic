@@ -132,7 +132,8 @@ IOMMU_TEST_DEV = "00:04.0"
 # gives virtio-blk-pci one queue per hart by default and one MSI-X vector more, so its table would otherwise change with OS_SMP.
 # The five devices on one machine (IOMMU9, the bus move): two disks, the network, the entropy source (also the IOMMU tests' function)
 # and `iommu-testdev`, which has no MSI-X capability and so is listed and never claimable (IOMMU-SPEC 8.6, Q-IOMMU-MSI 5). The network
-# function has no backend: nothing drives it before its driver moves (IOMMU11).
+# function has no backend: nothing drives it before its driver moves (IOMMU11). The disks (IOMMU10) are the scratch disk and the
+# second disk, writable, which `blkd` drives through `devmgr`'s claim; OS_DISK=0 leaves both off (`pci_devices`).
 PCI_DEVICES = [
     (4, "virtio-rng-pci", "1af4:1044", "", True),
     (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0,num-queues=1", True),
@@ -140,6 +141,16 @@ PCI_DEVICES = [
     (7, "virtio-net-pci", "1af4:1041", ",mac=52:54:00:12:34:57,romfile=", True),
     (8, "iommu-testdev", "1b36:0005", None, False),
 ]
+PCI_DISK_SLOTS = (5, 6)
+
+
+def pci_devices():
+    """PCI_DEVICES as this boot has them: without the disks when OS_DISK=0 (the no-disk boot: no disk on either bus)."""
+    if os.environ.get("OS_DISK") == "0":
+        return [d for d in PCI_DEVICES if d[0] not in PCI_DISK_SLOTS]
+    return PCI_DEVICES
+
+
 # The host bridge QEMU puts at 00:00.0, which `devmgr` lists too (not claimable).
 PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
 # The bus address of the block function (`pci_virtio_*` tests).
@@ -162,32 +173,41 @@ def pci_device(slot, model, extra):
     return ["-device", f"{model},iommu_platform=on,disable-legacy=on,addr={slot:#x}{extra}"]
 
 
-def pci_disk(mul=13, add=1):
-    """A 64 KiB raw image for a PCI block function, read-only, whose sector 0 holds its own pattern (byte i = (i * mul + add) mod
-    256): `pci_virtio_blk_reads_through_the_iommu` checks every byte of the first (13, 1), the interrupt tests tell the two disks
-    apart by the second's (7, 3). A fresh copy per boot."""
+def pci_args():
+    """The PCI functions of this boot (`pci_devices`) and the disks' drives: the scratch disk at 00:05.0 and the second disk at
+    00:06.0 (with `OS_PCI_TEST=0`, none: the no-IOMMU boot). Under record and replay the drives go through QEMU's `blkreplay` filter,
+    which block devices need in that mode."""
+    if os.environ.get("OS_PCI_TEST") == "0":
+        return []
+    drive = []
+    if os.environ.get("OS_DISK") != "0":
+        for name, disk in (("pd0", scratch_disk()), ("pd1", second_disk())):
+            if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
+                drive += ["-drive", f"file={disk},if=none,format=raw,id={name}-direct",
+                          "-drive", f"driver=blkreplay,if=none,image={name}-direct,id={name}"]
+            else:
+                drive += ["-drive", f"file={disk},if=none,format=raw,id={name}"]
+    return drive + [a for slot, model, _, extra, _ in pci_devices() for a in pci_device(slot, model, extra)]
+
+
+def wired_test_disk():
+    """The wired-interrupt test device: a 64 KiB read-only virtio-blk on the virtio-mmio transport whose sector 0 holds (i * 7 + 3)
+    mod 256. Only the suite's hand tests of a wired interrupt read it (`interrupt_object_fires_and_masks` and its neighbours, until
+    IOMMU12 moves them to the RTC); `devmgr` serves no disk on virtio-mmio. A fresh copy per boot."""
     import atexit, tempfile
-    f = tempfile.NamedTemporaryFile(prefix="os-pcidisk-", suffix=".img", delete=False)
-    f.write(bytes((i * mul + add) & 0xFF for i in range(512)))
+    f = tempfile.NamedTemporaryFile(prefix="os-wired-", suffix=".img", delete=False)
+    f.write(bytes((i * 7 + 3) & 0xFF for i in range(512)))
     f.truncate(64 * 1024)
     f.close()
     atexit.register(lambda: os.path.exists(f.name) and os.unlink(f.name))
     return f.name
 
 
-def pci_args():
-    """The PCI functions of PCI_DEVICES and the block function's drive (with `OS_PCI_TEST=0`, none: the no-IOMMU boot). Under record
-    and replay the drive goes through QEMU's `blkreplay` filter, which block devices need in that mode."""
-    if os.environ.get("OS_PCI_TEST") == "0":
-        return []
-    drive = []
-    for name, disk in (("pd0", pci_disk()), ("pd1", pci_disk(7, 3))):
-        if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
-            drive += ["-drive", f"file={disk},if=none,format=raw,readonly=on,id={name}-direct",
-                      "-drive", f"driver=blkreplay,if=none,image={name}-direct,readonly=on,id={name}"]
-        else:
-            drive += ["-drive", f"file={disk},if=none,format=raw,readonly=on,id={name}"]
-    return drive + [a for slot, model, _, extra, _ in PCI_DEVICES for a in pci_device(slot, model, extra)]
+def wired_disk_on():
+    """Whether this boot has the wired-interrupt test device: a boot with disks, not the kernel-only one (whose Kernel tests do not
+    read it) and not under record or replay (it would need its own replay filter)."""
+    return (os.environ.get("OS_DISK") != "0" and SHARD != "k"
+            and not os.environ.get("OS_RECORD") and not os.environ.get("OS_REPLAY"))
 
 
 def devmgr_pci_problems():
@@ -198,8 +218,8 @@ def devmgr_pci_problems():
     want = {PCI_HOST_BRIDGE[0]: PCI_HOST_BRIDGE[1]}
     claimable = set()
     if os.environ.get("OS_PCI_TEST") != "0":
-        want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _, _ in PCI_DEVICES})
-        claimable = {f"00:{slot:02x}.0" for slot, _, _, _, c in PCI_DEVICES if c}
+        want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _, _ in pci_devices()})
+        claimable = {f"00:{slot:02x}.0" for slot, _, _, _, c in pci_devices() if c}
     for m in LAST_DEVMGR_PCI:
         if m[7] is not None:  # an enumeration's last line
             got = {bdf: ids for bdf, ids, _, _, _ in current}
@@ -224,6 +244,48 @@ def devmgr_pci_problems():
     if current:
         found.append("devmgr printed PCI functions without the closing 'functions=' line")
     return found
+# IOMMU10: the suite's tests that make the IOMMU fault on purpose (a device aimed outside its domain, an ungranted or forged message,
+# a function with no domain at all). Every other test must take none, and nothing between the tests may either: the suite prints
+# `iofaults: <test> <n>` for each test that saw any and `iofaults: suite <n>` for the whole run.
+DELIBERATE_FAULT_TESTS = {
+    "iommu_is_on_and_denies_by_default",
+    "iommu_denies_messages_by_default",
+    "iodomain_maps_exactly_what_was_granted",
+    "iodomain_unmap_stops_the_device",
+    "iodomain_faults_reach_the_supervisor",
+    "iodomain_outlives_its_makers",
+    "msi_ungranted_vector_faults",
+    "msi_forgery_faults",
+    "msi_revoke_stops_the_vector",
+    "msi_destroy_revokes_every_vector",
+    "pci_virtio_outside_its_mapping_faults",
+    "pci_driver_cannot_forge_through_devmgr",
+    "blk_driver_cannot_reach_outside",
+}
+
+
+def iofault_problems(text, tests_run):
+    """The suite's `iofaults:` lines: faults only in DELIBERATE_FAULT_TESTS, and the suite's total is their sum (none between tests).
+    A boot whose suite did not finish has no total, and says nothing here (its failure is reported elsewhere)."""
+    per, total = {}, None
+    for l in text.split("\n"):
+        m = re.match(r"^iofaults: (\S+) (\d+)$", l)
+        if m and m[1] == "suite":
+            total = int(m[2])
+        elif m:
+            per[m[1]] = int(m[2])
+    if total is None:
+        # (a suite that reached its end always says its total: a missing line must not switch the check off)
+        if re.search(r"^init: \d+ of \d+ user tests failed$", text, re.M):
+            return ["the suite finished without its 'iofaults: suite <n>' line"]
+        return []
+    found = [f"IOMMU faults in {n} ({c}), which does not fault on purpose" for n, c in per.items()
+             if n not in DELIBERATE_FAULT_TESTS]
+    if total != sum(per.values()):
+        found.append(f"IOMMU faults outside any test: the suite saw {total}, its tests {sum(per.values())}")
+    return found
+
+
 # `##FF <name>=<value> ...` (T189): what the kernel understood of an `ff=` boot argument (test builds), so a run meant to start counters near their end cannot pass on a typo
 LAST_FF = []
 
@@ -234,10 +296,14 @@ LAST_DISK2 = [None]
 
 def check_disk(path):
     """The independent oracle for the block-driver tests (T44): after QEMU exits, look at the image
-    itself. Expected (see `blk_round_trip` / `blk_driver_restart` in init/src/bin/suite.rs): sector 0
-    untouched; sectors 100..227, 4000..4063, 7000..7031 and the last sector hold pattern(s, i) =
-    (s*31 + i*7 + 5) mod 256; sectors 5000..5015 hold zeros or the in-flight write's data
-    ((j*13 + 1) mod 256 at byte j of the 8 KiB); every other sector is zero. Returns problems."""
+    itself. Expected (see `blk_round_trip`, `blk_driver_restart`, `blk_driver_killed_mid_write` and
+    `blk_driver_cannot_reach_outside` in init/src/bin/suite.rs): sector 0 untouched; sectors 100..227,
+    4000..4063, 7000..7031 (zeros too in the kernel-only boot, which does not run the devmgr test),
+    9000..9015, 9100..9115 and the last sector hold pattern(s, i) = (s*31 + i*7 + 5) mod 256 (9300 that
+    or zeros: the hostile requests aimed at it moved what the IOMMU refused);
+    sectors 5000..5015 hold zeros or the in-flight write's data ((j*13 + 1) mod 256 at byte j of the
+    8 KiB); sector 9200 holds (i*17 + 9) mod 256 (the write whose buffer's handles were closed); every
+    other sector is zero. Returns problems."""
     SECTORS = 16 * 1024 * 2
     try:
         data = open(path, "rb").read()
@@ -252,8 +318,15 @@ def check_disk(path):
         got = data[s * 512:(s + 1) * 512]
         if s == 0:
             want = [bytes((i * 7 + 3) & 0xFF for i in range(512))]
-        elif 100 <= s < 228 or 4000 <= s < 4064 or 7000 <= s < 7032 or s == SECTORS - 1:
+        elif 7000 <= s < 7032 and SHARD == "k":
+            want = [pat(s), zero]
+        elif s == 9300:  # (the real driver's data, or the zeros of a transfer the IOMMU refused)
+            want = [pat(s), zero]
+        elif (100 <= s < 228 or 4000 <= s < 4064 or 7000 <= s < 7032 or 9000 <= s < 9016 or 9100 <= s < 9116
+              or s == SECTORS - 1):
             want = [pat(s)]
+        elif s == 9200:
+            want = [bytes((i * 17 + 9) & 0xFF for i in range(512))]
         elif 5000 <= s < 5016:
             j = (s - 5000) * 512
             want = [zero, bytes(((j + i) * 13 + 1) & 0xFF for i in range(512))]
@@ -892,8 +965,8 @@ SHARD = os.environ.get("OS_SHARD", "")
 if SHARD not in ("", "a", "b", "k"):
     sys.exit(f"OS_SHARD must be a, b or k, not {SHARD!r}")
 if SHARD == "k":
-    # the kernel-only boot (KT1, KERNEL-V1-SPEC 8): the Kernel tests of `init/ktests.txt` and the kernel's own, no disk, no network
-    os.environ["OS_DISK"] = "0"
+    # the kernel-only boot (KT1, KERNEL-V1-SPEC 8): the Kernel tests of `init/ktests.txt` and the kernel's own, no network. The PCI
+    # disks stay (IOMMU10: the block rig's tests are Kernel tests, at one, two and four harts); OS_DISK=0 still removes them.
     os.environ["OS_NET"] = "0"
 
 
@@ -1132,14 +1205,15 @@ LAST_RECORD = [None]
 
 
 def rr_args():
-    """The QEMU arguments of record/replay mode (KT2), or []. Recording needs no disk and no network device (they would need
-    block and network replay filters): run it with OS_SHARD=k, or OS_DISK=0 OS_NET=0. Record mode runs the harts in one TCG thread
-    (deterministic), so a race that needs true parallel harts may not reproduce under it (TESTING.md)."""
+    """The QEMU arguments of record/replay mode (KT2), or []. Recording needs no network device (it would need a network replay
+    filter): run it with OS_SHARD=k, or OS_NET=0. The PCI disks go through QEMU's `blkreplay` filter (`pci_args`), and the
+    wired-interrupt test device is left off (`wired_disk_on`). Record mode runs the harts in one TCG thread (deterministic), so a race
+    that needs true parallel harts may not reproduce under it (TESTING.md)."""
     rec, rep = os.environ.get("OS_RECORD"), os.environ.get("OS_REPLAY")
     if not rec and not rep:
         return []
-    if os.environ.get("OS_DISK") != "0" or os.environ.get("OS_NET") != "0":
-        sys.exit("OS_RECORD / OS_REPLAY need a boot with no disk and no network: OS_SHARD=k (or OS_DISK=0 OS_NET=0)")
+    if os.environ.get("OS_NET") != "0":
+        sys.exit("OS_RECORD / OS_REPLAY need a boot with no network: OS_SHARD=k (or OS_NET=0)")
     shift = "shift=auto"
     if rep:
         LAST_RECORD[0] = None
@@ -1195,16 +1269,11 @@ def run(kernel: str, extra=()):
         # Record and replay (KT2, TESTING.md): `OS_RECORD=<dir>` boots under QEMU's record mode and the harness keeps the recording only
         # when the boot fails; `OS_REPLAY=<file>` replays one (add OS_GDB=1 to wait for gdb on :1234 first)
         *rr_args(),
-        # The scratch disk (S6): a virtio block device on the modern transport. The kernel itself
-        # never touches it; OS_DISK=0 leaves it off.
-        *([] if os.environ.get("OS_DISK") == "0" else [
+        # The wired-interrupt test device (`wired_test_disk`): a read-only virtio-blk on the modern virtio-mmio transport, read only
+        # by the suite's hand tests of a wired interrupt. The disks are PCI functions (`pci_args`, IOMMU10).
+        *([] if not wired_disk_on() else [
             "-global", "virtio-mmio.force-legacy=false",
-            # (QEMU gives the first device the highest virtio-mmio slot and the device tree lists the
-            # slots lowest first, so the second disk is attached first: the 16 MiB scratch disk is
-            # then device 0 for the suite, and the small one is device 1)
-            "-drive", f"file={second_disk()},if=none,format=raw,id=hd1",
-            "-device", "virtio-blk-device,drive=hd1",
-            "-drive", f"file={scratch_disk()},if=none,format=raw,id=hd0",
+            "-drive", f"file={wired_test_disk()},if=none,format=raw,readonly=on,id=hd0",
             "-device", "virtio-blk-device,drive=hd0"]),
         *(["-append", " ".join(a for a in ("bench=full" if os.environ.get("OS_BENCH_FULL") == "1" else "",
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
@@ -1231,7 +1300,8 @@ def run(kernel: str, extra=()):
         finally:
             lossy_stop()
     text = out.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    return [l for l in text.split("\n") if l.startswith("##")], status, timed_out, text
+    # (the kernel's `##` lines, and `devmgr`'s, which reach the console behind the kernel's `user: ` prefix: DEVMGR_PCI)
+    return [l for l in text.split("\n") if l.startswith("##") or l.startswith("user: ## devmgr: ")], status, timed_out, text
 
 
 def parse(lines):
@@ -1486,16 +1556,22 @@ def main() -> int:
                         found.append(f"no '## iommu: fault cause=258 dev={IOMMU_TEST_DEV} ... {want}' line "
                                      f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
             # IOMMU8: the negative test of the block function (IOMMU-SPEC 15.1 L1) shows on the console as a fault naming it
-            if any(n == "pci_virtio_outside_its_mapping_faults" and ok for n, ok, _ in tests_run):
+            if (any(n == "pci_virtio_outside_its_mapping_faults" and ok for n, ok, _ in tests_run)
+                    and os.environ.get("OS_DISK") != "0"):
                 if not any(f[1] == PCI_BLK_DEV for f in LAST_IOMMU_FAULTS):
                     found.append(f"no '## iommu: fault ... dev={PCI_BLK_DEV}' line from pci_virtio_outside_its_mapping_faults "
                                  f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
             # IOMMU8: `devmgr` listed the bus the command line built, every time it enumerated it
             found += devmgr_pci_problems()
+            # T42 hole (c): a virtio-mmio reset that did not complete is said, never given up on silently
+            found += [f"devmgr: {l[len('user: ## devmgr: '):]}" for l in text.split("\n")
+                      if l.startswith("user: ## devmgr: mmio ") and " reset failed " in l]
+            # IOMMU10: no unexpected IOMMU fault over the boot
+            found += iofault_problems(text, tests_run)
             if SHARD != "k" and strict and not RELEASE_SUITE and not LAST_DEVMGR_PCI and os.environ.get("OS_PCI_TEST") != "0":
                 found.append("devmgr printed no '## devmgr: pci' lines (pci_devices_are_found_and_claimed starts it)")
-        # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (strict and os.environ.get("OS_DISK") != "0"
+        # The interrupt-object test must have run its full path (the wired-interrupt test device, an interrupt), not skipped.
+        if (strict and wired_disk_on()
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
         # The block-driver tests must have found the disk and run, with interrupts.
@@ -1504,7 +1580,7 @@ def main() -> int:
             found.append("the block-driver tests did not run with interrupts")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
         # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
-        if strict and os.environ.get("OS_DISK") != "0":
+        if strict and wired_disk_on():
             m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
             if not m:
                 found.append("the kernel did not report the device interrupt counts")
@@ -1518,7 +1594,7 @@ def main() -> int:
         if (strict and not found and os.environ.get("OS_DISK") != "0"
                 and LAST_DISK[0]):
             found += check_disk(LAST_DISK[0])
-            if LAST_DISK2[0]:
+            if LAST_DISK2[0] and SHARD != "k":  # (the kernel-only boot does not run the filesystem tests that format it)
                 found += fsck_second_disk()
         # The device manager found the disk (or, with OS_DISK=0, found none and started nothing).
         if strict and SHARD != "k":  # (the servers these checks look for are System tests: a kernel-only boot has none)
@@ -1560,7 +1636,9 @@ def main() -> int:
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)
             print("--- serial output ---", text, sep="\n", file=sys.stderr)
         else:
-            print(f"os boot test passed: {label} ({len(parse(lines)[1])} tests, exit status {status})")
+            m = re.search(r"^iofaults: suite (\d+)$", text, re.M)
+            faults = f", IOMMU faults {m[1]}, all in deliberate-fault tests" if m else ""
+            print(f"os boot test passed: {label} ({len(parse(lines)[1])} tests, exit status {status}{faults})")
             # where the time goes (guest milliseconds per test, from the suite's `tt:` lines): the smoke budget is watched from here
             tts = []
             for l in text.split("\n"):

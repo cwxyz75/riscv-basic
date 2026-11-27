@@ -1,5 +1,5 @@
-# The Kernel tests of the suite (KT1): they start no server and need no disk, network or console service. `shard=k` runs
-# exactly these, except that `kfast` boots (one and two harts) skip those marked `slow` (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test.
+# The Kernel tests of the suite (KT1): they need no network or console service. `shard=k` runs
+# exactly these, except that `kfast` boots (one and two harts) skip those marked `slow` (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test. The IOMMU tests at the end start `devmgr` (IOMMU9) and the block rig its `blkd` on the PCI disks (IOMMU10: the device path through the IOMMU is the kernel's to prove, at one, two and four harts); in the no-disk boot they skip.
 a_two_gib_vmo_committed_whole_stays_within_the_latency_bound
 user_mode_runs_and_prints
 clock_advances_in_user_mode
@@ -135,6 +135,10 @@ vector_calls_check_handles_rights_and_arguments
 pci_virtio_blk_interrupts_through_msix
 pci_two_devices_do_not_share
 pci_driver_cannot_forge_through_devmgr
+blk_round_trip
+blk_driver_restart
+blk_driver_killed_mid_write
+blk_driver_cannot_reach_outside
 socket_ends_travel_over_channels
 a_child_reads_a_socket_to_the_end
 a_blocked_reader_wakes_when_data_arrives

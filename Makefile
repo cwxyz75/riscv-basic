@@ -192,8 +192,8 @@ os-boot-test-smoke-a: kernel-main
 os-boot-test-smoke-b: kernel-main
 	OS_SHARD=b OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
-# The kernel-only boot (KT1, KERNEL-V1-SPEC 8): the kernel, `init` and the Kernel tests of the suite (`init/ktests.txt`: no server, no
-# disk, no network), as shard `k`. `os-ktest` boots the test build at one, two and four harts; `os-ktest-release` the optimised build
+# The kernel-only boot (KT1, KERNEL-V1-SPEC 8): the kernel, `init` and the Kernel tests of the suite (`init/ktests.txt`: the PCI disks,
+# no network), as shard `k`. `os-ktest` boots the test build at one, two and four harts; `os-ktest-release` the optimised build
 # (debug assertions and overflow checks off, no fat LTO so that the build is short) at four. The harness check proves the shard's
 # required list holds no System test and fails when a Kernel test is missing.
 os-ktest: os-ktest-small os-ktest-4
@@ -307,7 +307,7 @@ os-boot-test-smp: kernel os-interactive
 # serial sessions at four harts. A separate target so CI can run it as its own job: the whole SMP part took
 # about 28 minutes, too close to the job's timeout.
 # The scheduler's negative controls (L11d, SCHED-SMP-SPEC task 11): each kernel breaks one mechanism and the guarding test must fail (or the
-# kernel must stop). Kernel-only boots (shard k): no disk, no network. Part of the soak tier (OD142): the owner starts it.
+# kernel must stop). Kernel-only boots (shard k): no network. Part of the soak tier (OD142): the owner starts it.
 os-boot-test-sched-neg: kernel
 	cd kernel && cargo build --features fault-skip-poke --target-dir ../target/os-fault-poke
 	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --expect-panic "starved thread" $(OS_NOPOKE_ELF)
@@ -338,7 +338,7 @@ os-boot-test-smp-neg: kernel os-interactive
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
 	OS_SMP=4 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 
-# The same suite with no disk attached: the device manager must find no block device and start nothing.
+# The same suite with no disk attached (neither PCI disk): the device manager must find no block device on either bus and start nothing.
 os-boot-test-nodisk: kernel
 	OS_DISK=0 python3 scripts/os_boot_test.py $(OS_ELF)
 

@@ -10780,104 +10780,259 @@ fn cycles_do_not_grow_memory() -> Outcome {
 
 // --- The block driver (S6b) -----------------------------------------------------------------
 
-/// Everything a supervisor of `blkd` keeps: the root resource, the mapped MMIO window (to reset the
-/// device), the DMA buffer (kept across driver lifetimes: killing a driver must not free memory the
-/// device may still write to, T42) and the interrupt object when the machine has a PLIC.
+/// The block rig (IOMMU10): the suite as `blkd`'s supervisor, the way `devmgr` starts one. A `devmgr` of its own, and for each driver
+/// a connection to it that claims the scratch disk's function (`ClaimPci`) for a new driver job under the rig's; `blkd` started in
+/// that job with exactly the claim's handles and the claim as its argument. Closing the connection releases the claim: bus mastering
+/// off, the device reset, the domain destroyed (IOMMU-SPEC 10.2). No disk on the bus (the no-disk boot): no rig.
 struct BlkRig {
     res: u64,
-    dev: Blk,
-    dma: u64,
-    irq: Option<u64>,
+    /// The boot image (the suite's shared handle: not closed here).
     bi: u64,
+    /// The drivers' jobs are made under this one (a child of the root job).
+    job: u64,
+    /// The rig's own connection to its `devmgr`, its process and its job.
+    mgr_ch: u64,
+    mgr: u64,
+    mj: u64,
+}
+
+/// One driver the rig started: its process, our end of its service channel, the connection that holds its claim and its job.
+struct BlkDriver {
+    p: u64,
+    ch: u64,
+    conn: u64,
     job: u64,
 }
 
 fn blk_rig() -> Result<Option<BlkRig>, Detail> {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let Some(dev) = find_blk(res)? else {
+    if !pci_disks_present()? {
         return Ok(None);
+    }
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let bi = boot_image_vmo()?;
+    let job = root_job().and_then(|root| {
+        let j = job(root, u64::MAX, u64::MAX, u64::MAX);
+        sys::handle_close(root);
+        j
+    });
+    let job = match job {
+        Ok(j) => j,
+        Err(e) => {
+            sys::handle_close(res);
+            return Err(e);
+        }
     };
-    let made = sys::interrupt_create(res, dev.irq);
-    ensure!(
-        matches!(st(made), Some(S::Ok) | Some(S::NotSupported)),
-        "interrupt_create: {:?}",
-        st(made)
-    );
-    let irq = (st(made) == Some(S::Ok)).then_some(made.a1 as u64);
-    let dma = ok(sys::vmo_create_dma(res, 4), "the DMA buffer")?.a1 as u64;
-    let root = root_job()?;
-    let job = job(root, u64::MAX, u64::MAX, u64::MAX)?;
-    sys::handle_close(root);
+    let (mgr_ch, mgr, mj) = match start_devmgr_in_job(res) {
+        Ok(m) => m,
+        Err(e) => {
+            sys::handle_close(job);
+            sys::handle_close(res);
+            return Err(e);
+        }
+    };
     Ok(Some(BlkRig {
         res,
-        dev,
-        dma,
-        irq,
-        bi: boot_image_vmo()?,
+        bi,
         job,
+        mgr_ch,
+        mgr,
+        mj,
     }))
 }
 
+/// A driver dropped on any path (a test that returned early) is killed and everything of it closed: its connection goes, so the
+/// manager releases its claim and later tests find the disk free.
+impl Drop for BlkDriver {
+    fn drop(&mut self) {
+        if self.p != 0 {
+            let _ = sys::process_kill(self.p, 57);
+        }
+        for h in [self.p, self.ch, self.conn, self.job] {
+            if h != 0 {
+                sys::handle_close(h);
+            }
+        }
+    }
+}
+
+/// A new connection to the manager behind `ch` (`Connect`): our end of it.
+fn devmgr_connect(ch: u64, txid: u32) -> Result<u64, Detail> {
+    use proto::devmgr as dm;
+    let (c, theirs) = channel()?;
+    let req = dm::encode_connect(txid);
+    let w = sys::channel_write(ch, req.as_ptr(), req.len(), [theirs].as_ptr(), 1);
+    if st(w) != Some(S::Ok) {
+        sys::handle_close(c);
+        sys::handle_close(theirs);
+        ensure!(false, "send Connect: {:?}", st(w));
+    }
+    ensure_eq!(
+        st(sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000)),
+        Some(S::Ok),
+        "the manager answers Connect"
+    );
+    let mut rb = [0u8; 16];
+    let r = sys::channel_read(ch, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        dm::decode_reply(&rb[..r.a1]),
+        Some((txid, dm::Status::Ok)),
+        "connected"
+    );
+    Ok(c)
+}
+
+/// Wait until `devmgr` (behind `ch`) lists the scratch disk's function as not claimed: the release is done (the manager is one
+/// thread, so a list that says so was answered after it).
+fn blk_unclaimed(ch: u64) -> Outcome {
+    let t0 = sys::clock_get();
+    let mut txid = 500;
+    loop {
+        txid += 1;
+        if pci_list(ch, txid)?
+            .iter()
+            .any(|e| u64::from(e.rid) == PCI_BLK_DID && e.flags & proto::devmgr::PCI_CLAIMED == 0)
+        {
+            return Ok(());
+        }
+        ensure!(
+            sys::clock_get() < t0 + 5000,
+            "the claim was not released when its connection closed"
+        );
+        let _ = sys::object_wait(ch, 1 << 24, sys::clock_get() + 5);
+    }
+}
+
 impl BlkRig {
-    /// Start a driver in the rig's job: (its process, our end of its service channel).
-    fn spawn(&self) -> Result<(u64, u64), Detail> {
+    /// Claim the scratch disk for a new driver job and start `blkd` in it with the claim's handles.
+    fn spawn(&self) -> Result<BlkDriver, Detail> {
         let (off, len) = image_entry(self.bi, b"bin/blkd")?;
         let image = rt::spawn::read_image(self.bi, off, len).ok_or_else(|| msg_at(line!()))?;
-        let slot = u64::from(self.dev.irq - 1);
-        let mmio = ok(
-            sys::vmo_create_physical(self.res, 0x1000_1000 + slot * 4096, 4096),
-            "the slot's MMIO VMO",
-        )?
-        .a1 as u64;
-        let dma = ok(
-            sys::handle_duplicate(self.dma, Rights::SAME.0),
-            "dup the DMA buffer",
-        )?
-        .a1 as u64;
-        let (mine, theirs) = channel()?;
-        let mut handles = vec![mmio, dma, theirs];
-        let mut roles = vec![(Role::BlkMmio, 0), (Role::BlkDma, 1), (Role::ServiceBlk, 2)];
-        if let Some(irq) = self.irq {
-            let d = ok(
-                sys::handle_duplicate(irq, Rights::SAME.0),
-                "dup the interrupt",
+        let conn = devmgr_connect(self.mgr_ch, 1)?;
+        let dj = match job(self.job, u64::MAX, u64::MAX, u64::MAX) {
+            Ok(j) => j,
+            Err(e) => {
+                sys::handle_close(conn);
+                return Err(e);
+            }
+        };
+        let started = (|| {
+            let send = ok(
+                sys::handle_duplicate(dj, Rights::SAME.0),
+                "dup the driver's job",
             )?
             .a1 as u64;
-            handles.push(d);
-            roles.push((Role::BlkIrq, 3));
+            let (s, claim, mut hs) = pci_claim(conn, 2, PCI_BLK_DID as u16, Some(send))?;
+            let claimed = (|| {
+                ensure_eq!(s, proto::devmgr::Status::Ok, "the scratch disk is claimed");
+                let claim = claim.ok_or_else(|| msg_at(line!()))?;
+                // what the driver is given holds no physical address and no control of its domain: the BAR and the two DMA VMOs
+                // answer no address, and the domain handle maps and unmaps, nothing more
+                for (&h, what) in hs[..4].iter().zip([
+                    "the BAR",
+                    "the domain",
+                    "the queue memory",
+                    "the data buffer",
+                ]) {
+                    ensure!(
+                        matches!(
+                            st(sys::vmo_phys_addr(h)),
+                            Some(S::WrongType | S::AccessDenied)
+                        ),
+                        "{what}: no physical address ({:?})",
+                        st(sys::vmo_phys_addr(h))
+                    );
+                }
+                for (r, what) in [
+                    (sys::iodomain_destroy(hs[1]), "destroy"),
+                    (sys::iodomain_fault_read(hs[1]), "read faults"),
+                    (sys::iodomain_grant_vector(hs[1], 0), "grant a vector"),
+                    (
+                        sys::handle_duplicate(hs[1], Rights::IO_MAP.0),
+                        "duplicate it",
+                    ),
+                ] {
+                    ensure_eq!(
+                        st(r),
+                        Some(S::AccessDenied),
+                        "the driver's domain handle cannot {what}"
+                    );
+                }
+                let mut roles = vec![
+                    (Role::BlkMmio, 0),
+                    (Role::DeviceDomain, 1),
+                    (Role::BlkQueueDma, 2),
+                    (Role::BlkDma, 3),
+                ];
+                for (k, irq) in claim.irqs.iter().enumerate() {
+                    roles.push((
+                        Role::device_irq(irq.what).ok_or_else(|| msg_at(line!()))?,
+                        4 + k as u32,
+                    ));
+                }
+                roles.push((Role::ServiceBlk, hs.len() as u32));
+                let arg = proto::devmgr::encode_claim_arg(&claim).ok_or_else(|| msg_at(line!()))?;
+                let s = Startup {
+                    args: vec![b"blkd".to_vec(), arg],
+                    roles,
+                    ..Startup::default()
+                };
+                s.encode().map_err(|_| msg_at(line!()))
+            })();
+            let bytes = match claimed {
+                Ok(b) => b,
+                Err(e) => {
+                    for h in hs {
+                        sys::handle_close(h);
+                    }
+                    return Err(e);
+                }
+            };
+            let (mine, theirs) = channel()?;
+            hs.push(theirs);
+            // (exactly these handles: a driver gets no debug resource; spawn consumes them whatever happens)
+            match rt::spawn::spawn_in_exact(&image, &bytes, &hs, dj) {
+                Ok(p) => Ok((p, mine)),
+                Err(e) => {
+                    sys::handle_close(mine);
+                    let mut d = Detail::new();
+                    let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn blkd: {e:?}"));
+                    Err(d)
+                }
+            }
+        })();
+        match started {
+            Ok((p, ch)) => Ok(BlkDriver {
+                p,
+                ch,
+                conn,
+                job: dj,
+            }),
+            Err(e) => {
+                sys::handle_close(conn);
+                sys::handle_close(dj);
+                let _ = blk_unclaimed(self.mgr_ch);
+                Err(e)
+            }
         }
-        let s = Startup {
-            args: vec![b"blkd".to_vec()],
-            roles,
-            ..Startup::default()
-        };
-        let bytes = s.encode().map_err(|_| msg_at(line!()))?;
-        let p = rt::spawn::spawn_in(&image, &bytes, &handles, self.job).map_err(|e| {
-            let mut d = Detail::new();
-            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn blkd: {e:?}"));
-            d
-        })?;
-        Ok((p, mine))
     }
 
-    /// Put the device back to its reset state (a supervisor's job between two drivers).
-    fn reset(&self) {
-        wr(&self.dev, 0x70, 0);
-        wr(&self.dev, 0x64, rd(&self.dev, 0x60));
+    /// Kill driver `d` (if it still runs), close everything of it and release its claim; wait for the release.
+    fn release(&self, d: BlkDriver) -> Outcome {
+        let _ = sys::process_kill(d.p, 57);
+        let ended = wait_ended(d.p, 2000);
+        drop(d);
+        ended?;
+        blk_unclaimed(self.mgr_ch)
     }
 }
 
 impl Drop for BlkRig {
     fn drop(&mut self) {
-        self.reset();
-        let me = sys::process_self().a1 as u64;
-        sys::process_unmap(me, MMIO_VA);
-        sys::handle_close(me);
-        for h in [self.dma, self.job, self.res] {
+        // the manager ends with its last connection, releasing any claim still held
+        sys::handle_close(self.mgr_ch);
+        let _ = wait_ended(self.mgr, 5000);
+        for h in [self.mgr, self.mj, self.job, self.res] {
             sys::handle_close(h);
-        }
-        if let Some(i) = self.irq {
-            sys::handle_close(i);
         }
     }
 }
@@ -10977,12 +11132,9 @@ fn blk_round_trip() -> Outcome {
     let Some(rig) = blk_rig()? else {
         return Ok(()); // no disk attached (OS_DISK=0)
     };
-    ensure!(
-        rig.irq.is_some(),
-        "the block device has an interrupt (the AIA is required, PL6)"
-    );
     sys::debug_write(b"s6: blkd exercised (interrupts)\n");
-    let (p, ch) = rig.spawn()?;
+    let mut d = rig.spawn()?;
+    let ch = d.ch;
     let (st, body) = blk_call(ch, 1, blk::Op::Info)?;
     ensure_eq!(st, blk::Status::Ok, "info");
     let info = blk::decode_info(&body).ok_or_else(|| msg_at(line!()))?;
@@ -10990,6 +11142,12 @@ fn blk_round_trip() -> Outcome {
         (info.sectors, info.sector_size, info.read_only, info.max_io),
         (16 * 1024 * 2, 512, false, 16),
         "a 16 MiB disk"
+    );
+    // the driver mapped its own two buffers into its domain: the queue page and the four data pages, charged to its job
+    ensure_eq!(
+        sys::job_info(d.job, 12).a1 as u64,
+        5,
+        "the driver's I/O-mapped pages (its queue page and its data buffer)"
     );
     // the harness put a known pattern in sector 0 (a driver that reads zeroes would show)
     let (st, s0) = blk_call(
@@ -11006,8 +11164,8 @@ fn blk_round_trip() -> Outcome {
         (0..512).all(|i| s0[i] == ((i * 7 + 3) & 0xff) as u8),
         "sector 0 holds the harness pattern"
     );
-    // a request is answered promptly: a dead interrupt path would fall back to the driver's
-    // two-second timeout and pass everything else
+    // a request is answered promptly, by interrupt (the driver has no polling mode: a dead interrupt path is its two-second TIMEOUT)
+    let fired = sys::debug_stat(163);
     let t = sys::clock_get();
     let (status, _) = blk_call(
         ch,
@@ -11022,6 +11180,10 @@ fn blk_round_trip() -> Outcome {
         sys::clock_get() - t < 200,
         "a read took {} ticks",
         sys::clock_get() - t
+    );
+    ensure!(
+        sys::debug_stat(163) > fired,
+        "the read completed by a vector's notice (debug_stat 163)"
     );
     // a 64 KiB pattern in 8 KiB requests, read back identical
     write_pattern(ch, 100, 128)?;
@@ -11154,91 +11316,548 @@ fn blk_round_trip() -> Outcome {
     // still serving, and nothing above disturbed the data
     check_pattern(ch, 100, 128)?;
     // the client going away ends the driver cleanly
-    sys::handle_close(ch);
-    wait_ended(p, 2000)?;
-    ensure_eq!(
-        sys::process_info(p).a1 as i64,
-        0,
-        "the driver exits 0 when its client is gone"
-    );
-    sys::handle_close(p);
+    sys::handle_close(d.ch);
+    d.ch = 0;
+    wait_ended(d.p, 2000)?;
+    let code = sys::process_info(d.p).a1 as i64;
+    rig.release(d)?;
+    ensure_eq!(code, 0, "the driver exits 0 when its client is gone");
     Ok(())
 }
 
-fn blk_driver_restart() -> Outcome {
-    let Some(rig) = blk_rig()? else {
-        return Ok(());
-    };
-    let (p, ch) = rig.spawn()?;
-    write_pattern(ch, 4000, 64)?;
-    check_pattern(ch, 4000, 64)?;
-    // start a write and kill the driver before it can answer: the device may be mid-request
-    let inflight: Vec<u8> = (0..16 * 512).map(|i| (i * 13 + 1) as u8).collect();
+/// Send a 16-sector write of `data` at `sector` on `ch` and do not wait for its answer.
+fn blk_send_write(ch: u64, txid: u32, sector: u64, data: &[u8]) -> Outcome {
+    let req = blk::Request {
+        txid,
+        op: blk::Op::Write {
+            sector,
+            count: (data.len() / 512) as u32,
+            data,
+        },
+    }
+    .encode();
     ensure_eq!(
         st(sys::channel_write(
             ch,
-            blk::Request {
-                txid: 99,
-                op: blk::Op::Write {
-                    sector: 5000,
-                    count: 16,
-                    data: &inflight
-                }
-            }
-            .encode()
-            .as_ptr(),
-            blk::REQ_HEADER + inflight.len(),
+            req.as_ptr(),
+            req.len(),
             core::ptr::null(),
             0
         )),
         Some(S::Ok),
         "queue a write"
     );
-    // kill the driver: its client channel reports the loss, and the data is on the disk, not in it
-    ensure_eq!(st(sys::process_kill(p, 55)), Some(S::Ok), "kill the driver");
-    wait_ended(p, 2000)?;
-    let w = sys::object_wait(ch, sig::PEER_CLOSED, sys::clock_get() + 1000);
-    ensure_eq!(st(w), Some(S::Ok), "the client sees PEER_CLOSED");
-    sys::handle_close(p);
-    sys::handle_close(ch);
-    // the supervisor resets the device before the buffer goes to the next driver (T42)
-    rig.reset();
-    let (p2, ch2) = rig.spawn()?;
-    check_pattern(ch2, 4000, 64)?;
-    // the write that was in flight when the driver died happened completely, in part, or not at
-    // all; whichever, every sector holds the old zeros or the new data, and the new driver works
-    let (st5, body) = blk_call(
-        ch2,
+    Ok(())
+}
+
+/// Each of the `data.len() / 512` sectors from `sector` on `ch` holds zeros (the old contents) or `data`'s (the new): a write that
+/// was in flight when its driver died happened completely, in part, or not at all.
+fn blk_old_or_new(ch: u64, sector: u64, data: &[u8]) -> Outcome {
+    let n = data.len() / 512;
+    let (st, body) = blk_call(
+        ch,
         5,
         blk::Op::Read {
-            sector: 5000,
-            count: 16,
+            sector,
+            count: n as u32,
         },
     )?;
-    ensure_eq!(st5, blk::Status::Ok, "read the in-flight sectors");
-    for k in 0..16 {
+    ensure_eq!(st, blk::Status::Ok, "read the in-flight sectors");
+    for k in 0..n {
         let sec = &body[k * 512..(k + 1) * 512];
         ensure!(
-            sec.iter().all(|&b| b == 0) || sec == &inflight[k * 512..(k + 1) * 512],
+            sec.iter().all(|&b| b == 0) || sec == &data[k * 512..(k + 1) * 512],
             "sector {} is neither old nor new",
-            5000 + k
+            sector + k as u64
         );
     }
-    // it also takes writes: a second generation of data over the first
-    write_pattern(ch2, 4000, 16)?;
-    check_pattern(ch2, 4000, 16)?;
+    Ok(())
+}
+
+/// The device-domain counters (`debug_stat` 159 and 160: live domains, I/O-mapped pages) back at `(domains, pages)`, waited for
+/// briefly (a release is the manager's work).
+fn domains_at_baseline((domains, pages): (u64, u64)) -> Outcome {
+    let t0 = sys::clock_get();
+    while (sys::debug_stat(159), sys::debug_stat(160)) != (domains, pages)
+        && sys::clock_get() < t0 + 2000
+    {
+        sys::thread_yield();
+    }
     ensure_eq!(
-        st(sys::process_kill(p2, 56)),
-        Some(S::Ok),
-        "kill the second driver"
+        sys::debug_stat(159),
+        domains,
+        "live domains (debug_stat 159) back at the baseline"
     );
-    wait_ended(p2, 2000)?;
-    sys::handle_close(p2);
-    sys::handle_close(ch2);
+    ensure_eq!(
+        sys::debug_stat(160),
+        pages,
+        "I/O-mapped pages (debug_stat 160) back at the baseline"
+    );
+    Ok(())
+}
+
+/// IOMMU10 (IOMMU-SPEC 10.2): a driver killed with a write in flight. The supervisor releases its claim (bus mastering off, the device
+/// reset, the domain destroyed): the domain, its I/O-mapped pages, its vectors and their interrupt identities all come back. A new
+/// driver gets a new domain, maps its buffers afresh, and its first request completes by interrupt on its fresh vectors, promptly.
+fn blk_driver_restart() -> Outcome {
+    let Some(rig) = blk_rig()? else {
+        return Ok(());
+    };
+    let doms = (sys::debug_stat(159), sys::debug_stat(160));
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let d = rig.spawn()?;
+    let first = (|| {
+        write_pattern(d.ch, 4000, 64)?;
+        check_pattern(d.ch, 4000, 64)?;
+        ensure_eq!(
+            (sys::debug_stat(159), sys::debug_stat(160)),
+            (doms.0 + 1, doms.1 + 5),
+            "the driver's domain, with its queue page and data buffer mapped"
+        );
+        ensure_eq!(sys::debug_stat(146), live + 2, "its two vectors are live");
+        Ok(())
+    })();
+    if first.is_err() {
+        let _ = rig.release(d);
+        return first;
+    }
+    // start a write and kill the driver before it can answer: the device may be mid-request
+    let inflight: Vec<u8> = (0..16 * 512).map(|i| (i * 13 + 1) as u8).collect();
+    blk_send_write(d.ch, 99, 5000, &inflight)?;
+    ensure_eq!(
+        st(sys::process_kill(d.p, 55)),
+        Some(S::Ok),
+        "kill the driver"
+    );
+    wait_ended(d.p, 2000)?;
+    let w = sys::object_wait(d.ch, sig::PEER_CLOSED, sys::clock_get() + 1000);
+    ensure_eq!(st(w), Some(S::Ok), "the client sees PEER_CLOSED");
+    // the supervisor releases the claim: nothing of the old driver's device authority is left
+    rig.release(d)?;
+    ensure!(
+        !blk_bus_master(rig.res)?,
+        "bus mastering is off once the claim was released"
+    );
+    domains_at_baseline(doms)?;
+    vectors_at_baseline(live, ids)?;
+    // a new driver: a new domain, mapped afresh, and its first request completes by interrupt on its new vectors
+    let d2 = rig.spawn()?;
+    let second = (|| {
+        let fired = sys::debug_stat(163);
+        let t = sys::clock_get();
+        let (st0, s0) = blk_call(
+            d2.ch,
+            1,
+            blk::Op::Read {
+                sector: 0,
+                count: 1,
+            },
+        )?;
+        ensure_eq!(st0, blk::Status::Ok, "the new driver's first request");
+        ensure!(
+            sys::clock_get() - t < 200,
+            "the first request took {} ticks",
+            sys::clock_get() - t
+        );
+        ensure!(
+            sys::debug_stat(163) > fired,
+            "the first request completed by a vector's notice (debug_stat 163)"
+        );
+        ensure!(
+            (0..512).all(|i| s0[i] == ((i * 7 + 3) & 0xff) as u8),
+            "sector 0 holds the harness pattern"
+        );
+        ensure_eq!(
+            (
+                sys::debug_stat(159),
+                sys::debug_stat(160),
+                sys::debug_stat(146)
+            ),
+            (doms.0 + 1, doms.1 + 5, live + 2),
+            "one domain, its five pages and its two vectors again"
+        );
+        check_pattern(d2.ch, 4000, 64)?;
+        blk_old_or_new(d2.ch, 5000, &inflight)?;
+        // it also takes writes: a second generation of data over the first
+        write_pattern(d2.ch, 4000, 16)?;
+        check_pattern(d2.ch, 4000, 16)
+    })();
+    let released = rig.release(d2);
+    second?;
+    released?;
+    domains_at_baseline(doms)?;
+    vectors_at_baseline(live, ids)?;
     // both drivers' processes, threads and memory are gone: the rig's job is back to nothing
     job_use_settles(rig.job, 0, 0, 2000)?;
     job_use_settles(rig.job, 2, 0, 2000)?;
     Ok(())
+}
+
+/// IOMMU10 (IOMMU-SPEC 10.2): `devmgr`'s own driver for disk 0 is killed mid-write (its job, from above: the drivers' job the test
+/// gave the manager). The manager sees the driver end and releases the claim at once: bus mastering off, the device reset, the
+/// domain destroyed, so the live-domain count drops and the I/O-mapped pages return. The next `OpenBlock` makes a new domain, the
+/// new `blkd` maps afresh, and the next write lands. Then the rig variant: a driver (the suite) closes every handle to its data
+/// buffer while the buffer is mapped in its domain and a write is in flight, and the write still lands (the domain keeps the frames).
+fn blk_driver_killed_mid_write() -> Outcome {
+    use proto::devmgr::Status as D;
+    if !pci_disks_present()? {
+        return Ok(());
+    }
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let doms = (sys::debug_stat(159), sys::debug_stat(160));
+    let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
+    let leaked = sys::debug_stat(158);
+    let (mine, mgr, mj, dj) = start_devmgr_with_drivers(res)?;
+    let r = (|| {
+        let ch = open_disk(mine, 1, 0)?;
+        write_pattern(ch, 9000, 16)?;
+        check_pattern(ch, 9000, 16)?;
+        ensure_eq!(
+            (sys::debug_stat(159), sys::debug_stat(160)),
+            (doms.0 + 1, doms.1 + 5),
+            "the driver's domain, with its five pages mapped"
+        );
+        ensure_eq!(
+            sys::job_info(dj, 12).a1 as u64,
+            5,
+            "the pages are the driver's job's (below the drivers' job)"
+        );
+        ensure!(
+            blk_bus_master(res)?,
+            "bus mastering is on while the driver runs"
+        );
+        // a write in flight, and the driver killed under it
+        let inflight: Vec<u8> = (0..16 * 512).map(|i| (i * 29 + 7) as u8).collect();
+        blk_send_write(ch, 99, 9100, &inflight)?;
+        ensure_eq!(st(sys::job_kill(dj, 77)), Some(S::Ok), "kill the driver");
+        let w = sys::object_wait(ch, sig::PEER_CLOSED, sys::clock_get() + 2000);
+        sys::handle_close(ch);
+        ensure_eq!(st(w), Some(S::Ok), "the client sees PEER_CLOSED");
+        // the manager released the claim: the domain and its pages, the vectors, bus mastering
+        domains_at_baseline(doms)?;
+        vectors_at_baseline(live, ids)?;
+        ensure!(
+            !blk_bus_master(res)?,
+            "bus mastering is off once the driver died"
+        );
+        ensure_eq!(
+            sys::job_info(dj, 12).a1 as u64,
+            0,
+            "no I/O page is charged below"
+        );
+        // the kill left the drivers' job closed to new processes: the test, its supervisor, opens it again
+        ensure_eq!(
+            st(sys::job_set_limits(dj, &sys::NO_LIMITS)),
+            Some(S::Ok),
+            "lift the drivers' job's limits"
+        );
+        // a new driver: a new domain, mapped afresh; the in-flight write landed whole, in part or not at all, and the next one lands
+        let ch = open_disk(mine, 10, 0)?;
+        let r = (|| {
+            // (a request answered: the driver has brought the device up)
+            check_pattern(ch, 9000, 16)?;
+            ensure_eq!(
+                (sys::debug_stat(159), sys::debug_stat(160)),
+                (doms.0 + 1, doms.1 + 5),
+                "a new domain for the new driver, mapped afresh"
+            );
+            blk_old_or_new(ch, 9100, &inflight)?;
+            write_pattern(ch, 9100, 16)?;
+            check_pattern(ch, 9100, 16)
+        })();
+        sys::handle_close(ch);
+        r?;
+        // (the driver ends with its client, and the manager then releases its claim)
+        blk_unclaimed(mine)?;
+        // the rig variant: the suite is the driver, and lets go of its data buffer with a write in flight
+        let conn = devmgr_connect(mine, 20)?;
+        let mut b = match claim_and_bring_up(conn, 21, PCI_BLK_DID as u16, 0, &blk_vectors()) {
+            Ok(b) => b,
+            Err(e) => {
+                sys::handle_close(conn);
+                return Err(e);
+            }
+        };
+        let landed = blk_write_after_letting_go(&mut b);
+        b.drop_all();
+        sys::handle_close(conn);
+        let (sector, data) = landed?;
+        domains_at_baseline(doms)?;
+        let ch = open_disk(mine, 30, 0)?;
+        let r = (|| {
+            let (s, body) = blk_call(ch, 31, blk::Op::Read { sector, count: 1 })?;
+            ensure_eq!(s, blk::Status::Ok, "read the sector back");
+            ensure!(
+                body == data,
+                "the write whose buffer's handles were all closed landed"
+            );
+            Ok(())
+        })();
+        sys::handle_close(ch);
+        r?;
+        let (status, h) = devmgr_open_at(mine, 40, 2)?;
+        ensure_eq!((status, h), (D::NoDevice, None), "there is no third disk");
+        Ok(())
+    })();
+    sys::handle_close(mine);
+    let end = wait_ended(mgr, 5000);
+    sys::handle_close(mgr);
+    sys::handle_close(dj);
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    r?;
+    end?;
+    domains_at_baseline(doms)?;
+    vectors_at_baseline(live, ids)?;
+    ensure_eq!(
+        sys::debug_stat(158),
+        leaked,
+        "no frame or table lost (debug_stat 158)"
+    );
+    Ok(())
+}
+
+/// The sector the rig variant writes.
+const LET_GO_SECTOR: u64 = 9200;
+
+/// On a claimed block function: a one-sector write whose header and data are in the data page and whose status byte is in the queue
+/// page (at 2048, past the queue of 8). Before the device is told, the data page is unmapped here and its every handle closed: only
+/// the domain's mapping holds the frames. The request must complete OK by interrupt. (The sector and the data written.)
+fn blk_write_after_letting_go(b: &mut Claimed) -> Result<(u64, Vec<u8>), Detail> {
+    use virtio::Transport;
+    const STATUS_AT: u64 = 2048;
+    let data: Vec<u8> = (0..512).map(|i| (i * 17 + 9) as u8).collect();
+    let h = virtio::blk::header(virtio::blk::T_OUT, LET_GO_SECTOR);
+    for (i, w) in h.as_chunks::<8>().0.iter().enumerate() {
+        wr64(b.data_va() + BLK_HDR + 8 * i as u64, u64::from_le_bytes(*w));
+    }
+    for (i, w) in data.as_chunks::<8>().0.iter().enumerate() {
+        wr64(
+            b.data_va() + BLK_DATA + 8 * i as u64,
+            u64::from_le_bytes(*w),
+        );
+    }
+    wr64(b.rings_va() + STATUS_AT, 0xff);
+    let rings_io = b.q.io_base;
+    ensure!(
+        b.q.layout.bytes < STATUS_AT,
+        "the queue ends before the status byte"
+    );
+    let chain = [
+        virtio::Buf {
+            addr: b.data_io + BLK_HDR,
+            len: virtio::blk::HEADER_BYTES,
+            device_writes: false,
+        },
+        virtio::Buf {
+            addr: b.data_io + BLK_DATA,
+            len: virtio::blk::SECTOR,
+            device_writes: false,
+        },
+        virtio::Buf {
+            addr: rings_io + STATUS_AT,
+            len: 1,
+            device_writes: true,
+        },
+    ];
+    let mut mem = PageMem(b.rings_va());
+    let head = vio(b.q.add(&mut mem, &chain, true), "add the request")?;
+    // let go of the buffer: unmapped here, and the only handle to it closed (the claim's data VMO)
+    let pages = sys::debug_stat(160);
+    unmap_here(b.data_va());
+    let data_vmo = b.hs[3];
+    b.hs[3] = u64::MAX;
+    ensure_eq!(
+        st(sys::handle_close(data_vmo)),
+        Some(S::Ok),
+        "close the data VMO"
+    );
+    ensure_eq!(
+        sys::debug_stat(160),
+        pages,
+        "the domain still maps the buffer"
+    );
+    let q = b.irq(0).ok_or_else(|| msg_at(line!()))?;
+    b.t.notify(0);
+    ensure_eq!(
+        st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+        Some(S::Ok),
+        "the write's interrupt"
+    );
+    let u = vio(b.q.take_used(&PageMem(b.rings_va())), "the used ring")?;
+    ensure_eq!(u.map(|u| u.0), Some(head), "the device returned the write");
+    ensure_eq!(
+        (rd64(b.rings_va() + STATUS_AT) & 0xff) as u8,
+        virtio::blk::S_OK,
+        "the write's status"
+    );
+    let _ = sys::interrupt_ack(q);
+    Ok((LET_GO_SECTOR, data))
+}
+
+/// One hostile request on a claimed block function: type `t` at `sector`, its header and status in the data page and its data buffer
+/// at I/O address `data_io` (512 bytes, the device writing it for a read). Whether the device returned it with status OK within half
+/// a second (QEMU does: see `blk_driver_cannot_reach_outside`).
+fn blk_hostile_request(b: &mut Claimed, t: u32, sector: u64, data_io: u64) -> Result<bool, Detail> {
+    use virtio::Transport;
+    let h = virtio::blk::header(t, sector);
+    for (i, w) in h.as_chunks::<8>().0.iter().enumerate() {
+        wr64(b.data_va() + BLK_HDR + 8 * i as u64, u64::from_le_bytes(*w));
+    }
+    wr64(b.data_va() + BLK_STATUS, 0xff);
+    let chain = [
+        virtio::Buf {
+            addr: b.data_io + BLK_HDR,
+            len: virtio::blk::HEADER_BYTES,
+            device_writes: false,
+        },
+        virtio::Buf {
+            addr: data_io,
+            len: virtio::blk::SECTOR,
+            device_writes: t == virtio::blk::T_IN,
+        },
+        virtio::Buf {
+            addr: b.data_io + BLK_STATUS,
+            len: 1,
+            device_writes: true,
+        },
+    ];
+    let mut mem = PageMem(b.rings_va());
+    let head = vio(b.q.add(&mut mem, &chain, true), "add the request")?;
+    b.t.notify(0);
+    let q = b.irq(0).ok_or_else(|| msg_at(line!()))?;
+    let fired = st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 500)) == Some(S::Ok);
+    if fired {
+        let _ = sys::interrupt_ack(q);
+    }
+    let used = vio(b.q.take_used(&PageMem(b.rings_va())), "the used ring")?;
+    Ok(used.is_some_and(|u| u.0 == head) && rd8_dma(b.data_va() + BLK_STATUS) == virtio::blk::S_OK)
+}
+
+/// Wait for the IOMMU's fault count to pass `before` and settle: the last fault's device id and address.
+fn blk_fault_after(before: u64, what: &str) -> Result<(u64, u64), Detail> {
+    let t0 = sys::clock_get();
+    while iommu_faults() == before && sys::clock_get() < t0 + 2000 {
+        sys::thread_yield();
+    }
+    ensure!(iommu_faults() > before, "{what}: the IOMMU took no fault");
+    let mut n = iommu_faults();
+    let mut quiet = sys::clock_get();
+    while sys::clock_get() < quiet + 50 {
+        if iommu_faults() != n {
+            n = iommu_faults();
+            quiet = sys::clock_get();
+        }
+        sys::thread_yield();
+    }
+    let (did, iova, _, _) = iommu_last_fault();
+    Ok((did, iova))
+}
+
+/// IOMMU10 (IOMMU-SPEC 10, IO1): a hostile driver (the suite, holding a real claim of the scratch disk through `devmgr`) points a
+/// descriptor outside its buffer: at another process's frame (the pattern frame, by its physical address), for the device to write it
+/// and to read it; at kernel memory, for the device to read it; and at an I/O address past its own mapping. Each time the IOMMU refuses
+/// the transfer and records a fault naming the disk (device id 0x28) at the target, and the target is intact: the frame keeps its
+/// pattern, and the disk sector the reads were for holds what a real driver wrote there or zeros, never the frame's or the kernel's
+/// bytes. (QEMU's virtio does not fail such a request: it moves the data through a bounce buffer, the IOMMU refuses the bounce's
+/// transfer, and the request completes with status OK. The refusal shows as the fault and the untouched memory.) The driver's data
+/// VMO has no physical address to aim at in the first place.
+fn blk_driver_cannot_reach_outside() -> Outcome {
+    if !pci_disks_present()? {
+        return Ok(());
+    }
+    with_devmgr(|res, mine| {
+        // a sector of the disk with known contents, written by a real driver
+        let ch = open_disk(mine, 1, 0)?;
+        let w = write_pattern(ch, 9300, 1);
+        sys::handle_close(ch);
+        w?;
+        // (the driver ends with its client, and the manager then releases its claim)
+        blk_unclaimed(mine)?;
+        let (frame, pa) = pattern_frame(res)?;
+        let r = (|| {
+            let cases: [(&str, u32, u64); 4] = [
+                ("a read into another process's frame", virtio::blk::T_IN, pa),
+                (
+                    "a write from another process's frame",
+                    virtio::blk::T_OUT,
+                    pa,
+                ),
+                (
+                    "a write from kernel memory",
+                    virtio::blk::T_OUT,
+                    0x8020_0000,
+                ),
+                ("a read past its own mapping", virtio::blk::T_IN, 1),
+            ];
+            for (k, (what, t, target)) in cases.into_iter().enumerate() {
+                let conn = devmgr_connect(mine, 10 + k as u32)?;
+                let mut b = match claim_and_bring_up(conn, 2, PCI_BLK_DID as u16, 0, &blk_vectors())
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        sys::handle_close(conn);
+                        return Err(e);
+                    }
+                };
+                let r = (|| {
+                    if k == 0 {
+                        ensure_eq!(
+                            st(sys::vmo_phys_addr(b.hs[3])),
+                            Some(S::WrongType),
+                            "the driver's data VMO has no physical address"
+                        );
+                    }
+                    // (the third case aims a megabyte past the data page: nothing of the domain is mapped there)
+                    let target = if target == 1 {
+                        b.data_io + 0x10_0000
+                    } else {
+                        target
+                    };
+                    let before = iommu_faults();
+                    let sector = if t == virtio::blk::T_OUT { 9300 } else { 0 };
+                    blk_hostile_request(&mut b, t, sector, target)?;
+                    let (did, iova) = blk_fault_after(before, what)?;
+                    ensure_eq!(did, PCI_BLK_DID, "{what}: the fault names the disk");
+                    ensure_eq!(
+                        iova & !0xfff,
+                        target & !0xfff,
+                        "{what}: the fault is at the target"
+                    );
+                    if let Some(i) = pattern_intact() {
+                        ensure!(false, "{what}: the pattern frame changed at word {i}");
+                    }
+                    Ok(())
+                })();
+                b.drop_all();
+                sys::handle_close(conn);
+                r?;
+                blk_unclaimed(mine)?;
+            }
+            // the disk's sector holds what the real driver wrote, or the zeros of a refused transfer: nothing of the frame's or the
+            // kernel's memory reached it
+            let ch = open_disk(mine, 30, 0)?;
+            let c = blk_call(
+                ch,
+                31,
+                blk::Op::Read {
+                    sector: 9300,
+                    count: 1,
+                },
+            );
+            sys::handle_close(ch);
+            let (s, body) = c?;
+            ensure_eq!(s, blk::Status::Ok, "read the sector back");
+            ensure!(
+                (0..512).all(|i| body[i] == pattern(9300, i)) || body.iter().all(|&b| b == 0),
+                "the sector the hostile writes were for holds other memory's bytes: {:x?}",
+                &body[..16]
+            );
+            Ok(())
+        })();
+        pattern_drop(frame);
+        r
+    })
 }
 
 // --- Futexes and sleeping locks (S7b) -----------------------------------------------------------
@@ -12050,46 +12669,10 @@ fn devmgr_open_at(
 fn devmgr_starts_blkd_for_the_disk() -> Outcome {
     use proto::devmgr::Status as D;
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let have_disk = match find_blk(res)? {
-        Some(_) => {
-            let me = sys::process_self().a1 as u64;
-            sys::process_unmap(me, MMIO_VA);
-            sys::handle_close(me);
-            true
-        }
-        None => false,
-    };
-    // start the manager
-    let bi = boot_image_vmo()?;
-    let (off, len) = image_entry(bi, b"bin/devmgr")?;
-    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
-    let (mine, theirs) = channel()?;
-    let res_dup = ok(
-        sys::handle_duplicate(res, Rights::SAME.0),
-        "dup the resource",
-    )?
-    .a1 as u64;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
-    let s = Startup {
-        args: vec![b"devmgr".to_vec()],
-        roles: vec![
-            (Role::Resource, 0),
-            (Role::BootImage, 1),
-            (Role::ServiceDevmgr, 2),
-        ],
-        ..Startup::default()
-    };
-    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
-    // in a job of its own: when it and its driver are gone nothing of theirs is left (no leaked
-    // process, thread, page or object)
-    let root = root_job()?;
-    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
-    sys::handle_close(root);
-    let mgr = rt::spawn::spawn_in(&image, &bytes, &[res_dup, bi_dup, theirs], mj).map_err(|e| {
-        let mut d = Detail::new();
-        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn devmgr: {e:?}"));
-        d
-    })?;
+    let have_disk = pci_disks_present()?;
+    // start the manager, in a job of its own: when it and its driver are gone nothing of theirs is left (no leaked process, thread,
+    // page or object)
+    let (mine, mgr, mj) = start_devmgr_in_job(res)?;
     // a request that is not OpenBlock is refused with its txid
     let bad = [5u8, 0, 0, 0, 9, 0, 0, 0];
     ensure_eq!(
@@ -12394,13 +12977,19 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
     // every handle the test may still hold when a check fails is closed on the way out (a claim left open would keep its domain
     // alive into later tests of the same boot)
     let mut held: Vec<u64> = Vec::new();
+    let disks = pci_disks_present()?;
     let r = (|| {
-        // the list: the host bridge and the five functions of the harness, nothing else, in requester-id order
+        // the list: the host bridge and the five functions of the harness (three in the no-disk boot), nothing else, in requester-id
+        // order
         let list = pci_list(mine, 1)?;
         let rids: Vec<u16> = list.iter().map(|e| e.rid).collect();
         ensure_eq!(
             rids,
-            vec![0, 0x20, 0x28, 0x30, 0x38, 0x40],
+            if disks {
+                vec![0, 0x20, 0x28, 0x30, 0x38, 0x40]
+            } else {
+                vec![0, 0x20, 0x38, 0x40]
+            },
             "bus 0: {list:x?}"
         );
         let want = dm::PCI_CLAIMABLE | dm::PCI_MSIX | dm::PCI_VIRTIO | dm::PCI_ACCESS_PLATFORM;
@@ -12439,6 +13028,12 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
                     );
                 }
             }
+        }
+        if !disks {
+            // the no-disk boot: nothing to open on either bus
+            let (status, h) = devmgr_open_at(mine, 30, 0)?;
+            ensure_eq!((status, h), (D::NoDevice, None), "no disk to open");
+            return Ok(());
         }
         // a second client, whose connection will hold the claim
         let (c2, c2_theirs) = channel()?;
@@ -12717,35 +13312,54 @@ const FSD_UUID: [u8; 16] = *b"fsd-suite-volume";
 
 /// `devmgr` in a job of its own: (our channel to it, its process, its job).
 fn start_devmgr_in_job(res: u64) -> Result<(u64, u64, u64), Detail> {
+    let (mine, mgr, mj, dj) = start_devmgr_with_drivers(res)?;
+    sys::handle_close(dj);
+    Ok((mine, mgr, mj))
+}
+
+/// `devmgr` in a job of its own whose drivers' jobs are made under a child job of it: (our channel, its process, its job, the
+/// drivers' job). Killing the drivers' job kills every driver it started and nothing else.
+fn start_devmgr_with_drivers(res: u64) -> Result<(u64, u64, u64, u64), Detail> {
     let bi = boot_image_vmo()?;
+    let (mine, theirs) = channel()?;
+    let root = root_job()?;
+    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    let dj = job(mj, u64::MAX, u64::MAX, u64::MAX)?;
+    let mgr = spawn_devmgr(res, bi, theirs, mj, dj)?;
+    Ok((mine, mgr, mj, dj))
+}
+
+/// Start `devmgr` in job `mj`, serving `theirs`, with duplicates of the root resource, the boot image and `drivers` (the job it makes
+/// each driver's job under: IOMMU10).
+fn spawn_devmgr(res: u64, bi: u64, theirs: u64, mj: u64, drivers: u64) -> Result<u64, Detail> {
     let (off, len) = image_entry(bi, b"bin/devmgr")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
-    let (mine, theirs) = channel()?;
-    let res_dup = ok(
-        sys::handle_duplicate(res, Rights::SAME.0),
-        "dup the resource",
-    )?
-    .a1 as u64;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
+    let dup = |h: u64, what: &str| {
+        ok(sys::handle_duplicate(h, Rights::SAME.0), what).map(|r| r.a1 as u64)
+    };
+    let hs = [
+        dup(res, "dup the resource")?,
+        dup(bi, "dup the image")?,
+        dup(drivers, "dup the drivers' job")?,
+        theirs,
+    ];
     let s = Startup {
         args: vec![b"devmgr".to_vec()],
         roles: vec![
             (Role::Resource, 0),
             (Role::BootImage, 1),
-            (Role::ServiceDevmgr, 2),
+            (Role::Job, 2),
+            (Role::ServiceDevmgr, 3),
         ],
         ..Startup::default()
     };
     let bytes = s.encode().map_err(|_| msg_at(line!()))?;
-    let root = root_job()?;
-    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
-    sys::handle_close(root);
-    let mgr = rt::spawn::spawn_in(&image, &bytes, &[res_dup, bi_dup, theirs], mj).map_err(|e| {
+    rt::spawn::spawn_in(&image, &bytes, &hs, mj).map_err(|e| {
         let mut d = Detail::new();
         let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn devmgr: {e:?}"));
         d
-    })?;
-    Ok((mine, mgr, mj))
+    })
 }
 
 /// The block channel of device `index`, retrying while the previous driver for it winds down.
@@ -12790,15 +13404,7 @@ fn fsd_pattern(n: usize) -> Vec<u8> {
 
 fn fsd_keeps_files_across_a_restart() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let have_disk = match find_blk(res)? {
-        Some(_) => {
-            let me = sys::process_self().a1 as u64;
-            sys::process_unmap(me, MMIO_VA);
-            sys::handle_close(me);
-            true
-        }
-        None => false,
-    };
+    let have_disk = pci_disks_present()?;
     if !have_disk {
         return Ok(()); // OS_DISK=0
     }
@@ -13036,30 +13642,7 @@ fn clock_service_reports_the_rtc() -> Outcome {
     let t = |n: u64| sys::clock_get() + n;
     // ---- with the device manager (whose one client is the clock service): the RTC's time, quality FromRtc
     let (dm_mine, dm_theirs) = channel()?;
-    let res_dup = ok(
-        sys::handle_duplicate(res, Rights::SAME.0),
-        "dup the resource",
-    )?
-    .a1 as u64;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
-    let (off, len) = image_entry(bi, b"bin/devmgr")?;
-    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
-    let s = Startup {
-        args: vec![b"devmgr".to_vec()],
-        roles: vec![
-            (Role::Resource, 0),
-            (Role::BootImage, 1),
-            (Role::ServiceDevmgr, 2),
-        ],
-        ..Startup::default()
-    };
-    let mgr = rt::spawn::spawn_in(
-        &image,
-        &s.encode().map_err(|_| msg_at(line!()))?,
-        &[res_dup, bi_dup, dm_theirs],
-        mj,
-    )
-    .map_err(|_| msg_at(line!()))?;
+    let mgr = spawn_devmgr(res, bi, dm_theirs, mj, mj)?;
     let (mut view, mut procs) = start_clockd(bi, mj, dm_mine)?;
     procs.push(mgr);
     let mut c = Clock::connect(&mut view, t(8000)).map_err(|_| msg_at(line!()))?;
@@ -13142,30 +13725,8 @@ fn start_volmgr_rig(res: u64, bi: u64) -> Result<(Fs, u64), Detail> {
     let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
     sys::handle_close(root_j);
     let (dm_mine, dm_theirs) = channel()?;
-    let res_dup = ok(
-        sys::handle_duplicate(res, Rights::SAME.0),
-        "dup the resource",
-    )?
-    .a1 as u64;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
-    let (off, len) = image_entry(bi, b"bin/devmgr")?;
-    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
-    let s = Startup {
-        args: vec![b"devmgr".to_vec()],
-        roles: vec![
-            (Role::Resource, 0),
-            (Role::BootImage, 1),
-            (Role::ServiceDevmgr, 2),
-        ],
-        ..Startup::default()
-    };
-    rt::spawn::spawn_in(
-        &image,
-        &s.encode().map_err(|_| msg_at(line!()))?,
-        &[res_dup, bi_dup, dm_theirs],
-        mj,
-    )
-    .map_err(|_| msg_at(line!()))?;
+    // (the process handle is kept: closing the last handle to a process kills it; the rig ends with its job)
+    let _mgr = spawn_devmgr(res, bi, dm_theirs, mj, mj)?;
     let (off, len) = image_entry(bi, b"bin/registryd")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (reg_mine, reg_theirs) = channel()?;
@@ -13277,15 +13838,7 @@ impl Drop for KillOnDrop {
 
 fn volmgr_serves_volumes_by_the_table() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let have_disk = match find_blk(res)? {
-        Some(_) => {
-            let me = sys::process_self().a1 as u64;
-            sys::process_unmap(me, MMIO_VA);
-            sys::handle_close(me);
-            true
-        }
-        None => false,
-    };
+    let have_disk = pci_disks_present()?;
     if !have_disk {
         return Ok(());
     }
@@ -13415,15 +13968,7 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
 fn symlinks_are_followed_by_the_client_not_the_server() -> Outcome {
     use rt::fs::Stopped;
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let have_disk = match find_blk(res)? {
-        Some(_) => {
-            let me = sys::process_self().a1 as u64;
-            sys::process_unmap(me, MMIO_VA);
-            sys::handle_close(me);
-            true
-        }
-        None => false,
-    };
+    let have_disk = pci_disks_present()?;
     if !have_disk {
         return Ok(());
     }
@@ -15187,13 +15732,35 @@ fn drain_domain_faults(sup: u64) -> Vec<(u64, u64, u64, u64)> {
 
 // ---- the PCI block function (IOMMU8; IOMMU-SPEC 15.1 L1) -----------------------------------------------------------------------
 //
-// The harness's virtio-blk-pci at slot `PCI_BLK_SLOT` (`iommu_platform=on`, a read-only disk whose sector 0 holds byte i = (i * 13 +
-// 1) mod 256), driven through the `virtio` crate (the driver's code path: negotiation with VERSION_1 and ACCESS_PLATFORM, a split
-// queue) by polling, with MSI-X and INTx off. Kernel tests: the suite is the supervisor and the driver, as in the IOMMU6 tests.
+// The harness's virtio-blk-pci at slot `PCI_BLK_SLOT` (`iommu_platform=on`): since IOMMU10 the scratch disk (16 MiB, whose sector 0
+// holds byte i = (i * 7 + 3) mod 256 and is never written), driven through the `virtio` crate (the driver's code path: negotiation
+// with VERSION_1 and ACCESS_PLATFORM, a split queue) by polling, with MSI-X and INTx off. Kernel tests: the suite is the supervisor
+// and the driver, as in the IOMMU6 tests. The no-disk boot (`OS_DISK=0`) has no disk on either bus, and these tests have nothing to
+// drive there (`pci_disks_present`).
 
-/// The slot of the harness's block function on bus 0 (`addr=0x5`): device id `0x28`, `00:05.0`.
+/// The slot of the harness's block function on bus 0 (`addr=0x5`): device id `0x28`, `00:05.0`. `OpenBlock`'s device 0.
 const PCI_BLK_SLOT: u64 = 5;
 const PCI_BLK_DID: u64 = PCI_BLK_SLOT << 3;
+
+/// Whether the harness put the disks on bus 0 (the no-disk boot, `OS_DISK=0`, leaves them off): the scratch disk's function at
+/// `PCI_BLK_SLOT` answers its configuration reads with the virtio vendor.
+fn pci_disks_present() -> Result<bool, Detail> {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let cfg = ok(
+        sys::vmo_create_physical(res, PCI_ECAM + (PCI_BLK_SLOT << 15), 4096),
+        "the block function's configuration page",
+    )?
+    .a1 as u64;
+    sys::handle_close(res);
+    let m = sys::process_map(me, cfg, PCI_CFG_VA, 0, 4096, PF_R);
+    sys::handle_close(cfg);
+    ensure_eq!(st(m), Some(S::Ok), "map it");
+    let vendor = cfg_rd16(0);
+    sys::process_unmap(me, PCI_CFG_VA);
+    sys::handle_close(me);
+    Ok(vendor == 0x1af4)
+}
 /// Where the request's parts are in the data page (mapped at BUF_VA): the header, the sector, the status byte.
 const BLK_HDR: u64 = 0;
 const BLK_DATA: u64 = 0x200;
@@ -15339,13 +15906,16 @@ fn rd8_dma(va: u64) -> u8 {
 
 /// The first byte of the sector read at BUF_VA + BLK_DATA that is not the disk's pattern.
 fn blk_pattern_wrong() -> Option<u64> {
-    (0..512u64).find(|&i| rd8_dma(BUF_VA + BLK_DATA + i) != ((i * 13 + 1) & 0xff) as u8)
+    (0..512u64).find(|&i| rd8_dma(BUF_VA + BLK_DATA + i) != ((i * 7 + 3) & 0xff) as u8)
 }
 
 /// The block function with a domain (the suite is the supervisor), the driver's duplicate, and a rings page and a data page mapped
 /// here and in the domain: `body` gets the function, the supervisor's handle, the rings' and the data page's I/O addresses and the
 /// pattern frame's physical address. The device is reset before the domain goes.
 fn with_blk_domain(body: impl FnOnce(&PciFn, u64, u64, u64, u64) -> Outcome) -> Outcome {
+    if !pci_disks_present()? {
+        return Ok(()); // the no-disk boot
+    }
     with_function(PCI_BLK_SLOT, PCI_BLK_ID, |res, f, pa| {
         let sup = ok(
             sys::iodomain_create(res, PCI_BLK_DID, 0),
@@ -15414,7 +15984,7 @@ fn pci_virtio_blk_reads_through_the_iommu() -> Outcome {
                 false,
                 "sector 0 byte {i} is {:#x}, the disk holds {:#x}",
                 rd8_dma(BUF_VA + BLK_DATA + i),
-                (i * 13 + 1) & 0xff
+                (i * 7 + 3) & 0xff
             );
         }
         ensure_eq!(iommu_faults(), before, "the read took no IOMMU fault");
@@ -16683,8 +17253,8 @@ fn msi_destroy_revokes_every_vector() -> Outcome {
 // and programmed the MSI-X table, and the driver only maps each event to its entry (`config_msix_vector`, `queue_msix_vector`).
 // Every request below completes by interrupt: the used ring is read only after the queue's object fired.
 
-/// The block function the harness puts at slot 6 (`addr=0x6`, `PCI_DEVICES`): a second read-only disk whose sector 0 holds byte i =
-/// (i * 7 + 3) mod 256, so a sector read from it is told from the first disk's.
+/// The block function the harness puts at slot 6 (`addr=0x6`, `PCI_DEVICES`): the second disk (1 MiB), whose sector 0 holds byte i =
+/// (i * 11 + 5) mod 256 until the filesystem tests (which run after the `pci_*` tests) format it, so a sector read from it is told from the first disk's.
 const PCI_BLK2_SLOT: u64 = 6;
 /// The entropy function's device id (`IOMMU_TEST_SLOT`, 00:04.0), claimed through `devmgr` by the forging test.
 const PCI_RNG_RID: u16 = (IOMMU_TEST_SLOT << 3) as u16;
@@ -16925,9 +17495,9 @@ extern "C" fn place_here(irq: usize) -> ! {
     sys::thread_exit(0)
 }
 
-/// The disk patterns of the two PCI block functions (`pci_disk` in the script).
-const BLK1_PATTERN: (u64, u64) = (13, 1);
-const BLK2_PATTERN: (u64, u64) = (7, 3);
+/// The sector-0 patterns of the two PCI disks, the scratch disk and the second disk (`pci_disk` in the script).
+const BLK1_PATTERN: (u64, u64) = (7, 3);
+const BLK2_PATTERN: (u64, u64) = (11, 5);
 /// Block: the configuration change on entry 0, queue 0 on entry 1 (the class plan of `pcicore::claim`).
 fn blk_vectors() -> virtio::VectorMap {
     virtio::VectorMap {
@@ -16958,6 +17528,9 @@ fn with_devmgr(body: impl FnOnce(u64, u64) -> Outcome) -> Outcome {
 /// and is delivered there. The configuration object never fires, and the IOMMU takes no fault. The negative-control kernels
 /// `fault-vector-no-unmask` and `fault-vector-no-repend` (the vector twins of `interrupt_object_fires_and_masks`'s) must fail here.
 fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
+    if !pci_disks_present()? {
+        return Ok(()); // the no-disk boot
+    }
     with_devmgr(|res, mgr| {
         let mut b = claim_and_bring_up(mgr, 1, PCI_BLK_DID as u16, 0, &blk_vectors())?;
         let r = (|| {
@@ -17109,6 +17682,9 @@ fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
 /// and together. Every interrupt arrives on its own device's queue object and none on another's: each queue object's claims equal
 /// its device's requests, the configuration objects never fire, and each sector is its own disk's.
 fn pci_two_devices_do_not_share() -> Outcome {
+    if !pci_disks_present()? {
+        return Ok(()); // the no-disk boot
+    }
     with_devmgr(|_, mgr| {
         let mut a = claim_and_bring_up(mgr, 1, PCI_BLK_DID as u16, 0, &blk_vectors())?;
         let mut b = match claim_and_bring_up(mgr, 2, (PCI_BLK2_SLOT << 3) as u16, 1, &blk_vectors())
@@ -20608,6 +21184,11 @@ pub fn app_main() -> i32 {
         ("instruction_counts_report", instruction_counts_report),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
+        ("blk_driver_killed_mid_write", blk_driver_killed_mid_write),
+        (
+            "blk_driver_cannot_reach_outside",
+            blk_driver_cannot_reach_outside,
+        ),
         (
             "c_transcript_matches_the_host",
             c_transcript_matches_the_host,
@@ -21290,16 +21871,24 @@ pub fn app_main() -> i32 {
     ];
     // Each test's guest time (1 ms ticks) goes out as a plain `tt:` line, which the boot script's
     // profiler (`OS_PROFILE`) reads; the verdict harness ignores it (slice TS step 0).
+    // and each test's IOMMU faults (`debug_stat` 150) as an `iofaults:` line when there were any: the script allows them only for the
+    // tests that make them on purpose, and checks the boot's total against the sum (IOMMU10: no unexpected fault over a boot)
     let timed = |name: &str, test: fn() -> Outcome| -> bool {
         let t0 = sys::clock_get();
+        let f0 = sys::debug_stat(150);
         let r = test();
         let ticks = sys::clock_get() - t0;
+        let faults = sys::debug_stat(150) - f0;
         let ok = report(name, r);
         println!("tt: {name} {ticks}");
+        if faults != 0 {
+            println!("iofaults: {name} {faults}");
+        }
         ok
     };
     // Behind the lossy relay (`net=lossy`, S9-SPEC Q30) only the tests that move bulk TCP data in a way slirp copes with run: the others assume a clean link
     let lossy = sys::debug_stat(9) != 0;
+    let suite_faults = sys::debug_stat(150);
     const LOSSY_TESTS: [&str; 3] = [
         "net_fetch_from_a_host_server",
         "net_httpd_for_the_host",
@@ -21329,7 +21918,7 @@ pub fn app_main() -> i32 {
         if (shard == 1 && in_b(name)) || (shard == 2 && !in_b(name) && *name != PREREQ_OF_B) {
             continue;
         }
-        // the kernel-only boot (`shard=k`, KT1): the Kernel tests, which start no server and need no disk or network
+        // the kernel-only boot (`shard=k`, KT1): the Kernel tests, which need no network (`init/ktests.txt`)
         if shard >= 3 {
             let listed = KERNEL_TESTS
                 .lines()
@@ -21354,6 +21943,7 @@ pub fn app_main() -> i32 {
             }
         }
     }
+    println!("iofaults: suite {}", sys::debug_stat(150) - suite_faults);
     println!(
         "init: {} of {} user tests failed",
         failed,

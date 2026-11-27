@@ -1,10 +1,12 @@
 //! The device manager's protocol (S6c): a client asks for a block device and gets a channel to a
 //! driver for it.
 //!
-//! Request: `txid u32 | op u16 | index u16`. `index` names the block device in ascending address order of its
-//! virtio-mmio slot (0 is the lowest; slice DM: the manager serves every block device it finds, one
-//! driver each). Reply: `txid u32 | status i32`, and for `Ok` the message carries one handle: the
-//! client's end of the block protocol channel (`proto::blk`).
+//! Request: `txid u32 | op u16 | index u16`. `index` names the block device: since IOMMU10 every disk is a `virtio-blk-pci`
+//! function behind the IOMMU, and the index counts the claimable block functions of bus 0 in slot order (0 is the lowest slot;
+//! slice DM: the manager serves every block device it finds, one driver each). Reply: `txid u32 | status i32`, and for `Ok` the
+//! message carries one handle: the client's end of the block protocol channel (`proto::blk`). For each open the manager claims the
+//! function afresh (a new domain, new grants) and starts `blkd` in a job of its own; when the driver ends, however it ends, the
+//! claim is released (IOMMU-SPEC 10.1, 10.2), and an open of the device meanwhile is `Busy`.
 
 use crate::{rd_u16, rd_u32};
 use alloc::vec::Vec;
@@ -364,6 +366,39 @@ pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>
 pub fn decode_claim_pci_started(b: &[u8]) -> Option<u32> {
     match decode_reply(b)? {
         (t, Status::Ok) if b.len() == REPLY_LEN => Some(t),
+        _ => None,
+    }
+}
+
+/// A claim as a driver's startup argument (IOMMU10): the bytes of its `ClaimPci` reply (txid 0) in lower-case hexadecimal, since a
+/// startup argument holds no NUL byte. It carries the layout of the virtio structures inside the BAR VMO, the DMA VMOs' sizes and what
+/// each interrupt is for: offsets and sizes only, never an address. `None` where the reply could not be encoded.
+pub fn encode_claim_arg(c: &PciClaim) -> Option<Vec<u8>> {
+    let b = encode_claim_pci_reply(0, c)?;
+    let hex = b"0123456789abcdef";
+    Some(
+        b.iter()
+            .flat_map(|&x| [hex[usize::from(x >> 4)], hex[usize::from(x & 15)]])
+            .collect(),
+    )
+}
+
+/// The claim a driver's startup argument carries ([`encode_claim_arg`]), or `None` for anything else.
+pub fn decode_claim_arg(a: &[u8]) -> Option<PciClaim> {
+    if !a.len().is_multiple_of(2) {
+        return None;
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut b = Vec::with_capacity(a.len() / 2);
+    for [hi, lo] in a.as_chunks::<2>().0 {
+        b.push((nib(*hi)? << 4) | nib(*lo)?);
+    }
+    match decode_claim_pci_reply(&b)? {
+        (0, Status::Ok, Some(c)) => Some(c),
         _ => None,
     }
 }
