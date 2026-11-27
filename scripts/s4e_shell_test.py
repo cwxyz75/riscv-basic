@@ -82,7 +82,7 @@ UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
 
 
 def make_volume():
-    """A doofs volume made by the host tool, attached as a virtio disk: the volume manager finds it, the table names it
+    """A doofs volume made by the host tool, attached as a virtio-blk-pci disk: the volume manager finds it, the table names it
     `store`, and /etc/trusted grants it to ls, cat and ctest at /mnt/store (FS-SPEC 5e)."""
     import subprocess
     import tempfile
@@ -101,8 +101,10 @@ def make_volume():
 
 def main():
     here, img = make_volume()
-    Session.EXTRA_ARGS = ["-global", "virtio-mmio.force-legacy=false", "-drive", f"file={img},if=none,format=raw,id=hd0",
-                          "-device", "virtio-blk-device,drive=hd0"]
+    # (a PCI function behind the IOMMU, at the slot `devmgr`'s first block device has in the boot harness: since IOMMU12 the kernel
+    # admits no virtio-mmio device, and `devmgr` serves disks only on PCI since IOMMU10)
+    Session.EXTRA_ARGS = ["-drive", f"file={img},if=none,format=raw,id=pd0",
+                          "-device", "virtio-blk-pci,iommu_platform=on,disable-legacy=on,addr=0x5,drive=pd0,num-queues=1"]
     s = Session(sys.argv[1])
     s.skip_to(BANNER, "the banner")
     step = s.step

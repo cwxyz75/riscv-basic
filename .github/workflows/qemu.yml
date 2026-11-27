@@ -52,11 +52,13 @@ jobs:
           set +e
           timeout 10 qemu-system-riscv64 -machine virt,aia=aplic-imsic,iommu-sys=on -cpu rva23s64 -smp 4 -bios default -m 256M \
             -display none -serial stdio -monitor none -rtc base=2030-06-15T12:00:00,clock=vm \
-            -device virtio-rng-pci,iommu_platform=on,disable-legacy=on,addr=0x4 -global virtio-mmio.force-legacy=false \
+            -device virtio-rng-pci,iommu_platform=on,disable-legacy=on,addr=0x4 \
             -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:17777-:7777,hostfwd=tcp:127.0.0.1:17778-:7778 \
             -device virtio-net-pci,iommu_platform=on,disable-legacy=on,addr=0x7,netdev=n0,mac=52:54:00:12:34:56,romfile= \
             -object filter-dump,id=f0,netdev=n0,file=x.pcap \
-            -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 > out.txt 2>&1
+            -drive file=disk.img,if=none,format=raw,id=pd0 \
+            -device virtio-blk-pci,iommu_platform=on,disable-legacy=on,addr=0x5,drive=pd0,num-queues=1 \
+            -device iommu-testdev,addr=0x8 > out.txt 2>&1
           status=$?
           set -e
           cat out.txt

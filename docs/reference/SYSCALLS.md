@@ -27,7 +27,8 @@ written against the library alone that checks this reference; `syscall-tests.tsv
 - There is **no errno** and no partial success: a call either does everything it says
   or changes nothing (the exception, `channel_read` with a too-small buffer, is
   stated where it happens).
-- A number no call has returns `BAD_SYSCALL` (only through `sys_raw`).
+- A number no call has returns `BAD_SYSCALL` (only through `sys_raw`). That includes the retired numbers `abi::syscall::RETIRED` lists (IOMMU12: 45, the
+  old `vmo_create_dma`, and 46, `vmo_phys_addr`): no number is ever reused for another call.
 
 ### Status codes
 
@@ -68,7 +69,7 @@ its object kind defines; rights can only be removed, never added (INVARIANTS H3)
 | INSPECT | 9 | reading its properties |
 | KILL | 10 | ending a process with `process_kill` (so a service can be given the power to stop a job without being able to map memory into it or add threads) |
 | SET_LIMITS | 11 | changing a job's limits (`job_set_limits`); separate from MANAGE so that making things inside a job does not allow lifting its limits |
-| DMA | 12 | on a VMO: it may be mapped into a device domain (`iodomain_map`, IOMMU-SPEC 4.1); also learning the physical address of a contiguous DMA VMO (`vmo_phys_addr`, until IOMMU12) |
+| DMA | 12 | on a VMO: it may be mapped into a device domain (`iodomain_map`, IOMMU-SPEC 4.1); no call reveals a physical address (`vmo_phys_addr` is a library stub since IOMMU12) |
 | COMMIT | 13 | committing a VMO's pages now (`vmo_commit`); the pages are charged to the VMO's creating job |
 | IO_MAP | 14 | on a device domain: `iodomain_map` |
 | IO_UNMAP | 15 | on a device domain: `iodomain_unmap` |
@@ -229,7 +230,6 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | vmo_commit | `a0` vmo, `a1` offset, `a2` length |  |
 | vmo_create | `a0` bytes, `a1` job (0: the caller's), `a2` flags | `a1` handle |
 | vmo_create_child | `a0` vmo, `a1` offset, `a2` bytes, `a3` job (0: the caller's), `a4` flags | `a1` handle |
-| vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
 | vmo_create_dma_in | `a0` resource, `a1` pages, `a2` job (0: the caller's) | `a1` handle |
 | iodomain_create | `a0` resource, `a1` device id, `a2` job (0: the caller's) | `a1` handle |
 | iodomain_map | `a0` domain, `a1` vmo, `a2` vmo offset, `a3` pages, `a4` access (1 READ, 2 WRITE) | `a1` I/O address |
@@ -242,7 +242,6 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
 | vmo_decommit | `a0` vmo, `a1` offset, `a2` length |  |
 | vmo_get_size | `a0` vmo | `a1` bytes |
-| vmo_phys_addr | `a0` vmo | `a1` physical address |
 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length |  |
 | vmo_set_size | `a0` vmo, `a1` bytes |  |
 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length |  |
@@ -292,6 +291,12 @@ prints the first one), 141 the free identities of every hart's IMSIC file togeth
 `which` 145 (IOMMU5) takes the wired source number in `a2` and returns where that source is delivered: its live identity as
 (interrupt file << 16) | identity, or all ones when the source has no live route (read under the object lock). The suite uses it to aim
 a device's message at an identity the kernel gave an interrupt object, to see that the IOMMU refuses it.
+
+`which` 164 (IOMMU12, test builds only) takes a user virtual address of the caller's own space in `a2` and returns the physical address it
+is mapped to, or all ones when nothing is mapped there (read under the address-space lock). It is the suite's oracle for the frames a
+device must not reach (the hostile-driver matrix aims a device at them) and for a test device that reads memory back by physical address;
+a release kernel answers all ones, so no physical address is learnable from user mode on a release build (INVARIANTS D2). Like every
+selector it needs the debug resource with INSPECT.
 
 `which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
 (over the console limit of 16 a second), 152 the fault-queue overflows, 153 the device id of the last fault record, 154 its I/O address,
@@ -500,27 +505,27 @@ it on deliberately. A process without it cannot reach device memory.
 
 A VMO over device memory (MMIO). `resource` needs MANAGE. The range must be page aligned,
 non-empty, a whole number of pages and inside one *device window*: the kernel builds the windows at boot from the device tree (`kcore::devwin`) and the rule fails closed. A node
-contributes its `reg` ranges, widened to whole pages, only if its `compatible` is on the list of devices the system drives (`virtio,mmio`
-and `google,goldfish-rtc`), its `status` is not disabled and every bus above it passes addresses through unchanged (`ranges;`). A PCI host
+contributes its `reg` ranges, widened to whole pages, only if its `compatible` is on the list of devices the system drives (`google,goldfish-rtc`;
+virtio devices are reached only as PCI functions behind the IOMMU since IOMMU12), its `status` is not disabled and every bus above it passes addresses through unchanged (`ranges;`). A PCI host
 (`pci-host-ecam-generic`, IOMMU5, IOMMU-SPEC 2.6) is admitted only when its `iommu-map` puts its functions behind the IOMMU: it contributes
 its configuration window (ECAM, its `reg`) and its memory windows (the 32- and 64-bit memory spaces of its `ranges`), never its I/O-port
 window, and the windows are built only after the IOMMU denies every device. From the windows are cut RAM and everything reserved, the
 console, the IOMMU's registers, and the ranges of every interrupt controller, timer, test finisher and power or reset node. On QEMU `virt`
-with `iommu-sys=on` that is the eight virtio-mmio slots, the RTC page, the PCI ECAM window and the two PCI memory windows. Anything else,
-RAM and every other device included (fw-cfg, the flash banks, the IOMMU, the PCI I/O-port window), is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
+with `iommu-sys=on` that is the RTC page, the PCI ECAM window and the two PCI memory windows. Anything else, RAM and every other
+device included (the eight virtio-mmio slots, whose devices DMA around the IOMMU; fw-cfg, the flash banks, the IOMMU, the PCI I/O-port
+window), is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
 DMA). The frames are not in the frame database: they are never freed, zeroed or charged as pages,
 and `vmo_read`/`vmo_write` on it are NOT_SUPPORTED. **The kernel never copies through device
 memory**: a syscall buffer pointer that lands in an MMIO mapping is INVALID_ARGS. Errors, in
 order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS; NO_MEMORY (handle table or object
 quota).
 
-### vmo_create_dma(resource, pages) -> status, handle
+### vmo_create_dma(resource, pages) -> status, handle (library stub)
 
-A VMO of `pages` physically contiguous, zeroed frames, committed now and charged to the caller's
-job as pages. At most `MAX_DMA_PAGES` (64) per object and the DMA backstop (RAM / 16 pages, at least 1024) in the
-system (INVALID_ARGS past either, or for 0); NO_MEMORY if the job is out of pages or no
-free aligned block of the size rounded up to a power of two exists (a 33-page request needs a free aligned 64-page block; the frame
-allocator is a buddy allocator, MM2). The returned handle has VMO rights without EXECUTE plus **DMA**.
+Not a system call since IOMMU12 (IOMMU-SPEC 4.7): the libsys symbol and `rt::sys::vmo_create_dma` stay, and answer NOT_SUPPORTED with
+both values 0 without entering the kernel, whatever the arguments. Its old number (45) is retired and answers BAD_SYSCALL. A contiguous
+buffer at a known physical address was only for devices outside the IOMMU, and none is reachable: DMA buffers come from
+`vmo_create_dma_in` and are reached by devices only through `iodomain_map`.
 
 ### vmo_create_dma_in(resource, pages, job) -> status, handle
 
@@ -531,12 +536,13 @@ fixed (no decommit, resize, copy-on-write child or pager). The frames are taken 
 lock only, while no handle names the VMO (amendment 2026-11-26, OD168). Limits: the job's pages; the system DMA backstop (RAM / 16).
 Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (`resource`, `job`: the kinds rank across both handles); INVALID_ARGS (`pages`
 is 0 or past the backstop); NO_MEMORY (the job's pages or kernel bytes, the backstop's room, the frames). The handle has the VMO
-rights without EXECUTE, plus DMA. `vmo_phys_addr` on it is WRONG_TYPE (it has no single address).
+rights without EXECUTE, plus DMA.
 
-### vmo_phys_addr(vmo) -> status, address
+### vmo_phys_addr(vmo) -> status, address (library stub)
 
-The physical address of a DMA VMO's first byte. Needs the DMA right (ACCESS_DENIED without it, so
-a duplicate made without DMA cannot learn addresses); WRONG_TYPE for a VMO that is not a DMA VMO.
+Not a system call since IOMMU12: the libsys symbol and `rt::sys::vmo_phys_addr` stay, and answer NOT_SUPPORTED with address 0 without
+entering the kernel, whatever the handle. Its old number (46) is retired and answers BAD_SYSCALL. No call tells user mode a physical
+address (INVARIANTS D2); devices see I/O addresses from `iodomain_map`.
 
 ### resource_dtb(resource) -> status, handle, length
 
@@ -600,7 +606,7 @@ Maps `pages` pages of `vmo` from byte `vmo_offset` at an I/O address the kernel 
 that follow are complete. `access` is 1 (READ: the device may read) or 3 (READ and WRITE). Needs IO_MAP on `domain`; on `vmo`, DMA,
 READ, and WRITE when `access` has WRITE (IO4: never wider than the handle). The same page may be mapped any number of times; each mapping
 is charged. Errors, in order: BAD_HANDLE; WRONG_TYPE (`domain` not a domain, `vmo` not a VMO or not a DMA VMO from
-`vmo_create_dma_in` or `vmo_create_dma`); ACCESS_DENIED; INVALID_ARGS (`pages` 0, `vmo_offset` not page aligned, the range not inside
+`vmo_create_dma_in`); ACCESS_DENIED; INVALID_ARGS (`pages` 0, `vmo_offset` not page aligned, the range not inside
 the VMO, a bit of `access` other than READ and WRITE, or READ missing); BAD_STATE (the domain was destroyed, also when its destruction
 begins while a large map is under way: the map gives way and is rolled back); NO_MEMORY (the job's I/O-mapped pages, its kernel bytes
 for the record or the tables, no free I/O range, a fence that did not complete). A failed map is rolled back as an unmap: nothing is
@@ -679,7 +685,7 @@ mapped: nobody can be sleeping on an address the sleeper could not read.)
 ### interrupt_create(resource, source) -> status, handle
 
 An interrupt object for AIA source `source`: one of the sources the admitted devices of the device tree name in `interrupts` (`kcore::aiatree`: on
-QEMU `virt` the virtio-mmio slots, sources 1 to 8, and the RTC, 11; slot *n* is source *n*+1), up to the APLIC's `riscv,num-sources`; every
+QEMU `virt` the RTC, 11, alone: the virtio-mmio slots and their sources 1 to 8 are not admitted since IOMMU12), up to the APLIC's `riscv,num-sources`; every
 other source, the console's included, is refused (the kernel never keeps for itself a source an admitted device names). The kernel delivers the source to an interrupt
 identity it chooses in the calling hart's IMSIC file (IOMMU-SPEC 8.1: identities are per hart, 0 is invalid and 1 the inter-hart interrupt; any
 other identity up to `riscv,num-ids` may be used). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
@@ -1201,7 +1207,8 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |
 | socket_shutdown | specified and implemented (tidy-up, T17) |
-| vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
+| vmo_create_physical, resource_root | specified and implemented (S6a) |
+| vmo_create_dma, vmo_phys_addr | retired (IOMMU12): library stubs answering NOT_SUPPORTED, numbers 45 and 46 answer BAD_SYSCALL |
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
 | vmo_create_dma_in, iodomain_create, iodomain_map, iodomain_unmap, iodomain_destroy, iodomain_fault_read, job_set_io_limits | specified and implemented (IOMMU6) |
 | iodomain_grant_vector, interrupt_deliver_here | specified and implemented (IOMMU7) |

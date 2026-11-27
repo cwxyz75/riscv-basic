@@ -5,21 +5,23 @@
 //! the flash banks were then mappable), its `status` is not disabled, and every bus above it passes addresses through unchanged. From the
 //! admitted ranges are cut the kernel's own devices, RAM, and the ranges of every node the kernel or firmware drives ([`NEVER`]), so that
 //! a device sharing a page with an interrupt controller does not make the controller mappable.
+//!
+//! **No DMA-capable device outside the IOMMU** (IOMMU-SPEC 2.6, IOMMU12): a device that can issue memory transactions of its own is
+//! admitted only behind the IOMMU (the PCI host, with its `iommu-map`). `virtio,mmio` slots are DMA-capable and the tree puts them behind
+//! no IOMMU, so they are not admitted (Q-IOMMU-MODEL 7); fw-cfg and the flash banks never were. What remains outside the PCI host is
+//! the RTC, which has no DMA ability.
 
 use crate::fdt::Node;
 use alloc::vec::Vec;
 
 /// The devices a physical VMO may name, by `compatible` (exact match of one string of the property): what the device manager drives.
-/// Adding a device here is a deliberate decision about what a holder of the resource handle may touch.
+/// Adding a device here is a deliberate decision about what a holder of the resource handle may touch, and a DMA-capable one may be
+/// added only behind the IOMMU (IOMMU-SPEC 2.6): `virtio,mmio` left this list in IOMMU12.
 ///
 /// The PCI host (`pci-host-ecam-generic`, IOMMU-SPEC 2.6) is admitted only when it is behind the IOMMU (an `iommu-map`): its windows
 /// are its `reg` (the configuration window, ECAM) and the memory windows of its `ranges`, never its I/O-port window. That is safe
 /// only because the IOMMU denies every device id before any window exists (IO1; the kernel asserts the boot order).
-pub const ALLOWED: &[&str] = &[
-    "virtio,mmio",
-    "google,goldfish-rtc",
-    crate::iommutree::PCI_HOST,
-];
+pub const ALLOWED: &[&str] = &["google,goldfish-rtc", crate::iommutree::PCI_HOST];
 
 /// Compatible strings of nodes the kernel (or the firmware) drives or that are not memory-mapped devices at all: interrupt controllers
 /// and timers, the test finisher, the power and reset syscons. Their `reg` ranges are cut from every window.

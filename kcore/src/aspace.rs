@@ -265,9 +265,9 @@ pub enum VmoKind {
     /// read or written through the kernel, never charged as pages.
     Device,
     /// RAM committed, zeroed and pinned at creation, whose frames never change for the VMO's life (no decommit, resize, child or pager):
-    /// what a device may be given. Made contiguous by `create_dma` (the old call, whose address a DMA-right holder may learn until
-    /// IOMMU12) or from the ordinary allocator by `create_dma_in` (IOMMU-SPEC 4.7: a device sees it through its domain). Only this
-    /// kind is ever mapped for a device (`retain_for_io`, IO4).
+    /// what a device may be given. Made from the ordinary allocator by `create_dma_in` (IOMMU-SPEC 4.7: not promised contiguous, a
+    /// device sees it through its domain; the contiguous kind of the old two-argument call went with IOMMU12). Only this kind is ever
+    /// mapped for a device (`retain_for_io`, IO4), and no call tells its physical address (IOMMU-SPEC 4.8, D2).
     Dma,
 }
 
@@ -301,8 +301,6 @@ struct Vmo {
     committed: PageMap,
     /// Made with the RESIZABLE flag: `set_size` may change `pages` (MM6).
     resizable: bool,
-    /// A DMA VMO of the old call (`create_dma`), whose frames are one contiguous run: the only kind with a physical address (D2).
-    contiguous: bool,
     /// The node this one inherits from (MM8): a page it has not committed itself is found there, window `offset`.
     parent: Option<Link>,
     /// Nodes that have this one as their parent (a hidden node has two or more: with one left it is merged into it).
@@ -466,7 +464,7 @@ impl Vmos {
         }
     }
 
-    /// Make room for one more VMO, in memory: after `Ok`, `create`, `create_in`, `create_physical` and `create_dma` do not allocate for their
+    /// Make room for one more VMO, in memory: after `Ok`, `create`, `create_in` and `create_physical` do not allocate for their
     /// own bookkeeping, and destroying any VMO never does (KT9).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len()
     pub fn reserve_one(&mut self) -> Result<(), abi::status::Status> {
@@ -738,7 +736,6 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
-            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -763,7 +760,6 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
-            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -781,71 +777,8 @@ impl Vmos {
         self.dma_total_cap = pages;
     }
 
-    /// A VMO of `pages` physically contiguous zeroed frames, charged to `job` now. At most
-    /// `MAX_DMA_PAGES` per object and `MAX_DMA_TOTAL_PAGES` in the system.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pages is checked against MAX_DMA_PAGES and the system total just above, so the sums are small; `first + i` is inside the contiguous run the allocator returned
-    pub fn create_dma<M: PhysMem>(
-        &mut self,
-        mm: &mut Mm<M>,
-        jobs: &mut Jobs,
-        pages: u64,
-        job: JobId,
-    ) -> Result<u64, VmoError> {
-        use abi::limits::MAX_DMA_PAGES;
-        if pages == 0 || pages > MAX_DMA_PAGES || self.dma_pages + pages > self.dma_total_cap {
-            return Err(VmoError::OutOfRange);
-        }
-        jobs.charge(job, Resource::Pages, pages)
-            .map_err(|_| VmoError::NoMemory)?;
-        // (the index of a run is one leaf per 64 pages, charged with the pages)
-        let leaf_bytes = pages
-            .div_ceil(64)
-            .saturating_mul(crate::pagemap::LEAF_BYTES);
-        if jobs.charge(job, Resource::KernelBytes, leaf_bytes).is_err() {
-            jobs.credit(job, Resource::Pages, pages);
-            return Err(VmoError::NoMemory);
-        }
-        let Some(first) = mm.db.alloc_contiguous(pages as usize) else {
-            jobs.credit(job, Resource::KernelBytes, leaf_bytes);
-            jobs.credit(job, Resource::Pages, pages);
-            return Err(VmoError::NoMemory);
-        };
-        for i in 0..pages {
-            mm.mem.zero_frame(first + i);
-        }
-        jobs.retain(job);
-        self.dma_pages += pages;
-        Ok(self.place(Vmo {
-            kind: VmoKind::Dma,
-            job,
-            pages,
-            refs: 1,
-            committed: PageMap::from_run(pages, first),
-            resizable: false,
-            contiguous: true,
-            parent: None,
-            children: alloc::vec::Vec::new(),
-            hidden: false,
-            had_parent: false,
-            maps: crate::fmap::FMap::new(),
-            busy: None,
-            restore: None,
-            pager: None,
-            inherit: 0,
-        }))
-    }
-
     pub fn kind(&self, id: u64) -> Option<VmoKind> {
         self.vmo(id).map(|v| v.kind)
-    }
-
-    /// The physical address of a DMA VMO (its first byte), for the old call: only for one whose frames are contiguous (`create_dma`'s,
-    /// at most `MAX_DMA_PAGES`); a `create_dma_in` VMO's frames are not promised contiguous, so a first address would be a lie.
-    pub fn phys_addr(&self, id: u64) -> Option<u64> {
-        let v = self
-            .vmo(id)
-            .filter(|v| v.kind == VmoKind::Dma && v.contiguous)?;
-        Some(v.committed.get(0)? << 12)
     }
 
     /// A DMA VMO for `vmo_create_dma_in` (IOMMU-SPEC 4.7; OD162 point 3, OD166 point 9): `pages` zeroed frames from the ordinary allocator
@@ -934,7 +867,6 @@ impl Vmos {
             refs: 1,
             committed: b.committed,
             resizable: false,
-            contiguous: false,
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
@@ -1486,7 +1418,6 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
-            contiguous: false,
             parent: None,
             children: stash,
             hidden: false,
@@ -1558,7 +1489,6 @@ impl Vmos {
                         refs: 2,
                         committed,
                         resizable: false,
-                        contiguous: false,
                         parent: old_parent,
                         children: kids,
                         hidden: true,
@@ -1832,8 +1762,8 @@ impl Vmos {
             );
             let batched = vmo.committed.len() > crate::aspace::RANGE_STEP;
             // A DMA VMO, decided here and not by the size test (IOMMU3): its last holder has gone (a handle, a region, or a device
-            // mapping whose fence has completed), so neither a hart nor a device can reach its frames. It used to take the path below
-            // only because `MAX_DMA_PAGES` equals `RANGE_STEP`; `create_dma_in` has no per-object limit, so a large one goes back in
+            // mapping whose fence has completed), so neither a hart nor a device can reach its frames. `create_dma_in` has no
+            // per-object limit (IOMMU-SPEC 4.7), so a large one goes back in
             // batches like any other VMO, and its pages leave the DMA backstop as `drain_dying` frees them; a small one, at once.
             let dma = vmo.kind == VmoKind::Dma;
             if dma && !batched {

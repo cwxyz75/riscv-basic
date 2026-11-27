@@ -1,4 +1,5 @@
-//! The VMO calls (TS3b): create, physical and DMA creation, size, commit, read and write, and the DMA address.
+//! The VMO calls (TS3b): create, physical creation, size, commit, read and write. (The two-argument `vmo_create_dma` and `vmo_phys_addr`
+//! are retired, IOMMU-SPEC 4.8: their numbers are BAD_SYSCALL, and `vmo_create_dma_in` is in `iodomain`'s calls.)
 
 use crate::{fail, Ctx, Reply};
 use abi::limits::MAX_MSG_BYTES;
@@ -17,8 +18,6 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         n,
         nr::VMO_CREATE
             | nr::VMO_CREATE_PHYSICAL
-            | nr::VMO_CREATE_DMA
-            | nr::VMO_PHYS_ADDR
             | nr::VMO_COMMIT
             | nr::VMO_GET_SIZE
             | nr::VMO_READ
@@ -131,47 +130,6 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                     let _ = vmos.release(mm, jobs, id);
                     fail(e)
                 }
-            }
-        }
-        nr::VMO_CREATE_DMA => {
-            ipc::resource_of(objs, handles, h(0)).map_err(|e| (e, None, None))?;
-            vmos.reserve_one().map_err(|e| (e, None, None))?;
-            let id = match vmos.create_dma(mm, jobs, a[1], job) {
-                Ok(id) => id,
-                Err(kcore::aspace::VmoError::OutOfRange) => return fail(Status::InvalidArgs),
-                Err(_) => return fail(Status::NoMemory),
-            };
-            // the creator's handle carries DMA; duplicates may drop it
-            let rights = Rights(
-                Rights::READ.0
-                    | Rights::WRITE.0
-                    | Rights::MAP.0
-                    | Rights::DUPLICATE.0
-                    | Rights::TRANSFER.0
-                    | Rights::DMA.0,
-            );
-            match ipc::vmo_object_create_with(
-                objs,
-                handles,
-                id,
-                rights,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            ) {
-                Ok(h) => Ok((Some(h.0), None)),
-                Err(e) => {
-                    let _ = vmos.release(mm, jobs, id);
-                    fail(e)
-                }
-            }
-        }
-        nr::VMO_PHYS_ADDR => {
-            let id = ipc::vmo_of(objs, handles, h(0), Rights::DMA).map_err(|e| (e, None, None))?;
-            match vmos.phys_addr(id) {
-                Some(pa) => Ok((Some(pa), None)),
-                None => fail(Status::WrongType),
             }
         }
         nr::VMO_COMMIT => {

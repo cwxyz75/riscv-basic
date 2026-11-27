@@ -51,6 +51,15 @@ pub fn source() -> String {
             "    .globl {sym}\n    .type {sym},@function\n{sym}:\n    li a7, {number}\n    ecall\n    ret\n    .size {sym}, .-{sym}\n"
         ));
     }
+    // KERNEL-V1-SPEC 3.1 (the library is additive) and IOMMU-SPEC 4.8: a call the kernel no longer provides keeps its symbol, as a stub
+    // that answers NOT_SUPPORTED (a1 and a2 zero) without entering the kernel: no `ecall`, so its old number is never used
+    for &(name, _) in abi::syscall::RETIRED {
+        let sym = symbol_name(name);
+        s.push_str(&std::format!(
+            "    .globl {sym}\n    .type {sym},@function\n{sym}:\n    li a0, {ns}\n    li a1, 0\n    li a2, 0\n    ret\n    .size {sym}, .-{sym}\n",
+            ns = abi::status::Status::NotSupported as i32,
+        ));
+    }
     // AB9: the version of the ABI, read from the data page in user mode (no trap): `a0 = 0`, `a1 = version`. Features are probed by calling, not by this number
     s.push_str(&std::format!(
         "    .globl sys_abi_version\n    .type sys_abi_version,@function\nsys_abi_version:\n    lla t0, .Ldata\n    ld a1, {off}(t0)\n    li a0, 0\n    ret\n    .size sys_abi_version, .-sys_abi_version\n",
@@ -137,6 +146,20 @@ pub fn check(bytes: &[u8]) -> Result<(), String> {
                 "{sym} is outside the code segment ({:#x})",
                 s.value
             ));
+        }
+    }
+    // the stubs of the retired calls: present, inside the code, and with no `ecall` (32 bits, 0x00000073; it has no compressed form)
+    for &(name, _) in abi::syscall::RETIRED {
+        let sym = symbol_name(name);
+        let s = img
+            .lookup(&sym)
+            .ok_or_else(|| std::format!("no stub {sym}"))?;
+        let code = bytes
+            .get(s.value as usize..(s.value + s.size) as usize)
+            .filter(|c| s.size > 0 && (s.value + s.size) as usize <= len && !c.is_empty())
+            .ok_or_else(|| std::format!("the stub {sym} is outside the code segment"))?;
+        if code.windows(4).step_by(2).any(|w| w == [0x73, 0, 0, 0]) {
+            return Err(std::format!("the stub {sym} enters the kernel"));
         }
     }
     img.lookup("sys_raw").ok_or("no symbol sys_raw")?;

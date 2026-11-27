@@ -534,13 +534,13 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
             Some(S::AccessDenied),
             "the receive pool cannot be mapped writable from the stack's handle"
         );
-        // NET2 (IOMMU11): neither of the stack's pool handles gives a physical address (no process learns one: the driver's are
-        // checked in `net_device_cannot_write_the_transmit_pool`)
+        // NET2 (IOMMU11, IOMMU12): neither of the stack's pool handles gives a physical address (no process learns one, IOMMU-SPEC
+        // 4.8: the call is the library's stub; the driver's are checked in `net_device_cannot_write_the_transmit_pool`)
         for h in [n.rx, n.tx] {
             ensure_eq!(
                 st(sys::vmo_phys_addr(h)),
-                Some(S::AccessDenied),
-                "the stack's pool handle has no physical address to give (no DMA right)"
+                Some(S::NotSupported),
+                "the stack's pool handle has no physical address to give"
             );
         }
         // every completion came by its vector: none was found only by the driver's safety poll
@@ -1080,20 +1080,13 @@ pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
             mgr_grew < 130,
             "the manager's job does not pay for the claim (it grew by {mgr_grew} pages)"
         );
-        // NET2: no handle to the pools or the queue memory gives a physical address: the driver's have the DMA right, but the VMOs
-        // are the manager's `vmo_create_dma_in` ones (no single address: WRONG_TYPE); the stack's have no DMA right
-        for h in [q, rx, tx] {
+        // NET2: no handle to the pools or the queue memory gives a physical address, the driver's (with the DMA right) and the
+        // stack's alike: `vmo_phys_addr` is the library's stub, NOT_SUPPORTED for every caller (IOMMU-SPEC 4.8)
+        for h in [q, rx, tx, srx, stx] {
             ensure_eq!(
                 st(sys::vmo_phys_addr(h)),
-                Some(S::WrongType),
-                "the driver's DMA handle has no physical address to give"
-            );
-        }
-        for h in [srx, stx] {
-            ensure_eq!(
-                st(sys::vmo_phys_addr(h)),
-                Some(S::AccessDenied),
-                "the stack's pool view has no physical address to give"
+                Some(S::NotSupported),
+                "a pool or queue handle has no physical address to give"
             );
         }
         // the stack's views cannot be mapped into the domain, and the driver's pools cannot be mapped into a process

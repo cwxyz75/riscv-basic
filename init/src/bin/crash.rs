@@ -189,6 +189,7 @@ pub fn app_main() -> i32 {
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
+        121 => return hostile_driver(),
         26 => {
             // take a socket end from the bootstrap channel and drain it to the end of the
             // stream; the exit code is how many bytes arrived
@@ -389,14 +390,15 @@ pub fn app_main() -> i32 {
             if rt::sys::resource_root().status == -3 {
                 code |= 1;
             }
-            if rt::sys::vmo_create_physical(77, 0x1000_1000, 4096).status == -1
-                && rt::sys::vmo_create_dma(77, 1).status == -1
+            // (the RTC's page is a device window; `vmo_create_dma_in` is the DMA call since IOMMU12)
+            if rt::sys::vmo_create_physical(77, 0x10_1000, 4096).status == -1
+                && rt::sys::vmo_create_dma_in(77, 1, 0).status == -1
             {
                 code |= 2;
             }
             let ev = rt::sys::event_create().a1 as u64;
-            if rt::sys::vmo_create_physical(ev, 0x1000_1000, 4096).status == -2
-                && rt::sys::vmo_create_dma(ev, 1).status == -2
+            if rt::sys::vmo_create_physical(ev, 0x10_1000, 4096).status == -2
+                && rt::sys::vmo_create_dma_in(ev, 1, 0).status == -2
             {
                 code |= 4;
             }
@@ -692,6 +694,65 @@ pub fn app_main() -> i32 {
         _ => {}
     }
     0
+}
+
+/// IOMMU12, the hostile-driver matrix: a driver process that holds exactly the handles it is sent (a device claim's, in the driver's
+/// job) and makes the calls the suite asks for with them, nothing of its own. The first message carries the handles; the reply is
+/// their numbers here (8 bytes each). Then each request is eight words: an operation (0 a system call by number, 1 the library's
+/// `sys_vmo_phys_addr`, 2 its two-argument `sys_vmo_create_dma`, 3 exit), the number and six arguments; the reply is three words, the
+/// status (sign-extended), `a1` and `a2`. A closed channel ends it too.
+fn hostile_driver() -> i32 {
+    let rd = |m: &mut [u8], h: &mut [u64]| {
+        if rt::sys::object_wait(
+            rt::BOOTSTRAP,
+            rt::abi::signals::READABLE | rt::abi::signals::PEER_CLOSED,
+            u64::MAX,
+        )
+        .status
+            != 0
+        {
+            return None;
+        }
+        let r = rt::sys::channel_read(
+            rt::BOOTSTRAP,
+            m.as_mut_ptr(),
+            m.len(),
+            h.as_mut_ptr(),
+            h.len(),
+        );
+        (r.status == 0).then_some((r.a1, r.a2))
+    };
+    let mut m = [0u8; 64];
+    let mut hs = [0u64; 16];
+    let Some((_, n)) = rd(&mut m, &mut hs) else {
+        return 100;
+    };
+    let mut out = [0u8; 128];
+    for (i, h) in hs[..n].iter().enumerate() {
+        out[8 * i..8 * i + 8].copy_from_slice(&h.to_le_bytes());
+    }
+    rt::sys::channel_write(rt::BOOTSTRAP, out.as_ptr(), 8 * n, core::ptr::null(), 0);
+    loop {
+        let Some((len, _)) = rd(&mut m, &mut []) else {
+            return 0;
+        };
+        if len != 64 {
+            return 101;
+        }
+        let w = |i: usize| u64::from_le_bytes(m[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
+        let args = [w(2), w(3), w(4), w(5), w(6), w(7)].map(|a| a as usize);
+        let r = match w(0) {
+            0 => rt::syscall(w(1) as usize, args),
+            1 => rt::sys::vmo_phys_addr(w(2)),
+            2 => rt::sys::vmo_create_dma(w(2), w(3)),
+            _ => return 0,
+        };
+        let mut rep = [0u8; 24];
+        rep[..8].copy_from_slice(&(i64::from(r.status) as u64).to_le_bytes());
+        rep[8..16].copy_from_slice(&(r.a1 as u64).to_le_bytes());
+        rep[16..].copy_from_slice(&(r.a2 as u64).to_le_bytes());
+        rt::sys::channel_write(rt::BOOTSTRAP, rep.as_ptr(), 24, core::ptr::null(), 0);
+    }
 }
 
 #[repr(align(16))]

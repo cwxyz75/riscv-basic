@@ -182,7 +182,7 @@ fn a_shrink_drops_the_holes_past_the_end_with_their_leaves() {
 fn a_dma_run_pays_for_its_leaves_with_its_pages() {
     let (mut mm, mut vmos, mut jobs) = world();
     let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    let id = vmos.create_dma(&mut mm, &mut jobs, 3, job).unwrap();
+    let id = vmos.create_dma_in(&mut mm, &mut jobs, 3, job).unwrap();
     assert_eq!(kb(&jobs, job), LEAF_BYTES);
     assert_eq!(vmos.index_leaves(id), Some(1));
     vmos.release(&mut mm, &mut jobs, id).unwrap();
@@ -193,7 +193,7 @@ fn a_dma_run_pays_for_its_leaves_with_its_pages() {
     let poor = jobs.create(JobId::ROOT, lim).unwrap();
     let free = mm.db.free_count();
     assert_eq!(
-        vmos.create_dma(&mut mm, &mut jobs, 1, poor),
+        vmos.create_dma_in(&mut mm, &mut jobs, 1, poor),
         Err(VmoError::NoMemory)
     );
     assert_eq!(
