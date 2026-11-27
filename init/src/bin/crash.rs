@@ -779,6 +779,11 @@ const SPINS_PER_YIELD: u64 = 4096;
 /// running there with its translations cached (the point of the tests), and every [`SPINS_PER_YIELD`] turns a yield. With fewer harts
 /// than threads (one hart: the kernel-only boots and KT5's instruction counts) the thread being waited for gets the hart at once instead
 /// of at the end of the waiter's time slice: a round there took a dozen time slices, and the 300 rounds of each test most of a minute.
+///
+/// The tests' power at several harts rests on this: a yield with nothing else queued on the hart (`yield_fast`) leaves the caller where it
+/// is, with no `satp` write, no `sfence` and no migration, so its cached translations survive it. A change to what a yield does must rerun
+/// the three negative controls of `os-boot-test-smp-neg` at four harts (`fault-skip-shootdown`, `fault-decommit-no-shootdown`,
+/// `fault-protect-no-shootdown`): they are in the soak tier, so no gate would notice the tests going blind.
 fn relax(spins: u64) {
     if spins.is_multiple_of(SPINS_PER_YIELD) {
         rt::sys::thread_yield();
@@ -1026,6 +1031,8 @@ extern "C" fn protect_writer(id: usize) -> ! {
             done2 = true;
             P_ACKS2.fetch_add(1, Ordering::AcqRel);
         }
+        // (a bare spin on purpose, not `relax`: a writer switched out between its two writes would lose the writable translation the test
+        // needs; at one hart each of the twenty processes costs a time slice or two, which is cheap)
         core::hint::spin_loop();
     }
 }

@@ -1,5 +1,5 @@
 # The Kernel tests of the suite (KT1): they start no server and need no disk, network or console service. `shard=k` runs
-# exactly these, except that `kfast` boots (one and two harts) skip those marked `slow` (about 40 s of the 77 s a one-hart boot takes on the development machine) (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test.
+# exactly these, except that `kfast` boots (one and two harts) skip those marked `slow` (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test.
 a_two_gib_vmo_committed_whole_stays_within_the_latency_bound
 user_mode_runs_and_prints
 clock_advances_in_user_mode
