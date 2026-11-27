@@ -23,4 +23,3 @@ for o in aia iommu-sys; do
 done
 qemu-system-riscv64 -cpu help | grep -w rva23s64 >/dev/null || { echo "::error::this QEMU has no rva23s64 CPU"; exit 1; }
 qemu-system-riscv64 -machine none -netdev help | grep -x user >/dev/null || { echo "::error::this QEMU has no user network backend (slirp)"; exit 1; }
-qemu-system-riscv64 -device help 2>&1 | grep -q '"iommu-testdev"' || { echo "::error::this QEMU has no iommu-testdev device (the five-device boot, IOMMU9)"; exit 1; }

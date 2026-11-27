@@ -4,7 +4,9 @@
 //! The images (`fixtures/*.cfg`) were taken on 2026-11-26 from `qemu-system-riscv64 -M virt,aia=aplic-imsic,iommu-sys=on -cpu
 //! rva23s64` with `virtio-blk-pci` at slot 1, `virtio-net-pci` at 2, `virtio-rng-pci` at 3 (each `iommu_platform=on,disable-legacy=on`)
 //! and `iommu-testdev` at 4: the monitor's `xp /64wx` of each function's ECAM page, and the six BAR registers read back by a probe
-//! of a dozen M-mode instructions that wrote all ones to each and restored it.
+//! of a dozen M-mode instructions that wrote all ones to each and restored it. (`iommu-testdev` is on no test machine since OD175,
+//! IOMMU-SPEC amendment 2026-11-27 part 2: its image stays as the parser's vector of a function that is not virtio and has no
+//! capability at all.)
 //!
 //! The **independent listing** is `fixtures/info-pci.txt`: the monitor's `info pci` for the same machine after a second probe had
 //! placed the BARs at fixed addresses, so it prints each BAR's kind and range. The class codes, ids, BAR indexes, kinds and sizes
@@ -192,6 +194,7 @@ fn the_virtio_functions_have_their_structures_and_msix_where_qemu_puts_them() {
     }
 }
 
+/// Two functions that are not virtio and carry no capability (the recorded `iommu-testdev` image, see the file's comment).
 #[test]
 fn the_test_device_and_the_host_bridge_have_no_msix() {
     for (slot, name) in [(0, "host-bridge"), (4, "iommu-testdev")] {

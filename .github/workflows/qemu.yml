@@ -57,8 +57,7 @@ jobs:
             -device virtio-net-pci,iommu_platform=on,disable-legacy=on,addr=0x7,netdev=n0,mac=52:54:00:12:34:56,romfile= \
             -object filter-dump,id=f0,netdev=n0,file=x.pcap \
             -drive file=disk.img,if=none,format=raw,id=pd0 \
-            -device virtio-blk-pci,iommu_platform=on,disable-legacy=on,addr=0x5,drive=pd0,num-queues=1 \
-            -device iommu-testdev,addr=0x8 > out.txt 2>&1
+            -device virtio-blk-pci,iommu_platform=on,disable-legacy=on,addr=0x5,drive=pd0,num-queues=1 > out.txt 2>&1
           status=$?
           set -e
           cat out.txt

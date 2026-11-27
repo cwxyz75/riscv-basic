@@ -444,37 +444,36 @@ pub use waits::*;
 #[allow(unused_imports)]
 pub use wake::*;
 
-/// Debug builds: what the user state says about the processes that are not finished (for `debug_stat` 132).
+/// Debug builds: what the user state says about the processes that are not finished (for `debug_stat` 132, which holds the state already:
+/// `with_state` is not opened again, T239).
 #[cfg(debug_assertions)]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report
-pub(crate) fn dump_state() {
+pub(crate) fn dump_state(s: &UserState) {
     use core::fmt::Write;
     let mut out = crate::console::Console;
-    with_state(|s| {
+    let _ = writeln!(
+        out,
+        "##SCHED user: job exception channels {:?}, suspends {:?}, parked {:?}",
+        s.job_exc.keys().collect::<alloc::vec::Vec<_>>(),
+        s.threads
+            .iter()
+            .filter(|(_, t)| t.suspend.is_some())
+            .map(|(tid, _)| *tid)
+            .collect::<alloc::vec::Vec<_>>(),
+        s.threads
+            .iter()
+            .filter(|(_, t)| t.parked)
+            .map(|(tid, _)| *tid)
+            .collect::<alloc::vec::Vec<_>>()
+    );
+    for (pid, p) in s.procs.iter() {
+        if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
+            continue;
+        }
         let _ = writeln!(
             out,
-            "##SCHED user: job exception channels {:?}, suspends {:?}, parked {:?}",
-            s.job_exc.keys().collect::<alloc::vec::Vec<_>>(),
-            s.threads
-                .iter()
-                .filter(|(_, t)| t.suspend.is_some())
-                .map(|(tid, _)| *tid)
-                .collect::<alloc::vec::Vec<_>>(),
-            s.threads
-                .iter()
-                .filter(|(_, t)| t.parked)
-                .map(|(tid, _)| *tid)
-                .collect::<alloc::vec::Vec<_>>()
+            "##SCHED proc {pid}: state {:?} stopped {} killed {:?} exc_channel {:?} threads {:?} job {:?}",
+            p.state, p.stopped, p.killed, p.exc_channel, p.live_tids, p.job
         );
-        for (pid, p) in s.procs.iter() {
-            if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
-                continue;
-            }
-            let _ = writeln!(
-                out,
-                "##SCHED proc {pid}: state {:?} stopped {} killed {:?} exc_channel {:?} threads {:?} job {:?}",
-                p.state, p.stopped, p.killed, p.exc_channel, p.live_tids, p.job
-            );
-        }
-    });
+    }
 }

@@ -507,6 +507,16 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
             return Ok((Some(at.unwrap_or(u64::MAX)), None));
         }
+        // 132 (T243, debug builds): print every hart's scheduler state, the record of every thread that is not idle and the processes that are not
+        // finished, for a test that failed; the user state is the one this closure holds (`dump_state` opening it again would be two live `&mut`, T239)
+        if a[1] == 132 {
+            #[cfg(debug_assertions)]
+            {
+                thread::dump_sched();
+                super::dump_state(s);
+            }
+            return Ok((Some(0), None));
+        }
         // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
         if let Some(v) = backstop_stat(s, a[1]) {
             return Ok((Some(v), None));
