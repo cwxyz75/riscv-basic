@@ -92,6 +92,8 @@ struct Held {
     claim: devmgr::PciClaim,
     dev: RefCell<Device>,
     stats: Cell<ReclaimStats>,
+    /// The function was given back for good (`release_device`).
+    released: Cell<bool>,
     rx: u64,
     tx: u64,
     q: u64,
@@ -124,7 +126,14 @@ struct Child {
 
 /// Send `req` with a duplicate of the driver's job, and read the claim reply and then the message that says bus mastering is on:
 /// the claim and its handles. Exit codes 10 to 15 (13 NoDevice, 14 Busy).
-fn claim_request(chan: u64, job: u64, req: &[u8]) -> Result<(PciClaim, Vec<u64>), i32> {
+/// The transaction id of the next request to the manager (each its own, so a late reply can never be taken for another's).
+static TXID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+fn next_txid() -> u32 {
+    TXID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+fn claim_request(chan: u64, job: u64, txid: u32, req: &[u8]) -> Result<(PciClaim, Vec<u64>), i32> {
     let Some(j) = dup(job, Rights::SAME) else {
         return Err(10);
     };
@@ -153,9 +162,9 @@ fn claim_request(chan: u64, job: u64, req: &[u8]) -> Result<(PciClaim, Vec<u64>)
         }
     };
     let c = match devmgr::decode_claim_pci_reply(&buf[..n]) {
-        Some((1, DStatus::Ok, Some(c))) if handles.len() == c.handles() => c,
-        Some((_, DStatus::NoDevice, _)) => return Err(13),
-        Some((_, DStatus::Busy, _)) => return Err(14),
+        Some((t, DStatus::Ok, Some(c))) if t == txid && handles.len() == c.handles() => c,
+        Some((t, DStatus::NoDevice, _)) if t == txid => return Err(13),
+        Some((t, DStatus::Busy, _)) if t == txid => return Err(14),
         _ => {
             close(&handles);
             return Err(15);
@@ -164,7 +173,7 @@ fn claim_request(chan: u64, job: u64, req: &[u8]) -> Result<(PciClaim, Vec<u64>)
     // the device may start once the manager says bus mastering is on (IOMMU-SPEC 9 step 6)
     let mut b = [0u8; 16];
     match read(&mut b, &mut []) {
-        Ok((n, 0)) if devmgr::decode_claim_pci_started(&b[..n]) == Some(1) => Ok((c, handles)),
+        Ok((n, 0)) if devmgr::decode_claim_pci_started(&b[..n]) == Some(txid) => Ok((c, handles)),
         _ => {
             close(&handles);
             Err(15)
@@ -174,7 +183,8 @@ fn claim_request(chan: u64, job: u64, req: &[u8]) -> Result<(PciClaim, Vec<u64>)
 
 /// The first claim: the layout, the device's handles, and the DMA VMOs (queue memory, receive pool, transmit pool).
 fn claim(chan: u64, job: u64) -> Result<(PciClaim, Device, [u64; 3]), i32> {
-    let (c, hs) = claim_request(chan, job, &devmgr::encode_claim_net(1, 0))?;
+    let txid = next_txid();
+    let (c, hs) = claim_request(chan, job, txid, &devmgr::encode_claim_net(txid, 0))?;
     let n = c.dma_pages.len();
     if n != 3 || c.irqs.len() != 3 {
         for h in hs {
@@ -200,9 +210,21 @@ fn claim(chan: u64, job: u64) -> Result<(PciClaim, Device, [u64; 3]), i32> {
 }
 
 /// A re-claim before a new driver (IOMMU-SPEC 10.2 and 10.4): the manager resets the function and destroys the dead driver's
-/// domain, then makes a new one with new grants; our old handles to the device are closed and the new ones kept.
+/// domain, then makes a new one with new grants; our old handles to the device are closed and the new ones kept. It is made as soon
+/// as a driver dies (IOMMU-SPEC 10.2: the device is quiet and the dead driver's mappings gone before any backoff), and before any
+/// driver start on a claim another driver already used. A failure leaves the network down (`release_device`: the connection, and
+/// with it whatever the manager holds for us, goes).
 fn reclaim(h: &Held) -> Result<(), i32> {
-    let (c, hs) = claim_request(h.devmgr, h.drv_job, &devmgr::encode_reclaim_net(1, 0))?;
+    if h.released.get() {
+        return Err(16);
+    }
+    let txid = next_txid();
+    let (c, hs) = claim_request(
+        h.devmgr,
+        h.drv_job,
+        txid,
+        &devmgr::encode_reclaim_net(txid, 0),
+    )?;
     if !c.dma_pages.is_empty() || c.irqs.len() != 3 || hs.len() != 5 {
         for x in hs {
             sys::handle_close(x);
@@ -226,40 +248,71 @@ fn reclaim(h: &Held) -> Result<(), i32> {
     Ok(())
 }
 
+/// The network is down for good: give the function back (closing the manager's connection releases the claim: bus mastering off, the
+/// function reset, the domain destroyed) and drop our device handles and DMA VMOs, so the driver job's charge returns. Idempotent.
+fn release_device(h: &Held) {
+    if h.released.replace(true) {
+        return;
+    }
+    sys::handle_close(h.devmgr);
+    let mut d = h.dev.borrow_mut();
+    for x in [d.bar, d.domain].into_iter().chain(d.irqs.drain(..)) {
+        sys::handle_close(x);
+    }
+    for x in [h.q, h.rx, h.tx] {
+        sys::handle_close(x);
+    }
+}
+
 /// The device-side handles a driver gets, in the order of `DRIVER_ROLES` (see the header comment), each with TRANSFER so it can
 /// travel in a startup message.
 fn driver_handles(h: &Held) -> Option<Vec<u64>> {
+    if h.released.get() {
+        return None;
+    }
     let d = h.dev.borrow();
     let t = Rights::TRANSFER;
-    let mut v = alloc::vec![
-        dup(
+    let mut want = alloc::vec![
+        (
             d.bar,
             Rights::READ
                 .union(Rights::WRITE)
                 .union(Rights::MAP)
                 .union(t)
-        )?,
-        dup(d.domain, Rights::IO_MAP.union(Rights::IO_UNMAP).union(t))?,
-        dup(
+        ),
+        (d.domain, Rights::IO_MAP.union(Rights::IO_UNMAP).union(t)),
+        (
             h.q,
             Rights::DMA
                 .union(Rights::READ)
                 .union(Rights::WRITE)
                 .union(Rights::MAP)
-                .union(t)
-        )?,
-        dup(
+                .union(t),
+        ),
+        (
             h.rx,
             Rights::DMA
                 .union(Rights::READ)
                 .union(Rights::WRITE)
                 .union(t)
-        )?,
+        ),
         // the transmit pool read-only for the device: no WRITE (IO4), and no MAP (the driver never maps a pool)
-        dup(h.tx, Rights::DMA.union(Rights::READ).union(t))?,
+        (h.tx, Rights::DMA.union(Rights::READ).union(t)),
     ];
     for &i in &d.irqs {
-        v.push(dup(i, Rights::WAIT.union(Rights::MANAGE).union(t))?);
+        want.push((i, Rights::WAIT.union(Rights::MANAGE).union(t)));
+    }
+    let mut v = Vec::with_capacity(want.len());
+    for (x, r) in want {
+        match dup(x, r) {
+            Some(y) => v.push(y),
+            None => {
+                for y in v {
+                    sys::handle_close(y);
+                }
+                return None;
+            }
+        }
     }
     Some(v)
 }
@@ -470,6 +523,7 @@ pub fn app_main() -> i32 {
         claim,
         dev: RefCell::new(dev),
         stats: Cell::new(ReclaimStats::default()),
+        released: Cell::new(false),
         rx,
         tx,
         q,
@@ -589,6 +643,10 @@ pub fn app_main() -> i32 {
     let mut pending: Vec<(u64, usize)> = Vec::new(); // (restart at, child)
     let mut down = false;
     loop {
+        if down {
+            // nothing restarts any more: the function, its domain and the DMA memory go back (IOMMU-SPEC 10.2)
+            release_device(&held);
+        }
         let now = sys::clock_get();
         let deadline = pending.iter().map(|p| p.0).min().unwrap_or(u64::MAX);
         let r = sys::port_wait(port, deadline);
@@ -697,6 +755,15 @@ pub fn app_main() -> i32 {
                 );
                 if down {
                     continue;
+                }
+                // the driver is dead: quiet the device and destroy its domain now (IOMMU-SPEC 10.2), not at the next start, so no
+                // DMA of the dead driver's outlives it through the backoff; the next driver starts on this fresh claim
+                if idx == 0 {
+                    if let Err(code) = reclaim(&held) {
+                        rt::println!("##NETSUP re-claim failed (code {code})");
+                        rt::println!("##NETSUP down reason=reclaim");
+                        down = true;
+                    }
                 }
                 // exits that are only the consequence of the stack's death (the driver sees its control channel close, the DHCP
                 // client its connections) are restarted at once and do not count against the intensity limit

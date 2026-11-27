@@ -465,9 +465,10 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
         // NET2 (IOMMU11): neither of the stack's pool handles gives a physical address (no process learns one: the driver's are
         // checked in `net_device_cannot_write_the_transmit_pool`)
         for h in [n.rx, n.tx] {
-            ensure!(
-                sys::vmo_phys_addr(h).status != 0,
-                "the stack's pool handle has no physical address to give"
+            ensure_eq!(
+                st(sys::vmo_phys_addr(h)),
+                Some(S::AccessDenied),
+                "the stack's pool handle has no physical address to give (no DMA right)"
             );
         }
         // every completion came by its vector: none was found only by the driver's safety poll
@@ -1031,11 +1032,20 @@ pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
             mgr_grew < 130,
             "the manager's job does not pay for the claim (it grew by {mgr_grew} pages)"
         );
-        // NET2: no handle to the pools or the queue memory gives a physical address
-        for h in [q, rx, tx, srx, stx] {
-            ensure!(
-                sys::vmo_phys_addr(h).status != 0,
-                "a pool or the queue memory gave a physical address"
+        // NET2: no handle to the pools or the queue memory gives a physical address: the driver's have the DMA right, but the VMOs
+        // are the manager's `vmo_create_dma_in` ones (no single address: WRONG_TYPE); the stack's have no DMA right
+        for h in [q, rx, tx] {
+            ensure_eq!(
+                st(sys::vmo_phys_addr(h)),
+                Some(S::WrongType),
+                "the driver's DMA handle has no physical address to give"
+            );
+        }
+        for h in [srx, stx] {
+            ensure_eq!(
+                st(sys::vmo_phys_addr(h)),
+                Some(S::AccessDenied),
+                "the stack's pool view has no physical address to give"
             );
         }
         // the stack's views cannot be mapped into the domain, and the driver's pools cannot be mapped into a process
@@ -1135,23 +1145,10 @@ pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
         vio(t.setup_queue(1, 8, txq.addresses(), entry(1)?), "queue 1")?;
         t.driver_ok();
         let faults0 = sys::debug_stat(150);
-        // the transmit slot's I/O address as a receive buffer: the device may read it, never write it
         let mut rx_mem = PageMem(Q_VA);
         let mut tx_mem = PageMem(Q_VA + 4096);
         let rx_buf = tx_io + 3 * 2048;
-        vio(
-            rxq.add(
-                &mut rx_mem,
-                &[virtio::Buf {
-                    addr: rx_buf,
-                    len: 2048,
-                    device_writes: true,
-                }],
-                true,
-            ),
-            "post the receive buffer",
-        )?;
-        t.notify(0);
+        // the frame first (the device reads it from the read-only pool), so nothing unsolicited can fault the device before it sends
         let head = vio(
             txq.add(
                 &mut tx_mem,
@@ -1177,6 +1174,21 @@ pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
             );
             rt::io::nap(2);
         }
+        // then a transmit slot's I/O address as a receive buffer: the device may read it, never write it (QEMU holds slirp's answer
+        // until a receive buffer exists)
+        vio(
+            rxq.add(
+                &mut rx_mem,
+                &[virtio::Buf {
+                    addr: rx_buf,
+                    len: 2048,
+                    device_writes: true,
+                }],
+                true,
+            ),
+            "post the receive buffer",
+        )?;
+        t.notify(0);
         // slirp answers; the device's write of the answer into the read-only slot faults, and the supervisor reads the record
         let w = sys::object_wait(parent, sig::READABLE, sys::clock_get() + 3000);
         ensure_eq!(
@@ -1209,11 +1221,8 @@ pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
             NET_RID,
             "the fault names the network function (00:07.0)"
         );
-        // nothing was received, and the slot's bytes are as they were
-        ensure!(
-            vio(rxq.take_used(&rx_mem), "the receive used ring")?.is_none(),
-            "the device completed a receive into the transmit pool"
-        );
+        // the slot's bytes are as they were (QEMU may still complete the receive: its write went through a bounce buffer whose
+        // write-back the IOMMU refused, so the fault and the bytes are the proof, not the used ring)
         for i in 0..2048u64 {
             // SAFETY: as above.
             let v = unsafe { core::ptr::read_volatile((slot(3) + i) as *const u8) };
@@ -1234,7 +1243,7 @@ pub fn net_device_cannot_write_the_transmit_pool() -> Outcome {
     let settled = job_use_settles(cj, 2, 0, 3000);
     sys::process_kill(mgr, -1);
     let _ = sys::object_wait(mgr, sig::TERMINATED, sys::clock_get() + 3000);
-    for h in [sup, mgr, mine, me, mj, sj, cj, bi, res] {
+    for h in [sup, mgr, mine, me, mj, sj, cj, res] {
         sys::handle_close(h);
     }
     r?;
@@ -1255,8 +1264,8 @@ fn sup_status(f: &Full) -> Option<SupStatus> {
     if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
         return None;
     }
-    let mut b = [0u8; 64];
-    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 64, core::ptr::null_mut(), 0);
+    let mut b = [0u8; 96];
+    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 96, core::ptr::null_mut(), 0);
     if r.status != 0 || r.a1 < 8 + 27 + 9 {
         return None;
     }
@@ -2746,7 +2755,7 @@ pub fn rng_seeds_through_the_iommu() -> Outcome {
         let _ = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 3000);
         sys::handle_close(p);
     }
-    for h in [mine, reg_ch, bi, res] {
+    for h in [mine, reg_ch, res] {
         sys::handle_close(h);
     }
     let settled = [mj, sj, rj].map(|j| job_use_settles(j, 2, 0, 1500));

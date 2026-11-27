@@ -409,17 +409,15 @@ impl Drv {
                 fence();
                 let rx_moved = q16(qbase(0) + USED + 2) != self.rx_seen;
                 let tx_moved = q16(qbase(1) + USED + 2) != self.tx_seen;
-                let signalled = || {
-                    [IRQ_RX, IRQ_TX].iter().any(|&i| {
-                        sys::object_signals(self.irqs[i]).a1 as u32 & signals::INTERRUPT != 0
-                    })
-                };
-                if (rx_moved || tx_moved) && !signalled() {
-                    // the device writes the used ring before it sends the message: a timeout can fall between the two, so the
-                    // vector gets a moment to arrive before the work counts as found only by the poll
-                    let irq = self.irqs[if rx_moved { IRQ_RX } else { IRQ_TX }];
-                    let _ = sys::object_wait(irq, signals::INTERRUPT, sys::clock_get() + 2);
-                    if !signalled() {
+                // each queue that moved is checked against its own vector (another queue's pending message proves nothing). The
+                // device writes the used ring before it sends the message, so a timeout can fall between the two: the vector gets a
+                // grace of 10 ms (a working one arrives within microseconds) before the work counts as found only by the poll
+                for (moved, i) in [(rx_moved, IRQ_RX), (tx_moved, IRQ_TX)] {
+                    let irq = self.irqs[i];
+                    if moved
+                        && sys::object_wait(irq, signals::INTERRUPT, sys::clock_get() + 10).status
+                            != 0
+                    {
                         self.shm.count(stat::POLL_FOUND);
                     }
                 }

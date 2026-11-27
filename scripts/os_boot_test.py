@@ -132,7 +132,8 @@ IOMMU_TEST_DEV = "00:04.0"
 # gives virtio-blk-pci one queue per hart by default and one MSI-X vector more, so its table would otherwise change with OS_SMP.
 # The five devices on one machine (IOMMU9, the bus move): two disks, the network, the entropy source (also the IOMMU tests' function)
 # and `iommu-testdev`, which has no MSI-X capability and so is listed and never claimable (IOMMU-SPEC 8.6, Q-IOMMU-MSI 5). The network
-# function has no backend: nothing drives it before its driver moves (IOMMU11). The disks (IOMMU10) are the scratch disk and the
+# function is `netdrv`'s (IOMMU11); it is on QEMU's user network when the boot has the network (`pci_devices`), else it has no
+# backend (the suite's PCI tests still list and claim it). The disks (IOMMU10) are the scratch disk and the
 # second disk, writable, which `blkd` drives through `devmgr`'s claim; OS_DISK=0 leaves both off (`pci_devices`).
 PCI_DEVICES = [
     (4, "virtio-rng-pci", "1af4:1044", "", True),
@@ -145,7 +146,7 @@ PCI_DISK_SLOTS = (5, 6)
 
 
 # IOMMU11: the network function's backend and address when the boot has the network (`net_on`): QEMU's user network `n0`
-# (`net_args`). Without it the function is still there, with no backend, at another address.
+# (`net_args`). Without it the function is still there, with no backend and another MAC.
 PCI_NET_SLOT = 7
 PCI_NET_EXTRA = ",netdev=n0,mac=52:54:00:12:34:56,romfile="
 
@@ -984,6 +985,10 @@ if SHARD == "k":
     # the kernel-only boot (KT1, KERNEL-V1-SPEC 8): the Kernel tests of `init/ktests.txt` and the kernel's own, no network. The PCI
     # disks stay (IOMMU10: the block rig's tests are Kernel tests, at one, two and four harts); OS_DISK=0 still removes them.
     os.environ["OS_NET"] = "0"
+if os.environ.get("OS_NET") == "0" and SHARD in ("", "b"):
+    # IOMMU11: the network function is always on the bus (the suite's PCI tests list and claim it), so a boot without the network
+    # has no way to make the network tests skip: they would run against a function with no backend and fail. Run shard a or k.
+    sys.exit("OS_NET=0 needs OS_SHARD=a or k (the network tests run in shard b and the whole suite)")
 
 
 def _read_lines(path):
@@ -1219,14 +1224,14 @@ LAST_RECORD = [None]
 
 def rr_args():
     """The QEMU arguments of record/replay mode (KT2), or []. Recording needs no network device (it would need a network replay
-    filter): run it with OS_SHARD=k, or OS_NET=0. The PCI disks go through QEMU's `blkreplay` filter (`pci_args`), and the
+    filter): run it with OS_SHARD=k (or OS_SHARD=a, OS_NET=0). The PCI disks go through QEMU's `blkreplay` filter (`pci_args`), and the
     wired-interrupt test device is left off (`wired_disk_on`). Record mode runs the harts in one TCG thread (deterministic), so a race
     that needs true parallel harts may not reproduce under it (TESTING.md)."""
     rec, rep = os.environ.get("OS_RECORD"), os.environ.get("OS_REPLAY")
     if not rec and not rep:
         return []
     if os.environ.get("OS_NET") != "0":
-        sys.exit("OS_RECORD / OS_REPLAY need a boot with no network: OS_SHARD=k (or OS_NET=0)")
+        sys.exit("OS_RECORD / OS_REPLAY need a boot with no network: OS_SHARD=k (or OS_SHARD=a, OS_NET=0)")
     shift = "shift=auto"
     if rep:
         LAST_RECORD[0] = None

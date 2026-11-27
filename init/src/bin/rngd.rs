@@ -442,48 +442,62 @@ fn claim_device(devmgr_ch: u64, job: u64) -> Option<Device> {
             return None;
         }
     }
-    let (bar, dom, queue, data) = (hs[0], hs[1], hs[2], hs[3]);
-    let (irq_at, entry) = c.irq(0)?;
-    let irq = hs[irq_at];
-    if c.bar_bytes == 0 || c.bar_bytes > MAX_BAR || !c.bar_bytes.is_multiple_of(PAGE) {
-        return None;
+    let up = (|| -> Option<Device> {
+        let (bar, dom, queue, data) = (hs[0], hs[1], hs[2], hs[3]);
+        let (irq_at, entry) = c.irq(0)?;
+        let irq = hs[irq_at];
+        if c.bar_bytes == 0 || c.bar_bytes > MAX_BAR || !c.bar_bytes.is_multiple_of(PAGE) {
+            return None;
+        }
+        let me = sys::process_self().a1 as u64;
+        let mapped = sys::process_map(me, bar, BAR_VA, 0, c.bar_bytes, PF_RW).status == 0
+            && sys::process_map(me, queue, DMA_VA, 0, PAGE, PF_RW).status == 0
+            && sys::process_map(me, data, DMA_VA + PAGE, 0, PAGE, PF_RW).status == 0;
+        if !mapped {
+            return None;
+        }
+        // the two pages go into the device's domain here, read-write for the device, at addresses the kernel chooses
+        let (q_io, d_io) = (
+            sys::iodomain_map(dom, queue, 0, 1, IO_RW),
+            sys::iodomain_map(dom, data, 0, 1, IO_RW),
+        );
+        if q_io.status != 0 || d_io.status != 0 {
+            return None;
+        }
+        let t = virtio::PciTransport::new(
+            Bar { span: c.bar_bytes },
+            virtio::PciLocations {
+                common: u64::from(c.common.0),
+                notify: u64::from(c.notify.0),
+                notify_len: u64::from(c.notify.1),
+                notify_multiplier: c.notify_multiplier,
+                isr: u64::from(c.isr.0),
+                device: (c.device_cfg.1 != 0)
+                    .then(|| (u64::from(c.device_cfg.0), u64::from(c.device_cfg.1))),
+            },
+        );
+        let mut d = Device {
+            t,
+            q: virtio::SplitQueue::new(QUEUE_SIZE, q_io.a1 as u64, PAGE).ok()?,
+            queue_io: q_io.a1 as u64,
+            data_io: d_io.a1 as u64,
+            irq,
+            entry,
+            broken: false,
+        };
+        d.init().ok()?;
+        Some(d)
+    })();
+    if up.is_none() {
+        // a claim we cannot use goes back at once: the connection's end releases it (the function reset, the domain destroyed with
+        // whatever was mapped in it), then our mappings and handles go, so nothing stays charged to the job
+        sys::handle_close(devmgr_ch);
+        let me = sys::process_self().a1 as u64;
+        for va in [BAR_VA, DMA_VA, DMA_VA + PAGE] {
+            sys::process_unmap(me, va);
+        }
+        sys::handle_close(me);
+        close(&hs[..nh]);
     }
-    let me = sys::process_self().a1 as u64;
-    let mapped = sys::process_map(me, bar, BAR_VA, 0, c.bar_bytes, PF_RW).status == 0
-        && sys::process_map(me, queue, DMA_VA, 0, PAGE, PF_RW).status == 0
-        && sys::process_map(me, data, DMA_VA + PAGE, 0, PAGE, PF_RW).status == 0;
-    if !mapped {
-        return None;
-    }
-    // the two pages go into the device's domain here, read-write for the device, at addresses the kernel chooses
-    let (q_io, d_io) = (
-        sys::iodomain_map(dom, queue, 0, 1, IO_RW),
-        sys::iodomain_map(dom, data, 0, 1, IO_RW),
-    );
-    if q_io.status != 0 || d_io.status != 0 {
-        return None;
-    }
-    let t = virtio::PciTransport::new(
-        Bar { span: c.bar_bytes },
-        virtio::PciLocations {
-            common: u64::from(c.common.0),
-            notify: u64::from(c.notify.0),
-            notify_len: u64::from(c.notify.1),
-            notify_multiplier: c.notify_multiplier,
-            isr: u64::from(c.isr.0),
-            device: (c.device_cfg.1 != 0)
-                .then(|| (u64::from(c.device_cfg.0), u64::from(c.device_cfg.1))),
-        },
-    );
-    let mut d = Device {
-        t,
-        q: virtio::SplitQueue::new(QUEUE_SIZE, q_io.a1 as u64, PAGE).ok()?,
-        queue_io: q_io.a1 as u64,
-        data_io: d_io.a1 as u64,
-        irq,
-        entry,
-        broken: false,
-    };
-    d.init().ok()?;
-    Some(d)
+    up
 }
