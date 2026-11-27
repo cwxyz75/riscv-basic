@@ -16927,7 +16927,11 @@ fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
                 "fired: the second message sent no notice (D5)"
             );
             let a = ok(sys::interrupt_ack(q), "acknowledge")?;
-            ensure_eq!(a.a1, 1, "one claim for the first request");
+            ensure_eq!(
+                a.a1,
+                2,
+                "two claims: the first request, and the second's message taken from the pending bit at the acknowledgement"
+            );
             ensure_eq!(
                 st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 1)),
                 Some(S::Ok),
