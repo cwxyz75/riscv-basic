@@ -148,8 +148,10 @@ code is right.
 
 ## Kernel checks under QEMU
 
-**Instruction counts.** `make os-count` boots the kernel-only shard at one hart under `-icount shift=0`, where the
-guest's retired-instruction counter is deterministic, and compares the suite's `##BENCH count_<name> <n> instr` lines
+**Instruction counts.** `make os-count` boots the kernel-only shard at one hart under `-icount shift=0,sleep=off`, where the
+guest's retired-instruction counter is deterministic, with no disks (`OS_DISK=0`: under `sleep=off` the guest's clock jumps to its next
+timer deadline whenever it idles, so guest time bounds no host disk I/O and a disk test there times out at random; the harness refuses
+`sleep=off` with disks, unless `OS_PCI_TEST=0`), and compares the suite's `##BENCH count_<name> <n> instr` lines
 with `bench/counts.tsv`. A rise of more than 25 % fails (the slack absorbs the runner and unrelated changes, T223); a fall of more than 5 % is printed with a request to record it
 (`make os-count-record`, then read the diff of the file). Record and compare in the same configuration (the `kfast` boot). The file holds the numbers of the CI run (2026-11-20: PL1 moved the test CPU to `rva23s64` and the kernel's code generation to the profile's extensions, and the epic gate's numbers then differed from a laptop's by up to 12 % in either direction, so the recorded values came from the gate's own log): a local `make os-count` is a reproduction, not the check.
 
