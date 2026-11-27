@@ -92,18 +92,25 @@ to say nothing about whether that happened. Two tools now say it:
   that reads its clock and sees the gap, and sees none without the injector. Reproduce "a loaded host" on purpose with
   `OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4`: the kernel before T284 failed `realtime_thread_stays_responsive_under_load` in every
   such boot.
-- *The pause detector* (`kernel/src/pause.rs`, the rule in `kcore::pause`, `debug_stat` 216 and 217): per hart, how late its own timer
-  interrupts came against what it programmed. The timing tests take a window again when a pause later than their own bound covered it,
-  print `##PAUSE <test> hart <h> late <us> us` for it, and fail after three covered windows in a row (`host pause: ...` in the
-  message); a late window with no pause fails on the bound as before. A sleep the kernel delayed after an interrupt taken on time is
-  not a pause: the planted-delay control (`fault-rt-wake-late`, in `os-boot-test-sched-neg`) fails with and without the injector. The
-  detector cannot tell a host pause from a hart that ran with interrupts off for as long in a single window; a kernel that does that at
-  every wake fails on the three-in-a-row rule, and `make os-latency` measures interrupts-off spans directly. Record mode is a second
-  discriminator: it runs every hart in one TCG thread, so a failure that also shows under `OS_RECORD` is not a pause of one hart.
+- *The pause detector* (`kernel/src/pause.rs`, the rule in `kcore::pause`, `debug_stat` 216 to 218): per hart, how late its own timer
+  interrupts came against what it programmed. A window of a timing test is covered by a pause only when **two harts** were later than
+  the test's bound inside it (the one hart on a one-hart machine): a pause of the host stops every vCPU at once, while a kernel that
+  holds interrupts off or waits for a lock in its timer handler does it on one hart. While a test measures, every hart keeps a deadline
+  at most 1 ms ahead (the heartbeat, `pause::watch`, `debug_stat` 218), and after taking a timer interrupt a hart arms a 1 ms sentinel
+  until its handler arms the next event, so a stopped hart is late for something wherever the stop lands (without these, stalls were
+  seen to land between a taken interrupt and the re-arm, unseen). The tests take a covered window again, print `##PAUSE <test> hart
+  <h> late <us> us` for it, and fail after three covered windows in a row (`host pause: ...` in the message); a late window with no
+  pause fails on the bound as before, and names a one-hart lateness it saw. Two planted delays are the controls, in
+  `os-boot-test-sched-neg`: `fault-rt-wake-late` (every real-time wake 5 ms late, the interrupts on time) and
+  `fault-rt-wake-late-irqoff` (the hart held 5 ms with interrupts off at every real-time wake); both must fail on the bound, with and
+  without the injector (`OS_NEG_DETAIL` makes `--neg` insist on the failure's words). Under `-icount` with `sleep=off` at one hart the
+  harness puts `guesttime` on the kernel line: nothing is excused there and the real-time probe's bound is 1 ms of guest time. Record
+  mode is a further discriminator: it runs every hart in one TCG thread, so a failure that also shows under `OS_RECORD` is not a pause
+  of one hart.
 
-On the development machine (macOS) the detector also showed the emulator taking a timer interrupt programmed 10 ms ahead about 5 ms
-late, every time, with the hart running and interrupts on: a host lateness of about half the interval, which the equal-priority
-latency controls wait for (their own bound, 6 ms, is above it).
+On the development machine (macOS) the detector also showed the emulator taking a timer interrupt programmed T ahead about T / 2 late,
+every time, with the hart running and interrupts on (a 3 ms sleep about 1.6 ms, a 10 ms slice end 5.04 to 5.09 ms): a host lateness that
+the heartbeat keeps under a millisecond while a test measures.
 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the
 serial log of every failing run in `target/repeat/`. Over a soak target this is a soak run (`TESTING.md` rule 6). The overnight

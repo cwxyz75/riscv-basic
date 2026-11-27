@@ -819,7 +819,8 @@ def wait_streaming(proc, started, last_out, chunks):
             if now - started > TIMEOUT:
                 TIMEOUT_REASON[0] = f"timed out after {TIMEOUT} s"
             elif now - last_out[0] > STALL:
-                TIMEOUT_REASON[0] = f"stalled: no output for {STALL} s (the last line: {b''.join(chunks[-1:]).decode(errors='replace').strip()[:100]!r})"
+                guest = [c for c in chunks if not c.startswith(b"##HOSTSTALL ")]  # (the guest's last line, not the injector's)
+                TIMEOUT_REASON[0] = f"stalled: no output for {STALL} s (the last line: {b''.join(guest[-1:]).decode(errors='replace').strip()[:100]!r})"
             else:
                 continue
             proc.kill()
@@ -1186,7 +1187,7 @@ def run_with(kernel, extra, fixtures):
                                            fixtures.boot_arg() if fixtures else "",
                                            host_stall.boot_arg(),
                                            # (T21, T284: guest time is the instruction count, so a timing test may hold a bound of the guest's own)
-                                           "guesttime" if icount_sleep_off() and not rr_args() else "",
+                                           "guesttime" if icount_sleep_off() and not rr_args() and os.environ.get("OS_SMP", "1") == "1" else "",
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           ),
@@ -1260,7 +1261,7 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
         found.append(f"malformed ## lines: {bad}")
     if os.environ.get("OS_HOST_STALL"):
         # (T284) the injector must have stalled the emulator, and the guest must have seen a stall land (its own self-test, which runs
-        # only when the kernel line says `hoststall=`)
+        # only when the kernel line says `hoststall=`, and only in a test kernel: the injector is for test kernels)
         if not LAST_HOSTSTALLS:
             found.append("OS_HOST_STALL is set but the injector made no stall (no ##HOSTSTALL line)")
         if HOST_STALL_TEST not in {n for n, _, _ in tests}:
@@ -1359,6 +1360,12 @@ def negative_control(kernel, test):
                   f"{order[:1]}), so the control never reached it", file=sys.stderr)
             return 1
     how = "failed" if test in failed else "crashed or hung the kernel"
+    # (T284: `OS_NEG_DETAIL=<words>` requires the guarded test to have failed with those words, so a control is not passed by a failure
+    # of another kind, such as "host pause" for the planted-delay kernel under the injector)
+    want = os.environ.get("OS_NEG_DETAIL")
+    if want and not any(n == test and not ok and want in d for n, ok, d in tests):
+        print(f"negative control FAILED: {test} did not fail with {want!r} ({[d for n, ok, d in tests if n == test]})", file=sys.stderr)
+        return 1
     # (the guarded test's own words, so a run by hand records how the control was caught: the round of a race, say; T283)
     said = next((d for n, ok, d in tests if n == test and not ok), "")
     print(f"negative control passed: {test} {how} without its mechanism ({kernel})" + (f": {said}" if said else ""))

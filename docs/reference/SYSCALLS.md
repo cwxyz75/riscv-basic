@@ -157,7 +157,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | channel_write | `a0` channel, `a1` bytes, `a2` nbytes, `a3` handles, `a4` nhandles |  |
 | clock_get |  | `a1` nanoseconds since boot |
 | debug_root |  | `a1` handle |
-| debug_stat | `a0` debug (INSPECT), `a1` which | `a1` the kernel counter |
+| debug_stat | `a0` debug (INSPECT), `a1` which, `a2`/`a3` for some selectors | `a1` the kernel counter or the selector's answer |
 | debug_write | `a0` debug (WRITE), `a1` ptr, `a2` len |  |
 | event_create |  | `a1` handle |
 | event_signal | `a0` event, `a1` clear, `a2` set |  |
@@ -300,19 +300,29 @@ physical address, IOMMU-SPEC amendment 2026-11-27 part 2);
 a release kernel answers all ones (the translate path is not compiled into it), so no frame's physical address is learnable through a call on a release build (INVARIANTS D2). Like every
 selector it needs the debug resource with INSPECT.
 
-`which` 216 to 218 (T284, test kernels only: a release kernel answers 0 and does nothing) are the **pause detector**: each hart records
-how late it took its own timer interrupt against what it programmed into `stimecmp` (`kcore::pause::rearm`: a value already past is
-due from the moment it was written, unless an interrupt still pending was due earlier; a re-arm that cancels an interrupt already due
-counts as that interrupt, late by as much), keeping the newest 128 that were at least 200 us late. After taking a timer interrupt the hart
-arms a sentinel 1 ms ahead until the handler arms its next event. 218 is the one selector with an effect: for the next `a2` milliseconds
-(at most 60 s; 0 stops it) every hart keeps its timer deadline at most 1 ms ahead, so that a hart the host stops is late for an
-interrupt whatever it was running (a timing test turns it on while it measures, and off after). `a2` is the start of a window in nanoseconds on the clock `clock_ns` reads; the
-window ends now. 216 returns the worst such interrupt of any hart whose late span (from its due time to when it was taken) meets the
-window, as (hart << 48) | microseconds late, or 0 for none; 217 returns how long the harts were not taking their timer interrupts inside
-the window, summed over the harts, in microseconds. An interrupt taken late means the emulator did not run the hart (a pause of the host)
-or the hart ran with interrupts off; the timing tests take a window that such a pause later than their bound covered again (three in a
-row fail them), so a wake the scheduler delayed after an interrupt taken on time still fails them. Read under the object lock, like
-every selector; the detector itself is lock-free (one word per sample).
+`which` 216 to 218 (T284) are the **pause detector**, answered by test kernels and the release-suite kernel (a release kernel answers 0
+and does nothing; the recording itself runs in every kernel: a `time` read and a few relaxed atomics per arm of the timer). Each hart
+records how late it took its own timer interrupt against what it programmed into `stimecmp` (`kcore::pause::rearm`: a value already
+past is due from the moment it was written, unless an interrupt still pending was due earlier; a re-arm that cancels an interrupt
+already due counts as that interrupt, late by as much), keeping the newest 128 that were at least 200 us late; after taking a timer
+interrupt it arms a sentinel 1 ms ahead until the handler arms its next event.
+
+- 216: `a2` is the start of a window in nanoseconds on the clock `clock_ns` reads (the window ends now) and `a3` a test's bound in
+  microseconds. It returns whether a **pause of the host** covered the window: at least two harts (the one hart, on a one-hart machine)
+  took a timer interrupt more than `a3` late whose late span (from its due time to when it was taken) meets the window, as (hart << 48) |
+  microseconds late of the worst, or 0. One hart late alone is not a pause: a hart that ran with interrupts off or waited for a lock in
+  its timer handler looks the same, and a pause of the emulator stops every vCPU at once.
+- 217: `a2` as for 216; how long the harts were not taking their timer interrupts inside the window, summed over the harts, counting
+  only samples at least 2 ms late (microseconds).
+- 218 is the one selector with an effect, kept small and bounded (the debug resource is the trusted boot-time suite's, HD4; its handle
+  carries INSPECT only). For the next `a2` milliseconds (at most 60 s, so a test that dies with it on leaves it on for at most that; 0
+  stops it) every hart keeps its timer deadline at most 1 ms ahead (the other harts are told at once by a reschedule
+  interrupt), so that a hart the host stops is late for an interrupt whatever it was running. A timing test turns it on while it
+  measures, and off after.
+
+The timing tests take a window that a pause later than their bound covered again (three in a row fail them), so a wake the scheduler
+delayed after an interrupt taken on time, and a hart held with interrupts off, still fail them. Read under the object lock, like every
+selector; the detector itself is lock-free (one word per sample).
 
 `which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
 (over the console limit of 16 a second), 152 the fault-queue overflows, 153 the device id of the last fault record, 154 its I/O address,

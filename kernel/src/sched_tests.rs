@@ -68,21 +68,24 @@ fn clean(body: impl FnOnce() -> Outcome) -> Outcome {
 }
 
 /// T284, the host-stall injector's self-test, run only when the harness stops the emulator on purpose (`hoststall=<ms>:<period>` on
-/// the kernel line, from `OS_HOST_STALL`): the guest must see a stall land. It sleeps 1 ms at a time; a sleep across which the `time`
-/// counter jumped by at least the stall is one the host did not run, and the pause detector must have seen it there (a timer interrupt
-/// of this hart at least half the stall late). It gives up after four periods and a second.
+/// the kernel line, from `OS_HOST_STALL`; at least 5 ms, so that an ordinary 1 ms sleep cannot pass for one): the guest must see a stall
+/// land. With every hart keeping a deadline near (`pause::watch`), it sleeps 1 ms at a time; a sleep across which the `time` counter
+/// jumped by at least the stall is one the host did not run, and the pause detector must have seen it as a pause (`pause::covering`:
+/// on two harts, at least half the stall late). It gives up after four periods and a second.
 pub fn a_host_stall_is_seen_by_the_guest() -> Outcome {
-    let Some((ms, period)) =
-        crate::dtb::boot_arg_value("hoststall=").and_then(|v| kcore::pause::parse_stall_arg(&v))
-    else {
+    let Some((ms, period)) = stall_arg() else {
         return Err(String::from(
-            "the kernel line's hoststall= is not <ms>:<period ms>",
+            "the kernel line's hoststall= is not <ms>:<period ms> with a stall of at least 5 ms",
         ));
     };
     let stall_ns = ms * 1_000_000;
     let give_up = thread::now_ns() + (4 * period + 1000) * 1_000_000;
-    let (mut jumps, mut best) = (0u32, 0u64);
-    while thread::now_ns() < give_up {
+    let (mut jumps, mut best) = (0u32, kcore::pause::Cover::None);
+    crate::pause::watch((4 * period + 2000) * 1_000_000);
+    let seen = loop {
+        if thread::now_ns() >= give_up {
+            break None;
+        }
         let start = thread::now_ns();
         thread::sleep_ticks(1);
         let end = thread::now_ns();
@@ -90,16 +93,40 @@ pub fn a_host_stall_is_seen_by_the_guest() -> Outcome {
             continue;
         }
         jumps += 1;
-        let (hart, seen) = crate::pause::worst_in(start, end).unwrap_or((0, 0));
-        best = best.max(seen);
-        if seen * 1000 * 2 >= stall_ns {
-            crate::pause::report("a_host_stall_is_seen_by_the_guest", hart, seen);
-            return Ok(());
+        match crate::pause::covering(start, end, ms * 1000 / 2) {
+            kcore::pause::Cover::Pause { hart, late_us } => break Some((hart, late_us)),
+            other => best = other,
         }
+    };
+    crate::pause::watch(0);
+    stall_verdict(seen, ms, jumps, best)
+}
+
+/// `hoststall=<ms>:<period>` from the kernel line, with a stall of at least 5 ms.
+#[inline(never)]
+fn stall_arg() -> Option<(u64, u64)> {
+    crate::dtb::boot_arg_value("hoststall=")
+        .and_then(|v| kcore::pause::parse_stall_arg(&v))
+        .filter(|&(ms, _)| ms >= 5)
+}
+
+/// The self-test's verdict (a frame of its own: the 1 KiB budget).
+#[inline(never)]
+fn stall_verdict(
+    seen: Option<(usize, u64)>,
+    ms: u64,
+    jumps: u32,
+    best: kcore::pause::Cover,
+) -> Outcome {
+    match seen {
+        Some((hart, late_us)) => {
+            crate::pause::report("a_host_stall_is_seen_by_the_guest", hart, late_us);
+            Ok(())
+        }
+        None => Err(format!(
+            "no stall of {ms} ms was seen as a pause: {jumps} sleeps of 1 ms took at least {ms} ms, and the detector said {best:?} for the last"
+        )),
     }
-    Err(format!(
-        "no stall of {ms} ms was seen with the detector: {jumps} sleeps of 1 ms took at least {ms} ms, and the detector's worst inside them was {best} us"
-    ))
 }
 
 fn timer_ticks_advance() -> Outcome {
@@ -648,16 +675,35 @@ mod priority {
     static RETAKEN: AtomicU64 = AtomicU64::new(0);
     static WORST_PAUSE: AtomicU64 = AtomicU64::new(0);
     static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+    /// The worst lateness seen on one hart only inside a window (not excused: `kcore::pause::Cover::OneHart`), for a failure message.
+    static ONE_HART: AtomicU64 = AtomicU64::new(0);
     /// Which test the probe is measuring for: its `##PAUSE` lines name it, and a window is covered by a pause later than that test's
-    /// own bound (the real-time bound, 4 ms; the control's, 6 ms). The control's is its own for a reason seen on the development
-    /// machine: there the emulator takes a timer interrupt programmed 10 ms ahead about 5 ms late, every time (the detector measured
-    /// 5.04 to 5.09 ms with the hart running a hog, interrupts on), so the slice-end interrupt the equal-priority probe waits for is
-    /// always 5 ms late. That is the host's lateness, below the control's 6 ms; with the real-time bound every window would be covered.
+    /// own bound (the real-time bound, 4 ms; the control's, the lateness it must exceed, 6 ms). (Before the heartbeat, the development
+    /// machine's emulator took the 10 ms slice-end interrupt the control waits for about 5 ms late every time, which the real-time bound
+    /// would have called a pause in every window; with the heartbeat no timer is armed that far ahead while the probe measures.)
     static PROBE_FOR: AtomicUsize = AtomicUsize::new(0);
     const PROBES: [(&str, u64); 2] = [
         ("realtime_thread_stays_responsive_under_load", 4_000),
         ("the_latency_test_can_fail", 6_000),
     ];
+
+    /// The pause that covered a probe window, if one did (a lateness on one hart alone is kept for the failure message, not excused);
+    /// under `guesttime` the host cannot pause the guest, so a late interrupt there is the kernel's and nothing is excused. (A frame of
+    /// its own: the probe's is near the 1 KiB budget.)
+    #[inline(never)]
+    fn window_pause(start: u64, end: u64, bound_us: u64, guest_time: bool) -> Option<(usize, u64)> {
+        match crate::pause::covering(start, end, bound_us) {
+            _ if guest_time => None,
+            kcore::pause::Cover::Pause { hart, late_us } => Some((hart, late_us)),
+            kcore::pause::Cover::OneHart { hart, late_us } => {
+                if late_us > kcore::pause::decode(ONE_HART.load(SeqCst)).map_or(0, |(_, l)| l) {
+                    ONE_HART.store(kcore::pause::encode(Some((hart, late_us))), SeqCst);
+                }
+                None
+            }
+            kcore::pause::Cover::None => None,
+        }
+    }
 
     /// The latency probe: sleep 3 ticks until 50 wakes are measured, recording how late each was. A sleep that a pause of the host
     /// covered (T284: a timer interrupt of any hart taken more than the bound late inside it) is taken again, at most three in a row.
@@ -666,13 +712,14 @@ mod priority {
         let mut late = alloc::vec::Vec::new();
         let mut rs = Resampler::new();
         let (name, bound_us) = PROBES[PROBE_FOR.load(SeqCst) % PROBES.len()];
+        let guest_time = crate::dtb::boot_arg_present("guesttime");
         while late.len() < 50 {
             // (nanoseconds on the real clock: there is no tick to round to)
             let start = thread::now_ns();
             let target = start + 3_000_000;
             thread::sleep_ticks(3);
             let end = thread::now_ns();
-            match rs.judge(crate::pause::worst_in(start, end), bound_us) {
+            match rs.judge(window_pause(start, end, bound_us, guest_time), bound_us) {
                 Verdict::Keep => late.push(end.saturating_sub(target)),
                 Verdict::Retake { hart, late_us } => crate::pause::report(name, hart, late_us),
                 Verdict::GiveUp { hart, late_us } => {
@@ -697,13 +744,19 @@ mod priority {
 
     /// What the probe's re-sampling did, for a failure message: "" when no window was taken again.
     fn pauses_said() -> String {
-        match kcore::pause::decode(WORST_PAUSE.load(SeqCst)) {
+        let mut said = match kcore::pause::decode(WORST_PAUSE.load(SeqCst)) {
             None => String::new(),
             Some((h, us)) => format!(
                 "; {} windows taken again for a host pause, the worst {us} us on hart {h}",
                 RETAKEN.load(SeqCst)
             ),
+        };
+        if let Some((h, us)) = kcore::pause::decode(ONE_HART.load(SeqCst)) {
+            said.push_str(&format!(
+                "; a timer interrupt {us} us late on hart {h} alone (not a pause of the host: no other hart saw it)"
+            ));
         }
+        said
     }
 
     /// Worst lateness of the probe at `prio` while three hogs run at normal priority (an error when three windows in a row were
@@ -714,6 +767,7 @@ mod priority {
         RETAKEN.store(0, SeqCst);
         WORST_PAUSE.store(0, SeqCst);
         GAVE_UP.store(0, SeqCst);
+        ONE_HART.store(0, SeqCst);
         PROBE_FOR.store(usize::from(prio == NORMAL), SeqCst);
         let hogs: Vec<_> = (0..3)
             .map(|_| {

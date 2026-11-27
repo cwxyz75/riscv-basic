@@ -1526,6 +1526,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     // earlier than that, however long this thread is held off after the send. Read after the send, a stall of this thread
     // longer than three ticks between the send and the read made the close look instant: T267, seen at two harts on the
     // IOMMU machine, where `channel_write` was seen to return 80 to 120 ms late)
+    let _ = host_pause_watch(5_000); // (every hart keeps a deadline near, so a pause of the host is seen wherever it lands)
     let t0 = sys::clock_get();
     let t0_ns = sys::clock_ns();
     ensure_eq!(
@@ -1548,12 +1549,11 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     let waited = sys::clock_get() - t0;
     // (T284: the window cannot be taken again, since the helper's close is once only; a pause of the host can only lengthen it, so the
     // upper bound allows what the pause detector saw inside it, and the lower bound, the check, is as it was)
-    let pause_ms = host_pause_since(t0_ns).map_or(0, |(h, us)| {
-        if us > 4_000 {
-            pause_line("wait_is_woken_by_the_peer_closing", h, us);
-        }
+    let pause_ms = host_pause_since(t0_ns, 4_000).map_or(0, |(h, us)| {
+        pause_line("wait_is_woken_by_the_peer_closing", h, us);
         us.div_ceil(1000)
     });
+    let _ = host_pause_watch(0);
     ensure!(
         // (the lower bound is the check: three ticks from the helper's read of the request, which follows `t0`, less one for
         // the millisecond clock's rounding; the upper one only catches a lost wake-up and is loose because a loaded CI runner
@@ -20040,20 +20040,20 @@ static RT_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 /// The probe's bound in microseconds: a window that a pause later than this covered says nothing about the scheduler.
 const RT_BOUND_US: u64 = 4_000;
 /// The negative control's own bound (an equal-priority probe must be later than this): its windows are covered only by a pause later
-/// than it (the emulator on the development machine takes a timer interrupt programmed 10 ms ahead about 5 ms late every time, which
-/// the probe at the hogs' priority always waits for: the kernel twin, `the_latency_test_can_fail`, records it).
+/// than it, as the kernel twin's (`the_latency_test_can_fail`).
 const RT_CONTROL_BOUND_US: u64 = 6_000;
 
-/// The pause detector (T284, `debug_stat` 216): the worst timer interrupt of any hart taken late since `since_ns` (the `clock_ns` clock), as
-/// (hart, microseconds late), or None.
-fn host_pause_since(since_ns: u64) -> Option<(u64, u64)> {
+/// The pause detector (T284, `debug_stat` 216): whether a pause of the host covered the window since `since_ns` (the `clock_ns` clock) for
+/// a test whose bound is `bound_us` (two harts took a timer interrupt more than that late inside it), as (hart, microseconds late) of the
+/// worst, or None.
+fn host_pause_since(since_ns: u64, bound_us: u64) -> Option<(u64, u64)> {
     let r = rt::syscall(
         nr_debug_stat(),
         [
             rt::debug::handle() as usize,
             216,
             since_ns as usize,
-            0,
+            bound_us as usize,
             0,
             0,
         ],
@@ -20062,7 +20062,8 @@ fn host_pause_since(since_ns: u64) -> Option<(u64, u64)> {
     (v != 0).then_some((v >> 48, v & ((1 << 48) - 1)))
 }
 
-/// How long the harts were not taking their timer interrupts since `since_ns`, summed over the harts, in microseconds (`debug_stat` 217).
+/// How long the harts were not taking their timer interrupts since `since_ns`, summed over the harts, counting samples at least 2 ms late,
+/// in microseconds (`debug_stat` 217).
 fn host_paused_us_since(since_ns: u64) -> u64 {
     let r = rt::syscall(
         nr_debug_stat(),
@@ -20083,11 +20084,13 @@ fn host_paused_us_since(since_ns: u64) -> u64 {
 }
 
 /// For the next `ms` milliseconds (0: stop) every hart keeps a timer deadline at most 1 ms ahead (`debug_stat` 218).
-fn host_pause_watch(ms: u64) {
+fn host_pause_watch(ms: u64) -> bool {
     rt::syscall(
         nr_debug_stat(),
         [rt::debug::handle() as usize, 218, ms as usize, 0, 0, 0],
-    );
+    )
+    .status
+        == 0
 }
 
 fn nr_debug_stat() -> usize {
@@ -20119,7 +20122,7 @@ extern "C" fn rt_probe(_: usize) -> ! {
         } else {
             RT_CONTROL_BOUND_US
         };
-        if let Some((h, us)) = host_pause_since(start).filter(|&(_, us)| us > bound) {
+        if let Some((h, us)) = host_pause_since(start, bound) {
             pause_line(name, h, us);
             in_a_row += 1;
             if worst_pause & ((1 << 48) - 1) < us {
@@ -20170,16 +20173,20 @@ fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
     RT_WORST_LATE_US.store(u64::MAX, Ordering::SeqCst);
     RT_GAVE_UP.store(0, Ordering::SeqCst);
+    // (T284: every hart keeps a timer deadline near while the probe measures, so a pause of the host makes one late wherever it lands;
+    // asked before any hog exists, so a refusal leaves nothing running)
+    ensure!(
+        host_pause_watch(20_000),
+        "debug_stat 218 (the heartbeat) was refused"
+    );
     let mut hogs = Vec::new();
     for _ in 0..harts {
         hogs.push(new_thread(rt_hog, 0)?);
     }
     nap_ticks(5); // the hogs are running, one per hart
-                  // (T284: every hart keeps a timer deadline near while the probe measures, so a pause of the host makes one late wherever it lands)
-    host_pause_watch(20_000);
     let probe = new_thread(rt_probe, 0)?;
     let w = sys::object_wait(probe, sig::TERMINATED, sys::clock_get() + 20_000);
-    host_pause_watch(0);
+    let _ = host_pause_watch(0);
     RT_STOP.store(1, Ordering::SeqCst);
     for h in hogs {
         sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
@@ -20529,6 +20536,7 @@ fn pi_futex_bounds_inversion() -> Outcome {
     let progress_while_boosted = PI_PROGRESS.load(Ordering::SeqCst);
     PI_RELEASE.store(1, Ordering::SeqCst);
     let w = sys::object_wait(high, sig::TERMINATED, sys::clock_get() + 20_000);
+    let _ = host_pause_watch(0);
     RT_STOP.store(1, Ordering::SeqCst);
     ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
     for h in hogs {
@@ -20794,6 +20802,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     let mut trace: Vec<(u64, u64, u64)> = Vec::new(); // (ms into the 100 ms window, RT ms billed so far, ms of host pause in it)
     let mut naps_done = 0;
     let until = sys::clock_get() + 20_000;
+    let _ = host_pause_watch(20_000); // (T284: every hart keeps a deadline near, so a pause of the host is seen on each)
     while naps_done < 30 && sys::clock_get() < until {
         nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
         let used = job_use(root, 9)?.0;

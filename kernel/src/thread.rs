@@ -1251,6 +1251,17 @@ pub fn sleep_ticks(n: u64) {
                     sleep_ns(MS);
                 }
             }
+            #[cfg(feature = "fault-rt-wake-late-irqoff")]
+            if priority_of(current()).is_some_and(|p| p > crate::MAIN_PRIO) {
+                // (the twin: the kernel holds the hart 5 ms with interrupts off at every real-time wake, which delays this hart's timer
+                // interrupts too; seen on one hart only, it is not a pause of the host)
+                irq::off(|| {
+                    let until = now_ns().saturating_add(5 * MS);
+                    while now_ns() < until {
+                        core::hint::spin_loop();
+                    }
+                });
+            }
             return;
         }
     }

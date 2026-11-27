@@ -507,17 +507,24 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
             return Ok((Some(at.unwrap_or(u64::MAX)), None));
         }
-        // 216 and 217 (T284, test kernels): the pause detector since `a2` (nanoseconds on the clock `clock_ns` reads) up to now. 216: the worst
-        // timer interrupt of any hart taken late inside that window, as (hart << 48) | microseconds late, 0 for none; 217: how long the harts were
-        // not taking their timer interrupts inside it, summed over the harts (microseconds). A release kernel answers 0 to all three.
-        // 218 (T284, test kernels): for the next `a2` milliseconds (0: stop now) every hart keeps a timer deadline at most 1 ms ahead, so that
-        // a pause of the host makes an interrupt late wherever it lands (a timing test's measurement; the only selector with an effect)
+        // 216 to 218 (T284, test kernels and the release-suite kernel; a release kernel answers 0 and does nothing). 216: whether a pause of
+        // the host covered the window from `a2` (nanoseconds on the clock `clock_ns` reads) to now for a test whose bound is `a3`
+        // microseconds (two harts took a timer interrupt more than `a3` late inside it, `kcore::pause::covering`), as (hart << 48) |
+        // microseconds late of the worst, 0 for none. 217: how long the harts were not taking their timer interrupts inside that window,
+        // summed over the harts, counting samples at least 2 ms late (microseconds). 218 (the one selector with an effect, bounded: the
+        // debug resource is the trusted suite's, HD4): for the next `a2` milliseconds (at most 60 s, so a test that dies with it on does
+        // not leave it on for long; 0 stops it) every hart keeps a timer deadline at most 1 ms ahead.
         if a[1] == 216 || a[1] == 217 || a[1] == 218 {
             #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
             {
                 let now = crate::timer::now_ns();
                 let v = match a[1] {
-                    216 => kcore::pause::encode(crate::pause::worst_in(a[2], now)),
+                    216 => match crate::pause::covering(a[2], now, a[3]) {
+                        kcore::pause::Cover::Pause { hart, late_us } => {
+                            kcore::pause::encode(Some((hart, late_us)))
+                        }
+                        _ => 0,
+                    },
                     217 => crate::pause::paused_in(a[2], now),
                     _ => {
                         crate::pause::watch(a[2].min(60_000).saturating_mul(1_000_000));

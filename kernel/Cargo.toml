@@ -100,3 +100,6 @@ fault-vector-no-repend = ["kcore/fault-vector-no-repend"]
 # sleeps of 1 ms: the kernel delays every real-time wake while every timer interrupt comes on time, and no timer is armed far ahead);
 # `realtime_thread_stays_responsive_under_load` must fail on its bound with and without `OS_HOST_STALL` (`make os-boot-test-sched-neg`)
 fault-rt-wake-late = []
+# Its twin with interrupts off: the same thread spins 5 ms with interrupts off after the wake (a kernel that holds its hart at every
+# real-time wake); the one hart late is not a pause of the host, so the test must still fail on its bound
+fault-rt-wake-late-irqoff = []

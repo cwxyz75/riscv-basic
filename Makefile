@@ -113,6 +113,7 @@ OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
 OS_NOPULL_ELF  := target/os-fault-pull/$(KERNEL_TARGET)/debug/kernel
 OS_EARLYREAP_ELF := target/os-fault-earlyreap/$(KERNEL_TARGET)/debug/kernel
 OS_RTLATE_ELF := target/os-fault-rtlate/$(KERNEL_TARGET)/debug/kernel
+OS_RTLATE_IRQOFF_ELF := target/os-fault-rtlate-irqoff/$(KERNEL_TARGET)/debug/kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
@@ -320,8 +321,11 @@ os-boot-test-sched-neg: kernel
 	# latency test with and without the host-stall injector; the normal kernel passes the kernel-only boot with the emulator stopped for
 	# 20 ms about every 200 ms (the windows a pause covers are taken again, and the guest's own self-test shows the stalls land)
 	cd kernel && cargo build --features fault-rt-wake-late --target-dir ../target/os-fault-rtlate
-	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_ELF) realtime_thread_stays_responsive_under_load
-	OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_ELF) realtime_thread_stays_responsive_under_load
+	OS_NEG_DETAIL="with three hogs running (bound: 4 ms" OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_ELF) realtime_thread_stays_responsive_under_load
+	OS_NEG_DETAIL="with three hogs running (bound: 4 ms" OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_ELF) realtime_thread_stays_responsive_under_load
+	# and the planted delay with interrupts off (5 ms on the probe's own hart): one hart late is not a pause, so it too fails on the bound
+	cd kernel && cargo build --features fault-rt-wake-late-irqoff --target-dir ../target/os-fault-rtlate-irqoff
+	OS_NEG_DETAIL="with three hogs running (bound: 4 ms" OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_IRQOFF_ELF) realtime_thread_stays_responsive_under_load
 	OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test-smp-neg: kernel os-interactive

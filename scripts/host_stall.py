@@ -39,6 +39,9 @@ def parse(spec):
         raise SystemExit(f"OS_HOST_STALL={spec!r}: want <ms>[:<period ms>[:<seed>]], whole numbers")
     if ms <= 0 or period <= 0:
         raise SystemExit(f"OS_HOST_STALL={spec!r}: the stall and the period must be positive")
+    if ms < 5:
+        # (the guest's self-test sleeps 1 ms at a time: a shorter stall could not be told from an ordinary late sleep)
+        raise SystemExit(f"OS_HOST_STALL={spec!r}: the stall must be at least 5 ms")
     if period < 2 * ms:
         # (the shortest gap is half a period: below 2 * ms the emulator would be stopped more than it runs)
         raise SystemExit(f"OS_HOST_STALL={spec!r}: the period must be at least twice the stall")
@@ -48,8 +51,8 @@ def parse(spec):
 class HostStall:
     """Stops and continues `pid` from a thread of its own until `stop()`. `emit(line)` receives each `##HOSTSTALL` line."""
 
-    def __init__(self, pid, spec, emit):
-        self.pid = pid
+    def __init__(self, proc, spec, emit):
+        self.proc = proc  # (a Popen: its `send_signal` skips a process already reaped, whose pid may have been reused)
         self.ms, self.period, self.seed = parse(spec)
         self.emit = emit
         self.rng = random.Random(self.seed)
@@ -65,30 +68,33 @@ class HostStall:
     def _run(self):
         while not self.done.wait(self.rng.uniform(self.period / 2, 3 * self.period / 2) / 1000):
             t0 = time.monotonic()
-            try:
-                os.kill(self.pid, signal.SIGSTOP)
-            except ProcessLookupError:
+            if not self._signal(signal.SIGSTOP):
                 return
             try:
                 # (not `done.wait`: a stop asked for during a stall still lets the stall end at its length, then continues the process)
                 time.sleep(self.ms / 1000)
             finally:
-                try:
-                    os.kill(self.pid, signal.SIGCONT)
-                except ProcessLookupError:
+                if not self._signal(signal.SIGCONT):
                     return
             t1 = time.monotonic()
             self.stalls.append((t0 - self.started, (t1 - t0) * 1000))
             self.emit(f"##HOSTSTALL {t0 - self.started:.3f} {(t1 - t0) * 1000:.3f}\n".encode())
 
+    def _signal(self, sig):
+        """Signal the process if it has not exited; False once it has."""
+        if self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.send_signal(sig)
+            return True
+        except ProcessLookupError:
+            return False
+
     def stop(self):
         """End the injection; the process is left running (a stall under way finishes first)."""
         self.done.set()
         self.thread.join(timeout=5 + self.ms / 1000)
-        try:
-            os.kill(self.pid, signal.SIGCONT)
-        except ProcessLookupError:
-            pass
+        self._signal(signal.SIGCONT)
 
     def summary(self):
         if not self.stalls:
@@ -101,7 +107,7 @@ class HostStall:
 def from_env(proc, emit):
     """The injector `OS_HOST_STALL` asks for, started on `proc`, or None."""
     spec = os.environ.get("OS_HOST_STALL")
-    return HostStall(proc.pid, spec, emit).start() if spec else None
+    return HostStall(proc, spec, emit).start() if spec else None
 
 
 def boot_arg():
@@ -131,7 +137,7 @@ def self_test():
     # the spec's rules
     results["a full spec is read"] = parse("20:200:7") == (20, 200, 7)
     results["the period and seed default"] = parse("5") == (5, 1000, 1)
-    for bad in ("", "x", "20:", "0:100", "20:30", "1:2:3:4", "-5:100"):
+    for bad in ("", "x", "20:", "0:100", "4:100", "20:30", "1:2:3:4", "-5:100"):
         try:
             parse(bad)
             results[f"{bad!r} is refused"] = False
@@ -143,7 +149,7 @@ def self_test():
     # the stall lands: a child that reads its clock sees a gap at least the stall's length, and each stall is reported
     child = subprocess.Popen([sys.executable, "-I", "-c", CHILD, "1.2"], stdout=subprocess.PIPE, text=True)
     lines = []
-    inj = HostStall(child.pid, "150:400:5", lambda l: lines.append(l.decode())).start()
+    inj = HostStall(child, "150:400:5", lambda l: lines.append(l.decode())).start()
     out, _ = child.communicate(timeout=30)
     inj.stop()
     worst = float(out.strip() or 0)

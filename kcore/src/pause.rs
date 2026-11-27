@@ -77,14 +77,15 @@ impl HartRing {
         self.next.store(i.wrapping_add(1) % RING, Ordering::Release);
     }
 
-    /// How long (microseconds) the kept samples say the hart was not taking its interrupt inside `[start_us, end_us]`: the sum of
-    /// each sample's span `[arrival - late, arrival]` clipped to the window.
-    pub fn paused_in(&self, start_us: u64, end_us: u64) -> u64 {
+    /// How long (microseconds) the kept samples at least `min_late_us` late say the hart was not taking its interrupt inside
+    /// `[start_us, end_us]`: the sum of each sample's span `[arrival - late, arrival]` clipped to the window.
+    pub fn paused_in(&self, start_us: u64, end_us: u64, min_late_us: u64) -> u64 {
         self.slots
             .iter()
             .map(|s| s.load(Ordering::Acquire))
             .filter(|&w| w != 0)
             .map(unpack)
+            .filter(|&(_, late)| late >= min_late_us)
             .map(|(at, late)| overlap(at.saturating_sub(late), at, start_us, end_us))
             .fold(0u64, u64::saturating_add)
     }
@@ -135,17 +136,51 @@ pub fn worst_of<'a>(
         .max_by_key(|&(_, late)| late)
 }
 
-/// The pause time of several harts' rings inside a window, summed (microseconds): what a test that bills by the clock must allow
-/// for, since a hart that was not run was still charged to the thread it was running.
+/// The pause time of several harts' rings inside a window, summed (microseconds), counting only samples at least `min_late_us` late
+/// (an emulator's ordinary lateness of a few hundred microseconds is a hart that ran, not one that was stopped): what a test that
+/// bills by the clock must allow for, since a hart that was not run was still charged to the thread it was running.
 pub fn paused_total<'a>(
     rings: impl IntoIterator<Item = &'a HartRing>,
     start_us: u64,
     end_us: u64,
+    min_late_us: u64,
 ) -> u64 {
     rings
         .into_iter()
-        .map(|r| r.paused_in(start_us, end_us))
+        .map(|r| r.paused_in(start_us, end_us, min_late_us))
         .fold(0u64, u64::saturating_add)
+}
+
+/// Whether a pause covers a window, as a timing test judges it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cover {
+    /// No hart took an interrupt more than the bound late inside the window.
+    None,
+    /// Only one hart of several did (hart, microseconds late): a hart that ran with interrupts off for that long looks the same, so
+    /// it does not excuse the window (a failure message names it, so a single-vCPU stall of the host is still diagnosable).
+    OneHart { hart: usize, late_us: u64 },
+    /// The emulator stopped (at least two harts were that late inside the window, or the only hart of a one-hart machine): the worst
+    /// (hart, microseconds late). The window says nothing about the kernel.
+    Pause { hart: usize, late_us: u64 },
+}
+
+/// Judge a window against `bound_us`: a pause covers it only when it is seen on two harts (one, on a one-hart machine). A pause of
+/// the host stops every vCPU at once (the injector stops the whole process); a kernel that holds interrupts off, waits for a lock in
+/// the timer handler, or delays a wake, does it on one hart, so the rule cannot excuse it on a machine of several harts.
+pub fn covering(rings: &[HartRing], start_us: u64, end_us: u64, bound_us: u64) -> Cover {
+    let mut late: alloc::vec::Vec<(usize, u64)> = rings
+        .iter()
+        .enumerate()
+        .map(|(h, r)| (h, r.worst_in(start_us, end_us)))
+        .filter(|&(_, l)| l > bound_us)
+        .collect();
+    late.sort_unstable_by_key(|&(_, l)| core::cmp::Reverse(l));
+    let need = if rings.len() >= 2 { 2 } else { 1 };
+    match late.first() {
+        None => Cover::None,
+        Some(&(hart, late_us)) if late.len() >= need => Cover::Pause { hart, late_us },
+        Some(&(hart, late_us)) => Cover::OneHart { hart, late_us },
+    }
 }
 
 /// The length of `[a0, a1]` inside `[b0, b1]` (0 when they do not meet).

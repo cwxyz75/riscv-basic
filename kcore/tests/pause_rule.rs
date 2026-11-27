@@ -5,8 +5,8 @@
 //! it, and the third such window in a row fails the test; a window with no such pause is always kept, however late its own sample.
 
 use kcore::pause::{
-    covers, decode, encode, overlap, pack, parse_stall_arg, paused_total, rearm, unpack, worst_of,
-    HartRing, Resampler, Verdict, FLOOR_US, MAX_COVERED_IN_A_ROW, RING,
+    covering, covers, decode, encode, overlap, pack, parse_stall_arg, paused_total, rearm, unpack,
+    worst_of, Cover, HartRing, Resampler, Verdict, FLOOR_US, MAX_COVERED_IN_A_ROW, RING,
 };
 
 /// A small deterministic generator (xorshift64*), so a failing case can be replayed from its seed.
@@ -93,7 +93,7 @@ fn the_ring_keeps_the_newest_samples_above_the_floor() {
                 .map(|&&(a, l)| overlap(a.saturating_sub(l), a, s, e))
                 .sum();
             assert_eq!(
-                ring.paused_in(s, e),
+                ring.paused_in(s, e, 0),
                 total,
                 "round {round}, window [{s}, {e}]"
             );
@@ -123,7 +123,7 @@ fn the_worst_of_several_harts_names_the_hart() {
     assert_eq!(worst_of(&rings, 59_000, 61_000), Some((2, 30_000)));
     assert_eq!(worst_of(&rings, 53_000, 56_000), None);
     // the time the harts were not run, summed: hart 3's [40_000, 52_000] and hart 1's [57_000, 58_000] inside [40_000, 58_000]
-    assert_eq!(paused_total(&rings, 40_000, 58_000), 12_000 + 1_000);
+    assert_eq!(paused_total(&rings, 40_000, 58_000, 0), 12_000 + 1_000);
 }
 
 #[test]
@@ -334,4 +334,54 @@ fn a_re_arm_does_not_hide_an_interrupt_already_due() {
             assert_eq!(due, if pending { old } else { now });
         }
     }
+}
+
+#[test]
+fn a_pause_covers_a_window_only_when_two_harts_saw_it() {
+    let rings: Vec<HartRing> = (0..4).map(|_| HartRing::new()).collect();
+    assert_eq!(covering(&rings, 0, 100_000, 4_000), Cover::None);
+    // one hart late: a hart that ran with interrupts off looks the same, so the window is not excused
+    rings[0].record(50_000, 9_000);
+    assert_eq!(
+        covering(&rings, 45_000, 50_000, 4_000),
+        Cover::OneHart {
+            hart: 0,
+            late_us: 9_000
+        }
+    );
+    // a second hart late below the bound does not corroborate it
+    rings[2].record(50_100, 3_000);
+    assert_eq!(
+        covering(&rings, 45_000, 50_000, 4_000),
+        Cover::OneHart {
+            hart: 0,
+            late_us: 9_000
+        }
+    );
+    // a second hart late above it does: the emulator stopped
+    rings[3].record(50_200, 12_000);
+    assert_eq!(
+        covering(&rings, 45_000, 50_000, 4_000),
+        Cover::Pause {
+            hart: 3,
+            late_us: 12_000
+        }
+    );
+    // on a machine of one hart, the one hart is enough
+    let one = [HartRing::new()];
+    one[0].record(50_000, 9_000);
+    assert_eq!(
+        covering(&one, 45_000, 50_000, 4_000),
+        Cover::Pause {
+            hart: 0,
+            late_us: 9_000
+        }
+    );
+    // the billing allowance counts only samples late enough to be a stopped hart
+    // (hart 3's span [38_200, 50_200] is clipped to the window's start)
+    assert_eq!(paused_total(&rings, 40_000, 60_000, 5_000), 9_000 + 10_200);
+    assert_eq!(
+        paused_total(&rings, 40_000, 60_000, 0),
+        9_000 + 3_000 + 10_200
+    );
 }

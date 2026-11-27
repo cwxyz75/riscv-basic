@@ -10,7 +10,12 @@
 //! timing tests: a wake that the scheduler delayed after an interrupt taken on time (no pause), from a wake that came late because the
 //! interrupt itself came late (a pause).
 //!
-//! `debug_stat` 216 and 217 read it from user mode (test kernels only; SYSCALLS.md).
+//! What tells the two apart is that a pause of the host stops every vCPU at once: a window counts as covered only when two harts took
+//! an interrupt that late inside it (`kcore::pause::covering`; on a one-hart machine the one hart), while a kernel that holds
+//! interrupts off, waits for a lock in the timer handler or delays a wake does it on one hart. Two helpers keep every hart able to be
+//! late: after taking a timer interrupt a hart arms a sentinel 1 ms ahead until its handler arms the next event, and while a test
+//! watches (`watch`) every hart keeps a deadline at most 1 ms ahead (a heartbeat). The recording runs in every kernel (one `time` read
+//! and a few relaxed atomics per arm); only the readout is for test kernels: `debug_stat` 216 to 218 (SYSCALLS.md).
 
 use crate::percpu::MAX_HARTS;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +33,8 @@ static WATCH_UNTIL: AtomicU64 = AtomicU64::new(0);
 const HEARTBEAT_NS: u64 = 1_000_000;
 /// How far ahead the sentinel is that `timer_taken` arms until the handler arms the real next event.
 const SENTINEL_NS: u64 = 1_000_000;
+/// The same in counter cycles, computed once (the counter's rate is fixed at boot).
+static SENTINEL_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 fn hart() -> usize {
     crate::percpu::this().index.load(Ordering::Relaxed) % MAX_HARTS
@@ -71,27 +78,42 @@ pub fn timer_taken() {
     if armed != u64::MAX && now >= armed {
         record(h, now, now.saturating_sub(armed));
     }
-    let sentinel = now.saturating_add(crate::timer::cycles_from_ns(SENTINEL_NS));
+    let mut ahead = SENTINEL_CYCLES.load(Ordering::Relaxed);
+    if ahead == 0 {
+        ahead = crate::timer::cycles_from_ns(SENTINEL_NS).max(1);
+        SENTINEL_CYCLES.store(ahead, Ordering::Relaxed);
+    }
+    let sentinel = now.saturating_add(ahead);
     a.store(sentinel, Ordering::Relaxed);
     crate::timer::write_raw(sentinel);
 }
 
 /// A timing test measures for the next `ns` nanoseconds (0: it has finished): every hart keeps a deadline at most 1 ms ahead meanwhile.
+/// The other harts are told at once (a reschedule interrupt, whose handler re-arms through `thread::program_timer`): a hart that runs a
+/// lone thread with nothing armed, or idles with nothing armed, would otherwise not re-arm until something else woke it. This hart
+/// re-arms at its next switch or interrupt.
 pub fn watch(ns: u64) {
     WATCH_UNTIL.store(
         if ns == 0 {
             0
         } else {
-            crate::timer::now_ns().saturating_add(ns)
+            crate::timer::now_ns().saturating_add(ns).max(1)
         },
         Ordering::Relaxed,
     );
+    if ns != 0 {
+        crate::smp::kick_others();
+    }
 }
 
 /// The event a hart arms (`thread::program_timer`): `ev`, or at most a heartbeat ahead while a test watches.
 pub fn cap(ev: Option<u64>) -> Option<u64> {
+    let until = WATCH_UNTIL.load(Ordering::Relaxed);
+    if until == 0 {
+        return ev; // (no test watches: no clock read on the common path)
+    }
     let now = crate::timer::now_ns();
-    if now >= WATCH_UNTIL.load(Ordering::Relaxed) {
+    if now >= until {
         return ev;
     }
     let beat = now.saturating_add(HEARTBEAT_NS);
@@ -104,14 +126,24 @@ fn rings() -> &'static [HartRing] {
         .unwrap_or(&[])
 }
 
-/// The worst pause of any hart that overlaps `[start_ns, end_ns]` (the `now_ns` clock): (hart, microseconds late), or None.
-pub fn worst_in(start_ns: u64, end_ns: u64) -> Option<(usize, u64)> {
-    kcore::pause::worst_of(rings(), start_ns / 1000, end_ns.div_ceil(1000))
+/// Whether a pause covers `[start_ns, end_ns]` (the `now_ns` clock) for a test whose bound is `bound_us`: seen on two harts (on a
+/// one-hart machine, the one), `kcore::pause::covering`.
+pub fn covering(start_ns: u64, end_ns: u64, bound_us: u64) -> kcore::pause::Cover {
+    kcore::pause::covering(rings(), start_ns / 1000, end_ns.div_ceil(1000), bound_us)
 }
 
-/// How long, summed over the harts, the harts were not taking their timer interrupts inside `[start_ns, end_ns]` (microseconds).
+/// Samples less late than this are not counted by `paused_in`: the emulator's ordinary lateness is a hart that ran.
+const PAUSED_MIN_US: u64 = 2_000;
+
+/// How long, summed over the harts, the harts were not taking their timer interrupts inside `[start_ns, end_ns]` (microseconds),
+/// counting only samples at least 2 ms late.
 pub fn paused_in(start_ns: u64, end_ns: u64) -> u64 {
-    kcore::pause::paused_total(rings(), start_ns / 1000, end_ns.div_ceil(1000))
+    kcore::pause::paused_total(
+        rings(),
+        start_ns / 1000,
+        end_ns.div_ceil(1000),
+        PAUSED_MIN_US,
+    )
 }
 
 /// Print `##PAUSE <test> hart <h> late <us> us` (`kcore::testlog::pause`): a window of `test` that a pause covered.
