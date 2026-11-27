@@ -458,6 +458,9 @@ pub mod switch {
         pub fn new(entry: fn(usize), arg: usize, stack_top: usize) -> alloc::boxed::Box<Context> {
             unimplemented!()
         }
+        pub fn saved(&self) -> (u64, u64) {
+            (0, 0)
+        }
     }
     /// # Safety
     /// `old` is the running thread's context slot and `new` a context that was saved by `switch` or made by `Context::new`, neither borrowed elsewhere; interrupts are off. (A stub: AR1c.)

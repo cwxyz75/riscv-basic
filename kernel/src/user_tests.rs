@@ -201,6 +201,7 @@ pub fn run_all() -> Report {
     let frames_terms = frame_terms();
     let vmos_before = crate::irq::without(|| kmem::get().vmos.count());
     let threads_before = thread::thread_count();
+    let tids_before = thread::tids();
     let code = (|| -> Result<i32, String> {
         let (pid, tid) = user::start(
             user::SUITE_ELF,
@@ -279,6 +280,9 @@ pub fn run_all() -> Report {
         {
             Ok(())
         } else {
+            // (T278: the survivors name themselves, and each thread says where it waits, before the summary)
+            user::report_processes();
+            thread::report_threads(&tids_before);
             Err(format!(
                 "{} processes and {} VMOs left (wanted 0 and {vmos_before}), {} futex sleepers, {} pager waiters or pagers; (jobs, \
                  processes, threads) {:?}, wanted (1, 0, 0, 0, 0, 0); device domains, I/O-mapped pages, leaked holds {:?}; vectors live and                  leaked {:?}",
@@ -298,6 +302,7 @@ pub fn run_all() -> Report {
         if thread::thread_count() == threads_before {
             Ok(())
         } else {
+            thread::report_threads(&tids_before);
             Err(format!(
                 "kernel threads {} -> {}",
                 threads_before,

@@ -276,6 +276,121 @@ pub fn process_count() -> usize {
     locked_state(|s| s.procs.len())
 }
 
+/// The kinds of kernel object a leak report counts, by [`kind_index`] (the last: a handle whose object is gone).
+const KIND_NAMES: [&str; 15] = [
+    "channel",
+    "event",
+    "vmo",
+    "process",
+    "thread",
+    "exception",
+    "pager",
+    "socket",
+    "port",
+    "job",
+    "interrupt",
+    "resource",
+    "iodomain",
+    "debug",
+    "gone",
+];
+
+/// [`KIND_NAMES`]'s index for a handle whose object is gone.
+const KIND_GONE: usize = 14;
+
+fn kind_index(o: &ipc::KObj) -> usize {
+    use ipc::KObj as K;
+    match o {
+        K::Channel(_) => 0,
+        K::Event(_) => 1,
+        K::Vmo(_) => 2,
+        K::Process(_) => 3,
+        K::Thread(_) => 4,
+        K::Exception(_) => 5,
+        K::Pager(_) => 6,
+        K::Socket(_) => 7,
+        K::Port(_) => 8,
+        K::Job(_) => 9,
+        K::Interrupt(_) => 10,
+        K::Resource => 11,
+        K::IoDomain(_) => 12,
+        K::Debug => 13,
+    }
+}
+
+/// Print every process that exists (a leak test's failure report, T278): what it is waiting for to be torn down. The report is built
+/// under the lock and printed after it.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a failure-only report of the leak checks, run once on the boot thread's stack after init has ended
+pub fn report_processes() {
+    use core::fmt::Write as _;
+    let lines: alloc::vec::Vec<alloc::string::String> = locked_state(|s| {
+        // (every live kernel object by kind, and each process object with the process it names and whether it ended: which process
+        // handle is what keeps a process alive)
+        let mut live = [0usize; KIND_NAMES.len()];
+        let mut process_objs = alloc::vec::Vec::new();
+        for o in s.objs.live_ids() {
+            let Some(obj) = s.objs.get(o) else { continue };
+            if let Some(c) = live.get_mut(kind_index(obj)) {
+                *c = c.saturating_add(1);
+            }
+            if let ipc::KObj::Process(po) = obj {
+                process_objs.push((o, po.pid, po.terminated));
+            }
+        }
+        let live: alloc::vec::Vec<(&str, usize)> = KIND_NAMES
+            .iter()
+            .zip(live)
+            .filter(|&(_, n)| n > 0)
+            .map(|(&k, n)| (k, n))
+            .collect();
+        let summary = alloc::format!(
+            "leak: live objects {live:?}; process objects (object, pid, ended) {process_objs:?}"
+        );
+        core::iter::once(summary)
+            .chain(s.procs.iter()
+            .map(|(pid, p)| {
+                // (what its handles name, by kind: a fingerprint of which program it is, since a process has no name)
+                let mut kinds = [0usize; KIND_NAMES.len()];
+                for o in p.handles.objects() {
+                    let k = s.objs.get(o).map_or(KIND_GONE, kind_index);
+                    if let Some(c) = kinds.get_mut(k) {
+                        *c = c.saturating_add(1);
+                    }
+                }
+                let held: alloc::vec::Vec<(&str, usize)> = KIND_NAMES
+                    .iter()
+                    .zip(kinds)
+                    .filter(|&(_, n)| n > 0)
+                    .map(|(&k, n)| (k, n))
+                    .collect();
+                alloc::format!(
+                    "leak: proc {pid}: state {:?} detached {} privileged {} killed {:?} exit {:?} stopped {} threads alive {} live {:?} \
+                     handles {} {held:?} vmos {} job {:?} object {:?} bootstrap end {:?} exception channel {:?} entry {:#x}",
+                    p.state,
+                    p.detached,
+                    p.privileged,
+                    p.killed,
+                    p.exit_code,
+                    p.stopped,
+                    p.threads_alive,
+                    p.live_tids.iter().collect::<alloc::vec::Vec<_>>(),
+                    p.handles.len(),
+                    p.vmos.len(),
+                    p.job,
+                    p.obj,
+                    p.kernel_end,
+                    p.exc_channel,
+                    p.entry
+                )
+            }))
+            .collect()
+    });
+    let mut out = crate::console::Console;
+    for l in lines {
+        let _ = writeln!(out, "{l}");
+    }
+}
+
 /// Threads sleeping on a futex (for leak checks).
 pub fn futex_sleepers() -> usize {
     futex_table().len()
