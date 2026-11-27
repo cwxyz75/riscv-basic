@@ -16,31 +16,51 @@
 //! the manager enumerates bus 0 of the ECAM host the device tree names (`resource_dtb`, `kcore::iommutree`), with `pcicore` for
 //! every byte it reads: it sizes and assigns every function's memory BARs in the host's 32-bit window (no firmware does it on
 //! QEMU `virt`), turns memory decoding on, **disables INTx in every function's command register** and leaves bus mastering off.
-//! It never hands out configuration space. It prints one line per function, `## devmgr: pci <bb:dd.f> <vendor>:<device>
-//! class=<cccccc> <claimable | not-claimable <why> | refused <why>>`, then `## devmgr: pci functions=<n>`, which the boot script
-//! checks against the devices it put on the command line.
+//! It never hands out configuration space. It maps each function's MSI-X table BAR (and pending-bit BAR) privately. It prints one
+//! line per function, `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable msix=<entries>[ table-with-registers] |
+//! not-claimable <why> | refused <why>>`, then `## devmgr: pci functions=<n>`, which the boot script checks against the devices it
+//! put on the command line (`table-with-registers`: the MSI-X table or its pending bits share the BAR the driver is handed, so the
+//! manager cannot keep them from the driver; the IOMMU confines the device either way, IOMMU-SPEC 9).
+//!
+//! **The class plan** (`pcicore::claim`, a table in the source): block, the configuration change and one queue; network, the
+//! configuration change, receive and transmit; entropy, its one queue. Entry 0 of the MSI-X table is the configuration change and
+//! entry `n + 1` queue `n`; a function whose table is smaller than its class needs is not claimable, and says so.
+//!
+//! **The order of bring-up and teardown** (IOMMU-SPEC 9 and 10; the kernel does not rely on it, IOMMU6 and IOMMU7 order the safe part
+//! themselves; it keeps the fault log quiet). Up: the driver job's limits, the domain, the DMA VMOs, the vector grants, the MSI-X
+//! table programmed and MSI-X enabled, the driver's handles, bus mastering last; the driver then maps and starts. Down: MSI-X
+//! function mask and disable, bus mastering off, the device reset (and a function-level reset where offered), the domain destroyed
+//! (vectors revoked and mappings removed by the kernel), the interrupt handles closed.
 //!
 //! **The claim**, in the specification's order, each step a precondition of the next (`ClaimPci`, which carries the driver's job):
 //! 1. refuse, loudly, a function without MSI-X (8.6), a virtio function that does not offer `VIRTIO_F_ACCESS_PLATFORM` (15.1 L1),
-//!    one whose configuration space `pcicore` refused, or one of a class this manager has no plan for; bus mastering stays off;
-//!    and refuse (`Busy`) a function already claimed, or a driver job that already holds a claim (one function per job);
-//! 2. reset the device (10.4: it may have been left running; loud if it does not complete), set finite limits on the driver's job (`job_set_io_limits`: the I/O-mapped pages of the class's DMA plan, and the
-//!    function's MSI-X table size in vectors), then `iodomain_create` for the function's requester id, naming that job;
+//!    one whose configuration space `pcicore` refused, one of a class this manager has no plan for, or one whose MSI-X table is
+//!    smaller than its class needs; bus mastering stays off; and refuse (`Busy`) a function already claimed, or a driver job that
+//!    already holds a claim (one function per job);
+//! 2. reset the device (10.4: it may have been left running; loud if it does not complete), set **finite limits of both kinds** on
+//!    the driver's job (`job_set_io_limits`: the pages of the class's DMA VMOs with a small margin, and exactly the class's vectors;
+//!    hierarchical, so a job the driver makes is bound by them), then `iodomain_create` for the function's requester id, naming
+//!    that job;
 //! 3. create the driver's DMA VMOs (`vmo_create_dma_in`, charged to the driver's job);
-//! 4. (the vectors, MSI-X programmed with the function masked, INTx disabled, MSI-X enabled: IOMMU9);
+//! 4. grant the class's vectors (`iodomain_grant_vector`, with the control handle), and program the MSI-X table with the pairs the
+//!    kernel returned with the function masked, every other entry masked and cleared, INTx disabled, MSI-X enabled
+//!    (`pcicore::msix_enable`); a claim gets every vector of its class or fails whole, with a loud line
+//!    (`## devmgr: pci <bb:dd.f> claim failed <what>`), never a shared vector;
 //! 5. hand the driver its authority: a VMO over the BAR with the virtio structures, its **duplicate of the domain handle with
-//!    IO_MAP and IO_UNMAP only** (and TRANSFER), and its DMA VMOs; no I/O address travels (the driver maps its buffers itself);
+//!    IO_MAP and IO_UNMAP only** (and TRANSFER), its DMA VMOs, and a duplicate of each interrupt handle that can wait and
+//!    acknowledge only (and TRANSFER); no I/O address travels (the driver maps its buffers itself);
 //! 6. **bus mastering last**, once the reply is sent; then a second message (`txid | Ok`) tells the driver it may start the device.
 //!
-//! The manager keeps the domain's control handle and maps nothing into the domain.
+//! The manager keeps the domain's control handle and its own interrupt handles, and maps nothing into the domain.
 //!
-//! **Teardown** when the claimant's connection closes (its driver exited or was killed: 10.1, 10.2): bus mastering off, MSI-X
-//! masked and disabled, the device reset (virtio status 0, read back) and a function-level reset where the function advertises
-//! one (waited for, and the BARs programmed again), then `iodomain_destroy`, which removes every mapping the driver made. A reset
-//! that does not complete, or a domain that cannot be destroyed, is said on the console (`## devmgr: pci <bb:dd.f> reset failed
-//! <what>`, `## devmgr: pci <bb:dd.f> teardown failed <what>`), never passed over. Nothing is
-//! kept for the next driver: a re-claim makes a new domain (10.4, OD166 point 2). None of this is a safety property (the kernel's
-//! ordering is, IOMMU-SPEC 6.3); it keeps the device working and the fault log quiet.
+//! **Teardown** when the claimant's connection closes (its driver exited or was killed: 10.1, 10.2): MSI-X masked and disabled and
+//! the table cleared, bus mastering off, the device reset (virtio status 0, read back) and a function-level reset where the
+//! function advertises one (waited for, and the BARs programmed again), then `iodomain_destroy`, which revokes every vector and
+//! removes every mapping the driver made, and the manager's interrupt handles are closed. A reset that does not complete, or a
+//! domain that cannot be destroyed, is said on the console (`## devmgr: pci <bb:dd.f> reset failed <what>`, `## devmgr: pci
+//! <bb:dd.f> teardown failed <what>`), never passed over. Nothing is kept for the next driver: a re-claim makes a new domain and
+//! grants afresh (10.4, OD166 point 2). None of this is a safety property (the kernel's ordering is, IOMMU-SPEC 6.3, 10.6); it
+//! keeps the device working and the fault log quiet.
 #![no_std]
 #![no_main]
 
@@ -358,12 +378,81 @@ impl virtio::Regs for BarRegs {
     }
 }
 
-/// A live claim: the claimant's connection, the driver's job (its koid: one function per job), and the domain's control handle
-/// (kept by the manager: destroy, grant, faults).
+/// A live claim: the claimant's connection, the driver's job (its koid: one function per job), and what the manager keeps of it:
+/// the domain's control handle (destroy, grant, faults) and its own interrupt handles (the DMA VMOs went to the driver).
 struct PciClaimed {
     key: u64,
     job: u64,
-    domain: u64,
+    claim: pcicore::claim::Claim,
+}
+
+/// The kernel calls of a claim (`pcicore::claim::Kernel`), for one function and one driver job.
+struct SysKernel {
+    res: u64,
+    rid: u16,
+    job: u64,
+}
+
+impl pcicore::claim::Kernel for SysKernel {
+    fn set_io_limits(&mut self, pages: u64, vectors: u64) -> bool {
+        sys::job_set_io_limits(self.job, pages, vectors).status == 0
+    }
+    fn domain_create(&mut self) -> Option<u64> {
+        let r = sys::iodomain_create(self.res, u64::from(self.rid), self.job);
+        (r.status == 0).then_some(r.a1 as u64)
+    }
+    fn dma_create(&mut self, pages: u32) -> Option<u64> {
+        let r = sys::vmo_create_dma_in(self.res, u64::from(pages), self.job);
+        (r.status == 0).then_some(r.a1 as u64)
+    }
+    fn grant(&mut self, domain: u64, index: u16) -> Option<(u64, u64)> {
+        let r = sys::iodomain_grant_vector(domain, u64::from(index));
+        (r.status == 0).then_some((r.a1 as u64, r.a2 as u64))
+    }
+    fn domain_destroy(&mut self, domain: u64) -> bool {
+        sys::iodomain_destroy(domain).status == 0
+    }
+    fn close(&mut self, h: u64) {
+        sys::handle_close(h);
+    }
+}
+
+/// A BAR mapped in this process: (its register index, where, its span).
+type MappedBar = (u8, u64, u64);
+
+/// The function's configuration page and its mapped BARs, for `pcicore`'s MSI-X sequence. A BAR access outside a mapping, or not
+/// aligned, is not made (a read gives all ones): `pcicore` checks the table against the BAR's size first, so this is a backstop.
+struct DevAccess<'a> {
+    cfg: u64,
+    maps: &'a [MappedBar],
+}
+
+impl DevAccess<'_> {
+    fn at(&self, bar: u8, off: u64) -> Option<u64> {
+        let &(_, va, span) = self.maps.iter().find(|m| m.0 == bar)?;
+        (off.is_multiple_of(4) && off.checked_add(4)? <= span).then_some(va + off)
+    }
+}
+
+impl pcicore::MsixAccess for DevAccess<'_> {
+    fn cfg_read16(&mut self, off: u16) -> u16 {
+        cfg_rd16(self.cfg, off)
+    }
+    fn cfg_write16(&mut self, off: u16, v: u16) {
+        cfg_wr16(self.cfg, off, v)
+    }
+    fn bar_read32(&mut self, bar: u8, off: u64) -> u32 {
+        // SAFETY: `at` gives an address only inside a BAR this process mapped read-write for as long as the manager runs, aligned.
+        self.at(bar, off).map_or(u32::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u32)
+        })
+    }
+    fn bar_write32(&mut self, bar: u8, off: u64, v: u32) {
+        if let Some(a) = self.at(bar, off) {
+            // SAFETY: as `bar_read32`.
+            unsafe { core::ptr::write_volatile(a as *mut u32, v) }
+        }
+    }
 }
 
 /// One enumerated function.
@@ -380,38 +469,40 @@ struct PciDev {
     /// For a virtio function: its virtio BAR mapped here (address, span), and whether it offers ACCESS_PLATFORM.
     regs: Option<(u64, u64)>,
     access_platform: bool,
+    /// The BARs mapped here: the virtio structures', the MSI-X table's and the pending bits' (each once).
+    maps: Vec<MappedBar>,
     claim: Option<PciClaimed>,
 }
 
 impl PciDev {
-    /// The pages of each DMA VMO a driver of this function gets, or why it is not claimable.
-    fn plan(&self) -> Result<Vec<u32>, &'static str> {
+    /// The plan of the driver class of this function, or why it is not claimable.
+    fn plan(&self) -> Result<&'static pcicore::claim::Plan, alloc::string::String> {
         let f = self
             .desc
             .as_ref()
-            .map_err(|_| "its configuration space was refused")?;
-        if f.msix.is_none() {
-            return Err("no MSI-X capability");
-        }
+            .map_err(|_| alloc::string::String::from("its configuration space was refused"))?;
+        let Some(m) = f.msix else {
+            return Err("no MSI-X capability".into());
+        };
         let Some((id, _)) = f.virtio else {
-            return Err("no driver class");
+            return Err("no driver class".into());
         };
         if self.regs.is_none() || !self.access_platform {
-            return Err("no VIRTIO_F_ACCESS_PLATFORM");
+            return Err("no VIRTIO_F_ACCESS_PLATFORM".into());
         }
-        match id {
-            // the rings, the data pages
-            virtio::blk::DEVICE_ID => Ok(alloc::vec![1, 4]),
-            // the rings, the bytes it fills (as the mmio claim, S9 step 5)
-            4 => Ok(alloc::vec![1, 1]),
-            // the queues, the receive pool, the transmit pool (NET-SPEC 4.3, 5.1)
-            1 => Ok(alloc::vec![
-                NET_QUEUE_PAGES as u32,
-                NET_RX_PAGES as u32,
-                NET_TX_PAGES as u32
-            ]),
-            _ => Err("no driver class"),
+        let plan = pcicore::claim::for_virtio(id).ok_or("no driver class")?;
+        if m.table_size < plan.table_needed() {
+            return Err(alloc::format!(
+                "MSI-X table of {} entries, the {} class needs {}",
+                m.table_size,
+                plan.class,
+                plan.table_needed()
+            ));
         }
+        if !self.maps.iter().any(|b| b.0 == m.table_bar) {
+            return Err("its MSI-X table could not be mapped".into());
+        }
+        Ok(plan)
     }
 
     fn flags(&self) -> u16 {
@@ -575,6 +666,7 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
                 bars: Vec::new(),
                 regs: None,
                 access_platform: false,
+                maps: Vec::new(),
                 claim: None,
             });
             if func == 0 && !h.multifunction {
@@ -609,23 +701,42 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
     let mut next_va = PCI_BAR_VA;
     for d in &mut devs {
         d.program();
-        // a virtio function: map its virtio BAR here, and ask whether it offers ACCESS_PLATFORM (reset, acknowledge, read the
-        // features, reset again: nothing is accepted and the device never runs)
+        // the BARs this manager touches, mapped here: the MSI-X table's and the pending bits' (kept from every driver where they
+        // have a BAR of their own), and a virtio function's structures
+        let Ok(f) = &d.desc else {
+            continue;
+        };
+        let mut want: Vec<u8> = Vec::new();
+        want.extend(f.virtio.map(|(_, l)| l.bar));
+        want.extend(f.msix.iter().flat_map(|m| [m.table_bar, m.pba_bar]));
+        for idx in want {
+            if d.maps.iter().any(|m| m.0 == idx) {
+                continue;
+            }
+            let Some(&bar) = d.bars.iter().find(|a| a.index == idx) else {
+                continue;
+            };
+            let vmo = sys::vmo_create_physical(res, bar.addr, bar.span);
+            if vmo.status != 0 {
+                continue;
+            }
+            let vmo = vmo.a1 as u64;
+            let ok = sys::process_map(me, vmo, next_va, 0, bar.span, PF_RW).status == 0;
+            sys::handle_close(vmo);
+            if ok {
+                d.maps.push((idx, next_va, bar.span));
+                next_va += bar.span;
+            }
+        }
+        // a virtio function: ask whether it offers ACCESS_PLATFORM (reset, acknowledge, read the features, reset again: nothing
+        // is accepted and the device never runs)
         let Some(&bar) = d.virtio_bar() else {
             continue;
         };
-        let vmo = sys::vmo_create_physical(res, bar.addr, bar.span);
-        if vmo.status != 0 {
+        let Some(&(_, va, span)) = d.maps.iter().find(|m| m.0 == bar.index) else {
             continue;
-        }
-        let vmo = vmo.a1 as u64;
-        let ok = sys::process_map(me, vmo, next_va, 0, bar.span, PF_RW).status == 0;
-        sys::handle_close(vmo);
-        if !ok {
-            continue;
-        }
-        d.regs = Some((next_va, bar.span));
-        next_va += bar.span;
+        };
+        d.regs = Some((va, span));
         if let Some(mut t) = d.transport() {
             if virtio_reset(&mut t).is_ok() {
                 t.set_status(virtio::status::ACKNOWLEDGE);
@@ -648,7 +759,16 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
         );
         match (&d.desc, d.plan()) {
             (Err(e), _) => line.push_str(&alloc::format!("refused {e:?}")),
-            (Ok(_), Ok(_)) => line.push_str("claimable"),
+            (Ok(f), Ok(_)) => {
+                let m = f.msix.map_or(0, |m| m.table_size);
+                line.push_str(&alloc::format!("claimable msix={m}"));
+                let regs = f.virtio.map(|(_, l)| l.bar);
+                if f.msix
+                    .is_some_and(|m| Some(m.table_bar) == regs || Some(m.pba_bar) == regs)
+                {
+                    line.push_str(" table-with-registers");
+                }
+            }
             (Ok(_), Err(why)) => line.push_str(&alloc::format!("not-claimable {why}")),
         }
         line.push('\n');
@@ -661,14 +781,19 @@ fn pci_enumerate(res: u64, me: u64, nodes: &[kcore::fdt::Node]) -> Option<Pci> {
     })
 }
 
+fn print_claim_failed(bdf: Bdf, what: &str) {
+    sys::debug_write(alloc::format!("## devmgr: pci {bdf} claim failed {what}\n").as_bytes());
+}
+
 fn print_reset_failed(bdf: Bdf, what: &str) {
     sys::debug_write(alloc::format!("## devmgr: pci {bdf} reset failed {what}\n").as_bytes());
 }
 
 impl Pci {
-    /// Undo a claim (IOMMU-SPEC 10.1 and 10.2, the supervisor's steps): bus mastering off, MSI-X masked and off, the device reset
-    /// (and a function-level reset where offered), then the domain destroyed.
-    fn release(&mut self, i: usize) {
+    /// Undo a claim (IOMMU-SPEC 10.1 and 10.2, the supervisor's steps; the order of the header comment): MSI-X masked and off and
+    /// the table cleared, bus mastering off, the device reset (and a function-level reset where offered), then the domain destroyed
+    /// and the manager's interrupt handles closed.
+    fn release(&mut self, i: usize, res: u64) {
         let nap = self.nap;
         let Some(d) = self.devs.get_mut(i) else {
             return;
@@ -676,22 +801,23 @@ impl Pci {
         let Some(c) = d.claim.take() else {
             return;
         };
+        if let Ok(f) = &d.desc {
+            if let Some(m) = f.msix {
+                let mut acc = DevAccess {
+                    cfg: d.cfg,
+                    maps: &d.maps,
+                };
+                if let Err(e) = pcicore::msix_disable(&m, &f.bars, &mut acc) {
+                    print_teardown_failed(d.bdf, &alloc::format!("MSI-X off: {e:?}"));
+                }
+            }
+        }
         let cmd = cfg_rd16(d.cfg, pcicore::reg::COMMAND);
         cfg_wr16(
             d.cfg,
             pcicore::reg::COMMAND,
             (cmd & !pcicore::command::BUS_MASTER) | pcicore::command::INTX_DISABLE,
         );
-        if let Ok(f) = &d.desc {
-            if let Some(m) = f.msix {
-                let ctl = cfg_rd16(d.cfg, m.control_offset());
-                cfg_wr16(
-                    d.cfg,
-                    m.control_offset(),
-                    pcicore::msix_control(ctl, false, true),
-                );
-            }
-        }
         if let Some(mut t) = d.transport() {
             if virtio_reset(&mut t).is_err() {
                 print_reset_failed(d.bdf, "virtio status did not read back 0");
@@ -721,18 +847,19 @@ impl Pci {
             // the reset cleared the BARs and the command register: program them again (bus mastering stays off)
             d.program();
         }
-        let st = sys::iodomain_destroy(c.domain).status;
-        if st != 0 {
-            sys::debug_write(
-                alloc::format!(
-                    "## devmgr: pci {} teardown failed iodomain_destroy status {st}\n",
-                    d.bdf
-                )
-                .as_bytes(),
-            );
+        let mut k = SysKernel {
+            res,
+            rid: d.bdf.rid(),
+            job: 0,
+        };
+        if !pcicore::claim::release(c.claim, &mut k) {
+            print_teardown_failed(d.bdf, "iodomain_destroy");
         }
-        sys::handle_close(c.domain);
     }
+}
+
+fn print_teardown_failed(bdf: Bdf, what: &str) {
+    sys::debug_write(alloc::format!("## devmgr: pci {bdf} teardown failed {what}\n").as_bytes());
 }
 
 /// The service's total pool (OD84): a supervisor and a few more.
@@ -1055,8 +1182,13 @@ impl DevMgr {
             .ok_or(Status::NoDevice)?;
         let d = pci.devs.get_mut(i).ok_or(Status::NoDevice)?;
         // 1. refuse what is not claimable (said at enumeration, and again here)
-        // (the reason was printed with the enumeration's line for the function)
-        let plan = d.plan().map_err(|_| Status::Refused)?;
+        let plan = match d.plan() {
+            Ok(p) => p,
+            Err(why) => {
+                print_claim_failed(d.bdf, &why);
+                return Err(Status::Refused);
+            }
+        };
         if d.claim.is_some() {
             return Err(Status::Busy);
         }
@@ -1080,8 +1212,7 @@ impl DevMgr {
         let (Some(m), Some((_, l))) = (f.msix, f.virtio) else {
             return Err(Status::Refused);
         };
-        // 2. the device reset (it may have been left running: 10.4), finite limits on the driver's job, then the domain for the
-        // function, charged to that job
+        // 2. the device reset (it may have been left running: 10.4)
         let Some(mut t) = d.transport() else {
             return Err(Status::Refused);
         };
@@ -1089,46 +1220,55 @@ impl DevMgr {
             print_reset_failed(d.bdf, "virtio status did not read back 0");
             return Err(Status::Failed);
         }
-        let io_pages: u64 = plan.iter().map(|&p| u64::from(p)).sum();
-        if sys::job_set_io_limits(job, io_pages, u64::from(m.table_size)).status != 0 {
-            return Err(Status::Failed);
-        }
-        let dom = sys::iodomain_create(res, u64::from(rid), job);
-        if dom.status != 0 {
-            return Err(Status::Failed);
-        }
-        let dom = dom.a1 as u64;
-        let mut give: Vec<u64> = Vec::new();
-        let fail = |give: &[u64], st: Status| {
-            for &h in give {
-                sys::handle_close(h);
-            }
-            sys::iodomain_destroy(dom);
-            sys::handle_close(dom);
-            Err(st)
+        // 2 to 4: the job's limits, the domain, the DMA VMOs, the vectors and the MSI-X table (all or nothing)
+        let mut k = SysKernel { res, rid, job };
+        let mut acc = DevAccess {
+            cfg: d.cfg,
+            maps: &d.maps,
         };
-        // 5's first two handles: the BAR with the virtio structures, the driver's duplicate of the domain
-        let bar_vmo = sys::vmo_create_physical(res, bar.addr, bar.span);
-        if bar_vmo.status != 0 {
-            return fail(&give, Status::Failed);
-        }
-        give.push(bar_vmo.a1 as u64);
-        let drv = sys::handle_duplicate(
-            dom,
-            Rights::IO_MAP.0 | Rights::IO_UNMAP.0 | Rights::TRANSFER.0,
-        );
-        if drv.status != 0 {
-            return fail(&give, Status::Failed);
-        }
-        give.push(drv.a1 as u64);
-        // 3. the DMA VMOs, charged to the driver's job
-        for &pages in &plan {
-            let v = sys::vmo_create_dma_in(res, u64::from(pages), job);
-            if v.status != 0 {
-                return fail(&give, Status::Failed);
+        let mut c = match pcicore::claim::claim(
+            plan,
+            &m,
+            &f.bars,
+            rt::abi::iodomain::MSI_DATA as u32,
+            &mut k,
+            &mut acc,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                print_claim_failed(d.bdf, &alloc::format!("{e:?}"));
+                return Err(Status::Failed);
             }
-            give.push(v.a1 as u64);
-        }
+        };
+        // 5. the driver's handles: the BAR with the virtio structures, its duplicate of the domain, its DMA VMOs (moved), and a
+        // duplicate of each interrupt handle that waits and acknowledges only
+        let mut give: Vec<u64> = Vec::new();
+        let made = (|| {
+            let bar_vmo = sys::vmo_create_physical(res, bar.addr, bar.span);
+            if bar_vmo.status != 0 {
+                return Err("the BAR VMO");
+            }
+            give.push(bar_vmo.a1 as u64);
+            let drv = sys::handle_duplicate(
+                c.domain,
+                Rights::IO_MAP.0 | Rights::IO_UNMAP.0 | Rights::TRANSFER.0,
+            );
+            if drv.status != 0 {
+                return Err("the driver's domain handle");
+            }
+            give.push(drv.a1 as u64);
+            for &(_, h) in &c.irqs {
+                let r = sys::handle_duplicate(
+                    h,
+                    Rights::WAIT.0 | Rights::MANAGE.0 | Rights::TRANSFER.0,
+                );
+                if r.status != 0 {
+                    return Err("an interrupt handle");
+                }
+                give.push(r.a1 as u64);
+            }
+            Ok(())
+        })();
         let claim = devmgr::PciClaim {
             vendor: d.vendor,
             device: d.device,
@@ -1138,15 +1278,39 @@ impl DevMgr {
             notify_multiplier: l.notify_multiplier,
             isr: (l.isr.offset as u32, l.isr.len as u32),
             device_cfg: l.device.map_or((0, 0), |r| (r.offset as u32, r.len as u32)),
-            dma_pages: plan,
+            dma_pages: plan.dma_pages.to_vec(),
+            irqs: c
+                .irqs
+                .iter()
+                .map(|&(q, _)| devmgr::PciIrq {
+                    entry: q.entry(),
+                    what: match q {
+                        pcicore::claim::Irq::Config => devmgr::IRQ_CONFIG,
+                        pcicore::claim::Irq::Queue(n) => n,
+                    },
+                })
+                .collect(),
         };
-        let Some(reply) = devmgr::encode_claim_pci_reply(txid, &claim) else {
-            return fail(&give, Status::Failed);
+        let reply = match (made, devmgr::encode_claim_pci_reply(txid, &claim)) {
+            (Ok(()), Some(r)) => r,
+            (e, _) => {
+                print_claim_failed(d.bdf, e.err().unwrap_or("the reply"));
+                for h in give {
+                    sys::handle_close(h);
+                }
+                let _ = pcicore::msix_disable(&m, &f.bars, &mut acc);
+                pcicore::claim::release(c, &mut k);
+                return Err(Status::Failed);
+            }
         };
+        // (the handle order of the reply: the BAR, the domain, the DMA VMOs, the interrupts)
+        let irqs = give.split_off(2);
+        give.append(&mut c.dma);
+        give.extend(irqs);
         d.claim = Some(PciClaimed {
             key,
             job: job_koid,
-            domain: dom,
+            claim: c,
         });
         Ok((i, reply, give))
     }
@@ -1161,7 +1325,7 @@ impl DevMgr {
                     .and_then(|d| d.claim.as_ref())
                     .is_some_and(|c| c.key == key)
                 {
-                    pci.release(i);
+                    pci.release(i, self.res);
                 }
             }
         }
@@ -1297,7 +1461,7 @@ pub fn app_main() -> i32 {
     }
     if let Some(pci) = mgr.pci.as_mut() {
         for i in 0..pci.devs.len() {
-            pci.release(i);
+            pci.release(i, res);
         }
     }
     let blocks = &mut mgr.blocks;

@@ -107,6 +107,37 @@ pub enum Error {
     /// The queue's notification address (`queue_notify_off` times the multiplier, which the device chooses) is outside the
     /// notification structure.
     NotifyOutside(u16),
+    /// The device did not take an MSI-X vector: `config_msix_vector` (`queue` None) or queue `queue`'s `queue_msix_vector` read back
+    /// something other than what was written (VIRTIO 1.x 4.1.5.1.2: a device that cannot map an event reads back `NO_VECTOR`).
+    VectorRefused { queue: Option<u16>, vector: u16 },
+}
+
+/// Which MSI-X table entry each event of a device is mapped to (VIRTIO 1.x 4.1.5.1.2), given by the driver's caller from what its
+/// supervisor granted: the configuration change, and the queues. A queue past the end of `queues` shares the last entry; with no
+/// entry at all, or [`NO_VECTOR`], the event is not mapped (a polling driver).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VectorMap {
+    pub config: u16,
+    pub queues: Vec<u16>,
+}
+
+impl VectorMap {
+    /// Nothing mapped: the driver polls.
+    pub fn none() -> VectorMap {
+        VectorMap {
+            config: NO_VECTOR,
+            queues: Vec::new(),
+        }
+    }
+
+    /// The entry queue `q` is mapped to.
+    pub fn queue(&self, q: u16) -> u16 {
+        self.queues
+            .get(usize::from(q))
+            .or(self.queues.last())
+            .copied()
+            .unwrap_or(NO_VECTOR)
+    }
 }
 
 /// The transport: what a driver does to a virtio device, whatever the bus. One implementation here, [`PciTransport`].
@@ -120,9 +151,19 @@ pub trait Transport {
     fn set_driver_features(&mut self, f: u64);
     /// The largest size queue `q` may have (0: no such queue).
     fn queue_max(&mut self, q: u16) -> u16;
-    /// Program queue `q` with `size` entries at I/O addresses `(descriptors, driver area, device area)` and enable it, with no
-    /// MSI-X vector (this slice polls; IOMMU9 adds the vectors).
-    fn setup_queue(&mut self, q: u16, size: u16, addrs: (u64, u64, u64)) -> Result<(), Error>;
+    /// Program queue `q` with `size` entries at I/O addresses `(descriptors, driver area, device area)`, map its used-buffer event to
+    /// MSI-X entry `vector` ([`NO_VECTOR`]: none, the driver polls) and enable it. The vector is read back: a device that did not
+    /// take it fails the bring-up ([`Error::VectorRefused`]) before the queue is enabled.
+    fn setup_queue(
+        &mut self,
+        q: u16,
+        size: u16,
+        addrs: (u64, u64, u64),
+        vector: u16,
+    ) -> Result<(), Error>;
+    /// Map the configuration-change event to MSI-X entry `vector` ([`NO_VECTOR`]: none), and read it back: `VectorRefused` if the
+    /// device did not take it.
+    fn set_config_vector(&mut self, vector: u16) -> Result<(), Error>;
     /// Tell the device queue `q` has new buffers.
     fn notify(&mut self, q: u16);
     /// The device-specific configuration's byte at `off`; `None` if the device has none or `off` is outside it.
@@ -260,7 +301,13 @@ impl<R: Regs> Transport for PciTransport<R> {
         self.regs.read16(self.c(common::QUEUE_SIZE))
     }
 
-    fn setup_queue(&mut self, q: u16, size: u16, addrs: (u64, u64, u64)) -> Result<(), Error> {
+    fn setup_queue(
+        &mut self,
+        q: u16,
+        size: u16,
+        addrs: (u64, u64, u64),
+        vector: u16,
+    ) -> Result<(), Error> {
         let max = self.queue_max(q);
         if max == 0 || self.regs.read16(self.c(common::QUEUE_ENABLE)) != 0 {
             return Err(Error::QueueUnavailable(q));
@@ -269,8 +316,14 @@ impl<R: Regs> Transport for PciTransport<R> {
             return Err(Error::QueueSize(size));
         }
         self.regs.write16(self.c(common::QUEUE_SIZE), size);
-        self.regs
-            .write16(self.c(common::QUEUE_MSIX_VECTOR), NO_VECTOR);
+        self.regs.write16(self.c(common::QUEUE_MSIX_VECTOR), vector);
+        let got = self.regs.read16(self.c(common::QUEUE_MSIX_VECTOR));
+        if got != vector {
+            return Err(Error::VectorRefused {
+                queue: Some(q),
+                vector,
+            });
+        }
         for (reg, a) in [
             (common::QUEUE_DESC, addrs.0),
             (common::QUEUE_DRIVER, addrs.1),
@@ -292,6 +345,18 @@ impl<R: Regs> Transport for PciTransport<R> {
         self.notify_off.retain(|(n, _)| *n != q);
         self.notify_off.push((q, off));
         self.regs.write16(self.c(common::QUEUE_ENABLE), 1);
+        Ok(())
+    }
+
+    fn set_config_vector(&mut self, vector: u16) -> Result<(), Error> {
+        self.regs
+            .write16(self.c(common::CONFIG_MSIX_VECTOR), vector);
+        if self.regs.read16(self.c(common::CONFIG_MSIX_VECTOR)) != vector {
+            return Err(Error::VectorRefused {
+                queue: None,
+                vector,
+            });
+        }
         Ok(())
     }
 
@@ -460,7 +525,7 @@ impl SplitQueue {
     }
 
     /// Write `chain` into free descriptors and make it available; the head's id is returned. The caller then notifies the device
-    /// ([`Transport::notify`]). `interrupt` false sets `VIRTQ_AVAIL_F_NO_INTERRUPT` (this slice polls).
+    /// ([`Transport::notify`]). `interrupt` false sets `VIRTQ_AVAIL_F_NO_INTERRUPT` (a polling driver).
     pub fn add(&mut self, mem: &mut dyn Mem, chain: &[Buf], interrupt: bool) -> Result<u16, Error> {
         if chain.is_empty() || chain.len() > self.free.len() {
             return Err(Error::NoRoom);

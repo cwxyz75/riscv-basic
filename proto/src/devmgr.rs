@@ -41,13 +41,15 @@ pub const OP_LIST_PCI: u16 = 6;
 /// this function's needs) and charges for the device's domain and its DMA VMOs: **one function per driver job**, so a job that holds
 /// a live claim is refused (`Busy`). The reply is a [`PciClaim`] carrying, in order: a VMO over the BAR that holds the virtio
 /// structures (never the MSI-X table's BAR when the table has a BAR of its own), the driver's duplicate of the device's domain
-/// handle with IO_MAP and IO_UNMAP only (and TRANSFER, so a supervisor can pass it on), and one DMA VMO per entry of
-/// `dma_pages`, each with the `DMA` right. No I/O address travels: the driver maps its buffers itself with `iodomain_map`. The
+/// handle with IO_MAP and IO_UNMAP only (and TRANSFER, so a supervisor can pass it on), one DMA VMO per entry of
+/// `dma_pages`, each with the `DMA` right, and one interrupt handle per entry of `irqs` (IOMMU9: the vectors of the driver's class,
+/// granted and programmed into the MSI-X table by the manager; each handle can wait and acknowledge, and TRANSFER, nothing else). A
+/// claim without its vectors fails: there is no claim without interrupts. No I/O address travels: the driver maps its buffers itself
+/// with `iodomain_map`. The
 /// manager enables bus mastering only after the reply is sent (IOMMU-SPEC 9, step 6), then sends a second message, the plain reply
 /// `txid | Ok` ([`decode_claim_pci_started`]): the driver waits for it before its device's first DMA (a virtio-pci device does not
 /// fetch from a queue while bus mastering is off, and nothing fetches again when it comes on). The claim is released (bus mastering
-/// off, the device reset, the domain destroyed) when the claimant's connection closes. The interrupt handles are added with MSI-X
-/// (IOMMU9).
+/// off, the device reset, the domain destroyed) when the claimant's connection closes.
 pub const OP_CLAIM_PCI: u16 = 7;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
@@ -198,10 +200,43 @@ pub fn decode_claim_pci(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
 
 /// The most DMA VMOs a claim hands out.
 pub const MAX_CLAIM_DMA: usize = 8;
-/// A `ClaimPci` reply without its DMA list: `txid u32 | status i32 | vendor u16 | device u16 | bar_bytes u64 | common (offset u32,
+/// The most interrupt handles a claim hands out.
+pub const MAX_CLAIM_IRQS: usize = 16;
+/// A `ClaimPci` reply without its lists: `txid u32 | status i32 | vendor u16 | device u16 | bar_bytes u64 | common (offset u32,
 /// length u32) | notify (offset u32, length u32) | notify_multiplier u32 | isr (offset u32, length u32) | device configuration
-/// (offset u32, length u32: 0 if none) | dma_count u32`, then `dma_count` page counts (u32), one per DMA VMO in handle order.
+/// (offset u32, length u32: 0 if none) | dma_count u32`, then `dma_count` page counts (u32), one per DMA VMO in handle order, then
+/// `irq_count u32` and `irq_count` [`PciIrq`] records of 4 bytes (`entry u16 | what u16`), one per interrupt handle in handle order.
 pub const PCI_CLAIM_FIXED_LEN: usize = 60;
+/// `PciIrq::what` for the configuration-change interrupt; any other value is a queue's index.
+pub const IRQ_CONFIG: u16 = 0xffff;
+
+/// What one interrupt handle of a claim is for (VIRTIO 1.x 4.1.5.1.2): the device's configuration change, or queue `n`'s used
+/// buffers. The driver maps that event to MSI-X table entry `entry` (`config_msix_vector`, `queue_msix_vector`): the entry the
+/// manager programmed with this vector's pair. By the manager's rule the entry is 0 for the configuration change and `n + 1` for
+/// queue `n` ([`irq_entry`]), so a role alone names it ([`crate::startup::Role::DeviceIrqConfig`] and the queue roles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciIrq {
+    pub entry: u16,
+    /// [`IRQ_CONFIG`], or the queue's index.
+    pub what: u16,
+}
+
+/// The MSI-X entry of the interrupt that means `what` ([`IRQ_CONFIG`] or a queue's index).
+pub fn irq_entry(what: u16) -> u16 {
+    if what == IRQ_CONFIG {
+        0
+    } else {
+        what.saturating_add(1)
+    }
+}
+
+/// Interrupt records as `devmgr` makes them: each at the entry its meaning has ([`irq_entry`]), no meaning twice. Both directions
+/// refuse anything else.
+fn irqs_consistent(irqs: &[PciIrq]) -> bool {
+    irqs.iter()
+        .enumerate()
+        .all(|(i, r)| r.entry == irq_entry(r.what) && !irqs[..i].iter().any(|o| o.what == r.what))
+}
 
 /// What a driver is handed with its handles (IOMMU-SPEC 9). Offsets are inside the BAR VMO.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,21 +252,35 @@ pub struct PciClaim {
     pub device_cfg: (u32, u32),
     /// The pages of each DMA VMO, in handle order.
     pub dma_pages: Vec<u32>,
+    /// What each interrupt handle is for, in handle order (after the DMA VMOs).
+    pub irqs: Vec<PciIrq>,
 }
 
 impl PciClaim {
-    /// The handles the reply carries: the BAR VMO, the domain, the DMA VMOs.
+    /// The handles the reply carries: the BAR VMO, the domain, the DMA VMOs, the interrupts.
     pub fn handles(&self) -> usize {
-        2 + self.dma_pages.len()
+        2 + self.dma_pages.len() + self.irqs.len()
+    }
+
+    /// The handle index of the interrupt that means `what` ([`IRQ_CONFIG`] or a queue's index), and its entry.
+    pub fn irq(&self, what: u16) -> Option<(usize, u16)> {
+        self.irqs
+            .iter()
+            .position(|i| i.what == what)
+            .map(|k| (2 + self.dma_pages.len() + k, self.irqs[k].entry))
     }
 }
 
-/// `None` if the claim names more than [`MAX_CLAIM_DMA`] DMA VMOs.
+/// `None` if the claim names more than [`MAX_CLAIM_DMA`] DMA VMOs or [`MAX_CLAIM_IRQS`] interrupts.
 pub fn encode_claim_pci_reply(txid: u32, c: &PciClaim) -> Option<Vec<u8>> {
-    if c.dma_pages.len() > MAX_CLAIM_DMA {
+    if c.dma_pages.len() > MAX_CLAIM_DMA
+        || c.irqs.len() > MAX_CLAIM_IRQS
+        || !irqs_consistent(&c.irqs)
+    {
         return None;
     }
-    let mut b = Vec::with_capacity(PCI_CLAIM_FIXED_LEN + 4 * c.dma_pages.len());
+    let mut b =
+        Vec::with_capacity(PCI_CLAIM_FIXED_LEN + 4 * c.dma_pages.len() + 4 + 4 * c.irqs.len());
     b.extend_from_slice(&txid.to_le_bytes());
     b.extend_from_slice(&(Status::Ok as i32).to_le_bytes());
     b.extend_from_slice(&c.vendor.to_le_bytes());
@@ -250,6 +299,11 @@ pub fn encode_claim_pci_reply(txid: u32, c: &PciClaim) -> Option<Vec<u8>> {
     for p in &c.dma_pages {
         b.extend_from_slice(&p.to_le_bytes());
     }
+    b.extend_from_slice(&(c.irqs.len() as u32).to_le_bytes());
+    for i in &c.irqs {
+        b.extend_from_slice(&i.entry.to_le_bytes());
+        b.extend_from_slice(&i.what.to_le_bytes());
+    }
     Some(b)
 }
 
@@ -260,13 +314,29 @@ pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>
         return (s != Status::Ok).then_some((t, s, None));
     }
     let n = rd_u32(b, 56)? as usize;
-    if n > MAX_CLAIM_DMA || b.len() != PCI_CLAIM_FIXED_LEN + 4 * n {
+    if n > MAX_CLAIM_DMA {
+        return None;
+    }
+    let at_irqs = PCI_CLAIM_FIXED_LEN + 4 * n;
+    let m = rd_u32(b, at_irqs)? as usize;
+    if m > MAX_CLAIM_IRQS || b.len() != at_irqs + 4 + 4 * m {
         return None;
     }
     let pair = |at: usize| Some((rd_u32(b, at)?, rd_u32(b, at + 4)?));
     let mut dma_pages = Vec::with_capacity(n);
     for i in 0..n {
         dma_pages.push(rd_u32(b, PCI_CLAIM_FIXED_LEN + 4 * i)?);
+    }
+    let mut irqs = Vec::with_capacity(m);
+    for i in 0..m {
+        let at = at_irqs + 4 + 4 * i;
+        irqs.push(PciIrq {
+            entry: rd_u16(b, at)?,
+            what: rd_u16(b, at + 2)?,
+        });
+    }
+    if !irqs_consistent(&irqs) {
+        return None;
     }
     let status = Status::from_i32(rd_u32(b, 4)? as i32)?;
     if status != Status::Ok {
@@ -285,6 +355,7 @@ pub fn decode_claim_pci_reply(b: &[u8]) -> Option<(u32, Status, Option<PciClaim>
             isr: pair(40)?,
             device_cfg: pair(48)?,
             dma_pages,
+            irqs,
         }),
     ))
 }

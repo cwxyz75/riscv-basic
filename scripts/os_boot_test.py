@@ -124,15 +124,21 @@ LAST_IOMMU_FENCES = []
 IOMMU_BOOT = re.compile(r"^kernel: iommu version=(\d+)\.(\d+) mode=(\S+) caps=0x([0-9a-f]+)(?: handover=(\S+))?$", re.M)
 # The bus address of the function the harness puts behind the IOMMU (`-device virtio-rng-pci,...,addr=0x4`, in `run`)
 IOMMU_TEST_DEV = "00:04.0"
-# IOMMU8: the PCI functions of every boot, in one table (the command line and the check of `devmgr`'s lines both come from it):
-# (slot, QEMU device, vendor:device, what `pci_device` adds). PCI slots are stable, unlike the virtio-mmio order: the suite names the
-# same slots (`IOMMU_TEST_SLOT`, `PCI_BLK_SLOT`). Every one goes through `pci_device`, which adds `iommu_platform=on` (without it QEMU's
-# virtio device bypasses the IOMMU: IOMMU-SPEC 15.1 L1) and `disable-legacy=on`, and never `vectors=0` (a function without MSI-X is
-# not claimable: Q-IOMMU-MSI 5). The block function is pinned to one queue: QEMU gives virtio-blk-pci one queue per hart by default
-# and one MSI-X vector more, so its table (and the vector limit `devmgr` sets) would otherwise change with OS_SMP.
+# IOMMU8, IOMMU9: the PCI functions of every boot, in one table (the command line and the check of `devmgr`'s lines both come from
+# it): (slot, QEMU device, vendor:device, what `pci_device` adds, claimable). PCI slots are stable, unlike the virtio-mmio order: the
+# suite names the same slots (`IOMMU_TEST_SLOT`, `PCI_BLK_SLOT`, `PCI_BLK2_SLOT`). Every virtio function goes through `pci_device`,
+# which adds `iommu_platform=on` (without it QEMU's virtio device bypasses the IOMMU: IOMMU-SPEC 15.1 L1) and `disable-legacy=on`, and
+# never `vectors=0`: QEMU's defaults give each its MSI-X table (IOMMU0 item 13). The block functions are pinned to one queue: QEMU
+# gives virtio-blk-pci one queue per hart by default and one MSI-X vector more, so its table would otherwise change with OS_SMP.
+# The five devices on one machine (IOMMU9, the bus move): two disks, the network, the entropy source (also the IOMMU tests' function)
+# and `iommu-testdev`, which has no MSI-X capability and so is listed and never claimable (IOMMU-SPEC 8.6, Q-IOMMU-MSI 5). The network
+# function has no backend: nothing drives it before its driver moves (IOMMU11).
 PCI_DEVICES = [
-    (4, "virtio-rng-pci", "1af4:1044", ""),
-    (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0,num-queues=1"),
+    (4, "virtio-rng-pci", "1af4:1044", "", True),
+    (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0,num-queues=1", True),
+    (6, "virtio-blk-pci", "1af4:1042", ",drive=pd1,num-queues=1", True),
+    (7, "virtio-net-pci", "1af4:1041", ",mac=52:54:00:12:34:57,romfile=", True),
+    (8, "iommu-testdev", "1b36:0005", None, False),
 ]
 # The host bridge QEMU puts at 00:00.0, which `devmgr` lists too (not claimable).
 PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
@@ -140,24 +146,29 @@ PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
 PCI_BLK_DEV = "00:05.0"
 # `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable | not-claimable <why> | refused <why>>`, then
 # `## devmgr: pci functions=<n>` (one enumeration), and `## devmgr: pci <bb:dd.f> reset failed <what>` (a reset that did not complete)
-# or `teardown failed <what>` (a domain that could not be destroyed).
+# or `teardown failed <what>` (a domain that could not be destroyed), or `claim failed <what>` (a claim refused or undone: allowed only for
+# a function PCI_DEVICES says is not claimable, which the suite's refusal checks ask for).
 # A process's `##` line reaches the console as `user: ##...` (the kernel's prefix, so that no program can forge a kernel line).
 DEVMGR_PCI = re.compile(r"^user: ## devmgr: pci (?:([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) (?:([0-9a-f]{4}:[0-9a-f]{4}) class=([0-9a-f]{6}) "
-                        r"(claimable|not-claimable|refused)(?: (.+))?|(?:reset|teardown) failed (.+))|functions=(\d+))$")
+                        r"(claimable|not-claimable|refused)(?: (.+))?|(reset|teardown|claim) failed (.+))|functions=(\d+))$")
 LAST_DEVMGR_PCI = []
 
 
 def pci_device(slot, model, extra):
-    """The one way a PCI function gets on the command line (see PCI_DEVICES)."""
+    """The one way a PCI function gets on the command line (see PCI_DEVICES): a virtio function behind the IOMMU, or (`extra`
+    None) a device that is not virtio, with no property added."""
+    if extra is None:
+        return ["-device", f"{model},addr={slot:#x}"]
     return ["-device", f"{model},iommu_platform=on,disable-legacy=on,addr={slot:#x}{extra}"]
 
 
-def pci_disk():
-    """A 64 KiB raw image for the PCI block function, read-only, whose sector 0 holds its own pattern (byte i = (i * 13 + 1) mod
-    256): `pci_virtio_blk_reads_through_the_iommu` checks every byte. A fresh copy per boot."""
+def pci_disk(mul=13, add=1):
+    """A 64 KiB raw image for a PCI block function, read-only, whose sector 0 holds its own pattern (byte i = (i * mul + add) mod
+    256): `pci_virtio_blk_reads_through_the_iommu` checks every byte of the first (13, 1), the interrupt tests tell the two disks
+    apart by the second's (7, 3). A fresh copy per boot."""
     import atexit, tempfile
     f = tempfile.NamedTemporaryFile(prefix="os-pcidisk-", suffix=".img", delete=False)
-    f.write(bytes((i * 13 + 1) & 0xFF for i in range(512)))
+    f.write(bytes((i * mul + add) & 0xFF for i in range(512)))
     f.truncate(64 * 1024)
     f.close()
     atexit.register(lambda: os.path.exists(f.name) and os.unlink(f.name))
@@ -169,33 +180,45 @@ def pci_args():
     and replay the drive goes through QEMU's `blkreplay` filter, which block devices need in that mode."""
     if os.environ.get("OS_PCI_TEST") == "0":
         return []
-    disk = pci_disk()
-    if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
-        drive = ["-drive", f"file={disk},if=none,format=raw,readonly=on,id=pd0-direct",
-                 "-drive", "driver=blkreplay,if=none,image=pd0-direct,readonly=on,id=pd0"]
-    else:
-        drive = ["-drive", f"file={disk},if=none,format=raw,readonly=on,id=pd0"]
-    return drive + [a for slot, model, _, extra in PCI_DEVICES for a in pci_device(slot, model, extra)]
+    drive = []
+    for name, disk in (("pd0", pci_disk()), ("pd1", pci_disk(7, 3))):
+        if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
+            drive += ["-drive", f"file={disk},if=none,format=raw,readonly=on,id={name}-direct",
+                      "-drive", f"driver=blkreplay,if=none,image={name}-direct,readonly=on,id={name}"]
+        else:
+            drive += ["-drive", f"file={disk},if=none,format=raw,readonly=on,id={name}"]
+    return drive + [a for slot, model, _, extra, _ in PCI_DEVICES for a in pci_device(slot, model, extra)]
 
 
 def devmgr_pci_problems():
-    """Every enumeration `devmgr` printed lists exactly the functions the command line put on bus 0 (and the host bridge), with each
-    virtio function claimable; no reset failed."""
+    """Every enumeration `devmgr` printed lists exactly the functions the command line put on bus 0 (and the host bridge); each
+    function PCI_DEVICES says is claimable is, and reported its MSI-X table (`msix=<entries>`, at least one); the test device is not
+    claimable for want of MSI-X; no reset or teardown failed."""
     found, current = [], []
     want = {PCI_HOST_BRIDGE[0]: PCI_HOST_BRIDGE[1]}
+    claimable = set()
     if os.environ.get("OS_PCI_TEST") != "0":
-        want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _ in PCI_DEVICES})
+        want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _, _ in PCI_DEVICES})
+        claimable = {f"00:{slot:02x}.0" for slot, _, _, _, c in PCI_DEVICES if c}
     for m in LAST_DEVMGR_PCI:
-        if m[6] is not None:  # an enumeration's last line
+        if m[7] is not None:  # an enumeration's last line
             got = {bdf: ids for bdf, ids, _, _, _ in current}
-            if got != want or len(current) != int(m[6]):
+            if got != want or len(current) != int(m[7]):
                 found.append(f"devmgr listed {sorted(got.items())}, the command line has {sorted(want.items())}")
             for bdf, ids, _, verdict, why in current:
-                if bdf != PCI_HOST_BRIDGE[0] and verdict != "claimable":
-                    found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: every test function is claimable")
+                if bdf in claimable:
+                    if verdict != "claimable":
+                        found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: it should be claimable")
+                    elif not re.match(r"msix=[1-9]\d*( table-with-registers)?$", why or ""):
+                        found.append(f"devmgr: {bdf} {ids} is claimable without reporting its MSI-X table ({why!r})")
+                elif bdf != PCI_HOST_BRIDGE[0] and (verdict, why) != ("not-claimable", "no MSI-X capability"):
+                    found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: a function without MSI-X is not claimable")
             current = []
+        elif m[5] == "claim":
+            if m[0] in claimable:
+                found.append(f"devmgr: a claim of {m[0]} failed: {m[6]}")
         elif m[5] is not None:
-            found.append(f"devmgr: {m[0]} reset or teardown failed: {m[5]}")
+            found.append(f"devmgr: {m[0]} {m[5]} failed: {m[6]}")
         else:
             current.append((m[0], m[1], m[2], m[3], m[4]))
     if current:
@@ -1160,10 +1183,11 @@ def run(kernel: str, extra=()):
         "-cpu", os.environ.get("OS_CPU", "rva23s64"),  # PL1: the profile CPU is the only test CPU (only the negative control overrides it)
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
-        # IOMMU5, IOMMU8: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and the functions of PCI_DEVICES sit
-        # behind it (`iommu_platform=on`: their DMA and their MSI-X messages go through the IOMMU): the entropy function at 00:04.0,
-        # which the suite's `iommu_*`, `iodomain_*` and `msi_*` tests program by hand, and the block function at 00:05.0, which the
-        # `pci_*` tests drive (by hand, and through `devmgr`'s claim). `devmgr` enumerates them all.
+        # IOMMU5, IOMMU8, IOMMU9: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and the functions of
+        # PCI_DEVICES sit behind it (`iommu_platform=on`: their DMA and their MSI-X messages go through the IOMMU): the entropy function
+        # at 00:04.0, which the suite's `iommu_*`, `iodomain_*` and `msi_*` tests program by hand, the block functions at 00:05.0 and
+        # 00:06.0, which the `pci_*` tests drive (by hand, and through `devmgr`'s claim), the network function at 00:07.0, and
+        # `iommu-testdev` at 00:08.0. `devmgr` enumerates them all.
         *pci_args(),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
         # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off

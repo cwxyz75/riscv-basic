@@ -100,6 +100,48 @@ pub enum Role {
     /// A debug resource (HD4): the authority to write to the kernel's console and read its counters. Given only to the programs that need it; a
     /// program without one cannot print through `debug_write` or forge a `##TEST` line.
     Debug = 43,
+    /// A device driver's interrupt handles (IOMMU9; `proto::devmgr::PciClaim::irqs`): the configuration-change interrupt, and the
+    /// interrupt of queue `n` (`DeviceIrqQueue0` + n, up to [`MAX_DEVICE_IRQ_QUEUES`] queues). The role says what the handle is for
+    /// and so which MSI-X entry the driver maps the event to (`proto::devmgr::irq_entry`: 0 for the configuration change, `n + 1`
+    /// for queue `n`).
+    DeviceIrqConfig = 44,
+    DeviceIrqQueue0 = 45,
+    DeviceIrqQueue1 = 46,
+    DeviceIrqQueue2 = 47,
+    DeviceIrqQueue3 = 48,
+    DeviceIrqQueue4 = 49,
+    DeviceIrqQueue5 = 50,
+    DeviceIrqQueue6 = 51,
+    DeviceIrqQueue7 = 52,
+}
+
+/// The queues a driver's startup message can name an interrupt for.
+pub const MAX_DEVICE_IRQ_QUEUES: u16 = 8;
+
+impl Role {
+    /// The role of the interrupt that means `what` (`proto::devmgr::IRQ_CONFIG` or a queue's index), or `None` past
+    /// [`MAX_DEVICE_IRQ_QUEUES`].
+    pub fn device_irq(what: u16) -> Option<Role> {
+        if what == crate::devmgr::IRQ_CONFIG {
+            return Some(Role::DeviceIrqConfig);
+        }
+        (what < MAX_DEVICE_IRQ_QUEUES)
+            .then(|| Role::from_u32(Role::DeviceIrqQueue0 as u32 + u32::from(what)))
+            .flatten()
+    }
+
+    /// What an interrupt role is for (`proto::devmgr::IRQ_CONFIG` or a queue's index), or `None` for any other role.
+    pub fn device_irq_what(self) -> Option<u16> {
+        match self {
+            Role::DeviceIrqConfig => Some(crate::devmgr::IRQ_CONFIG),
+            r if (Role::DeviceIrqQueue0 as u32..=Role::DeviceIrqQueue7 as u32)
+                .contains(&(r as u32)) =>
+            {
+                Some((r as u32 - Role::DeviceIrqQueue0 as u32) as u16)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Role {
@@ -148,6 +190,15 @@ impl Role {
             41 => Role::ServiceSpawn,
             42 => Role::SignalChannel,
             43 => Role::Debug,
+            44 => Role::DeviceIrqConfig,
+            45 => Role::DeviceIrqQueue0,
+            46 => Role::DeviceIrqQueue1,
+            47 => Role::DeviceIrqQueue2,
+            48 => Role::DeviceIrqQueue3,
+            49 => Role::DeviceIrqQueue4,
+            50 => Role::DeviceIrqQueue5,
+            51 => Role::DeviceIrqQueue6,
+            52 => Role::DeviceIrqQueue7,
             _ => return None,
         })
     }

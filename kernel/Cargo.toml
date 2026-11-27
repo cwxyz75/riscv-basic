@@ -93,3 +93,6 @@ fault-aia-no-unmask = []
 fault-aia-no-repend = []
 # IOMMU4's negative control: an interrupt identity is freed at the move, not when its old hart retired it (IO10, IO12).
 fault-msiid-free-at-move = ["kcore/fault-msiid-free-at-move"]
+# IOMMU9: the vector twins of the two above (D5 for an MSI-X vector through the IOMMU's MRIF).
+fault-vector-no-unmask = ["kcore/fault-vector-no-unmask"]
+fault-vector-no-repend = ["kcore/fault-vector-no-repend"]

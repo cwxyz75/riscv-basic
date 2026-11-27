@@ -39,6 +39,9 @@ struct Device {
     qsel: u16,
     queues: Vec<Queue>,
     notified: RefCell<Vec<(u64, u16)>>,
+    /// The MSI-X table's entries: a vector at or past it is refused (read back as 0xffff, VIRTIO 1.x 4.1.5.1.2).
+    table: u16,
+    config_vector: u16,
     reads_left: RefCell<u32>,
     config: HashMap<u64, u8>,
 }
@@ -56,6 +59,8 @@ impl Device {
         Device {
             offered,
             platform: true,
+            table: 4,
+            config_vector: 0xffff,
             queues: queues
                 .iter()
                 .enumerate()
@@ -78,7 +83,9 @@ impl Device {
             for q in &mut self.queues {
                 q.enable = 0;
                 q.size = 0;
+                q.vector = 0xffff;
             }
+            self.config_vector = 0xffff;
             *self.reads_left.borrow_mut() = self.slow_reset;
             return;
         }
@@ -121,6 +128,7 @@ impl Regs for Bar {
         let mut d = self.0.borrow_mut();
         let qsel = d.qsel;
         match off - COMMON {
+            0x10 => d.config_vector,
             0x12 => d.queues.len() as u16,
             0x16 => qsel,
             0x18 => d
@@ -167,9 +175,18 @@ impl Regs for Bar {
         match off - COMMON {
             0x16 => d.qsel = v,
             0x18 => d.q().unwrap().size = v,
-            0x1a => d.q().unwrap().vector = v,
+            0x1a => {
+                let ok = v == 0xffff || v < d.table;
+                d.q().unwrap().vector = if ok { v } else { 0xffff };
+            }
             0x1c => d.q().unwrap().enable = v,
-            0x10 => {}
+            0x10 => {
+                d.config_vector = if v == 0xffff || v < d.table {
+                    v
+                } else {
+                    0xffff
+                }
+            }
             o => panic!("write16 at {o:#x}"),
         }
     }
@@ -354,24 +371,24 @@ fn queue_setup_programs_addresses_and_notifies_at_offset_times_multiplier() {
     t.negotiate(0).unwrap();
     assert_eq!(t.queue_max(1), 128);
     assert_eq!(
-        t.setup_queue(1, 256, (0, 0, 0)),
+        t.setup_queue(1, 256, (0, 0, 0), 0xffff),
         Err(Error::QueueSize(256)),
         "above the device's maximum"
     );
     assert_eq!(
-        t.setup_queue(1, 48, (0, 0, 0)),
+        t.setup_queue(1, 48, (0, 0, 0), 0xffff),
         Err(Error::QueueSize(48)),
         "not a power of two"
     );
     assert_eq!(
-        t.setup_queue(2, 8, (0, 0, 0)),
+        t.setup_queue(2, 8, (0, 0, 0), 0xffff),
         Err(Error::QueueUnavailable(2)),
         "no such queue"
     );
     let a = (0x100_0000_5000, 0x100_0000_5080, 0x100_0000_5098);
-    t.setup_queue(1, 8, a).unwrap();
+    t.setup_queue(1, 8, a, 0xffff).unwrap();
     assert_eq!(
-        t.setup_queue(1, 8, a),
+        t.setup_queue(1, 8, a, 0xffff),
         Err(Error::QueueUnavailable(1)),
         "already enabled"
     );
@@ -418,9 +435,12 @@ fn a_notify_offset_outside_the_structure_is_refused() {
     // queue 3: offset 3 * 4 = 12, the last 16-bit slot that fits in 16 bytes; queue 4's would end at 18
     let mut t = transport(Device::new((1 << 33) | (1 << 32), &[8, 8, 8, 8, 8]));
     t.negotiate(0).unwrap();
-    t.setup_queue(3, 8, (0, 0, 0)).unwrap();
+    t.setup_queue(3, 8, (0, 0, 0), 0xffff).unwrap();
     assert_eq!(t.notify_address(3), Some(NOTIFY + 12));
-    assert_eq!(t.setup_queue(4, 8, (0, 0, 0)), Err(Error::NotifyOutside(4)));
+    assert_eq!(
+        t.setup_queue(4, 8, (0, 0, 0), 0xffff),
+        Err(Error::NotifyOutside(4))
+    );
     assert_eq!(t.notify_address(4), None);
     t.notify(4);
     assert!(
@@ -440,7 +460,10 @@ fn a_notify_offset_outside_the_structure_is_refused() {
         },
     );
     t.negotiate(0).unwrap();
-    assert_eq!(t.setup_queue(1, 8, (0, 0, 0)), Err(Error::NotifyOutside(1)));
+    assert_eq!(
+        t.setup_queue(1, 8, (0, 0, 0), 0xffff),
+        Err(Error::NotifyOutside(1))
+    );
     assert_eq!(t.config_read8(0), None, "no device configuration");
 }
 
@@ -638,4 +661,74 @@ fn a_block_request_header_is_type_reserved_sector() {
         ),
         (512, 16, 0, 1, 2)
     );
+}
+
+#[test]
+fn the_vectors_are_written_and_read_back() {
+    // VIRTIO 1.x 4.1.4.3: config_msix_vector at 0x10, queue_msix_vector at 0x1a; 4.1.5.1.2: 0xffff is "no vector"
+    let mut t = transport(Device::new((1 << 33) | (1 << 32), &[8, 8, 8]));
+    t.negotiate(0).unwrap();
+    t.set_config_vector(0).unwrap();
+    t.setup_queue(0, 8, (0, 0, 0), 1).unwrap();
+    t.setup_queue(1, 8, (0, 0, 0), 2).unwrap();
+    {
+        let d = t.regs.0.borrow();
+        assert_eq!(d.config_vector, 0, "the configuration change on entry 0");
+        assert_eq!(
+            (d.queues[0].vector, d.queues[1].vector),
+            (1, 2),
+            "each queue on its entry"
+        );
+    }
+    // unmapping is always possible
+    t.set_config_vector(0xffff).unwrap();
+    t.setup_queue(2, 8, (0, 0, 0), 0xffff).unwrap();
+    assert_eq!(t.regs.0.borrow().queues[2].vector, 0xffff);
+}
+
+#[test]
+fn a_vector_the_device_refuses_fails_the_bring_up() {
+    let mut t = transport(Device::new((1 << 33) | (1 << 32), &[8, 8]));
+    t.negotiate(0).unwrap();
+    // the device has four entries: entry 4 does not exist and reads back 0xffff
+    assert_eq!(
+        t.set_config_vector(4),
+        Err(Error::VectorRefused {
+            queue: None,
+            vector: 4
+        })
+    );
+    assert_eq!(
+        t.setup_queue(1, 8, (0, 0, 0), 9),
+        Err(Error::VectorRefused {
+            queue: Some(1),
+            vector: 9
+        })
+    );
+    assert_eq!(
+        t.regs.0.borrow().queues[1].enable,
+        0,
+        "a queue whose vector was refused is not enabled"
+    );
+    // a device with no MSI-X table at all refuses every vector
+    let mut d = Device::new((1 << 33) | (1 << 32), &[8]);
+    d.table = 0;
+    let mut t = transport(d);
+    t.negotiate(0).unwrap();
+    assert!(matches!(
+        t.setup_queue(0, 8, (0, 0, 0), 0),
+        Err(Error::VectorRefused { .. })
+    ));
+    assert!(t.set_config_vector(0).is_err());
+}
+
+#[test]
+fn a_vector_map_gives_each_queue_its_entry_or_shares_the_last() {
+    let m = VectorMap {
+        config: 0,
+        queues: vec![1, 2],
+    };
+    assert_eq!((m.queue(0), m.queue(1), m.queue(5)), (1, 2, 2));
+    assert_eq!(VectorMap::none().queue(0), 0xffff);
+    assert_eq!(VectorMap::none().config, 0xffff);
 }

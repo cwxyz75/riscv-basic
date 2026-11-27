@@ -8208,19 +8208,29 @@ fn fetch_the_fuzzer_image() -> Outcome {
 /// by chance), killing the job must bring the job's counters and the kernel heap back to where they began, and the kernel must still be running (a panic is
 /// the boot test's `##PANIC`).
 ///
-/// Each seed runs twice and only the second run is measured. The kernel's object tables keep the room they grew to (the VMO table is a slab of
+/// Each seed runs once unmeasured, then is measured. The kernel's object tables keep the room they grew to (the VMO table is a slab of
 /// 376-byte slots that doubles when it fills: from 256 slots to 512, with its free list, is 97,280 bytes, kept for the next VMOs and held by
 /// nobody), and whether a sequence is the one that pushes a table past its size depends on how many objects the rest of the system has at that
-/// moment. The first run brings the tables to what the sequence needs; the second, the same sequence again, must give back everything it took.
+/// moment. The first run brings the tables to what the sequence needs; the same sequence again must give back everything it took. A table
+/// grows once and keeps its room, so a measured run that kept bytes is repeated, up to three in all: one that gives everything back passes,
+/// and a leak, which takes its bytes on every run, fails all three (T277: the second run alone failed at two harts when the system's VMO
+/// count sat just below a doubling).
 fn the_guest_fuzzer_leaves_nothing_behind() -> Outcome {
     const SEEDS: u64 = 4;
     let root = root_job()?;
     for seed in 1..=SEEDS {
         guest_fuzzer_run(root, seed)?;
-        let held = guest_fuzzer_run(root, seed)?;
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let h = guest_fuzzer_run(root, seed)?;
+            held.push(h);
+            if h <= 64 * 1024 {
+                break;
+            }
+        }
         ensure!(
-            held <= 64 * 1024,
-            "seed {seed}: {held} kernel heap bytes stayed behind"
+            held.last().is_some_and(|&h| h <= 64 * 1024),
+            "seed {seed}: kernel heap bytes stayed behind in each of three runs: {held:?}"
         );
     }
     sys::handle_close(root);
@@ -12370,9 +12380,10 @@ fn blk_bus_master(res: u64) -> Result<bool, Detail> {
     Ok(on)
 }
 
-/// IOMMU8 (IOMMU-SPEC 8, 9): `devmgr` lists bus 0 as the command line built it, and hands a driver a claim: the BAR VMO with the
-/// virtio structures, the domain with IO_MAP and IO_UNMAP only, the DMA VMOs, the driver's job limited; bus mastering on after the
-/// reply. The claim reads the disk through the IOMMU; a second claim is Busy, the host bridge is Refused, a claim without its job is
+/// IOMMU8, IOMMU9 (IOMMU-SPEC 8, 9): `devmgr` lists bus 0 as the command line built it (the five functions: `iommu-testdev` listed
+/// and not claimable, for want of MSI-X), and hands a driver a claim: the BAR VMO with the virtio structures, the domain with IO_MAP
+/// and IO_UNMAP only, the DMA VMOs, one interrupt handle per vector of the class (wait and acknowledge, no duplicate), the driver's
+/// job limited; bus mastering on after the reply. The claim reads the disk through the IOMMU; a second claim is Busy, the host bridge is Refused, a claim without its job is
 /// BadRequest; when the claimant's connection closes the claim is released (bus mastering off, the domain destroyed) and can be
 /// taken again.
 fn pci_devices_are_found_and_claimed() -> Outcome {
@@ -12384,10 +12395,14 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
     // alive into later tests of the same boot)
     let mut held: Vec<u64> = Vec::new();
     let r = (|| {
-        // the list: the host bridge and the two functions of the harness, nothing else, in requester-id order
+        // the list: the host bridge and the five functions of the harness, nothing else, in requester-id order
         let list = pci_list(mine, 1)?;
         let rids: Vec<u16> = list.iter().map(|e| e.rid).collect();
-        ensure_eq!(rids, vec![0, 0x20, 0x28], "bus 0: {list:x?}");
+        ensure_eq!(
+            rids,
+            vec![0, 0x20, 0x28, 0x30, 0x38, 0x40],
+            "bus 0: {list:x?}"
+        );
         let want = dm::PCI_CLAIMABLE | dm::PCI_MSIX | dm::PCI_VIRTIO | dm::PCI_ACCESS_PLATFORM;
         for e in &list {
             match e.rid {
@@ -12399,8 +12414,19 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
                         "the host bridge is not claimable"
                     );
                 }
+                0x40 => {
+                    ensure_eq!(
+                        (e.vendor, e.device, e.flags),
+                        (0x1b36, 0x0005, 0),
+                        "iommu-testdev: no MSI-X, not virtio, not claimable"
+                    );
+                }
                 rid => {
-                    let dev = if rid == 0x20 { 0x1044 } else { 0x1042 };
+                    let dev = match rid {
+                        0x20 => 0x1044,
+                        0x38 => 0x1041,
+                        _ => 0x1042,
+                    };
                     ensure_eq!(
                         (e.vendor, e.device),
                         (0x1af4, dev),
@@ -12450,8 +12476,11 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         let (s, _, _) = pci_claim(c2, 4, 0, Some(send))?;
         ensure_eq!(s, D::Refused, "the host bridge");
         let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
-        let (s, _, _) = pci_claim(c2, 5, 0x30, Some(send))?;
-        ensure_eq!(s, D::NoDevice, "no function at 00:06.0");
+        let (s, _, _) = pci_claim(c2, 5, 0x48, Some(send))?;
+        ensure_eq!(s, D::NoDevice, "no function at 00:09.0");
+        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
+        let (s, _, _) = pci_claim(c2, 5, 0x40, Some(send))?;
+        ensure_eq!(s, D::Refused, "iommu-testdev has no MSI-X (IOMMU-SPEC 8.6)");
         ensure!(
             !blk_bus_master(res)?,
             "bus mastering is off before the claim"
@@ -12468,7 +12497,36 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
             vec![1, 4],
             "the block class's DMA VMOs: the rings and the data pages"
         );
+        ensure_eq!(
+            c.irqs,
+            vec![
+                dm::PciIrq {
+                    entry: 0,
+                    what: dm::IRQ_CONFIG
+                },
+                dm::PciIrq { entry: 1, what: 0 }
+            ],
+            "the block class's vectors: the configuration change on entry 0, queue 0 on entry 1"
+        );
+        ensure_eq!(
+            (c.handles(), hs.len()),
+            (6, 6),
+            "the BAR, the domain, two DMA VMOs, two interrupts"
+        );
         let (bar, dom, rings, data) = (hs[0], hs[1], hs[2], hs[3]);
+        for &h in &hs[4..] {
+            ensure!(vector_route(h) != u64::MAX, "a live vector");
+            ensure_eq!(
+                st(sys::interrupt_ack(h)),
+                Some(S::BadState),
+                "an interrupt handle acknowledges (nothing fired yet)"
+            );
+            ensure_eq!(
+                st(sys::handle_duplicate(h, Rights::WAIT.0)),
+                Some(S::AccessDenied),
+                "the driver's interrupt handle cannot be duplicated"
+            );
+        }
         ensure_eq!(
             sys::vmo_get_size(bar).a1 as u64,
             c.bar_bytes,
@@ -12479,8 +12537,8 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
                 sys::job_info(dj, 12).a2 as u64,
                 sys::job_info(dj, 13).a2 as u64
             ),
-            (5, 2),
-            "the driver's job is limited to its DMA pages and its MSI-X vectors (one queue: two)"
+            (7, 2),
+            "the driver's job is limited to its DMA pages and a margin of two, and its MSI-X vectors (one queue: two)"
         );
         // the domain handle maps and unmaps, nothing more
         for (r, what) in [
@@ -12514,6 +12572,45 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
         let (s, _, _) = pci_claim(mine, 9, 0x20, Some(send))?;
         ensure_eq!(s, D::Busy, "a second function for the same driver job");
+        // the network class, on its own job: the configuration change, receive and transmit, and both limits from its plan
+        let (nj, send) = driver_job()?;
+        held.push(nj);
+        let (s, net, nhs) = pci_claim(c2, 12, 0x38, Some(send))?;
+        held.extend(&nhs);
+        ensure_eq!(s, D::Ok, "the network function is claimed");
+        let net = net.ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(
+            (net.dma_pages.clone(), net.irqs.clone()),
+            (
+                vec![2, 64, 64],
+                vec![
+                    dm::PciIrq {
+                        entry: 0,
+                        what: dm::IRQ_CONFIG
+                    },
+                    dm::PciIrq { entry: 1, what: 0 },
+                    dm::PciIrq { entry: 2, what: 1 }
+                ]
+            ),
+            "the network class: the rings and two buffer pools; the configuration change, receive and transmit"
+        );
+        ensure_eq!(
+            (net.handles(), nhs.len()),
+            (8, 8),
+            "the BAR, the domain, three DMA VMOs, three interrupts"
+        );
+        ensure!(
+            nhs[5..].iter().all(|&h| vector_route(h) != u64::MAX),
+            "three live vectors"
+        );
+        ensure_eq!(
+            (
+                sys::job_info(nj, 12).a2 as u64,
+                sys::job_info(nj, 13).a2 as u64
+            ),
+            (132, 3),
+            "the network driver's job: its 130 DMA pages and the margin of two, and its three vectors"
+        );
         // a read through the claim, as a driver does it: the BAR here, the rings and the data mapped by the driver
         let me = ok(sys::process_self(), "process_self")?.a1 as u64;
         let m = sys::process_map(me, bar, PCI_BAR_VA, 0, c.bar_bytes, PF_R | PF_W);
@@ -12539,8 +12636,7 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
                         u64::from(c.device_cfg.1),
                     )
                 }),
-                msix_cap: 0,
-                msix_table: 0,
+                msix: None,
             };
             let used = pci_blk_read_sector0(
                 &f,
@@ -14438,8 +14534,66 @@ struct PciFn {
     isr: u64,
     /// The device configuration (address, length), if the function has one.
     device: Option<(u64, u64)>,
-    msix_cap: u64,
-    msix_table: u64,
+    /// Its MSI-X capability and table, when the suite drives the function by hand (`pci_fn_up`); a function claimed through
+    /// `devmgr` has none here (the manager keeps the table).
+    msix: Option<PciMsix>,
+}
+
+/// A hand-driven function's MSI-X capability, its BARs (as `pcicore` sizes them) and where each BAR is mapped here.
+struct PciMsix {
+    m: pcicore::Msix,
+    bars: Vec<pcicore::Bar>,
+    maps: Vec<(u8, u64)>,
+}
+
+/// `pcicore`'s MSI-X sequence over the hand-driven function: its configuration page at PCI_CFG_VA, its BARs where `pci_fn_up` mapped
+/// them (`pcicore` checks every offset against the BAR's size before it asks).
+struct PciMsixRegs<'a>(&'a PciMsix);
+
+impl pcicore::MsixAccess for PciMsixRegs<'_> {
+    fn cfg_read16(&mut self, off: u16) -> u16 {
+        cfg_rd16(u64::from(off))
+    }
+    fn cfg_write16(&mut self, off: u16, v: u16) {
+        cfg_wr16(u64::from(off), v)
+    }
+    fn bar_read32(&mut self, bar: u8, off: u64) -> u32 {
+        self.0
+            .maps
+            .iter()
+            .find(|m| m.0 == bar)
+            .map_or(u32::MAX, |m| mmio_rd32(m.1 + off))
+    }
+    fn bar_write32(&mut self, bar: u8, off: u64, v: u32) {
+        if let Some(m) = self.0.maps.iter().find(|m| m.0 == bar) {
+            mmio_wr32(m.1 + off, v)
+        }
+    }
+}
+
+impl PciFn {
+    /// Program MSI-X entry 0 with `msg` and turn MSI-X on (`pcicore::msix_enable`: the function masked while the table is written,
+    /// every other entry masked and cleared, INTx disabled).
+    fn msix_on(&self, msg: pcicore::MsixEntry) -> Outcome {
+        let x = self.msix.as_ref().ok_or_else(|| msg_at(line!()))?;
+        let r = pcicore::msix_enable(&x.m, &x.bars, &[(0, msg)], &mut PciMsixRegs(x));
+        ensure_eq!(r, Ok(()), "MSI-X programmed through pcicore");
+        Ok(())
+    }
+
+    /// MSI-X off and the table cleared (`pcicore::msix_disable`).
+    fn msix_off(&self) {
+        if let Some(x) = &self.msix {
+            let _ = pcicore::msix_disable(&x.m, &x.bars, &mut PciMsixRegs(x));
+        }
+    }
+
+    /// Whether MSI-X is enabled (message control, read through the configuration page).
+    fn msix_enabled(&self) -> bool {
+        self.msix
+            .as_ref()
+            .is_some_and(|x| cfg_rd16(u64::from(x.m.control_offset())) & pcicore::msix::ENABLE != 0)
+    }
 }
 
 fn cfg_rd32(off: u64) -> u32 {
@@ -14453,10 +14607,6 @@ fn cfg_rd16(off: u64) -> u16 {
 fn cfg_wr16(off: u64, v: u16) {
     // SAFETY: as `cfg_rd16`.
     unsafe { core::ptr::write_volatile((PCI_CFG_VA + off) as *mut u16, v) }
-}
-fn cfg_rd8(off: u64) -> u8 {
-    // SAFETY: as `cfg_rd32`, one byte.
-    unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u8) }
 }
 fn mmio_wr16(va: u64, v: u16) {
     // SAFETY: `va` is inside the BAR window mapped at PCI_BAR_VA (`pci_fn_up`), at a register the virtio structure there defines.
@@ -14491,8 +14641,9 @@ const PCI_MEM32_LEN: u64 = 0x4000_0000;
 
 /// Place every memory BAR of bus 0 the way `devmgr` does (IOMMU8: `pcicore::assign` over the whole bus, which is deterministic), so
 /// that a hand-driven function and `devmgr`'s functions never decode overlapping windows: enumerate, size, assign, program every
-/// function's BARs (each function is left with decoding off) and return the assignment.
-fn pci_bus_program(res: u64) -> Result<Vec<pcicore::Assignment>, Detail> {
+/// function's BARs (each function is left with decoding off) and return the assignment and what `pcicore` made of each function.
+#[allow(clippy::type_complexity)]
+fn pci_bus_program(res: u64) -> Result<(Vec<pcicore::Assignment>, Vec<pcicore::Function>), Detail> {
     let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     let ecam = sys::vmo_create_physical(res, PCI_ECAM, PCI_BUS_BYTES);
     if st(ecam) != Some(S::Ok) {
@@ -14522,6 +14673,7 @@ fn pci_bus_program(res: u64) -> Result<Vec<pcicore::Assignment>, Detail> {
     let wr32 = |va: u64, v: u32| unsafe { core::ptr::write_volatile(va as *mut u32, v) };
     let wr16 = |va: u64, v: u16| unsafe { core::ptr::write_volatile(va as *mut u16, v) };
     let mut bars = Vec::new();
+    let mut funcs = Vec::new();
     for dev in 0..pcicore::DEVICES {
         for func in 0..pcicore::FUNCTIONS {
             let Some(bdf) = pcicore::Bdf::new(0, dev, func) else {
@@ -14555,6 +14707,7 @@ fn pci_bus_program(res: u64) -> Result<Vec<pcicore::Assignment>, Detail> {
             // (a function `describe` refuses is left out, as `devmgr` leaves it out)
             if let Ok(Some(f)) = pcicore::describe(bdf, &cfg, &masks) {
                 bars.extend(f.bars.iter().map(|b| (bdf, *b)));
+                funcs.push(f);
             }
             if func == 0 && !h.multifunction {
                 break;
@@ -14572,10 +14725,10 @@ fn pci_bus_program(res: u64) -> Result<Vec<pcicore::Assignment>, Detail> {
     sys::process_unmap(me, PCI_BUS_VA);
     sys::handle_close(me);
     match r {
-        Ok(a) => Ok(a),
+        Ok(a) => Ok((a, funcs)),
         Err(e) => {
             ensure!(false, "bus 0's BARs do not fit the 32-bit window: {e:?}");
-            Ok(Vec::new())
+            Ok((Vec::new(), Vec::new()))
         }
     }
 }
@@ -14584,7 +14737,7 @@ fn pci_bus_program(res: u64) -> Result<Vec<pcicore::Assignment>, Detail> {
 /// `devmgr` would (`pci_bus_program`), map this function's BARs, and find its virtio structures and MSI-X table. The function is
 /// left with memory decoding and bus mastering on and INTx off.
 fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
-    let assigned = pci_bus_program(res)?;
+    let (assigned, funcs) = pci_bus_program(res)?;
     let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     let cfg = sys::vmo_create_physical(res, PCI_ECAM + (slot << 15), 4096);
     ensure_eq!(
@@ -14626,66 +14779,44 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
     sys::handle_close(w);
     sys::handle_close(me);
     ensure_eq!(st(m), Some(S::Ok), "map the BARs");
-    let va = |bar: u8, off: u32| -> u64 {
-        mine.iter()
-            .find(|a| a.index == bar)
-            .map_or(0, |a| PCI_BAR_VA + (a.addr - lo) + u64::from(off))
+    let maps: Vec<(u8, u64)> = mine
+        .iter()
+        .map(|a| (a.index, PCI_BAR_VA + (a.addr - lo)))
+        .collect();
+    let va =
+        |bar: u8, off: u64| -> u64 { maps.iter().find(|m| m.0 == bar).map_or(0, |m| m.1 + off) };
+    // the virtio structures and the MSI-X capability, as `pcicore` read them (the same code as `devmgr`'s)
+    let f = funcs
+        .into_iter()
+        .find(|f| f.bdf == bdf)
+        .ok_or_else(|| msg_at(line!()))?;
+    let (Some((_, l)), Some(msix)) = (f.virtio, f.msix) else {
+        ensure!(
+            false,
+            "pcicore found no virtio structures or no MSI-X at {bdf}: {f:x?}"
+        );
+        return Err(msg_at(line!()));
     };
-    // the capability list: the virtio structures (vendor capability 9) and MSI-X (17)
-    ensure!(cfg_rd16(6) & (1 << 4) != 0, "a capability list");
-    let (mut common, mut notify, mut msix_cap, mut msix_table) = (0, 0, 0, 0);
-    let (mut isr, mut device, mut notify_multiplier, mut notify_len) = (0, None, 0, 0);
-    let mut p = u64::from(cfg_rd8(0x34) & !3);
-    let mut hops = 0;
-    while p != 0 && hops < 48 {
-        match cfg_rd8(p) {
-            9 => {
-                let (kind, bar, off) = (cfg_rd8(p + 3), cfg_rd8(p + 4), cfg_rd32(p + 8));
-                match kind {
-                    1 if common == 0 => common = va(bar, off),
-                    2 if notify == 0 => {
-                        notify_multiplier = cfg_rd32(p + 16);
-                        notify_len = u64::from(cfg_rd32(p + 12));
-                        ensure_eq!(notify_multiplier, 4, "the notify multiplier QEMU uses");
-                        notify = va(bar, off);
-                    }
-                    3 if isr == 0 => isr = va(bar, off),
-                    4 if device.is_none() => {
-                        device = Some((va(bar, off), u64::from(cfg_rd32(p + 12))))
-                    }
-                    _ => {}
-                }
-            }
-            0x11 => {
-                msix_cap = p;
-                let t = cfg_rd32(p + 4);
-                msix_table = va((t & 7) as u8, t & !7);
-            }
-            _ => {}
-        }
-        p = u64::from(cfg_rd8(p + 1) & !3);
-        hops += 1;
-    }
-    ensure!(
-        common != 0 && notify != 0 && isr != 0 && msix_cap != 0 && msix_table != 0,
-        "virtio common {common:#x}, notify {notify:#x}, isr {isr:#x}, MSI-X {msix_cap:#x} table {msix_table:#x}"
-    );
+    ensure_eq!(l.notify_multiplier, 4, "the notify multiplier QEMU uses");
     cfg_wr16(4, (1 << 1) | (1 << 2) | (1 << 10)); // memory decoding, bus mastering, INTx disabled
     Ok(PciFn {
-        common,
-        notify,
-        notify_len,
-        notify_multiplier,
-        isr,
-        device,
-        msix_cap,
-        msix_table,
+        common: va(l.bar, l.common.offset),
+        notify: va(l.bar, l.notify.offset),
+        notify_len: l.notify.len,
+        notify_multiplier: l.notify_multiplier,
+        isr: va(l.bar, l.isr.offset),
+        device: l.device.map(|d| (va(l.bar, d.offset), d.len)),
+        msix: Some(PciMsix {
+            m: msix,
+            bars: f.bars,
+            maps,
+        }),
     })
 }
 
 fn pci_fn_down(f: &PciFn) {
     mmio_wr8(f.common + 0x14, 0); // virtio reset
-    cfg_wr16(f.msix_cap + 2, 0); // MSI-X off
+    f.msix_off();
     cfg_wr16(4, 1 << 10); // no decoding, no bus mastering
     pci_unmap();
 }
@@ -14703,8 +14834,20 @@ fn pci_unmap() {
 }
 
 /// Reset the function and bring it to DRIVER_OK with queue 0 at `rings` (descriptors, available ring, used ring) and the
-/// configuration-change interrupt on MSI-X vector 0, whose table entry says `(address, data)`.
+/// configuration-change interrupt on MSI-X vector 0, whose table entry says `(address, data)` (masked: `virtio_up_masked`).
 fn virtio_up(f: &PciFn, rings: (u64, u64, u64), msg: (u64, u32)) -> Outcome {
+    virtio_up_entry(
+        f,
+        rings,
+        pcicore::MsixEntry {
+            address: msg.0,
+            data: msg.1,
+            masked: false,
+        },
+    )
+}
+
+fn virtio_up_entry(f: &PciFn, rings: (u64, u64, u64), msg: pcicore::MsixEntry) -> Outcome {
     let c = f.common;
     mmio_wr8(c + 0x14, 0);
     let t0 = sys::clock_get();
@@ -14725,12 +14868,8 @@ fn virtio_up(f: &PciFn, rings: (u64, u64, u64), msg: (u64, u32)) -> Outcome {
     mmio_wr32(c + 12, 0);
     mmio_wr8(c + 0x14, 1 | 2 | 8); // FEATURES_OK
     ensure!(mmio_rd8(c + 0x14) & 8 != 0, "FEATURES_OK accepted");
-    // the MSI-X table entry first, then the vector for configuration changes, then MSI-X on with the function unmasked
-    mmio_wr32(f.msix_table, msg.0 as u32);
-    mmio_wr32(f.msix_table + 4, (msg.0 >> 32) as u32);
-    mmio_wr32(f.msix_table + 8, msg.1);
-    mmio_wr32(f.msix_table + 12, 0);
-    cfg_wr16(f.msix_cap + 2, 1 << 15);
+    // the MSI-X table entry and MSI-X on (pcicore's sequence), then the vector for configuration changes
+    f.msix_on(msg)?;
     mmio_wr16(c + 0x10, 0);
     ensure_eq!(
         mmio_rd16(c + 0x10),
@@ -15011,8 +15150,16 @@ fn rng_request(f: &PciFn, rings: u64, buf: u64, len: u32, wait_ms: u64) -> Resul
     wr16(RINGS_VA + 0x100, 1); // VIRTQ_AVAIL_F_NO_INTERRUPT
     wr16(RINGS_VA + 0x104, 0); // ring[0] = descriptor 0
     wr16(RINGS_VA + 0x102, 1); // idx 1
-    virtio_up(f, (rings, rings + 0x100, rings + 0x200), (0, 0))?;
-    mmio_wr32(f.msix_table + 12, 1); // the configuration message masked: the queue's transactions are the only ones
+                               // the configuration message masked: the queue's transactions are the only ones
+    virtio_up_entry(
+        f,
+        (rings, rings + 0x100, rings + 0x200),
+        pcicore::MsixEntry {
+            address: 0,
+            data: 0,
+            masked: true,
+        },
+    )?;
     mmio_wr16(f.notify, 0);
     let t0 = sys::clock_get();
     while sys::clock_get() < t0 + wait_ms {
@@ -15150,7 +15297,10 @@ fn pci_blk_read_sector0(
         "VERSION_1 and ACCESS_PLATFORM accepted"
     );
     let mut q = vio(virtio::SplitQueue::new(8, rings_io, 4096), "the queue")?;
-    vio(t.setup_queue(0, 8, q.addresses()), "queue 0")?;
+    vio(
+        t.setup_queue(0, 8, q.addresses(), virtio::NO_VECTOR),
+        "queue 0",
+    )?;
     t.driver_ok();
     let chain = [
         virtio::Buf {
@@ -15268,11 +15418,7 @@ fn pci_virtio_blk_reads_through_the_iommu() -> Outcome {
             );
         }
         ensure_eq!(iommu_faults(), before, "the read took no IOMMU fault");
-        ensure_eq!(
-            cfg_rd16(f.msix_cap + 2) & (1 << 15),
-            0,
-            "MSI-X stayed off (this slice polls)"
-        );
+        ensure!(!f.msix_enabled(), "MSI-X stayed off (this test polls)");
         ensure!(cfg_rd16(4) & (1 << 10) != 0, "INTx stayed disabled");
         Ok(())
     })
@@ -16136,9 +16282,7 @@ fn msi_granted_vector_is_delivered() -> Outcome {
         ok(sys::interrupt_deliver_here(irq), "interrupt_deliver_here")?;
         let here = vector_route(irq);
         ensure!(here != u64::MAX, "placed (debug_stat 148)");
-        if here >> 16 != 0 {
-            vector_moves_off_an_offline_hart(f, d, irq, address, here)?;
-        }
+        vector_moves_off_an_offline_hart(f, d, irq, address, here)?;
         msi_send(f, d, address, 1)?;
         ensure_eq!(
             st(sys::object_wait(
@@ -16226,7 +16370,9 @@ fn vector_calls_check_handles_rights_and_arguments() -> Outcome {
 }
 
 /// The hart vector `irq` is placed on (`here`, from debug_stat 148) goes offline: the vector moves to another hart and is still
-/// delivered; the hart comes back.
+/// delivered; the hart comes back. `debug_stat` 148 names the interrupt file, and files follow the hart ids, not the logical harts
+/// (hart 0 is the boot hart, whichever id that is), so the hart is found by taking the others offline one at a time until the route
+/// leaves `here`. A route on hart 0, which never goes offline, moves for none of them: nothing to check.
 fn vector_moves_off_an_offline_hart(
     f: &PciFn,
     d: &Domain,
@@ -16234,34 +16380,46 @@ fn vector_moves_off_an_offline_hart(
     address: u64,
     here: u64,
 ) -> Outcome {
-    let hart = here >> 16;
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
-    let off = sys::hart_set_online(res, hart, 0);
-    let r = (|| {
-        ensure_eq!(st(off), Some(S::Ok), "hart {hart} offline");
-        let moved = vector_route(irq);
-        ensure!(
-            moved != u64::MAX && moved >> 16 != hart,
-            "the vector moved off hart {hart} ({here:#x} to {moved:#x})"
-        );
-        msi_send(f, d, address, 1)?;
-        ensure_eq!(
-            st(sys::object_wait(
-                irq,
-                sig::INTERRUPT,
-                sys::clock_get() + 2000
-            )),
-            Some(S::Ok),
-            "delivered after the move"
-        );
-        ok(sys::interrupt_ack(irq), "acknowledge after the move")?;
-        Ok(())
-    })();
-    let back = sys::hart_set_online(res, hart, 1);
+    let harts = hart_count(res);
+    let mut r = Ok(());
+    for hart in 1..harts {
+        let off = sys::hart_set_online(res, hart, 0);
+        let mut moved_here = false;
+        r = (|| {
+            ensure_eq!(st(off), Some(S::Ok), "hart {hart} offline");
+            let moved = vector_route(irq);
+            if moved == here {
+                return Ok(());
+            }
+            moved_here = true;
+            ensure!(
+                moved != u64::MAX && moved >> 16 != here >> 16,
+                "the vector moved off hart {hart}'s file ({here:#x} to {moved:#x})"
+            );
+            msi_send(f, d, address, 1)?;
+            ensure_eq!(
+                st(sys::object_wait(
+                    irq,
+                    sig::INTERRUPT,
+                    sys::clock_get() + 2000
+                )),
+                Some(S::Ok),
+                "delivered after the move"
+            );
+            ok(sys::interrupt_ack(irq), "acknowledge after the move")?;
+            Ok(())
+        })();
+        let back = sys::hart_set_online(res, hart, 1);
+        if r.is_ok() && st(back) != Some(S::Ok) {
+            r = Err(msg_at(line!()));
+        }
+        if r.is_err() || moved_here {
+            break;
+        }
+    }
     sys::handle_close(res);
-    r?;
-    ensure_eq!(st(back), Some(S::Ok), "hart {hart} online again");
-    Ok(())
+    r
 }
 
 /// IOMMU-SPEC 8.4, first row: a message to a page of the window whose vector is not granted is an IOMMU fault (MSI entry not valid)
@@ -16516,6 +16674,751 @@ fn msi_destroy_revokes_every_vector() -> Outcome {
         r
     });
     r.and(vectors_at_baseline(live, ids))
+}
+
+// ---- interrupts through devmgr's claim (IOMMU9; IOMMU-SPEC 8, 9 and 10) --------------------------------------------------------
+//
+// The suite is the driver here and `devmgr` the supervisor, as a real driver will be in IOMMU10: the claim reply carries the BAR, the
+// domain handle with IO_MAP and IO_UNMAP, the DMA VMOs and one interrupt handle per vector of the class; `devmgr` granted the vectors
+// and programmed the MSI-X table, and the driver only maps each event to its entry (`config_msix_vector`, `queue_msix_vector`).
+// Every request below completes by interrupt: the used ring is read only after the queue's object fired.
+
+/// The block function the harness puts at slot 6 (`addr=0x6`, `PCI_DEVICES`): a second read-only disk whose sector 0 holds byte i =
+/// (i * 7 + 3) mod 256, so a sector read from it is told from the first disk's.
+const PCI_BLK2_SLOT: u64 = 6;
+/// The entropy function's device id (`IOMMU_TEST_SLOT`, 00:04.0), claimed through `devmgr` by the forging test.
+const PCI_RNG_RID: u16 = (IOMMU_TEST_SLOT << 3) as u16;
+/// Where a claimed function's BAR, rings and data page are mapped here: slot `k` at CLAIM_VA + k * CLAIM_STRIDE.
+const CLAIM_VA: u64 = 0x7e0_0000;
+const CLAIM_STRIDE: u64 = 0x4_0000;
+const CLAIM_RINGS: u64 = 0x1_0000;
+const CLAIM_DATA: u64 = 0x2_0000;
+
+/// One page of queue memory mapped at a page-aligned address.
+struct PageMem(u64);
+impl PageMem {
+    fn at(&self, off: u64) -> u64 {
+        self.0 + (off & 0xfff)
+    }
+}
+impl virtio::Mem for PageMem {
+    fn read16(&self, off: u64) -> u16 {
+        rd16(self.at(off))
+    }
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: `at` keeps the address inside the page mapped read-write at `self.0` (a claimed function's rings), and the queue
+        // layout aligns it.
+        unsafe { core::ptr::read_volatile(self.at(off) as *const u32) }
+    }
+    fn write16(&mut self, off: u64, v: u16) {
+        wr16(self.at(off), v)
+    }
+    fn write32(&mut self, off: u64, v: u32) {
+        // SAFETY: as `read32`.
+        unsafe { core::ptr::write_volatile(self.at(off) as *mut u32, v) }
+    }
+    fn write64(&mut self, off: u64, v: u64) {
+        wr64(self.at(off), v)
+    }
+}
+
+/// A function claimed through `devmgr` and brought up by the suite as its driver.
+struct Claimed {
+    /// Every handle the claim carried, in the reply's order (closed at the end), and the driver's job.
+    hs: Vec<u64>,
+    job: u64,
+    c: proto::devmgr::PciClaim,
+    base: u64,
+    t: virtio::PciTransport<VaRegs>,
+    q: virtio::SplitQueue,
+    data_io: u64,
+}
+
+impl Claimed {
+    fn dom(&self) -> u64 {
+        self.hs[1]
+    }
+    /// The interrupt handle that means `what` (`IRQ_CONFIG` or a queue).
+    fn irq(&self, what: u16) -> Option<u64> {
+        self.c.irq(what).map(|(i, _)| self.hs[i])
+    }
+    fn data_va(&self) -> u64 {
+        self.base + CLAIM_DATA
+    }
+    fn rings_va(&self) -> u64 {
+        self.base + CLAIM_RINGS
+    }
+
+    /// Give everything back: the device reset, the mappings and the handles (the claim is released when the connection closes).
+    fn drop_all(self) {
+        use virtio::Transport;
+        let mut t = self.t;
+        t.set_status(0);
+        unmap_here(self.base + CLAIM_DATA);
+        unmap_here(self.base + CLAIM_RINGS);
+        unmap_here(self.base);
+        for h in self.hs {
+            sys::handle_close(h);
+        }
+        sys::handle_close(self.job);
+    }
+}
+
+/// Claim `rid` on `ch` for a new driver job and bring it up as its driver at slot `k`'s addresses: the BAR, the rings and the data
+/// page mapped here and (the rings and the data page) in the domain, features negotiated, the configuration change and queue 0
+/// mapped to the MSI-X entries `vectors` names, queue 0 of 8 entries enabled, DRIVER_OK.
+fn claim_and_bring_up(
+    ch: u64,
+    txid: u32,
+    rid: u16,
+    k: u64,
+    vectors: &virtio::VectorMap,
+) -> Result<Claimed, Detail> {
+    use virtio::Transport;
+    let (job, send) = driver_job()?;
+    let (s, c, hs) = match pci_claim(ch, txid, rid, Some(send)) {
+        Ok(r) => r,
+        Err(e) => {
+            sys::handle_close(job);
+            return Err(e);
+        }
+    };
+    let base = CLAIM_VA + k * CLAIM_STRIDE;
+    let up = (|| {
+        ensure_eq!(s, proto::devmgr::Status::Ok, "the claim of {rid:#x}");
+        let c = c.clone().ok_or_else(|| msg_at(line!()))?;
+        let (bar, dom, rings, data) = (hs[0], hs[1], hs[2], hs[3]);
+        let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+        let m = sys::process_map(me, bar, base, 0, c.bar_bytes, PF_R | PF_W);
+        sys::handle_close(me);
+        ensure_eq!(st(m), Some(S::Ok), "map the BAR VMO");
+        map_here(rings, base + CLAIM_RINGS, 1, PF_R | PF_W)?;
+        map_here(data, base + CLAIM_DATA, 1, PF_R | PF_W)?;
+        let rings_io = ok(sys::iodomain_map(dom, rings, 0, 1, 3), "map the rings")?.a1 as u64;
+        let data_io = ok(sys::iodomain_map(dom, data, 0, 1, 3), "map a data page")?.a1 as u64;
+        for i in 0..512 {
+            wr64(base + CLAIM_RINGS + 8 * i, 0);
+            wr64(base + CLAIM_DATA + 8 * i, 0);
+        }
+        let mut t = virtio::PciTransport::new(
+            VaRegs,
+            virtio::PciLocations {
+                common: base + u64::from(c.common.0),
+                notify: base + u64::from(c.notify.0),
+                notify_len: u64::from(c.notify.1),
+                notify_multiplier: c.notify_multiplier,
+                isr: base + u64::from(c.isr.0),
+                device: (c.device_cfg.1 != 0)
+                    .then(|| (base + u64::from(c.device_cfg.0), u64::from(c.device_cfg.1))),
+            },
+        );
+        let t0 = sys::clock_get();
+        vio(t.reset(&mut || sys::clock_get() < t0 + 1000), "reset")?;
+        vio(t.negotiate(virtio::feature::REQUIRED), "negotiate")?;
+        vio(t.set_config_vector(vectors.config), "config_msix_vector")?;
+        let q = vio(virtio::SplitQueue::new(8, rings_io, 4096), "the queue")?;
+        vio(
+            t.setup_queue(0, 8, q.addresses(), vectors.queue(0)),
+            "queue 0",
+        )?;
+        t.driver_ok();
+        Ok(Claimed {
+            hs: hs.clone(),
+            job,
+            c,
+            base,
+            t,
+            q,
+            data_io,
+        })
+    })();
+    if up.is_err() {
+        for &h in &hs {
+            sys::handle_close(h);
+        }
+        unmap_here(base + CLAIM_DATA);
+        unmap_here(base + CLAIM_RINGS);
+        unmap_here(base);
+        sys::handle_close(job);
+    }
+    up
+}
+
+/// Read sector 0 of a claimed block function, asking for an interrupt: the header and status in its data page, the sector after
+/// them. The head's id.
+fn claimed_blk_submit(b: &mut Claimed) -> Result<u16, Detail> {
+    use virtio::Transport;
+    let h = virtio::blk::header(virtio::blk::T_IN, 0);
+    for (i, w) in h.as_chunks::<8>().0.iter().enumerate() {
+        wr64(b.data_va() + BLK_HDR + 8 * i as u64, u64::from_le_bytes(*w));
+    }
+    for i in 0..64 {
+        wr64(b.data_va() + BLK_DATA + 8 * i, 0);
+    }
+    wr64(b.data_va() + BLK_STATUS, 0xff);
+    let chain = [
+        virtio::Buf {
+            addr: b.data_io + BLK_HDR,
+            len: virtio::blk::HEADER_BYTES,
+            device_writes: false,
+        },
+        virtio::Buf {
+            addr: b.data_io + BLK_DATA,
+            len: virtio::blk::SECTOR,
+            device_writes: true,
+        },
+        virtio::Buf {
+            addr: b.data_io + BLK_STATUS,
+            len: 1,
+            device_writes: true,
+        },
+    ];
+    let mut mem = PageMem(b.rings_va());
+    let head = vio(b.q.add(&mut mem, &chain, true), "add the request")?;
+    b.t.notify(0);
+    Ok(head)
+}
+
+/// The used element a claimed function returned for request `head`: OK status and its disk's pattern `(mul, add)` in the sector.
+fn claimed_blk_done(b: &mut Claimed, head: u16, (mul, add): (u64, u64)) -> Outcome {
+    let u = vio(b.q.take_used(&PageMem(b.rings_va())), "the used ring")?;
+    ensure_eq!(
+        u.map(|u| u.0),
+        Some(head),
+        "the device returned the request it was interrupting for"
+    );
+    ensure_eq!(
+        rd8_dma(b.data_va() + BLK_STATUS),
+        virtio::blk::S_OK,
+        "the request's status"
+    );
+    let wrong = (0..512u64)
+        .find(|&i| rd8_dma(b.data_va() + BLK_DATA + i) != ((i * mul + add) & 0xff) as u8);
+    ensure_eq!(
+        wrong,
+        None,
+        "sector 0 is its own disk's (byte i = i * {mul} + {add})"
+    );
+    Ok(())
+}
+
+/// Wait for the used ring to reach `n` entries (a request completed while its interrupt was masked: no notice to wake for).
+fn claimed_used_reaches(b: &Claimed, n: u16) -> Outcome {
+    let t0 = sys::clock_get();
+    while rd16(b.rings_va() + b.q.layout.used_idx()) != n {
+        ensure!(
+            sys::clock_get() < t0 + 2000,
+            "the device did not return the request"
+        );
+        sys::thread_yield();
+    }
+    Ok(())
+}
+
+/// `interrupt_deliver_here` from a thread of its own (`place_here`'s status, u64::MAX until it ran).
+static PLACE_RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
+extern "C" fn place_here(irq: usize) -> ! {
+    PLACE_RESULT.store(
+        sys::interrupt_deliver_here(irq as u64).status as u64,
+        Ordering::SeqCst,
+    );
+    sys::thread_exit(0)
+}
+
+/// The disk patterns of the two PCI block functions (`pci_disk` in the script).
+const BLK1_PATTERN: (u64, u64) = (13, 1);
+const BLK2_PATTERN: (u64, u64) = (7, 3);
+/// Block: the configuration change on entry 0, queue 0 on entry 1 (the class plan of `pcicore::claim`).
+fn blk_vectors() -> virtio::VectorMap {
+    virtio::VectorMap {
+        config: 0,
+        queues: vec![1],
+    }
+}
+
+/// Run `body` with `devmgr` started (its service channel) and the root resource; the manager ends when the channel closes, which
+/// releases every claim, and the test waits for that.
+fn with_devmgr(body: impl FnOnce(u64, u64) -> Outcome) -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let (mine, mgr, mj) = start_devmgr_in_job(res)?;
+    let r = body(res, mine);
+    sys::handle_close(mine);
+    let end = wait_ended(mgr, 5000);
+    sys::handle_close(mgr);
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    r.and(end)
+}
+
+/// IOMMU9 (IOMMU-SPEC 8.3, 8.5, 9; D5 for a vector): the block function claimed through `devmgr`'s real path. The reply carries one
+/// interrupt handle per vector of the block class (the configuration change on entry 0, the queue on entry 1); a request completes by
+/// **interrupt** (the used ring is read only after the queue's object fired); while fired the object stays masked (a second request
+/// completes with no notice) and the acknowledgement fires it again at once from the pending bit; armed, nothing more. Placed on the
+/// hart that asks (`interrupt_deliver_here`, made with every other hart offline so the asking hart is known: hart 0), it stays there
+/// and is delivered there. The configuration object never fires, and the IOMMU takes no fault. The negative-control kernels
+/// `fault-vector-no-unmask` and `fault-vector-no-repend` (the vector twins of `interrupt_object_fires_and_masks`'s) must fail here.
+fn pci_virtio_blk_interrupts_through_msix() -> Outcome {
+    with_devmgr(|res, mgr| {
+        let mut b = claim_and_bring_up(mgr, 1, PCI_BLK_DID as u16, 0, &blk_vectors())?;
+        let r = (|| {
+            use proto::devmgr::{PciIrq, IRQ_CONFIG};
+            ensure_eq!(
+                b.c.irqs,
+                vec![
+                    PciIrq {
+                        entry: 0,
+                        what: IRQ_CONFIG
+                    },
+                    PciIrq { entry: 1, what: 0 }
+                ],
+                "the block class's vectors: the configuration change on entry 0, the queue on entry 1"
+            );
+            let (cfg, q) = (
+                b.irq(IRQ_CONFIG).ok_or_else(|| msg_at(line!()))?,
+                b.irq(0).ok_or_else(|| msg_at(line!()))?,
+            );
+            let (faults, notices) = (iommu_faults(), sys::debug_stat(162));
+            // the first request, by interrupt
+            let head = claimed_blk_submit(&mut b)?;
+            ensure_eq!(
+                st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                Some(S::Ok),
+                "the request's interrupt (notices {notices} to {}, faults {faults} to {})",
+                sys::debug_stat(162),
+                iommu_faults()
+            );
+            claimed_blk_done(&mut b, head, BLK1_PATTERN)?;
+            // masked until acknowledged: the second request completes with no notice, and the acknowledgement fires it again
+            let head = claimed_blk_submit(&mut b)?;
+            claimed_used_reaches(&b, 2)?;
+            msi_settle();
+            ensure_eq!(
+                sys::debug_stat(162),
+                notices + 1,
+                "fired: the second message sent no notice (D5)"
+            );
+            let a = ok(sys::interrupt_ack(q), "acknowledge")?;
+            ensure_eq!(
+                a.a1,
+                2,
+                "two claims: the first request, and the second's message taken from the pending bit at the acknowledgement"
+            );
+            ensure_eq!(
+                st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 1)),
+                Some(S::Ok),
+                "the message that came while masked fires again at the acknowledgement"
+            );
+            claimed_blk_done(&mut b, head, BLK1_PATTERN)?;
+            ok(sys::interrupt_ack(q), "acknowledge again")?;
+            ensure_eq!(
+                st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 50)),
+                Some(S::TimedOut),
+                "armed, nothing pending"
+            );
+            // placed on the hart that asks: with the other harts offline the asking thread runs on hart 0, whose interrupt file is
+            // then the route's (`debug_stat` 148 names the file, and file numbers follow the hart ids, not the logical harts: hart 0 is
+            // the boot hart, whichever id that is)
+            let harts = hart_count(res);
+            let mut off = Vec::new();
+            let placed = (|| {
+                for h in 1..harts {
+                    ensure_eq!(
+                        st(sys::hart_set_online(res, h, 0)),
+                        Some(S::Ok),
+                        "hart {h} offline"
+                    );
+                    off.push(h);
+                }
+                ok(sys::interrupt_deliver_here(q), "interrupt_deliver_here")?;
+                Ok(vector_route(q))
+            })();
+            let mut back = Ok(());
+            for &h in &off {
+                if st(sys::hart_set_online(res, h, 1)) != Some(S::Ok) && back.is_ok() {
+                    back = Err(msg_at(line!()));
+                }
+            }
+            let route = placed?;
+            back?;
+            ensure!(route != u64::MAX, "placed on hart 0, which asked");
+            let file0 = route >> 16;
+            let head = claimed_blk_submit(&mut b)?;
+            ensure_eq!(
+                st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                Some(S::Ok),
+                "delivered where it was placed"
+            );
+            claimed_blk_done(&mut b, head, BLK1_PATTERN)?;
+            ensure_eq!(
+                vector_route(q),
+                route,
+                "it stays where it was asked to be (no automatic follow)"
+            );
+            ok(sys::interrupt_ack(q), "acknowledge")?;
+            // and with more harts, the call moves it: a thread that runs elsewhere (the asking thread spins here meanwhile) asks
+            // for it, and the route leaves hart 0's file for the file of the hart that asked; a request is delivered there
+            if harts > 1 {
+                let mut moved = None;
+                for _ in 0..50 {
+                    PLACE_RESULT.store(u64::MAX, Ordering::SeqCst);
+                    let t = new_thread(place_here, q as usize)?;
+                    let t0 = sys::clock_get();
+                    while sys::object_signals(t).a1 as u32 & sig::TERMINATED == 0
+                        && sys::clock_get() < t0 + 2000
+                    {
+                        core::hint::spin_loop();
+                    }
+                    sys::handle_close(t);
+                    ensure_eq!(
+                        PLACE_RESULT.load(Ordering::SeqCst),
+                        0,
+                        "interrupt_deliver_here from another thread"
+                    );
+                    let r = vector_route(q);
+                    if r != u64::MAX && r >> 16 != file0 {
+                        moved = Some(r);
+                        break;
+                    }
+                }
+                let moved = moved.ok_or_else(|| msg_at(line!()))?;
+                let head = claimed_blk_submit(&mut b)?;
+                ensure_eq!(
+                    st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                    Some(S::Ok),
+                    "delivered on the hart that asked ({moved:#x})"
+                );
+                claimed_blk_done(&mut b, head, BLK1_PATTERN)?;
+                ensure_eq!(vector_route(q), moved, "and it stays there");
+                ok(sys::interrupt_ack(q), "acknowledge")?;
+            }
+            msi_settle();
+            ensure_eq!(
+                st(sys::object_wait(cfg, sig::INTERRUPT, sys::clock_get() + 1)),
+                Some(S::TimedOut),
+                "the configuration-change object never fired"
+            );
+            ensure_eq!(iommu_faults(), faults, "no IOMMU fault");
+            Ok(())
+        })();
+        b.drop_all();
+        r
+    })
+}
+
+/// IOMMU9 (IOMMU-SPEC 8.3, 9): two block functions claimed at once, each with its two vectors; requests on both, one after the other
+/// and together. Every interrupt arrives on its own device's queue object and none on another's: each queue object's claims equal
+/// its device's requests, the configuration objects never fire, and each sector is its own disk's.
+fn pci_two_devices_do_not_share() -> Outcome {
+    with_devmgr(|_, mgr| {
+        let mut a = claim_and_bring_up(mgr, 1, PCI_BLK_DID as u16, 0, &blk_vectors())?;
+        let mut b = match claim_and_bring_up(mgr, 2, (PCI_BLK2_SLOT << 3) as u16, 1, &blk_vectors())
+        {
+            Ok(b) => b,
+            Err(e) => {
+                a.drop_all();
+                return Err(e);
+            }
+        };
+        let r = (|| {
+            use proto::devmgr::IRQ_CONFIG;
+            let faults = iommu_faults();
+            let irq = |x: &Claimed, w| x.irq(w).ok_or_else(|| msg_at(line!()));
+            let (aq, ac, bq, bc) = (
+                irq(&a, 0)?,
+                irq(&a, IRQ_CONFIG)?,
+                irq(&b, 0)?,
+                irq(&b, IRQ_CONFIG)?,
+            );
+            ensure!(
+                [aq, ac, bq, bc]
+                    .iter()
+                    .all(|&h| vector_route(h) != u64::MAX),
+                "four live vectors"
+            );
+            const N: u64 = 4;
+            for i in 0..N {
+                // one at a time: A's request interrupts A's queue object only
+                for (x, q, others, pat) in [
+                    (&mut a, aq, [ac, bq, bc], BLK1_PATTERN),
+                    (&mut b, bq, [bc, aq, ac], BLK2_PATTERN),
+                ] {
+                    let head = claimed_blk_submit(x)?;
+                    ensure_eq!(
+                        st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                        Some(S::Ok),
+                        "request {i}'s interrupt"
+                    );
+                    msi_settle();
+                    for o in others {
+                        ensure_eq!(
+                            sys::object_signals(o).a1 as u32 & sig::INTERRUPT,
+                            0,
+                            "request {i}: another object fired"
+                        );
+                    }
+                    claimed_blk_done(x, head, pat)?;
+                    let n = ok(sys::interrupt_ack(q), "acknowledge")?.a1;
+                    ensure_eq!(n as u64, 2 * i + 1, "one claim per request");
+                }
+                // and together
+                let (ha, hb) = (claimed_blk_submit(&mut a)?, claimed_blk_submit(&mut b)?);
+                for (x, q, h, pat) in [
+                    (&mut a, aq, ha, BLK1_PATTERN),
+                    (&mut b, bq, hb, BLK2_PATTERN),
+                ] {
+                    ensure_eq!(
+                        st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                        Some(S::Ok),
+                        "request {i}'s interrupt, both devices busy"
+                    );
+                    claimed_blk_done(x, h, pat)?;
+                    let n = ok(sys::interrupt_ack(q), "acknowledge")?.a1;
+                    ensure_eq!(
+                        n as u64,
+                        2 * i + 2,
+                        "one claim per request, both devices busy"
+                    );
+                }
+            }
+            msi_settle();
+            for (h, what) in [(ac, "A's configuration"), (bc, "B's configuration")] {
+                ensure_eq!(
+                    st(sys::interrupt_ack(h)),
+                    Some(S::BadState),
+                    "{what} object never fired"
+                );
+            }
+            for q in [aq, bq] {
+                ensure_eq!(
+                    st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 20)),
+                    Some(S::TimedOut),
+                    "nothing more after the last request"
+                );
+            }
+            ensure_eq!(iommu_faults(), faults, "no IOMMU fault");
+            Ok(())
+        })();
+        a.drop_all();
+        b.drop_all();
+        r
+    })
+}
+
+/// IOMMU9 (IOMMU-SPEC 8.4, 8.7, 9): what a driver is handed cannot reach past its device. The entropy function is claimed through
+/// `devmgr` (its class has one vector, queue 0 on entry 1; entry 0 of its two is left masked and cleared). The suite then uses only
+/// the claim's handles, as a driver would: the BAR VMO is the virtio structures' BAR, not the MSI-X table's (which the configuration
+/// space, read here through the root resource as an observer, puts in another BAR), and the entry `devmgr` programmed, read by the
+/// observer, appears nowhere in what the BAR VMO maps; the domain handle cannot grant a vector, destroy the domain, read its faults or
+/// be duplicated; the interrupt handle cannot be duplicated or grant. The driver then points `queue_msix_vector` at entry 0, which
+/// `devmgr` did not program: the device's message for the queue is not sent (or, were it sent, would fault in the IOMMU with cause
+/// 262), and nobody is interrupted. Pointed at its own entry 1, the same request interrupts (the negative is not vacuous).
+///
+/// What this does not show, by construction: the test runs in the suite's process, which also holds the root resource (it is the
+/// observer above), so "a driver has no handle for the configuration space or the table" rests on the claim's handle list (five
+/// handles, each checked by type and rights here), not on a process that holds nothing else. And because entry 0 is masked and
+/// cleared, QEMU does not send the message at all: this proves the table's mask, not the IOMMU's refusal of an ungranted vector,
+/// which `msi_forgery_faults` (IOMMU7) proves with a message actually sent.
+fn pci_driver_cannot_forge_through_devmgr() -> Outcome {
+    with_devmgr(|res, mgr| {
+        let mut x = claim_and_bring_up(
+            mgr,
+            1,
+            PCI_RNG_RID,
+            0,
+            &virtio::VectorMap {
+                config: virtio::NO_VECTOR,
+                queues: vec![0],
+            },
+        )?;
+        let r = (|| {
+            use proto::devmgr::PciIrq;
+            ensure_eq!(
+                (x.c.dma_pages.clone(), x.c.irqs.clone()),
+                (vec![1, 1], vec![PciIrq { entry: 1, what: 0 }]),
+                "the entropy class: two DMA pages, queue 0 on entry 1"
+            );
+            ensure_eq!(
+                x.hs.len(),
+                5,
+                "the BAR, the domain, two DMA VMOs, one interrupt"
+            );
+            let q = x.irq(0).ok_or_else(|| msg_at(line!()))?;
+            // the configuration space as an observer sees it: the MSI-X table is in a BAR of its own
+            let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+            let cfgv = ok(
+                sys::vmo_create_physical(res, PCI_ECAM + (IOMMU_TEST_SLOT << 15), 4096),
+                "the configuration page",
+            )?
+            .a1 as u64;
+            let m = sys::process_map(me, cfgv, PCI_CFG_VA, 0, 4096, PF_R);
+            sys::handle_close(cfgv);
+            sys::handle_close(me);
+            ensure_eq!(st(m), Some(S::Ok), "map it read-only");
+            let mut cfg = [0u8; pcicore::CFG_BYTES];
+            for (i, w) in cfg.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *w = cfg_rd32(4 * i as u64).to_le_bytes();
+            }
+            unmap_here(PCI_CFG_VA);
+            let caps = pcicore::capabilities(&cfg).map_err(|_| msg_at(line!()))?;
+            let msix = pcicore::msix_cap(&cfg, &caps)
+                .ok()
+                .flatten()
+                .ok_or_else(|| msg_at(line!()))?;
+            let vbar = pcicore::virtio_caps(&cfg, &caps)
+                .ok()
+                .and_then(|v| {
+                    v.iter()
+                        .find(|c| c.cfg_type == pcicore::virtio_cfg::COMMON)
+                        .map(|c| c.bar)
+                })
+                .ok_or_else(|| msg_at(line!()))?;
+            ensure!(
+                msix.table_bar != vbar && msix.pba_bar != vbar,
+                "the MSI-X table (BAR {}) is not in the driver's BAR ({vbar})",
+                msix.table_bar
+            );
+            ensure_eq!(
+                msix.table_size,
+                2,
+                "QEMU's entropy function has two entries"
+            );
+            // the table's entry 1 as the observer reads it (devmgr's grant: an address in the MRIF window, the ABI's data), and
+            // nowhere in what the driver can read through its BAR VMO: the driver's mapping does not contain the table
+            let bar_reg = |i: u8| {
+                let at = 0x10 + 4 * usize::from(i);
+                let w = |o: usize| u32::from_le_bytes([cfg[o], cfg[o + 1], cfg[o + 2], cfg[o + 3]]);
+                let lo = w(at);
+                let hi = if lo & 0x6 == 0x4 { w(at + 4) } else { 0 };
+                (u64::from(hi) << 32) | u64::from(lo & !0xf)
+            };
+            let entry1 = bar_reg(msix.table_bar) + u64::from(msix.table_offset) + 16;
+            let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+            let tv = ok(
+                sys::vmo_create_physical(res, entry1 & !0xfff, 4096),
+                "the table's page",
+            )?
+            .a1 as u64;
+            let m = sys::process_map(me, tv, PCI_CFG_VA, 0, 4096, PF_R);
+            sys::handle_close(tv);
+            sys::handle_close(me);
+            ensure_eq!(st(m), Some(S::Ok), "map the table's page read-only");
+            let e = PCI_CFG_VA + (entry1 & 0xfff);
+            let (lo, hi, data) = (mmio_rd32(e), mmio_rd32(e + 4), mmio_rd32(e + 8));
+            unmap_here(PCI_CFG_VA);
+            let granted = (u64::from(hi) << 32) | u64::from(lo);
+            ensure!(
+                granted != 0 && u64::from(data) == rt::abi::iodomain::MSI_DATA,
+                "devmgr programmed entry 1 ({granted:#x}, data {data})"
+            );
+            let isr = u64::from(x.c.isr.0)..u64::from(x.c.isr.0) + u64::from(x.c.isr.1).max(4);
+            let seen = (0..x.c.bar_bytes / 4)
+                .map(|i| 4 * i)
+                .filter(|o| !isr.contains(o))
+                .find(|&o| {
+                    o + 8 < x.c.bar_bytes
+                        && mmio_rd32(x.base + o) == lo
+                        && mmio_rd32(x.base + o + 4) == hi
+                        && mmio_rd32(x.base + o + 8) == data
+                });
+            ensure_eq!(
+                seen,
+                None,
+                "the granted entry is not readable through the driver's BAR VMO"
+            );
+            // the domain handle maps and unmaps; the interrupt handle waits and acknowledges
+            for (r, what) in [
+                (sys::iodomain_grant_vector(x.dom(), 0), "grant vector 0"),
+                (sys::iodomain_grant_vector(x.dom(), 1), "grant vector 1"),
+                (sys::iodomain_destroy(x.dom()), "destroy the domain"),
+                (
+                    sys::iodomain_fault_read(x.dom()),
+                    "read the domain's faults",
+                ),
+                (
+                    sys::handle_duplicate(x.dom(), Rights::IO_MAP.0),
+                    "duplicate the domain",
+                ),
+                (
+                    sys::handle_duplicate(q, Rights::WAIT.0),
+                    "duplicate the interrupt",
+                ),
+            ] {
+                ensure_eq!(st(r), Some(S::AccessDenied), "the driver cannot {what}");
+            }
+            ensure_eq!(
+                st(sys::iodomain_grant_vector(q, 0)),
+                Some(S::WrongType),
+                "an interrupt handle grants nothing"
+            );
+            // queue 0 pointed at entry 0, which devmgr left masked and cleared: one request
+            let (faults, notices, no_route) =
+                (iommu_faults(), sys::debug_stat(162), sys::debug_stat(140));
+            claimed_rng_request(&mut x)?;
+            claimed_used_reaches(&x, 1)?;
+            msi_settle();
+            ensure_eq!(sys::debug_stat(162), notices, "no notice reached a hart");
+            ensure_eq!(
+                sys::debug_stat(140),
+                no_route,
+                "no message on an identity with no route"
+            );
+            ensure_eq!(
+                st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 20)),
+                Some(S::TimedOut),
+                "the granted vector did not fire for a message aimed elsewhere"
+            );
+            if iommu_faults() != faults {
+                let (did, _, cause, _) = iommu_last_fault();
+                ensure_eq!(
+                    (did, cause),
+                    (u64::from(PCI_RNG_RID), CAUSE_MSI_INVALID),
+                    "a message that left the device faults as an ungranted vector"
+                );
+            }
+            let _ = vio(x.q.take_used(&PageMem(x.rings_va())), "the used ring")?;
+            // and pointed at its own entry: the same request interrupts
+            {
+                use virtio::Transport;
+                let t0 = sys::clock_get();
+                vio(x.t.reset(&mut || sys::clock_get() < t0 + 1000), "reset")?;
+                vio(x.t.negotiate(virtio::feature::REQUIRED), "negotiate")?;
+                let rings_io = x.q.io_base;
+                x.q = vio(virtio::SplitQueue::new(8, rings_io, 4096), "the queue")?;
+                for i in 0..512 {
+                    wr64(x.rings_va() + 8 * i, 0);
+                }
+                vio(
+                    x.t.setup_queue(0, 8, x.q.addresses(), 1),
+                    "queue 0 on entry 1",
+                )?;
+                x.t.driver_ok();
+            }
+            claimed_rng_request(&mut x)?;
+            ensure_eq!(
+                st(sys::object_wait(q, sig::INTERRUPT, sys::clock_get() + 2000)),
+                Some(S::Ok),
+                "the queue on its own entry interrupts"
+            );
+            ok(sys::interrupt_ack(q), "acknowledge")?;
+            Ok(())
+        })();
+        x.drop_all();
+        r
+    })
+}
+
+/// One entropy request on a claimed virtio-rng function: 64 device-writable bytes of its data page, an interrupt asked for.
+fn claimed_rng_request(x: &mut Claimed) -> Outcome {
+    use virtio::Transport;
+    let chain = [virtio::Buf {
+        addr: x.data_io,
+        len: 64,
+        device_writes: true,
+    }];
+    let mut mem = PageMem(x.rings_va());
+    vio(x.q.add(&mut mem, &chain, true), "add the request")?;
+    x.t.notify(0);
+    Ok(())
 }
 
 /// IOMMU4: identities are allocated per hart, next-fit, so an object re-created again and again walks the whole identity space of a
@@ -19807,6 +20710,15 @@ pub fn app_main() -> i32 {
         (
             "vector_calls_check_handles_rights_and_arguments",
             vector_calls_check_handles_rights_and_arguments,
+        ),
+        (
+            "pci_virtio_blk_interrupts_through_msix",
+            pci_virtio_blk_interrupts_through_msix,
+        ),
+        ("pci_two_devices_do_not_share", pci_two_devices_do_not_share),
+        (
+            "pci_driver_cannot_forge_through_devmgr",
+            pci_driver_cannot_forge_through_devmgr,
         ),
         (
             "socket_ends_travel_over_channels",
