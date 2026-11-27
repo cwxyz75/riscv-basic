@@ -266,12 +266,24 @@ pub fn run_all() -> Report {
     })();
     // A child that outlived init dies asynchronously (kill flag, then its own exit): give it a
     // bounded time, so one leaking test does not also fail the leak checks below.
+    // (T265: how long the processes left when init ended took to go, how many there were and how many sweeps ran meanwhile: printed for
+    // every boot as one `leak: settle` line, so a slow teardown shows its size before any check fails)
+    let (t0, left, sweeps0) = (thread::ticks(), user::process_count(), user::sweep_epoch());
     for _ in 0..200 {
-        if user::process_count() == 0 {
+        if user::process_count() == 0 && user::dying::count() == 0 {
             break;
         }
         thread::sleep_ticks(1);
     }
+    let _ = core::fmt::Write::write_fmt(
+        &mut crate::console::Console,
+        format_args!(
+            "leak: settle {} ms: {left} processes in the table when init ended, {} on their way out now, {} sweeps begun meanwhile\n",
+            thread::ticks().wrapping_sub(t0),
+            user::process_count().saturating_add(user::dying::count()),
+            user::sweep_epoch().wrapping_sub(sweeps0)
+        ),
+    );
     let reported = user::reported();
     push(
         "init_runs_in_user_mode_and_passes",

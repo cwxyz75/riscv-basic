@@ -228,8 +228,9 @@ const TEARDOWN_SWEEP: usize = 256;
 
 #[inline(never)]
 pub(super) fn teardown_objects(process: &mut Process, code: i32) {
-    // 1. the handles, a slice at a time: each slice is its own critical section, so the big lock is let go (and a switch taken) between them
-    loop {
+    // 1. the handles, a slice at a time: each slice is its own critical section, so the big lock is let go (and a switch taken) between them.
+    // The last slice reads the sweep number (T265): any sweep that begins after it no longer has these handles among its roots.
+    let mark = loop {
         let done = locked_state(|s| {
             let done = process.handles.drain_some(&mut s.objs, TEARDOWN_HANDLES);
             if done {
@@ -241,38 +242,38 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
                 }
                 // (the process's handles were drained: a job exception channel it held the user end of is reaped now)
                 ksys::exception::reap_closed_job_channels(s);
+                return Some(s.objs.sweep_epoch());
             }
-            done
+            None
         });
-        if done {
-            break;
+        if let Some(mark) = done {
+            break mark;
         }
         irq::window(); // (T206: interrupts are taken between the slices)
-    }
+    };
     // 2. anything still alive that nothing can reach (reference cycles): the sweep as the state machine of MM10, a slice per critical section. The roots
     // are shaded a process table per slice (T206), the kernel's own table last; a handle made or moved once the sweep has begun marks its object (that is
-    // what the machine's barrier is for). A sweep another
-    // call started (with older roots) is finished first, a slice at a time.
+    // what the machine's barrier is for). Any sweep that began after the drain above collects what this process left, whoever began it: a running sweep
+    // is helped a slice at a time, and one is begun only when none has begun since the drain (T265, T278: many processes ending at once share sweeps
+    // instead of each running a pass over every live object after the others).
     loop {
-        let began = locked_state(|s| {
-            if s.objs.sweep_active() {
-                s.sweep_slice(TEARDOWN_SWEEP);
-                return false;
+        let covered = locked_state(|s| {
+            match kcore::object::collect_step(mark, s.objs.sweep_epoch(), s.objs.sweep_active()) {
+                kcore::object::CollectStep::Covered => true,
+                kcore::object::CollectStep::Help => {
+                    let _ = s.sweep_slice(TEARDOWN_SWEEP);
+                    false
+                }
+                kcore::object::CollectStep::Start => {
+                    // (with no room for the root list no sweep begins, T177: tried again after the window)
+                    let _ = s.sweep_start();
+                    false
+                }
             }
-            s.sweep_start()
         });
-        if began {
+        if covered {
             break;
         }
-        irq::window();
-    }
-    while locked_state(|s| {
-        s.objs.sweep_active()
-            && !matches!(
-                s.sweep_slice(TEARDOWN_SWEEP),
-                kcore::object::SweepStep::Done(_)
-            )
-    }) {
         irq::window();
     }
     // (T206: what the sweep's freeing left owed is paid before the process is over, a bounded slice per critical section)

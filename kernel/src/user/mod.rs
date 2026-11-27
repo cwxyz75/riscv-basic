@@ -277,6 +277,12 @@ pub fn process_count() -> usize {
     locked_state(|s| s.procs.len())
 }
 
+/// The number of the last reachability sweep begun (a leak report's count of the sweeps a teardown storm ran, T265).
+#[cfg(any(not(feature = "release"), feature = "release-suite"))] // (the leak checks of `user_tests`)
+pub fn sweep_epoch() -> u64 {
+    locked_state(|s| s.objs.sweep_epoch())
+}
+
 /// The kinds of kernel object a leak report counts, by [`kind_index`] (the last: a handle whose object is gone).
 const KIND_NAMES: [&str; 15] = [
     "channel",
