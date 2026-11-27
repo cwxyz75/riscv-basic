@@ -50,14 +50,17 @@ pub enum Role {
     Stderr = 17,
     /// The channel the service registry serves (`proto::file` as a directory, slice SD).
     ServiceRegistry = 18,
-    /// The network driver's device memory: the virtio-mmio slot (S8).
+    /// The network driver's device memory (IOMMU11): a VMO over the PCI BAR that holds the `virtio-net-pci` function's virtio
+    /// structures, like `BlkMmio`; the layout travels as the driver's second argument (`proto::devmgr::encode_claim_arg`).
     NetMmio = 19,
-    /// The network driver's DMA memory, each with the DMA right: the receive pool, the transmit pool and the virtqueue page(s).
+    /// The network driver's DMA memory, each with the DMA right, which it maps **into its device's domain** (`DeviceDomain`), never
+    /// into its own address space but for the queue memory (IOMMU11; NET-SPEC amendment 2026-11-25): the receive pool (READ and
+    /// WRITE: read-write for the device), the transmit pool (READ, **no WRITE**: it can only be mapped read-only for the device) and
+    /// the virtqueue pages (read-write, and MAP). (23, the old wired interrupt of the virtio-mmio network device, is retired: the
+    /// network function's interrupts are `DeviceIrqConfig`, `DeviceIrqQueue0` (receive) and `DeviceIrqQueue1` (transmit).)
     NetRxDma = 20,
     NetTxDma = 21,
     NetQueueDma = 22,
-    /// The network device's interrupt (absent where the machine has no controller to drive: the driver polls).
-    NetIrq = 23,
     /// The shared ring VMO (control header and the four rings) of the driver/stack data path.
     NetRing = 24,
     /// The two doorbell events: the driver signals `NetEventToStack` (the stack waits on it) and the stack signals
@@ -176,7 +179,6 @@ impl Role {
             20 => Role::NetRxDma,
             21 => Role::NetTxDma,
             22 => Role::NetQueueDma,
-            23 => Role::NetIrq,
             24 => Role::NetRing,
             25 => Role::NetEventToStack,
             26 => Role::NetEventToDriver,

@@ -54,8 +54,8 @@ jobs:
             -display none -serial stdio -monitor none -rtc base=2030-06-15T12:00:00,clock=vm \
             -device virtio-rng-pci,iommu_platform=on,disable-legacy=on,addr=0x4 -global virtio-mmio.force-legacy=false \
             -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:17777-:7777,hostfwd=tcp:127.0.0.1:17778-:7778 \
-            -device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56 -object filter-dump,id=f0,netdev=n0,file=x.pcap \
-            -object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-device,rng=rng0 \
+            -device virtio-net-pci,iommu_platform=on,disable-legacy=on,addr=0x7,netdev=n0,mac=52:54:00:12:34:56,romfile= \
+            -object filter-dump,id=f0,netdev=n0,file=x.pcap \
             -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 > out.txt 2>&1
           status=$?
           set -e

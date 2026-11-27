@@ -1151,6 +1151,33 @@ pub mod claim {
         k: &mut dyn Kernel,
         a: &mut dyn MsixAccess,
     ) -> Result<Claim, Failed> {
+        claim_with(plan, true, m, bars, msi_data, k, a)
+    }
+
+    /// A **re-claim** (IOMMU-SPEC 10.4; IOMMU11), after the previous claim was released ([`release`]): the claim of [`claim`]
+    /// with the same limits (the plan's I/O pages and vectors: the driver maps the same DMA VMOs into the new domain), a new domain
+    /// and every vector granted afresh, but **no DMA VMO made**: the claimant kept the first claim's, which survive driver lifetimes.
+    /// The returned claim's `dma` is empty. All or nothing, as [`claim`].
+    pub fn reclaim(
+        plan: &Plan,
+        m: &Msix,
+        bars: &[Bar],
+        msi_data: u32,
+        k: &mut dyn Kernel,
+        a: &mut dyn MsixAccess,
+    ) -> Result<Claim, Failed> {
+        claim_with(plan, false, m, bars, msi_data, k, a)
+    }
+
+    fn claim_with(
+        plan: &Plan,
+        make_dma: bool,
+        m: &Msix,
+        bars: &[Bar],
+        msi_data: u32,
+        k: &mut dyn Kernel,
+        a: &mut dyn MsixAccess,
+    ) -> Result<Claim, Failed> {
         if m.table_size < plan.table_needed() {
             return Err(Failed::TableTooSmall {
                 has: m.table_size,
@@ -1167,8 +1194,10 @@ pub mod claim {
             irqs: Vec::new(),
         };
         let r = (|| {
-            for (n, &pages) in plan.dma_pages.iter().enumerate() {
-                c.dma.push(k.dma_create(pages).ok_or(Failed::Dma(n))?);
+            if make_dma {
+                for (n, &pages) in plan.dma_pages.iter().enumerate() {
+                    c.dma.push(k.dma_create(pages).ok_or(Failed::Dma(n))?);
+                }
             }
             let mut entries = Vec::with_capacity(plan.irqs.len());
             for &irq in plan.irqs {

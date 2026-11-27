@@ -6,6 +6,8 @@ boot whose device tree has no seed says so and still passes the kernel-only shar
 2. QEMU's own tree is dumped (`-machine ...,dumpdtb=`), `/chosen/rng-seed` is removed from it, and a boot with `-dtb` of that tree reports
    `entropy: unseeded` and passes every test (the self-test `the_entropy_pool_is_seeded_as_the_tree_says` checks the pool is unseeded
    exactly when the tree has no seed).
+3. In every one of those boots the random service's `rngd` seeds from the PCI entropy function behind the IOMMU (IOMMU11: the Kernel
+   test `rng_seeds_through_the_iommu` prints `entropy: rngd seeded from the PCI device through the IOMMU`).
 
 Usage: entropy_boot_test.py <kernel ELF>
 """
@@ -17,6 +19,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MACHINE = "virt,aia=aplic-imsic,iommu-sys=on"
+RNGD_SEEDED = "entropy: rngd seeded from the PCI device through the IOMMU"
 RAM = "256M"
 
 
@@ -47,13 +50,15 @@ def main():
         m = re.search(r"entropy: seeded .*first output (0x[0-9a-f]+)", text)
         if rc != 0 or not m:
             sys.exit(f"boot {i} failed (status {rc}) or printed no seeded entropy line:\n{text[-2000:]}")
+        if RNGD_SEEDED not in text:
+            sys.exit(f"boot {i}: rngd did not seed from the PCI entropy function:\n{text[-2000:]}")
         outs.append(m.group(1))
     if outs[0] == outs[1]:
         sys.exit(f"two boots produced the same first output {outs[0]}")
     print(f"entropy: two boots differ ({outs[0]} and {outs[1]})")
     with tempfile.TemporaryDirectory() as tmp:
         rc, text = boot(kernel, {"OS_DTB": stripped_dtb(tmp)})
-    if rc != 0 or "entropy: unseeded" not in text:
+    if rc != 0 or "entropy: unseeded" not in text or RNGD_SEEDED not in text:
         sys.exit(f"the boot without a seed failed (status {rc}) or did not report unseeded:\n{text[-2000:]}")
     print("entropy: a tree without a seed boots unseeded and passes")
 

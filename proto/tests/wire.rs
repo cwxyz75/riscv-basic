@@ -1155,6 +1155,23 @@ fn devmgr_list_pci_golden_bytes_and_errors() {
 }
 
 #[test]
+fn devmgr_net_and_rng_claims_golden_bytes() {
+    use proto::devmgr::*;
+    // ClaimNet, ClaimRng and ReclaimNet (IOMMU11): the request layout of OpenBlock with their own op; the reply is ClaimPci's
+    assert_eq!(encode_claim_net(7, 0), hex("07 00 00 00 03 00 00 00"));
+    assert_eq!(encode_claim_rng(7, 0), hex("07 00 00 00 04 00 00 00"));
+    assert_eq!(encode_reclaim_net(7, 0), hex("07 00 00 00 08 00 00 00"));
+    assert_eq!(
+        decode_reclaim_net(&hex("07 00 00 00 08 00 01 00")),
+        Ok((7, 1))
+    );
+    assert_eq!(decode_reclaim_net(&encode_claim_pci(7, 1)), Err(Some(7)));
+    assert_eq!(decode_claim_pci(&encode_reclaim_net(7, 1)), Err(Some(7)));
+    assert_eq!(op_of(&encode_reclaim_net(7, 1)), Some(OP_RECLAIM_NET));
+    assert_eq!((NET_DMA_QUEUE, NET_DMA_RX, NET_DMA_TX), (0, 1, 2));
+}
+
+#[test]
 fn devmgr_claim_pci_golden_bytes_and_errors() {
     use proto::devmgr::*;
     assert_eq!(encode_claim_pci(7, 0x28), hex("07 00 00 00 07 00 28 00"));
@@ -1377,6 +1394,11 @@ fn a_drivers_claim_travels_as_its_startup_argument() {
         Role::from_u32(13),
         None,
         "the wired interrupt's role is retired"
+    );
+    assert_eq!(
+        Role::from_u32(23),
+        None,
+        "the network device's wired interrupt's role is retired (IOMMU11)"
     );
     // anything else is refused: an odd length, upper case, a digit that is no digit, a reply with another txid or an error
     let mut odd = a.clone();

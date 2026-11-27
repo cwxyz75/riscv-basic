@@ -64,7 +64,10 @@ pub mod stat {
     pub const DOORBELLS_SENT: usize = 7;
     pub const DOORBELLS_SUPPRESSED: usize = 8;
     pub const RING_VIOLATIONS: usize = 9;
-    pub const COUNT: usize = 10;
+    /// Device work the driver's safety poll found with no vector signalled (IOMMU11): every completion should arrive by its
+    /// interrupt, so a quiet run counts none, and a broken vector shows here rather than hiding behind the poll.
+    pub const POLL_FOUND: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 /// Shared memory as the ring code sees it: aligned 32-bit words with acquire/release ordering, and byte access for

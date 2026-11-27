@@ -21751,6 +21751,10 @@ pub fn app_main() -> i32 {
             net_tests::random_service_gives_seeded_distinct_bytes,
         ),
         (
+            "rng_seeds_through_the_iommu",
+            net_tests::rng_seeds_through_the_iommu,
+        ),
+        (
             "c_sockets_over_the_stack",
             net_tests::c_sockets_over_the_stack,
         ),
@@ -21793,6 +21797,10 @@ pub fn app_main() -> i32 {
             net_tests::net_clients_are_confined,
         ),
         ("net_children_restart", net_tests::net_children_restart),
+        (
+            "net_device_cannot_write_the_transmit_pool",
+            net_tests::net_device_cannot_write_the_transmit_pool,
+        ),
         (
             "net_dhcp_configures_the_interface",
             net_tests::net_dhcp_configures_the_interface,
