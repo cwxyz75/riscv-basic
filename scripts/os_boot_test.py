@@ -1353,6 +1353,8 @@ def parse(lines):
             LAST_BENCH.append(m.groups())
         elif line.startswith("##PANIC "):
             panics.append(line[8:])
+        elif line.startswith("##SCHED "):
+            pass  # (T243: the scheduler report a failing test asks for with `debug_stat(132)`; it stays in the serial log)
         else:
             bad.append(line)
     return boot, tests, done, panics, bad
