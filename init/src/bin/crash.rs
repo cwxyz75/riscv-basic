@@ -4,6 +4,9 @@
 #![no_main]
 
 use core::arch::asm;
+#[path = "../storm_pattern.rs"]
+mod storm_pattern;
+use storm_pattern::{msg_byte, msg_len, stream_byte};
 
 #[no_mangle]
 pub fn app_main() -> i32 {
@@ -2046,22 +2049,6 @@ fn hand_serve_calls(ch: u64) {
             return;
         }
     }
-}
-
-/// T266: the byte at `offset` of a pattern-checked stream (the reader computes it from the offset, it is not echoed): not periodic at
-/// 256 bytes, 1 KiB or 4 KiB, so a chunk copied to the wrong place or not at all shows.
-fn stream_byte(offset: u64) -> u8 {
-    (offset ^ (offset >> 8) ^ (offset >> 16)) as u8
-}
-
-/// T266: the length of message `i` of a channel kill storm: 1 to 64 KiB, the big copies of T215 (1 KiB and more go outside the lock).
-fn msg_len(i: u32) -> usize {
-    1024 * (1 + (i as usize * 37 + 11) % 64)
-}
-
-/// T266: the byte at `offset` of message `i` (the reader computes it).
-fn msg_byte(i: u32, offset: usize) -> u8 {
-    (offset ^ (offset >> 8) ^ (i as usize).wrapping_mul(31)) as u8
 }
 
 /// Write `bytes` with two fresh events on `ch`, waiting out a full queue or a job at its limit. False when the peer has closed (or

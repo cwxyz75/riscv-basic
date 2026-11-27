@@ -6,6 +6,9 @@
 //! the jobs' ledgers (`job_info`, selector 5: IPC bytes) show who is charged. Where the test needs the server to be the
 //! program under test (the stack's side of a stream), the suite process itself plays the server, in the root job.
 use super::*;
+#[path = "storm_pattern.rs"]
+mod storm_pattern;
+use storm_pattern::{msg_byte, msg_len, stream_byte};
 
 const MAX: u64 = u64::MAX;
 /// A job with an IPC byte limit and nothing else limited.
@@ -576,21 +579,6 @@ pub fn a_kill_storm_on_a_stream_loses_no_range() -> Outcome {
     Ok(())
 }
 
-/// T266: the byte at `offset` of a pattern-checked stream (`crash.rs`'s socket hand writes it with 'P').
-fn stream_byte(offset: u64) -> u8 {
-    (offset ^ (offset >> 8) ^ (offset >> 16)) as u8
-}
-
-/// T266: the length of message `i` of the channel kill storm (as `crash.rs` computes it): 1 to 64 KiB.
-fn msg_len(i: u32) -> usize {
-    1024 * (1 + (i as usize * 37 + 11) % 64)
-}
-
-/// T266: the byte at `offset` of message `i` (as `crash.rs` computes it).
-fn msg_byte(i: u32, offset: usize) -> u8 {
-    (offset ^ (offset >> 8) ^ (i as usize).wrapping_mul(31)) as u8
-}
-
 /// One message of the channel storm as it came back: `n` bytes in `buf` and `nh` handles in `hs`.
 struct Got<'a> {
     buf: &'a [u8],
@@ -677,7 +665,9 @@ pub fn a_kill_storm_on_a_channel_loses_no_message() -> Outcome {
             // reads: the client sends 24 messages (about 750 KiB) while this thread reads them, killed after a random number of reads
             hand.send(b'M', 24, None)?;
             let kill_after = next() % 40;
-            let (mut reads, mut got, mut spins) = (0u64, 0u32, 0u32);
+            let (mut reads, mut got) = (0u64, 0u32);
+            // (a round reads about 750 KiB: 10 s is far beyond it, so a channel that never closes fails in proportion)
+            let give_up = sys::clock_get() + 10_000;
             loop {
                 if reads >= kill_after || got == 24 {
                     kill(&mut killed);
@@ -698,9 +688,8 @@ pub fn a_kill_storm_on_a_channel_loses_no_message() -> Outcome {
                         got += 1;
                     }
                     Some(S::ShouldWait) => {
-                        spins += 1;
-                        if spins > 200_000 {
-                            return Err(detail("the channel never closed"));
+                        if sys::clock_get() > give_up {
+                            return Err(detail("the channel never closed (10 s)"));
                         }
                         let _ = sys::object_wait(
                             ch,

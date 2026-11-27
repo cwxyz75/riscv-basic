@@ -125,8 +125,9 @@ serial log of every failing run in `target/repeat/`. Over a soak target this is 
 that stack that point into the kernel's code, innermost first (the panic handler's own frames, then the return addresses of the calls that led
 here, among a few stale ones). `python3 scripts/resolve_trace.py <kernel ELF> <log file>` names the symbol nearest each address (it needs only
 `nm`); `llvm-addr2line -e <ELF> <addr>` gives the line. It is how a panic whose location is the standard library's (T233) is traced to its caller. Two debug detectors say more than where they fired
-(T266): the big-lock spin panic (`has spun for ... 30 million iterations`) ends with `owner takes since: <n>, waited <ms> ms` (0: one section held
-the whole time, at the site it names; more: the lock changed hands and this hart lost every race), and the starvation watchdog counts a sample only
+(T266): the big-lock spin panic (`has spun for ... 30 million iterations`) ends with `owner at the start: ..., owner takes since: <n>, waited <ms> ms` and a
+reading (the lock is FIFO: the same owner with no take since held it the whole wait, at the site named, unless the host did not run its hart;
+another owner means it passed through the harts queued ahead; takes since mean FIFO order broke), and the starvation watchdog counts a sample only
 when the hart the thread waits on took an interrupt since the last one (`kcore::watchdog`), so `starved thread` means that hart ran and left the
 thread, and `stalled hart` means it took no interrupt for 10 s.
 

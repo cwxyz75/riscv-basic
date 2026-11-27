@@ -11,13 +11,19 @@
 //! nor a reset of the count. A hart that ticks, has the thread queued, and neither runs it nor gives it to the idle hart is still
 //! reported, on the third sample in a row ([`REPORT_AT`]), as before. A hart that shows no progress at all for [`STALL_NS`] while
 //! the thread waits is reported differently ([`Verdict::Stalled`]): a hart stuck with interrupts off, or a lost poke on a hart that
-//! armed no timer, is a real defect too, and far beyond any pause of a host.
+//! armed no timer, is a real defect too, and far beyond any pause of a host. One interrupt between two samples is enough: a hart with
+//! queued work arms one event per 100 ms sampling period (`program_timer`), so asking for two (the plan's first figure) would void
+//! samples of a hart that runs. **Not covered:** a pause of the *idle* hart the finding names (marked idle, not run by the host, so it
+//! cannot pull the thread) while the thread's own hart ticks still counts; an idle hart takes no interrupt at all, so its progress
+//! cannot tell a pause from the lost poke the watchdog exists to catch (T266's record of T197).
 //!
 //! **The spin report** (T212): a hart that spins 30 million times for the big lock panics and names the owner and where the owner
-//! took the lock. [`spin_verdict`] adds how many times the owner hart took the lock while this one waited: none is one long
-//! section (the site named is the culprit), some is a waiter that lost every race (an unfair hand-over, or a waiter the host did
-//! not run while the owner kept going).
-
+//! took the lock. The lock is a ticket lock (`crate::ticket`): FIFO, so once this hart has its ticket nobody queued behind it is served
+//! first. [`spin_verdict`] compares the owner at the first spin with the owner now: the **same owner with no outermost take since**
+//! held the lock the whole wait (one long section at the site named, or an owner hart the host did not run: the owner holds the lock
+//! with interrupts off, so no counter of its own can tell the two apart); **another owner** means the lock passed through the harts
+//! queued ahead (a convoy of long sections); the **same owner with takes since** means it was served again before this hart, which
+//! FIFO order forbids (a broken lock).
 /// The rule needs this many samples of one finding in a row, the first included (the same three as before T266).
 pub const REPORT_AT: u32 = 3;
 /// A hart that shows no progress for this long (by the sampling hart's clock) while a thread waits on it is reported as stalled
@@ -130,36 +136,50 @@ pub struct SpinStart {
 /// What the spin report says about the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpinVerdict {
-    /// The owner at the start still holds the lock and took it no more since: one section held the whole time (the site the report
-    /// names is where it was taken).
-    OneLongSection { waited_ms: u64 },
-    /// The lock changed hands while this hart waited (`takes`: the start owner's outermost takes since, or 0 when another hart owns
-    /// it now): the waiter was starved, not the lock held for ever.
-    Starved { takes: u64, waited_ms: u64 },
+    /// The owner at the start still holds the lock and took it no more since: one hold the whole wait.
+    OneHold { waited_ms: u64 },
+    /// Another hart owns it now: the lock passed through the harts queued ahead of this one.
+    Passed { waited_ms: u64 },
+    /// The start owner took it again (`takes` outermost takes) before this hart was served: FIFO order is broken.
+    ServedAgain { takes: u64, waited_ms: u64 },
+    /// Nobody owned it at the first spin (a hand-over in flight, or the mirror not yet written): no reading.
+    Unknown { waited_ms: u64 },
 }
 
 /// The verdict at the report: `start` as recorded at the first spin, `owner` and `owner_takes` (of the start owner's hart) now, and
-/// the clock now. The takes counter is read without a lock from another hart: a hint, used for this report only.
+/// the clock now. The owner mirror and the takes counter are read without a lock from another hart: hints, used for this report only.
 pub fn spin_verdict(start: SpinStart, owner: u64, owner_takes: u64, now_ns: u64) -> SpinVerdict {
     let waited_ms = now_ns.saturating_sub(start.at_ns) / 1_000_000;
     let takes = owner_takes.saturating_sub(start.owner_takes);
-    if owner == start.owner && takes == 0 {
-        SpinVerdict::OneLongSection { waited_ms }
+    if start.owner == 0 {
+        SpinVerdict::Unknown { waited_ms }
+    } else if takes > 0 {
+        SpinVerdict::ServedAgain { takes, waited_ms }
+    } else if owner == start.owner {
+        SpinVerdict::OneHold { waited_ms }
     } else {
-        SpinVerdict::Starved { takes, waited_ms }
+        SpinVerdict::Passed { waited_ms }
     }
 }
 
 impl core::fmt::Display for SpinVerdict {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
-            SpinVerdict::OneLongSection { waited_ms } => write!(
+            SpinVerdict::OneHold { waited_ms } => write!(
                 f,
-                "owner takes since: 0, waited {waited_ms} ms: one long section"
+                "owner takes since: 0, waited {waited_ms} ms: one hold the whole wait (a long section at that site, or an owner hart the host did not run)"
             ),
-            SpinVerdict::Starved { takes, waited_ms } => write!(
+            SpinVerdict::Passed { waited_ms } => write!(
                 f,
-                "owner takes since: {takes}, waited {waited_ms} ms: the lock changed hands, a starved waiter"
+                "owner takes since: 0, waited {waited_ms} ms: the lock passed through the harts queued ahead (a convoy of long sections)"
+            ),
+            SpinVerdict::ServedAgain { takes, waited_ms } => write!(
+                f,
+                "owner takes since: {takes}, waited {waited_ms} ms: the start owner was served again first (FIFO order broken)"
+            ),
+            SpinVerdict::Unknown { waited_ms } => write!(
+                f,
+                "waited {waited_ms} ms: no owner was recorded at the start"
             ),
         }
     }
