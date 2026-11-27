@@ -1,6 +1,7 @@
-//! `place_anywhere` (MM7, HD2) stays inside the mapping arena `[MAP_ARENA_BASE, STACK_ARENA_BASE)` whatever the random draw and however full the
-//! arena is. The boot suite's fixed-address mappings rely on it (T272): they live above the stack arena, where nothing the kernel places may land,
-//! after a fixed 2 GiB in the mapping arena collided now and then with the randomly placed image or library.
+//! `place_anywhere` (MM7, HD2: ANYWHERE mappings, a static-PIE image, the system library) stays inside the mapping arena
+//! `[MAP_ARENA_BASE, STACK_ARENA_BASE)` whatever the random draw and however full the arena is: one of the placers behind the promise that nothing
+//! the kernel places lands above the stack arena, where the boot suite keeps its fixed-address mappings (T272). (`thread_spawn`'s stacks staying in
+//! the stack arena is pinned by `spawn_calls.rs`; the loader's main stack is kernel code, `kernel/src/user/loader.rs`.)
 use abi::user::{MAP_ARENA_BASE, STACK_ARENA_BASE, STACK_ARENA_END, TOP};
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::frame::FrameDb;
@@ -38,7 +39,7 @@ fn inside_the_arena(at: u64, bytes: u64) -> bool {
 }
 
 #[test]
-fn the_fixed_window_above_the_stack_arena_is_never_placed_into() {
+fn anywhere_placement_stays_inside_the_mapping_arena() {
     // (the window the suite uses is real: room above the stack arena, below the top of the user half)
     const {
         assert!(
@@ -96,7 +97,4 @@ fn the_fixed_window_above_the_stack_arena_is_never_placed_into() {
         None,
         "no room left in the arena"
     );
-    space
-        .unmap_region(&mut mm, &mut vmos, &mut jobs, hole)
-        .unwrap();
 }

@@ -8,8 +8,8 @@ use netring::{ctl, msg, stat, state, Entry, Pool, Ring, RingId, Slot};
 mod netshm;
 use netshm::Shm;
 
-// (in the last GiB of the suite's fixed window, `FIXED_WINDOW`: nothing the kernel places lands there, T272)
-const RING_VA: u64 = FIXED_WINDOW + 0x7_0000_0000;
+// (28 GiB into the suite's fixed window, above the thread stacks: nothing the kernel places lands there, T272)
+const RING_VA: u64 = FIXED_RINGS;
 const RX_VA: u64 = RING_VA + 0x10_0000;
 const TX_VA: u64 = RING_VA + 0x20_0000;
 const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];

@@ -182,18 +182,10 @@ pub fn app_main() -> i32 {
             }
         }
         25 => {
-            // touch the 4 stack pages the parent mapped at 0x20_0000_0000 (present in the page
-            // table, so a thread started on them takes no first-touch fault), then block forever
-            // Give the parent time to map the pages (a scheduler that runs the child first, as
-            // the round-robin class does, would otherwise fault here before they exist).
-            let ev = rt::sys::event_create().a1 as u64;
-            rt::sys::object_wait(ev, rt::abi::signals::USER_MASK, rt::sys::clock_get() + 60);
-            for page in 0..4usize {
-                // SAFETY: the parent mapped these pages read-write before starting us.
-                unsafe {
-                    core::ptr::write_volatile((0x20_0000_0000usize + page * 4096) as *mut u8, 1)
-                };
-            }
+            // block forever while the parent adds a thread on a stack it mapped ANYWHERE
+            // (`child_with_a_ready_exit_thread`). This used to touch 4 pages at the fixed
+            // 0x20_0000_0000 first, which since HD2 nobody maps: a child the parent was slow to
+            // kill would have faulted there (T272).
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }

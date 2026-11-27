@@ -47,10 +47,8 @@ fn my_stack_top() -> usize {
 }
 
 /// Print the mappings of `process` that overlap `[lo, hi)`, one line each (`process_map_info`): what a refused fixed-address map ran into (T272).
-/// Returns how many there are.
-fn print_mappings(process: u64, lo: u64, hi: u64) -> u64 {
+fn print_mappings(process: u64, lo: u64, hi: u64) {
     let mut at = lo;
-    let mut n = 0;
     for _ in 0..4096 {
         let mut rec = [0u64; 6];
         let r = sys::process_map_info(process, at, rec.as_mut_ptr());
@@ -67,14 +65,12 @@ fn print_mappings(process: u64, lo: u64, hi: u64) -> u64 {
                 rec[4],
                 rec[5]
             );
-            n += 1;
         }
         if r.a1 == 0 {
             break;
         }
         at = r.a1 as u64;
     }
-    n
 }
 
 /// Map `length` bytes of `vmo` (from offset 0) into `process` where the kernel chooses (ANYWHERE) and return the address. A test that needs room asks
@@ -106,9 +102,22 @@ fn map_anywhere(
 
 /// Where the suite's fixed-address mappings go: the 32 GiB from the end of the stack arena to the top of the user half. Nothing the kernel places
 /// lands there (ANYWHERE mappings, a program's image and the system library go in the mapping arena, stacks in the stack arena), so a fixed address
-/// here is free unless a test of this suite mapped it (T272). The thread stacks of `own_stack` grow up from its start, the network tests' rings sit
-/// from 28 GiB into it (`net_tests.rs`), and the page below the top is never mapped.
+/// here is free unless a test of this suite mapped it (T272). The thread stacks of `own_stack` grow up from its start (`next_fixed`), the network
+/// tests' rings sit at `FIXED_RINGS` (`net_tests.rs`), and the page below the top is never mapped.
 const FIXED_WINDOW: u64 = rt::abi::user::STACK_ARENA_END;
+/// Where the network tests' rings go: 28 GiB into the fixed window; `next_fixed` hands out the room below.
+const FIXED_RINGS: u64 = FIXED_WINDOW + 0x7_0000_0000;
+
+/// The next `bytes` of the fixed window for a test's own mapping (thread stacks and the like): a failure, not an overlap, when the room below
+/// `FIXED_RINGS` is used up.
+fn next_fixed(bytes: u64) -> Result<u64, Detail> {
+    let base = NEXT_STACK.fetch_add(bytes, Ordering::SeqCst);
+    ensure!(
+        base + bytes <= FIXED_RINGS,
+        "the fixed window is used up ({base:#x} + {bytes:#x})"
+    );
+    Ok(base)
+}
 
 /// A failure detail with this text.
 fn detail(what: &str) -> Detail {
@@ -5299,7 +5308,7 @@ fn me() -> Result<u64, Detail> {
 
 /// Map a fresh 4-page stack into our own address space; returns its top.
 fn own_stack() -> Result<u64, Detail> {
-    let base = NEXT_STACK.fetch_add(0x10_0000, Ordering::SeqCst);
+    let base = next_fixed(0x10_0000)?;
     let v = vmo(4)?;
     ok(
         sys::process_map(me()?, v, base, 0, 4 * 4096, PF_R | PF_W),
@@ -17239,7 +17248,7 @@ fn vmo_commit_charges_up_front_and_foreign_maps_need_it() -> Outcome {
     );
     // mapping a stranger's VMO (it is charged to job `j`, we are neither `j` nor in it) needs it committed
     let me = me()?;
-    let base = NEXT_STACK.fetch_add(0x10_0000, Ordering::SeqCst);
+    let base = next_fixed(0x10_0000)?;
     ensure_eq!(
         st(sys::process_map(me, v, base, 0, 8 * 4096, PF_R | PF_W)),
         Some(S::BadState),
@@ -18639,7 +18648,7 @@ fn instruction_counts_report() -> Outcome {
     // a page fault on a fresh page: touch the next page of a mapped VMO each time
     let pages = n + 8;
     let v = vmo(pages)?;
-    let base = NEXT_STACK.fetch_add(0x100_0000, Ordering::SeqCst);
+    let base = next_fixed(0x100_0000)?;
     ok(
         sys::process_map(me()?, v, base, 0, pages * 4096, PF_R | PF_W),
         "map the touched pages",
