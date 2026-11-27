@@ -12224,9 +12224,11 @@ fn page_intact(va: u64, salt: u64) -> bool {
 }
 
 /// The device rig (see the section's comment): `body` gets the rig. Afterwards everything is undone and the leak oracles hold: no
-/// domain, mapped page or vector is left, and the driver's job is back to nothing. No disk (the no-disk boot): nothing to do.
+/// domain, mapped page or vector is left, and the driver's job is back to nothing. No disk (the no-disk boot): nothing to do, and the
+/// line `matrix: no disk, device rig skipped`, which the harness refuses in a boot that has the disks.
 fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
     if !pci_disks_present()? {
+        println!("matrix: no disk, device rig skipped");
         return Ok(());
     }
     let doms = (sys::debug_stat(159), sys::debug_stat(160));
@@ -12536,6 +12538,37 @@ fn dut_write(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
     }
 }
 
+/// Make device `d` send its configuration-change message: a memory write of the word `data` at `address` (MSI-X entry 0, which the
+/// rig writes) that needs no fetch from its rings, so a quarantine row shows a write refused, not only a ring read. The entropy
+/// function as `msi_send` does it; the disk brought up (`mblk_up`), its configuration vector on entry 0 and the driver error that
+/// makes a modern virtio device send it (`virtio_message`), then its MSI-X off again once the device has settled.
+fn dut_message(m: &Matrix, d: Dut, address: u64, data: u32) -> Outcome {
+    match d {
+        Dut::Rng => msi_send(m.f, &m.rng_domain(), address, data),
+        Dut::Blk => {
+            let r = (|| {
+                mblk_up(m.g, m.blk_rings_io)?;
+                m.g.msix_on(pcicore::MsixEntry {
+                    address,
+                    data,
+                    masked: false,
+                })?;
+                mmio_wr16(m.g.common + 0x10, 0);
+                ensure_eq!(
+                    mmio_rd16(m.g.common + 0x10),
+                    0,
+                    "the disk's configuration vector took MSI-X entry 0"
+                );
+                virtio_message(m.g);
+                msi_settle();
+                Ok(())
+            })();
+            m.g.msix_off();
+            r
+        }
+    }
+}
+
 /// The bystanders after a row: the pattern frame, both buffers (as last filled: the device under test's own only when `own` is set),
 /// no vector fired, no notice and no message on an identity with no route since `(notices, no_route)`.
 fn bystanders_intact(
@@ -12645,7 +12678,7 @@ fn hostile_dma_at_another_device_bar() -> Outcome {
 
 /// Row: an IMSIC page as DMA: a device write into every hart's supervisor interrupt file (its `seteipnum` register takes the low word
 /// as an identity). Refused as a translation (the files are not in any domain): the fault and the refusal are the check. Neither
-/// device can choose a word that is a live identity (the disk writes its sector 0, which begins 0x18110a03, the entropy function random
+/// row chooses a word that is a live identity (the disk writes its sector 0, which begins 0x18110a03, the entropy function random
 /// bytes), so "no hart is interrupted" (the bystander check) is a backstop here, not the oracle.
 fn hostile_dma_at_an_interrupt_file() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
@@ -12729,12 +12762,25 @@ fn hostile_dma_after_its_own_unmap() -> Outcome {
     })
 }
 
-/// Row: use after its supervisor destroyed the domain. The device is quarantined (IOMMU-SPEC 6.3, A14): its writes, at its old buffer
-/// address included, are refused and not reported, and the buffer (still the driver's, mapped here) keeps its contents.
+/// Row: use after its supervisor destroyed the domain. The device is quarantined (IOMMU-SPEC 6.3, A14): its requests are refused
+/// and not reported, and the buffer (still the driver's, mapped here) keeps its contents. A request cannot be fetched (its rings are
+/// gone with the domain), so the device's writes are shown by its configuration-change message (`dut_message`), a write that needs no
+/// fetch: first while the domain lives, aimed at its own buffer, where it lands (the rig is not broken), then quarantined, at its old
+/// buffer address and at another frame.
 fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
     for d in [Dut::Rng, Dut::Blk] {
         with_matrix(|m| {
             let x = m.dev(d);
+            let salt = if d == Dut::Rng { 1 } else { 2 };
+            dut_message(m, d, x.buf_io, 0x5157_0a1e)?;
+            msi_settle();
+            ensure_eq!(
+                rd64(x.buf_va) as u32,
+                0x5157_0a1e,
+                "{d:?}: its message lands in its buffer while the domain lives"
+            );
+            fill_page(x.buf_va, salt);
+            drain_domain_faults(x.sup);
             let base = (sys::debug_stat(162), sys::debug_stat(140));
             ok(
                 sys::iodomain_destroy(x.sup),
@@ -12747,6 +12793,7 @@ fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
                     !served,
                     "{d:?}: the quarantined device was served at {what}"
                 );
+                dut_message(m, d, target, 0x5157_0a1e)?;
             }
             msi_settle();
             ensure_eq!(
@@ -12755,7 +12802,7 @@ fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
                 "{d:?}: a quarantined device's faults are not reported (A14)"
             );
             ensure!(
-                page_intact(x.buf_va, if d == Dut::Rng { 1 } else { 2 }),
+                page_intact(x.buf_va, salt),
                 "{d:?}: the destroyed domain's buffer changed"
             );
             bystanders_intact(m, None, base, "after the destroy")
@@ -12843,6 +12890,8 @@ fn hostile_dma_after_its_supervisor_died() -> Outcome {
                 !dut_write_by_the_suite(m, d, x.buf_io)?,
                 "{d:?}: the device reached its old buffer after both died"
             );
+            // (and a write that needs no fetch from the rings: its message, at its old buffer)
+            dut_message(m, d, x.buf_io, 0x5157_0a1e)?;
             msi_settle();
             ensure_eq!(
                 iommu_faults(),
@@ -17296,7 +17345,8 @@ const DIR_READ: u64 = 1;
 const DIR_WRITE: u64 = 2;
 
 fn wr16(va: u64, v: u16) {
-    // SAFETY: `va` is inside one of the DMA VMOs this test mapped read-write at DMA_VA.
+    // SAFETY: `va` is inside a DMA VMO this process mapped read-write: at IODMA_VA (RINGS_VA, BUF_VA, RO_VA, SCRATCH_VA), or the
+    // matrix's MBLK_RINGS_VA and MBLK_BUF_VA.
     unsafe { core::ptr::write_volatile(va as *mut u16, v) }
 }
 fn rd16(va: u64) -> u16 {

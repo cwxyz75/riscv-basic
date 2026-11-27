@@ -1268,7 +1268,7 @@ def elf_load_address(kernel: str) -> int:
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     # (first, before anything reads the kernel: the parts of the command line a caller or the environment chooses)
-    refused_devices.refuse([os.environ.get("OS_MACHINE", ""), os.environ.get("OS_BOOT_ARGS", ""), *pci_args(), *extra])
+    refused_devices.refuse([os.environ.get("OS_MACHINE", ""), os.environ.get("OS_BOOT_ARGS", ""), *extra])
     if os.environ.get("OS_LOAD") and int(os.environ["OS_LOAD"], 16) != elf_load_address(kernel):
         raise SystemExit(f"{kernel} is linked to load at {elf_load_address(kernel):#x}, not at OS_LOAD={os.environ['OS_LOAD']}: the load-address build did not take")
     cmd = [
@@ -1585,6 +1585,10 @@ def main() -> int:
                                  f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
             # IOMMU8: `devmgr` listed the bus the command line built, every time it enumerated it
             found += devmgr_pci_problems()
+            # IOMMU12: the hostile-driver matrix's device rig skips only where there is no disk (its second device is the scratch disk)
+            if ("matrix: no disk, device rig skipped" in text.split("\n") and os.environ.get("OS_DISK") != "0"
+                    and os.environ.get("OS_PCI_TEST") != "0"):
+                found.append("the hostile-driver matrix skipped its device rig ('matrix: no disk') in a boot that has the disks")
             # IOMMU10: no unexpected IOMMU fault over the boot
             found += iofault_problems(text, tests_run)
             if SHARD != "k" and strict and not RELEASE_SUITE and not LAST_DEVMGR_PCI and os.environ.get("OS_PCI_TEST") != "0":
