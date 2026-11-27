@@ -75,7 +75,9 @@ pub fn a_host_stall_is_seen_by_the_guest() -> Outcome {
     let Some((ms, period)) =
         crate::dtb::boot_arg_value("hoststall=").and_then(|v| kcore::pause::parse_stall_arg(&v))
     else {
-        return Err(String::from("the kernel line's hoststall= is not <ms>:<period ms>"));
+        return Err(String::from(
+            "the kernel line's hoststall= is not <ms>:<period ms>",
+        ));
     };
     let stall_ns = ms * 1_000_000;
     let give_up = thread::now_ns() + (4 * period + 1000) * 1_000_000;
@@ -646,13 +648,15 @@ mod priority {
     static RETAKEN: AtomicU64 = AtomicU64::new(0);
     static WORST_PAUSE: AtomicU64 = AtomicU64::new(0);
     static GAVE_UP: AtomicU64 = AtomicU64::new(0);
-    /// The probe's bound (4 ms): a window that a pause later than this covered says nothing about the scheduler.
-    const PROBE_BOUND_US: u64 = 4_000;
-    /// Which test the probe is measuring for (its `##PAUSE` lines name it).
+    /// Which test the probe is measuring for: its `##PAUSE` lines name it, and a window is covered by a pause later than that test's
+    /// own bound (the real-time bound, 4 ms; the control's, 6 ms). The control's is its own for a reason seen on the development
+    /// machine: there the emulator takes a timer interrupt programmed 10 ms ahead about 5 ms late, every time (the detector measured
+    /// 5.04 to 5.09 ms with the hart running a hog, interrupts on), so the slice-end interrupt the equal-priority probe waits for is
+    /// always 5 ms late. That is the host's lateness, below the control's 6 ms; with the real-time bound every window would be covered.
     static PROBE_FOR: AtomicUsize = AtomicUsize::new(0);
-    const PROBE_NAMES: [&str; 2] = [
-        "realtime_thread_stays_responsive_under_load",
-        "the_latency_test_can_fail",
+    const PROBES: [(&str, u64); 2] = [
+        ("realtime_thread_stays_responsive_under_load", 4_000),
+        ("the_latency_test_can_fail", 6_000),
     ];
 
     /// The latency probe: sleep 3 ticks until 50 wakes are measured, recording how late each was. A sleep that a pause of the host
@@ -661,14 +665,14 @@ mod priority {
         use kcore::pause::{Resampler, Verdict};
         let mut late = alloc::vec::Vec::new();
         let mut rs = Resampler::new();
-        let name = PROBE_NAMES[PROBE_FOR.load(SeqCst) % PROBE_NAMES.len()];
+        let (name, bound_us) = PROBES[PROBE_FOR.load(SeqCst) % PROBES.len()];
         while late.len() < 50 {
             // (nanoseconds on the real clock: there is no tick to round to)
             let start = thread::now_ns();
             let target = start + 3_000_000;
             thread::sleep_ticks(3);
             let end = thread::now_ns();
-            match rs.judge(crate::pause::worst_in(start, end), PROBE_BOUND_US) {
+            match rs.judge(crate::pause::worst_in(start, end), bound_us) {
                 Verdict::Keep => late.push(end.saturating_sub(target)),
                 Verdict::Retake { hart, late_us } => crate::pause::report(name, hart, late_us),
                 Verdict::GiveUp { hart, late_us } => {
@@ -684,7 +688,10 @@ mod priority {
         MAX_LATE.store(late.last().copied().unwrap_or(0), SeqCst);
         // (the next to worst of the 50: `len * 99 / 100` was index 49, the worst itself, so the "99th" bound was on the worst sample
         // and one pause of the host failed it, T178; found by T284)
-        P99_LATE.store(late.get(late.len().saturating_sub(2)).copied().unwrap_or(0), SeqCst);
+        P99_LATE.store(
+            late.get(late.len().saturating_sub(2)).copied().unwrap_or(0),
+            SeqCst,
+        );
         LATE_DONE.store(true, SeqCst);
     }
 
@@ -738,6 +745,15 @@ mod priority {
         Ok(MAX_LATE.load(SeqCst))
     }
 
+    /// The bound in guest time (T21, T284): every wake within 1 ms. (A frame of its own: the test's closure is near the 1 KiB budget.)
+    #[inline(never)]
+    fn guest_time_bound(late: u64) -> Outcome {
+        ensure(
+            late <= 1_000_000,
+            &format!("a real-time thread woke {late} ns late in guest time with three hogs running (bound: 1 ms, every wake)"),
+        )
+    }
+
     pub fn realtime_thread_stays_responsive_under_load() -> Outcome {
         clean(|| {
             let late = lateness_under_load(MAIN_PRIO + 10)?;
@@ -747,6 +763,12 @@ mod priority {
                 let mut out = crate::console::Console;
                 let _ = writeln!(out, "##BENCH rt_latency_p99 {} ns", P99_LATE.load(SeqCst));
                 let _ = writeln!(out, "##BENCH rt_latency_max {late} ns");
+            }
+            // T21 (T284): under `-icount` with `sleep=off` (the counts boot, `make os-count`: one hart, `guesttime` on the kernel line) the clock
+            // is the instruction count, the host cannot delay a wake, and the bound is the guest's own: every one of the 50 wakes within
+            // 1 ms (measured: 36 us).
+            if crate::dtb::boot_arg_present("guesttime") {
+                return guest_time_bound(late);
             }
             ensure(
                 // (the emulator delivers a timer interrupt up to a few milliseconds late on a loaded host: observed 2.2 ms; a thread of the hogs'

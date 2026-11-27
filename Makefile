@@ -112,6 +112,7 @@ OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
 OS_NOPULL_ELF  := target/os-fault-pull/$(KERNEL_TARGET)/debug/kernel
 OS_EARLYREAP_ELF := target/os-fault-earlyreap/$(KERNEL_TARGET)/debug/kernel
+OS_RTLATE_ELF := target/os-fault-rtlate/$(KERNEL_TARGET)/debug/kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
@@ -315,6 +316,13 @@ os-boot-test-sched-neg: kernel
 	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --expect-panic "starved thread" $(OS_NOPULL_ELF)
 	cd kernel && cargo build --features fault-early-reap --target-dir ../target/os-fault-earlyreap
 	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_EARLYREAP_ELF) teardown_with_threads_on_other_harts
+	# T284: a host pause is told from a kernel delay. The planted delay (every real-time wake 5 ms late, the interrupts on time) fails the
+	# latency test with and without the host-stall injector; the normal kernel passes the kernel-only boot with the emulator stopped for
+	# 20 ms about every 200 ms (the windows a pause covers are taken again, and the guest's own self-test shows the stalls land)
+	cd kernel && cargo build --features fault-rt-wake-late --target-dir ../target/os-fault-rtlate
+	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_ELF) realtime_thread_stays_responsive_under_load
+	OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_RTLATE_ELF) realtime_thread_stays_responsive_under_load
+	OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test-smp-neg: kernel os-interactive
 	cd kernel && cargo build --features fault-skip-shootdown --target-dir ../target/os-fault-shootdown
@@ -529,6 +537,8 @@ docs-check:
 	python3 scripts/bench_compare.py --self-test
 	# T195: two boots at once get their own host fixture ports, and the kernel line tells each guest its own
 	python3 scripts/host_fixtures.py --self-test
+	# T284: the host-stall injector stops a process for the time asked, and says so (no emulator)
+	python3 scripts/host_stall.py --self-test
 	# T283: the tiers' summary and pieces, and the docs check's own rules for the workflows' dispatch inputs
 	python3 scripts/tier.py --self-test
 	python3 scripts/check_docs.py --self-test

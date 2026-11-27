@@ -854,6 +854,11 @@ if (any(o.strip() in ("sleep=off", "sleep=no", "sleep=false") for o in os.enviro
     sys.exit("OS_ICOUNT with sleep=off needs OS_DISK=0: guest time does not bound the host's disk I/O in that mode")
 
 
+def icount_sleep_off():
+    """Whether OS_ICOUNT asks for `sleep=off`: the guest's clock is then its instruction count, which the host cannot pause."""
+    return any(o.strip() in ("sleep=off", "sleep=no", "sleep=false") for o in os.environ.get("OS_ICOUNT", "").split(","))
+
+
 def _read_lines(path):
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", path)) as f:
         return [l.strip() for l in f if l.strip() and not l.startswith("#")]
@@ -1180,6 +1185,8 @@ def run_with(kernel, extra, fixtures):
                                            os.environ.get("OS_BOOT_ARGS", ""),
                                            fixtures.boot_arg() if fixtures else "",
                                            host_stall.boot_arg(),
+                                           # (T21, T284: guest time is the instruction count, so a timing test may hold a bound of the guest's own)
+                                           "guesttime" if icount_sleep_off() and not rr_args() else "",
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           ),

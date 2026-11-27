@@ -22,6 +22,7 @@ exits with pass or fail. Its switches are environment variables:
 | `OS_BOOT_TIMEOUT` | the runaway ceiling in seconds (default 1800) |
 | `OS_PROFILE=<file>` | append host seconds and guest ticks per test to a TSV |
 | `OS_RECORD=<dir>`, `OS_REPLAY=<file>`, `OS_GDB=1` | record and replay (below) |
+| `OS_HOST_STALL=<ms>[:<period ms>[:<seed>]]` | the host-stall injector (below): stop the emulator for `<ms>` at seeded moments about every `<period>` |
 
 **A boot is judged on progress, not on total time.** A loaded host slows a healthy suite several times over, so the
 harness fails a boot that prints nothing for the stall window, not one that is slow. A test must not assume the boot is
@@ -78,6 +79,31 @@ on its pass line.
 fails; `OS_REPLAY=<file>` replays it, and `OS_GDB=1` waits for gdb on :1234. Recording needs a boot with no network
 device, so use `OS_SHARD=k` (the PCI disks go through QEMU's `blkreplay` filter). Record mode runs the harts in one TCG thread: a race that needs truly parallel
 harts may not reproduce under it, and its instruction-counted time changes what timing-dependent tests see.
+
+**A host pause or a kernel delay?** (T284) A bound on host time fails when the host does not run an emulated hart, and the boot used
+to say nothing about whether that happened. Two tools now say it:
+
+- *The host-stall injector* (`scripts/host_stall.py`): `OS_HOST_STALL=<ms>[:<period>[:<seed>]]` makes the harness stop the QEMU process
+  (SIGSTOP) for `<ms>` milliseconds, then continue it, again and again, the gaps drawn uniformly from half to one and a half periods
+  (default period 1000 ms, seed 1). Each stall goes into the serial log as `##HOSTSTALL <t> <ms>` (seconds since QEMU started, the
+  measured stop). The kernel line gets `hoststall=<ms>:<period>`, and the guest's self-test `a_host_stall_is_seen_by_the_guest` (run only
+  then) must see a stall land: a 1 ms sleep across which the clock jumped by the stall, with the detector showing it. The harness fails a
+  boot with the variable set that made no stall or lacks that test. `host_stall.py --self-test` (the docs check) stops a child process
+  that reads its clock and sees the gap, and sees none without the injector. Reproduce "a loaded host" on purpose with
+  `OS_HOST_STALL=20:200 OS_SHARD=k OS_SMP=4`: the kernel before T284 failed `realtime_thread_stays_responsive_under_load` in every
+  such boot.
+- *The pause detector* (`kernel/src/pause.rs`, the rule in `kcore::pause`, `debug_stat` 216 and 217): per hart, how late its own timer
+  interrupts came against what it programmed. The timing tests take a window again when a pause later than their own bound covered it,
+  print `##PAUSE <test> hart <h> late <us> us` for it, and fail after three covered windows in a row (`host pause: ...` in the
+  message); a late window with no pause fails on the bound as before. A sleep the kernel delayed after an interrupt taken on time is
+  not a pause: the planted-delay control (`fault-rt-wake-late`, in `os-boot-test-sched-neg`) fails with and without the injector. The
+  detector cannot tell a host pause from a hart that ran with interrupts off for as long in a single window; a kernel that does that at
+  every wake fails on the three-in-a-row rule, and `make os-latency` measures interrupts-off spans directly. Record mode is a second
+  discriminator: it runs every hart in one TCG thread, so a failure that also shows under `OS_RECORD` is not a pause of one hart.
+
+On the development machine (macOS) the detector also showed the emulator taking a timer interrupt programmed 10 ms ahead about 5 ms
+late, every time, with the hart running and interrupts on: a host lateness of about half the interval, which the equal-priority
+latency controls wait for (their own bound, 6 ms, is above it).
 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the
 serial log of every failing run in `target/repeat/`. Over a soak target this is a soak run (`TESTING.md` rule 6). The overnight

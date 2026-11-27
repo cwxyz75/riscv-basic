@@ -1241,6 +1241,15 @@ pub fn sleep_ticks(n: u64) {
             false
         });
         if done {
+            #[cfg(feature = "fault-rt-wake-late")]
+            if priority_of(current()).is_some_and(|p| p > crate::MAIN_PRIO) {
+                // (T284's planted delay: the kernel holds a real-time wake back 5 ms, in steps of 1 ms so that every timer it arms is
+                // near: a timer armed far ahead is one the emulator delivers late on some hosts, which the pause detector would rightly
+                // call the host's)
+                for _ in 0..5 {
+                    sleep_ns(MS);
+                }
+            }
             return;
         }
     }

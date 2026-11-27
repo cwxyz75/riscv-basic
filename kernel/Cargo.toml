@@ -96,3 +96,7 @@ fault-msiid-free-at-move = ["kcore/fault-msiid-free-at-move"]
 # IOMMU9: the vector twins of the two above (D5 for an MSI-X vector through the IOMMU's MRIF).
 fault-vector-no-unmask = ["kcore/fault-vector-no-unmask"]
 fault-vector-no-repend = ["kcore/fault-vector-no-repend"]
+# T284's planted delay: a kernel thread above the boot thread's priority returns from `sleep_ticks` 5 ms after its deadline (five more
+# sleeps of 1 ms: the kernel delays every real-time wake while every timer interrupt comes on time, and no timer is armed far ahead);
+# `realtime_thread_stays_responsive_under_load` must fail on its bound with and without `OS_HOST_STALL` (`make os-boot-test-sched-neg`)
+fault-rt-wake-late = []

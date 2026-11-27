@@ -300,6 +300,16 @@ physical address, IOMMU-SPEC amendment 2026-11-27 part 2);
 a release kernel answers all ones (the translate path is not compiled into it), so no frame's physical address is learnable through a call on a release build (INVARIANTS D2). Like every
 selector it needs the debug resource with INSPECT.
 
+`which` 216 and 217 (T284, test kernels only: a release kernel answers 0) read the **pause detector**: each hart records how late it took
+its own timer interrupt against what it programmed into `stimecmp` (the later of the value and the moment it was written), keeping the
+newest 64 that were at least 200 us late (`kcore::pause`). `a2` is the start of a window in nanoseconds on the clock `clock_ns` reads; the
+window ends now. 216 returns the worst such interrupt of any hart whose late span (from its due time to when it was taken) meets the
+window, as (hart << 48) | microseconds late, or 0 for none; 217 returns how long the harts were not taking their timer interrupts inside
+the window, summed over the harts, in microseconds. An interrupt taken late means the emulator did not run the hart (a pause of the host)
+or the hart ran with interrupts off; the timing tests take a window that such a pause later than their bound covered again (three in a
+row fail them), so a wake the scheduler delayed after an interrupt taken on time still fails them. Read under the object lock, like
+every selector; the detector itself is lock-free (one word per sample).
+
 `which` 150 to 157 (IOMMU5, IOMMU-SPEC 7.3): 150 the fault records taken from the IOMMU's fault queue, 151 the fault lines not printed
 (over the console limit of 16 a second), 152 the fault-queue overflows, 153 the device id of the last fault record, 154 its I/O address,
 155 its cause | (transaction type << 32), 156 the commands submitted to the command queue, 157 the fences that did not complete within

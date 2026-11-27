@@ -119,7 +119,11 @@ pub fn worst_of<'a>(
 
 /// The pause time of several harts' rings inside a window, summed (microseconds): what a test that bills by the clock must allow
 /// for, since a hart that was not run was still charged to the thread it was running.
-pub fn paused_total<'a>(rings: impl IntoIterator<Item = &'a HartRing>, start_us: u64, end_us: u64) -> u64 {
+pub fn paused_total<'a>(
+    rings: impl IntoIterator<Item = &'a HartRing>,
+    start_us: u64,
+    end_us: u64,
+) -> u64 {
     rings
         .into_iter()
         .map(|r| r.paused_in(start_us, end_us))

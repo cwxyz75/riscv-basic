@@ -1527,6 +1527,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     // longer than three ticks between the send and the read made the close look instant: T267, seen at two harts on the
     // IOMMU machine, where `channel_write` was seen to return 80 to 120 ms late)
     let t0 = sys::clock_get();
+    let t0_ns = sys::clock_ns();
     ensure_eq!(
         st(sys::channel_write(
             BOOTSTRAP,
@@ -1545,12 +1546,20 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
         "a blocked wait is woken by PEER_CLOSED"
     );
     let waited = sys::clock_get() - t0;
+    // (T284: the window cannot be taken again, since the helper's close is once only; a pause of the host can only lengthen it, so the
+    // upper bound allows what the pause detector saw inside it, and the lower bound, the check, is as it was)
+    let pause_ms = host_pause_since(t0_ns).map_or(0, |(h, us)| {
+        if us > 4_000 {
+            pause_line("wait_is_woken_by_the_peer_closing", h, us);
+        }
+        us.div_ceil(1000)
+    });
     ensure!(
         // (the lower bound is the check: three ticks from the helper's read of the request, which follows `t0`, less one for
         // the millisecond clock's rounding; the upper one only catches a lost wake-up and is loose because a loaded CI runner
         // can delay the helper, or this thread, by many ticks)
-        within(waited, 2, 60),
-        "the close came after about 3 ticks (waited {waited})"
+        within(waited, 2, 60 + pause_ms),
+        "the close came after about 3 ticks (waited {waited}; a host pause of {pause_ms} ms inside the wait)"
     );
     let mut reply = [0u8; 32];
     let (m, n) = request(10, b'E', b"");
@@ -20030,18 +20039,42 @@ static RT_WORST_PAUSE: AtomicU64 = AtomicU64::new(0);
 static RT_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 /// The probe's bound in microseconds: a window that a pause later than this covered says nothing about the scheduler.
 const RT_BOUND_US: u64 = 4_000;
+/// The negative control's own bound (an equal-priority probe must be later than this): its windows are covered only by a pause later
+/// than it (the emulator on the development machine takes a timer interrupt programmed 10 ms ahead about 5 ms late every time, which
+/// the probe at the hogs' priority always waits for: the kernel twin, `the_latency_test_can_fail`, records it).
+const RT_CONTROL_BOUND_US: u64 = 6_000;
 
 /// The pause detector (T284, `debug_stat` 216): the worst timer interrupt of any hart taken late since `since_ns` (the `clock_ns` clock), as
 /// (hart, microseconds late), or None.
 fn host_pause_since(since_ns: u64) -> Option<(u64, u64)> {
-    let r = rt::syscall(nr_debug_stat(), [rt::debug::handle() as usize, 216, since_ns as usize, 0, 0, 0]);
+    let r = rt::syscall(
+        nr_debug_stat(),
+        [
+            rt::debug::handle() as usize,
+            216,
+            since_ns as usize,
+            0,
+            0,
+            0,
+        ],
+    );
     let v = if r.status == 0 { r.a1 as u64 } else { 0 };
     (v != 0).then_some((v >> 48, v & ((1 << 48) - 1)))
 }
 
 /// How long the harts were not taking their timer interrupts since `since_ns`, summed over the harts, in microseconds (`debug_stat` 217).
 fn host_paused_us_since(since_ns: u64) -> u64 {
-    let r = rt::syscall(nr_debug_stat(), [rt::debug::handle() as usize, 217, since_ns as usize, 0, 0, 0]);
+    let r = rt::syscall(
+        nr_debug_stat(),
+        [
+            rt::debug::handle() as usize,
+            217,
+            since_ns as usize,
+            0,
+            0,
+            0,
+        ],
+    );
     if r.status == 0 {
         r.a1 as u64
     } else {
@@ -20073,7 +20106,12 @@ extern "C" fn rt_probe(_: usize) -> ! {
         // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
         let late = sys::clock_ns().saturating_sub(target * 1_000_000);
         let late = late / 1000; // microseconds
-        if let Some((h, us)) = host_pause_since(start).filter(|&(_, us)| us > RT_BOUND_US) {
+        let bound = if RT_PROBE_PRIO.load(Ordering::SeqCst) == 40 {
+            RT_BOUND_US
+        } else {
+            RT_CONTROL_BOUND_US
+        };
+        if let Some((h, us)) = host_pause_since(start).filter(|&(_, us)| us > bound) {
             pause_line(name, h, us);
             in_a_row += 1;
             if worst_pause & ((1 << 48) - 1) < us {
@@ -20164,7 +20202,7 @@ fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not(
     // the negative control: at the hogs' priority the wake waits for a slice to end
     let (normal, _) = worst_lateness_us(10)?;
     ensure!(
-        normal > 6_000,
+        normal > RT_CONTROL_BOUND_US,
         "an equal-priority probe was only {normal} us late: the hogs are not loading the harts{}",
         rt_pauses_said()
     );
@@ -20757,7 +20795,11 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
         if used.saturating_sub(paused_ns) > worst_rt.saturating_sub(worst_paused) {
             (worst_rt, worst_paused) = (used, paused_ns);
         }
-        trace.push((sys::clock_get() % 100, used / 1_000_000, paused_ns / 1_000_000));
+        trace.push((
+            sys::clock_get() % 100,
+            used / 1_000_000,
+            paused_ns / 1_000_000,
+        ));
         naps_done += 1;
     }
     RT_STOP.store(1, Ordering::SeqCst);

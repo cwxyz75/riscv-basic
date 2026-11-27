@@ -1587,13 +1587,13 @@ fn debug_lines(line: &mut String, bytes: &[u8]) -> alloc::vec::Vec<String> {
     out
 }
 
-/// Show one line, as the console shows a program's output: a well-formed `##BENCH` line and a well-formed `##TEST name PASS|FAIL` result pass through
+/// Show one line, as the console shows a program's output: a well-formed `##BENCH` or `##PAUSE` line and a well-formed `##TEST name PASS|FAIL` result pass through
 /// (the verdicts are counted in `pass` and `fail`), any other line starting `##` is prefixed so user code cannot forge the kernel's verdict lines.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a pair of test counters
 #[inline(never)]
 fn show_debug_line(text: &str, pass: &mut u32, fail: &mut u32) {
     // A well-formed `##BENCH name value unit` line (SCHED-SMP-SPEC 6.1, amends OD28) passes through like a result.
-    if is_bench_line(text) {
+    if is_bench_line(text) || kcore::testlog::is_pause_line(text) {
         let _ = writeln!(Console, "{text}");
         return;
     }

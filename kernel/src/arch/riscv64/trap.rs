@@ -538,9 +538,9 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         crate::pause::timer_taken(); // (T284: how late this hart took its timer, measured before any lock is waited for)
-        // L12b: a tick that interrupted user mode takes the big lock only when something needs it: the user's FP registers are dirty
-        // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
-        // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
+                                     // L12b: a tick that interrupted user mode takes the big lock only when something needs it: the user's FP registers are dirty
+                                     // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
+                                     // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
         if from_user && crate::fp::light_save(frame) {
             let switch = crate::thread::timer_interrupt();
             if !switch

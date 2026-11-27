@@ -405,6 +405,7 @@ ATOMICS = {
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
     "kcore/src/msiid.rs": (3, "`IdSet`, the identities a hart claimed from its IMSIC file and has not yet delivered: kept in the hart's own record (not on the trap stack, KT13), written by that hart's trap and emptied by its delivery under the lock; atomic only so a shared `PerHart` can hold it, never touched by another hart"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
+    "kcore/src/pause.rs": (6, "T284 pause detector ring: one writer (the hart, interrupts off), any reader, one word per sample so no reader sees half of one"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
     "kernel/src/arch/aarch64/mod.rs": (4, "the AArch64 stub (AR1): the two statistics the riscv64 layer has (T206), never run"),
@@ -414,6 +415,7 @@ ATOMICS = {
     "kernel/src/bkl.rs": (13, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
+    "kernel/src/pause.rs": (3, "T284 pause detector: each hart's armed deadline (written by that hart only) and its sample ring (diagnostics only)"),
     "kernel/src/user/lifecycle.rs": (4, "the number of threads with suspend state (EX1): a copy of the table's size, read with no lock by `thread::block` so that a kernel thread that blocks holding a lock the big lock must not be taken under pays one load; the table itself is under the big lock"),
     "kernel/src/smp.rs": (12, "hart bring-up and IPI flags, and the two counters of instruction-cache synchronisations (PL7)"),
     "kernel/src/arch/riscv64/iommu.rs": (22, "the IOMMU's on flag (set once at boot after the directory denies every device, read by `build_windows`) and its counters (IOMMU-SPEC 7.3: faults, dropped lines, overflows, the last fault, fence timeouts; the commands are the store's, under the lock; statistics read by `debug_stat` 150 to 157); `Direct` reads and writes the directory and the tables as `AtomicU64` words because the IOMMU reads them while the kernel writes them; the queues and the directory themselves are under the IOMMU lock (class Iommu); `UNFINISHED` (IOMMU6), a destruction begun and not ended as last seen by the store: written only under the IOMMU lock (by a last-handle close, and by `drain` after it settled the destructions), read with no lock by `drain`'s fast path; a stale true costs one settle, and a close's own write of true cannot be overtaken by a stale false because both writes are made under the lock"),
@@ -435,7 +437,7 @@ ATOMICS = {
     "kernel/src/console.rs": (12, "the console's panic flag and line state, the lock-broken flag that stops other harts' output after a panic (KT14), and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
-    "kernel/src/sched_tests.rs": (49, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile)"),
+    "kernel/src/sched_tests.rs": (57, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile; T284 the probe's re-sampling record)"),
     "kernel/src/smp_tests.rs": (18, "self-test flags and counters (PM1: the offline test's tick counter)"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
