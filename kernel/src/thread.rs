@@ -977,10 +977,10 @@ pub fn reschedule_fast() -> bool {
     switch
 }
 
-/// Print what the scheduler knows (for `debug_stat` 132).
+/// Print what the scheduler knows (for `debug_stat` 132: `user::trap::debug_stat_call`, which also prints the user state its call holds).
 #[cfg(debug_assertions)]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report that holds a thread record
-fn dump_sched() {
+pub fn dump_sched() {
     use core::fmt::Write;
     let sc = sched();
     let mut out = crate::console::Console;
@@ -1001,7 +1001,6 @@ fn dump_sched() {
         }
         let _ = writeln!(out, "##SCHED thread {t}: {:?}", sc.record(t));
     }
-    crate::user::dump_state();
 }
 
 /// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds), now a timer entry (L13): a hart with queued work arms an event every
@@ -1750,12 +1749,7 @@ pub fn wake_stat(which: u64) -> u64 {
         131 => crate::user::clock_traps(),
         // (KT9: 1 when this kernel has the allocation-failure hooks, `debug_stat` 200 to 202)
         203 => u64::from(cfg!(feature = "fault-alloc")),
-        // (T243, debug builds: print every hart's scheduler state and the record of every thread that is not idle, for a test that timed out)
-        132 => {
-            #[cfg(debug_assertions)]
-            dump_sched();
-            0
-        }
+        // (132, the T243 report, is answered by `user::trap::debug_stat_call` itself: it prints the user state its closure holds)
         // (T213 M2: sums over every hart of the counters a benchmark reads before and after: 209 reschedule IPIs received, 210 retentive suspends,
         // 211 `wfi` idles, 212 nanoseconds idle; 213 the idle policy a boot argument asked for: 0 normal, 1 `idle=nosuspend`, 2 `idle=spin`)
         209..=215 => idle_stat(which),

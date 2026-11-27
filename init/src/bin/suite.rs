@@ -3211,22 +3211,48 @@ fn a_two_gib_vmo_committed_whole_stays_within_the_latency_bound() -> Outcome {
 fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
     const LINKS: usize = 1200;
     static STOP: AtomicU32 = AtomicU32::new(0);
-    /// A hart's worth of work to compete with the closing thread, so that a scheduler tick is armed on every hart (a thread alone on a hart has none).
+    static STARTED: AtomicU32 = AtomicU32::new(0);
+    /// A hart's worth of work to compete with the closing thread: a scheduler tick (a slice end) is armed only on a hart where an equal thread waits, and
+    /// the closing thread's own hart must have one (a thread alone on a hart has no timer event at all, L13).
     extern "C" fn spinner(_arg: usize) -> ! {
+        STARTED.fetch_add(1, Ordering::SeqCst);
         while STOP.load(Ordering::SeqCst) == 0 {
             core::hint::spin_loop();
         }
         sys::thread_exit(0)
     }
-    STOP.store(0, Ordering::SeqCst);
-    let harts = job_use(root_job()?, 7)?.0 as usize;
-    let mut spinners = Vec::new();
-    for _ in 0..=harts {
-        spinners.push(new_thread(spinner, 0)?);
+    /// Stop the spinners and wait for them to end.
+    fn disband(spinners: &mut Vec<u64>) {
+        STOP.store(1, Ordering::SeqCst);
+        for t in spinners.drain(..) {
+            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000);
+            sys::handle_close(t);
+        }
     }
-    let before_traps = sys::debug_stat(214);
-    let mut rounds = 0;
-    while sys::debug_stat(214) == before_traps && rounds < 40 {
+    /// Start `harts + 1` spinners, one at a time, each running before the next is made. Placement reads the harts' running-priority hints
+    /// (SCHED-SMP-SPEC 4.4), and a hart that has been given a thread but has not switched to it yet still reads as running nothing, so
+    /// spinners made back to back can all land on the other harts and leave this thread alone on its own: its hart then arms no tick, and
+    /// no interrupt can fall in a window (the 4-hart failure of CI run 46018655715, every round of it). With each one running first, the
+    /// first `harts - 1` take the idle harts and the rest go to this thread's hart (rule 5: no hart runs anything below them, so the
+    /// creator's), where they compete with it.
+    fn muster(harts: usize, spinners: &mut Vec<u64>) -> Outcome {
+        STOP.store(0, Ordering::SeqCst);
+        STARTED.store(0, Ordering::SeqCst);
+        for n in 1..=harts as u32 + 1 {
+            spinners.push(new_thread(spinner, 0)?);
+            let until = sys::clock_get() + 5_000;
+            while STARTED.load(Ordering::SeqCst) < n {
+                if sys::clock_get() > until {
+                    disband(spinners);
+                    return Err(detail("a spinner did not start within 5 s"));
+                }
+                sys::thread_yield();
+            }
+        }
+        Ok(())
+    }
+    /// One round: a chain of `LINKS` channels, each queuing both ends of the one before, and the close of its head.
+    fn round() -> Outcome {
         let mut prev: Option<(u64, u64)> = None;
         let mut head = (0, 0);
         for _ in 0..LINKS {
@@ -3243,17 +3269,39 @@ fn a_close_that_frees_a_chain_takes_interrupts_between_its_slices() -> Outcome {
         }
         sys::handle_close(head.0);
         sys::handle_close(head.1);
+        Ok(())
+    }
+    let harts = job_use(root_job()?, 7)?.0 as usize;
+    let mut spinners = Vec::new();
+    muster(harts, &mut spinners)?;
+    let before_traps = sys::debug_stat(214);
+    let before_windows = sys::debug_stat(215);
+    let (mut rounds, mut alone) = (0, 0);
+    while sys::debug_stat(214) == before_traps && rounds < 40 {
+        let (w0, c0) = (sys::clock_ns(), sys::thread_cpu_ns(0).a1 as u64);
+        if let Err(e) = round() {
+            disband(&mut spinners);
+            return Err(e);
+        }
         rounds += 1;
+        // (the premise, checked: with an equal thread waiting on its hart this thread runs a half or a third of the round; nine tenths or
+        // more of it means it was alone there after all, moved since by a pull, say, and the spinners are placed around it again)
+        let (w1, c1) = (sys::clock_ns(), sys::thread_cpu_ns(0).a1 as u64);
+        if c1.saturating_sub(c0) * 10 >= w1.saturating_sub(w0) * 9 {
+            alone += 1;
+            disband(&mut spinners);
+            muster(harts, &mut spinners)?;
+        }
     }
-    STOP.store(1, Ordering::SeqCst);
-    for t in spinners {
-        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000);
-        sys::handle_close(t);
+    if sys::debug_stat(214) == before_traps {
+        sys::debug_stat(132); // (debug builds: every hart's scheduler state, where the spinners and this thread are)
     }
+    disband(&mut spinners);
     ensure!(
         sys::debug_stat(214) > before_traps,
-        "no interrupt was taken inside a window in {rounds} rounds of closing a chain ({} windows were made)",
-        sys::debug_stat(215)
+        "no interrupt was taken inside a window in {rounds} rounds of closing a chain ({} windows were made; in {alone} rounds this thread \
+         was alone on its hart)",
+        sys::debug_stat(215) - before_windows
     );
     // (everything is gone: a channel can be made again, and nothing of the chain is left to count against the budget)
     let (a, b) = channel()?;
