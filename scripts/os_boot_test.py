@@ -937,7 +937,7 @@ def net_problems(text):
                 found.append("the fetch tests did not finish")
         # T195: the harness started the host fixtures and named their ports on the kernel line, so the tests that use them must have
         # reached them (a skip here would hide a fixture that was never reached; lossy mode runs only the fetch tests of the two)
-        if "s9: fetch tests done" not in text and "s9: fetch|" not in text:
+        if "s9: fetch|" not in text:
             found.append("the fetch tests did not reach the host's HTTP server ('s9: fetch tests done' missing)")
         if not lossy and "s9: host-tcp-server done" not in text:
             found.append("the guest did not reach the host's TCP server ('s9: host-tcp-server done' missing)")

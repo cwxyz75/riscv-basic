@@ -573,14 +573,15 @@ smoke: $(SMOKE_TARGETS)
 SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-iommu-neg os-boot-test-iommu-bare os-boot-test-iommu-inval os-boot-test-iommu-msi os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 1
 soak:
-	python3 scripts/tier.py run "$(SOAK_JOBS)" $(SOAK_TARGETS)
+	python3 scripts/tier.py run "$(SOAK_JOBS)" "$(MAKE)" $(SOAK_TARGETS)
 
 # One soak target as a piece of at most two hours (STAB0, T283): `make soak-piece PIECE=os-boot-test-smp`. soak.yml's `piece` job runs it
 # when the owner dispatches the workflow with a `target`; a PIECE that is not one of SOAK_PIECES is refused. (SOAK_PIECES: the soak
 # targets, the parts soak.yml runs `os-boot-test` as, and Miri.)
 SOAK_PIECES := $(SOAK_TARGETS) os-boot-test-main os-boot-test-rr os-boot-test-release os-miri
 soak-piece:
-	python3 scripts/tier.py piece "$(PIECE)" $(SOAK_PIECES)
+	# (the shell's $$PIECE, from the command line through the environment: never make's text pasted into the script before it is checked)
+	python3 scripts/tier.py piece "$$PIECE" $(SOAK_PIECES)
 	$(MAKE) $(PIECE)
 
 # Tier 3 (overnight): hours-long runs, started ONLY by the owner (OD142, KT6): `overnight.yml` has a manual trigger and nothing else.
@@ -595,7 +596,7 @@ overnight-repeat-smp:
 # `PIECE=overnight-repeat-smp N=10`, `PIECE=os-mutants PKG=kcore SHARD=3/8`. overnight.yml's `piece` job runs it when the owner
 # dispatches the workflow with a `target`; a PIECE that is not an overnight target, or a malformed variable, is refused.
 overnight-piece:
-	python3 scripts/tier.py piece "$(PIECE)" $(OVERNIGHT_TARGETS)
+	python3 scripts/tier.py piece "$$PIECE" $(OVERNIGHT_TARGETS)
 	$(MAKE) $(PIECE)
 
 # KT12: the release kernel with the debug assertions on, through the whole suite at four harts and the kernel-only shard at one, two and eight.

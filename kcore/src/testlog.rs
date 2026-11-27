@@ -58,7 +58,12 @@ pub fn host_ports(value: &str) -> u64 {
     let mut parts = value.split(',');
     let mut packed = 0u64;
     for shift in [0u32, 16, 32] {
-        match parts.next().and_then(|p| p.parse::<u16>().ok()) {
+        // (digits only: `u16::from_str` would also take a leading `+`)
+        let port = parts
+            .next()
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u16>().ok());
+        match port {
             Some(port) if port != 0 => packed |= u64::from(port) << shift,
             _ => return 0,
         }
@@ -69,12 +74,14 @@ pub fn host_ports(value: &str) -> u64 {
     packed
 }
 
-/// One port out of [`host_ports`]'s packing: `which` 0 the TCP server, 1 the DNS server, 2 the HTTP server; `None` when there is none.
+/// One port out of [`host_ports`]'s packing: `which` 0 the TCP server, 1 the DNS server, 2 the HTTP server; `None` when there is none
+/// (or `which` names no fixture).
 pub fn host_port(packed: u64, which: u32) -> Option<u16> {
     let shift = match which {
         0 => 0,
         1 => 16,
-        _ => 32,
+        2 => 32,
+        _ => return None,
     };
     let port = (packed >> shift) as u16;
     (port != 0).then_some(port)

@@ -1,11 +1,16 @@
-//! TLB1 and TLB2 (INVARIANTS.md) by construction, on the host (T193, T283): a machine of several harts whose TLBs hold every
+//! TLB2 and SMP5 (INVARIANTS.md) for the calls that change a live mapping, on the host (T193, T283): a machine of several harts whose TLBs hold every
 //! translation any thread could have walked, and lose one only when the call asks the machine to flush (`Machine::shootdown` for the
 //! other harts, `Machine::flush_tlb` for the caller's). After every `process_unmap`, `process_protect` and `vmo_decommit` the model
 //! checks that no hart caches a translation the page table no longer has (a page gone, a frame changed, a permission taken away). This
 //! is the QEMU test `unmap_while_siblings_touch` without the emulator: there a stale entry shows only if the emulated TLB happens to
 //! keep it (QEMU drops entries on its own schedule, T193); here every hart keeps everything, so a missing shootdown always shows.
 //! The control `a_machine_that_skips_the_remote_flush_is_caught` runs the same rounds on a machine whose shootdown does nothing (the
-//! `fault-skip-shootdown` kernel) and must be caught.
+//! `fault-skip-shootdown` kernel) and must be caught; the per-call controls skip only the decommit's or only the protect's shootdown
+//! (`Machine::skip_shootdown`, as the `fault-decommit-no-shootdown` and `fault-protect-no-shootdown` kernels do).
+//!
+//! What it does not check: ASIDs and generations (TLB1: `kcore/tests/asid_model.rs`), process teardown (SMP5's second half: the QEMU
+//! test `teardown_with_threads_on_other_harts`), and the order inside a call (it compares the state after the call, so a frame freed
+//! before its shootdown within one locked section would not show; the kernel's argument for that is the locked region).
 use abi::syscall as nr;
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::frame::FrameDb;
@@ -32,6 +37,8 @@ struct Harts {
     tlb: Vec<BTreeMap<(u64, u64), Translation>>,
     /// The negative control: the remote flush does nothing (`fault-skip-shootdown`).
     skip_remote: bool,
+    /// The per-call control: the call with this number leaves out its shootdown (`Machine::skip_shootdown`).
+    skip_call: Option<usize>,
     shootdowns: u32,
 }
 
@@ -40,6 +47,7 @@ impl Harts {
         Harts {
             tlb: (0..HARTS).map(|_| BTreeMap::new()).collect(),
             skip_remote,
+            skip_call: None,
             shootdowns: 0,
         }
     }
@@ -59,6 +67,9 @@ impl Machine for Harts {
     }
     fn flush_tlb(&mut self) {
         self.tlb[ME].clear();
+    }
+    fn skip_shootdown(&self, call: usize) -> bool {
+        self.skip_call == Some(call)
     }
 }
 
@@ -234,7 +245,12 @@ const X: u64 = 0x40_0000;
 /// The rounds of `unmap_while_siblings_touch` and its two siblings (decommit, protect), with a seeded mix of sizes and offsets. Returns
 /// the first stale translation found after a call, with the round and the call.
 fn rounds(skip_remote: bool, seed: u64) -> Result<u32, String> {
+    rounds_with(skip_remote, None, seed)
+}
+
+fn rounds_with(skip_remote: bool, skip_call: Option<usize>, seed: u64) -> Result<u32, String> {
     let (mut w, ph) = world(skip_remote);
+    w.harts.skip_call = skip_call;
     let mut rng = seed | 1;
     let mut next = |n: u64| {
         rng ^= rng << 13;
@@ -311,6 +327,21 @@ fn a_machine_that_skips_the_remote_flush_is_caught() {
         let e = rounds(true, seed)
             .expect_err("a machine without the remote flush keeps stale translations");
         assert!(e.contains("caches"), "{e}");
+    }
+}
+
+#[test]
+fn a_decommit_or_a_protect_without_its_shootdown_is_caught() {
+    // the two kernels that leave out one call's shootdown: every seed has rounds of that call, and one of them is caught there
+    for (call, what) in [
+        (nr::VMO_DECOMMIT, "decommit"),
+        (nr::PROCESS_PROTECT, "protect"),
+    ] {
+        for seed in 1..=40 {
+            let e = rounds_with(false, Some(call), seed)
+                .expect_err("a call without its shootdown leaves a stale translation");
+            assert!(e.contains(&format!("after {what}")), "seed {seed}: {e}");
+        }
     }
 }
 

@@ -201,8 +201,10 @@ def check_pieces(makefile, rules):
             out.append(f"Makefile: the target {target} is missing (T283)")
             continue
         recipe = rules[target][1]
-        if not re.search(rf'python3 scripts/tier\.py piece "\$\(PIECE\)" \$\({var}\)', recipe.splitlines()[0] if recipe else ""):
-            out.append(f"Makefile: {target} must first check the piece with `python3 scripts/tier.py piece \"$(PIECE)\" $({var})`")
+        first = next((l for l in recipe.splitlines() if not l.strip().startswith("#")), "")
+        if not re.search(rf'python3 scripts/tier\.py piece "\$\$PIECE" \$\({var}\)', first):
+            out.append(f"Makefile: {target} must first check the piece with `python3 scripts/tier.py piece \"$$PIECE\" $({var})` (the shell's "
+                       "variable: make's $(PIECE) would paste the input into the script before it is checked)")
         extra = set(make_var(makefile, var)) - allowed[target]
         if extra:
             out.append(f"Makefile: {var} names targets outside its tier: {sorted(extra)}")
@@ -280,8 +282,10 @@ jobs:
     assert check_pieces(makefile, make_rules(makefile)) == [], check_pieces(makefile, make_rules(makefile))
     planted = makefile.replace("SOAK_PIECES := $(SOAK_TARGETS)", "SOAK_PIECES := os-ktest-4 $(SOAK_TARGETS)")
     assert any("outside its tier" in p for p in check_pieces(planted, make_rules(planted))), "a smoke target among the soak pieces"
-    unchecked = makefile.replace('\tpython3 scripts/tier.py piece "$(PIECE)" $(OVERNIGHT_TARGETS)\n', "")
-    assert any("must first check" in p for p in check_pieces(unchecked, make_rules(unchecked))), "a piece target without its check"
+    unchecked = makefile.replace('\tpython3 scripts/tier.py piece "$$PIECE" $(OVERNIGHT_TARGETS)\n', "")
+    assert unchecked != makefile and any("must first check" in p for p in check_pieces(unchecked, make_rules(unchecked))), "a piece target without its check"
+    pasted = makefile.replace('\tpython3 scripts/tier.py piece "$$PIECE" $(OVERNIGHT_TARGETS)\n', '\tpython3 scripts/tier.py piece "$(PIECE)" $(OVERNIGHT_TARGETS)\n')
+    assert pasted != makefile and any("must first check" in p for p in check_pieces(pasted, make_rules(pasted))), "make's text pasted into the check"
     print(f"check_docs self-test passed ({len(bad)} planted workflows refused, the piece inputs accepted)")
     return 0
 

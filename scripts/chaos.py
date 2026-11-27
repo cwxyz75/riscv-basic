@@ -13,7 +13,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("elf")
 ap.add_argument("seeds")
 ap.add_argument("--smp", default="2,4,8")
-ap.add_argument("--jobs", type=int, default=int(os.environ.get("SOAK_JOBS", "1")))  # (one at a time by default: T195)
+ap.add_argument("--jobs", type=int, default=int(os.environ.get("SOAK_JOBS", "3")))
 ap.add_argument("--expect-fail", action="store_true")
 a = ap.parse_args()
 

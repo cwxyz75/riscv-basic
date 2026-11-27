@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The soak and overnight tiers as runs of their targets (T195, T283). Only the owner starts either tier (OD142).
 
-    tier.py run JOBS TARGET...       run each make target (JOBS at a time), keep going after a failure, and end with one line per
+    tier.py run JOBS MAKE TARGET...  run each make target (JOBS at a time), keep going after a failure, and end with one line per
                                      target: PASS or FAIL, its wall time, and the log of a failing one (`make soak` is this)
     tier.py piece PIECE ALLOWED...   check that PIECE is one of ALLOWED and that the piece variables in the environment are well formed
                                      (`make soak-piece`, `make overnight-piece`: the two-hour pieces of STAB0 that the workflows'
@@ -38,10 +38,17 @@ def piece_problems(piece, allowed, env):
         if v and not form.fullmatch(v):
             out.append(f"{name}={v!r} is not of the form {form.pattern}")
     shard = env.get("SHARD", "")
-    if shard and form_ok(shard):
+    if shard and PIECE_VARS["SHARD"].fullmatch(shard):
         k, n = map(int, shard.split("/"))
         if k >= n:
             out.append(f"SHARD={shard}: k must be below n")
+    if shard and not env.get("PKG"):
+        out.append("SHARD needs PKG (a shard of every crate at once is not a piece)")
+    seeds = env.get("CHAOS_SEEDS", "")
+    if ".." in seeds and PIECE_VARS["CHAOS_SEEDS"].fullmatch(seeds):
+        lo, hi = map(int, seeds.split(".."))
+        if lo > hi:
+            out.append(f"CHAOS_SEEDS={seeds} is empty: a piece that boots nothing would pass")
     if (env.get("SHARD") or env.get("PKG")) and piece != "os-mutants":
         out.append("SHARD and PKG are os-mutants' variables")
     if env.get("CHAOS_SEEDS") and piece != "os-chaos":
@@ -51,17 +58,13 @@ def piece_problems(piece, allowed, env):
     return out
 
 
-def form_ok(shard):
-    return bool(PIECE_VARS["SHARD"].fullmatch(shard))
-
-
 def fmt(secs):
     m, s = divmod(int(secs), 60)
     h, m = divmod(m, 60)
     return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
 
 
-def run(jobs, targets):
+def run(jobs, make, targets):
     import concurrent.futures
     logdir = os.path.join(ROOT, "target", "tier")
     os.makedirs(logdir, exist_ok=True)
@@ -72,13 +75,13 @@ def run(jobs, targets):
         with open(log, "w") as f:
             if jobs == 1:
                 # one at a time: the output streams as it would from make, and goes to the log too
-                p = subprocess.Popen(["make", "-C", ROOT, t], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                p = subprocess.Popen([make, "-C", ROOT, t], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 for line in p.stdout:
                     sys.stdout.write(line)
                     f.write(line)
                 code = p.wait()
             else:
-                code = subprocess.run(["make", "-C", ROOT, t], stdout=f, stderr=subprocess.STDOUT).returncode
+                code = subprocess.run([make, "-C", ROOT, t], stdout=f, stderr=subprocess.STDOUT).returncode
         took = time.monotonic() - start
         print(f"tier: {t} {'PASS' if code == 0 else 'FAIL'} in {fmt(took)}", flush=True)
         return t, code == 0, took, log
@@ -103,7 +106,10 @@ def self_test():
     assert piece_problems("os-ktest-4", allowed, {}), "a target of another tier is refused"
     assert piece_problems("os-chaos; rm -rf /", allowed, {}), "a command is not a target"
     assert piece_problems("os-chaos", allowed, {"CHAOS_SEEDS": "1..50\" && true"}), "a malformed seed range"
-    assert piece_problems("os-mutants", allowed, {"SHARD": "8/8"}), "k must be below n"
+    assert piece_problems("os-mutants", allowed, {"PKG": "kcore", "SHARD": "8/8"}), "k must be below n"
+    assert piece_problems("os-mutants", allowed, {"SHARD": "3/8"}), "a shard needs its crate"
+    assert piece_problems("os-chaos", allowed, {"CHAOS_SEEDS": "50..1"}), "an empty seed range"
+    assert piece_problems("os-chaos", allowed, {"CHAOS_SEEDS": "7..7"}) == [], "one seed"
     assert piece_problems("os-mutants", allowed, {"SHARD": "x/8"}), "a malformed shard"
     assert piece_problems("overnight-repeat-smp", allowed, {"N": "0"}), "N of 0"
     assert piece_problems("os-boot-test-smp", allowed, {"N": "5"}), "a variable of another target"
@@ -116,8 +122,12 @@ def self_test():
 def main(argv):
     if argv[1:] == ["--self-test"]:
         return self_test()
-    if len(argv) >= 3 and argv[1] == "run":
-        return run(int(argv[2] or "1"), argv[3:])
+    if len(argv) >= 4 and argv[1] == "run":
+        jobs = int(argv[2] or "1")
+        if jobs < 1:
+            print("tier run: JOBS must be at least 1", file=sys.stderr)
+            return 2
+        return run(jobs, argv[3], argv[4:])
     if len(argv) >= 3 and argv[1] == "piece":
         found = piece_problems(argv[2], set(argv[3:]), os.environ)
         for p in found:

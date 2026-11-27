@@ -30,10 +30,16 @@ fn anything_but_three_ports_is_no_fixtures() {
         "47802,,47804",
         " 47802,47803,47804",
         "-1,2,3",
+        "+1,2,3",
     ] {
         assert_eq!(host_ports(bad), 0, "{bad:?}");
     }
     for which in 0..3 {
         assert_eq!(host_port(0, which), None);
     }
+    assert_eq!(
+        host_port(host_ports("1,2,3"), 3),
+        None,
+        "there are three fixtures"
+    );
 }

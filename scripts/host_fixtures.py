@@ -65,8 +65,13 @@ class HostWeb:
         self.http = S(("127.0.0.1", 0), H)
         self.http_port = self.http.server_address[1]
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
-        self.dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.dns.bind(("127.0.0.1", 0))
+        try:
+            self.dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.dns.bind(("127.0.0.1", 0))
+        except BaseException:
+            self.http.shutdown()
+            self.http.server_close()
+            raise
         self.dns_port = self.dns.getsockname()[1]
         self.dns.settimeout(0.3)
         self.seen = {}
