@@ -1526,7 +1526,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     // earlier than that, however long this thread is held off after the send. Read after the send, a stall of this thread
     // longer than three ticks between the send and the read made the close look instant: T267, seen at two harts on the
     // IOMMU machine, where `channel_write` was seen to return 80 to 120 ms late)
-    let _ = host_pause_watch(5_000); // (every hart keeps a deadline near, so a pause of the host is seen wherever it lands)
+    let watch = PauseWatch::start(5_000); // (every hart keeps a deadline near, so a pause of the host is seen wherever it lands)
     let t0 = sys::clock_get();
     let t0_ns = sys::clock_ns();
     ensure_eq!(
@@ -1553,7 +1553,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
         pause_line("wait_is_woken_by_the_peer_closing", h, us);
         us.div_ceil(1000)
     });
-    let _ = host_pause_watch(0);
+    drop(watch);
     ensure!(
         // (the lower bound is the check: three ticks from the helper's read of the request, which follows `t0`, less one for
         // the millisecond clock's rounding; the upper one only catches a lost wake-up and is loose because a loaded CI runner
@@ -20093,6 +20093,22 @@ fn host_pause_watch(ms: u64) -> bool {
         == 0
 }
 
+/// The heartbeat on for at most `ms`, and off again when this is dropped, however the test returns (an early `?` or a failed
+/// check must not leave every hart taking an interrupt a millisecond for the tests after it).
+struct PauseWatch;
+
+impl PauseWatch {
+    fn start(ms: u64) -> Option<PauseWatch> {
+        host_pause_watch(ms).then_some(PauseWatch)
+    }
+}
+
+impl Drop for PauseWatch {
+    fn drop(&mut self) {
+        let _ = host_pause_watch(0);
+    }
+}
+
 fn nr_debug_stat() -> usize {
     rt::abi::syscall::DEBUG_STAT
 }
@@ -20175,8 +20191,9 @@ fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     RT_GAVE_UP.store(0, Ordering::SeqCst);
     // (T284: every hart keeps a timer deadline near while the probe measures, so a pause of the host makes one late wherever it lands;
     // asked before any hog exists, so a refusal leaves nothing running)
+    let watch = PauseWatch::start(20_000);
     ensure!(
-        host_pause_watch(20_000),
+        watch.is_some(),
         "debug_stat 218 (the heartbeat) was refused"
     );
     let mut hogs = Vec::new();
@@ -20186,7 +20203,7 @@ fn worst_lateness_us(prio: u32) -> Result<(u64, u64), Detail> {
     nap_ticks(5); // the hogs are running, one per hart
     let probe = new_thread(rt_probe, 0)?;
     let w = sys::object_wait(probe, sig::TERMINATED, sys::clock_get() + 20_000);
-    let _ = host_pause_watch(0);
+    drop(watch);
     RT_STOP.store(1, Ordering::SeqCst);
     for h in hogs {
         sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
@@ -20536,7 +20553,6 @@ fn pi_futex_bounds_inversion() -> Outcome {
     let progress_while_boosted = PI_PROGRESS.load(Ordering::SeqCst);
     PI_RELEASE.store(1, Ordering::SeqCst);
     let w = sys::object_wait(high, sig::TERMINATED, sys::clock_get() + 20_000);
-    let _ = host_pause_watch(0);
     RT_STOP.store(1, Ordering::SeqCst);
     ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
     for h in hogs {
@@ -20802,7 +20818,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     let mut trace: Vec<(u64, u64, u64)> = Vec::new(); // (ms into the 100 ms window, RT ms billed so far, ms of host pause in it)
     let mut naps_done = 0;
     let until = sys::clock_get() + 20_000;
-    let _ = host_pause_watch(20_000); // (T284: every hart keeps a deadline near, so a pause of the host is seen on each)
+    let watch = PauseWatch::start(20_000); // (T284: every hart keeps a deadline near, so a pause of the host is seen on each)
     while naps_done < 30 && sys::clock_get() < until {
         nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
         let used = job_use(root, 9)?.0;
@@ -20822,6 +20838,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
         ));
         naps_done += 1;
     }
+    drop(watch);
     RT_STOP.store(1, Ordering::SeqCst);
     ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
     for h in hogs {

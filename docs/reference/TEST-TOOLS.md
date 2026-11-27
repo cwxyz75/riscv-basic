@@ -104,7 +104,10 @@ to say nothing about whether that happened. Two tools now say it:
   `os-boot-test-sched-neg`: `fault-rt-wake-late` (every real-time wake 5 ms late, the interrupts on time) and
   `fault-rt-wake-late-irqoff` (the hart held 5 ms with interrupts off at every real-time wake); both must fail on the bound, with and
   without the injector (`OS_NEG_DETAIL` makes `--neg` insist on the failure's words). Under `-icount` with `sleep=off` at one hart the
-  harness puts `guesttime` on the kernel line: nothing is excused there and the real-time probe's bound is 1 ms of guest time. Record
+  harness puts `guesttime` on the kernel line: nothing is excused there and the real-time probe's bound is 1 ms of guest time. What
+  the two-hart rule still cannot tell from a pause is a kernel delay that shows on two harts at once (a lock held with interrupts off
+  on one hart while another spins for it with interrupts off, for longer than the bound): only the three-in-a-row rule catches that,
+  when it happens at every wake, and the `latency-trace` build (`make os-latency`) measures such spans directly. Record
   mode is a further discriminator: it runs every hart in one TCG thread, so a failure that also shows under `OS_RECORD` is not a pause
   of one hart.
 
