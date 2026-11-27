@@ -11863,38 +11863,45 @@ fn blk_driver_cannot_reach_outside() -> Outcome {
 // its own (`crash` mode 121, `Hostile`) started in a driver's job with exactly the handles a real driver is given, and nothing else:
 // it makes the calls the suite asks for with them and reports what the kernel said. Two rigs:
 //
-// * **The device rig** (`with_matrix`): the suite is the supervisor, as `devmgr` is, with the root resource. Two devices are brought up
-//   by hand, each with a domain charged to one driver's job that has finite limits (`MATRIX_IO_PAGES`, `MATRIX_VECTORS`, as `devmgr`
-//   sets them): the entropy function (a real virtio-pci device, slot 4) with its rings and a buffer mapped and vector 0 granted, and
-//   `iommu-testdev` (slot 8, which `devmgr` lists but never claims: it has no MSI-X) with a buffer mapped and a vector granted that no
-//   device ever sends to. The hostile driver holds the two drivers' domain handles (IO_MAP and IO_UNMAP) and the two buffers (DMA, READ,
-//   WRITE); the suite keeps the control handles, and writes the descriptors and rings the doorbells through its own mappings of the
-//   same memory (the IOMMU sees only the device's requests, so who wrote a descriptor does not matter to it). Each device row aims one
-//   device at a target and checks: the IOMMU took a fault, the device's domain holds a record at the target (the other device's domain
-//   holds none), the last fault names this device, the targets and every bystander's memory are intact, no vector fired and no notice
-//   or message on an identity with no route reached a hart. The message rows (the entropy function only: the test device sends no
-//   messages) are the worst case of Q-IOMMU-MSI 6: the rig holds the function's MSI-X table, which a real driver never does.
+// * **The device rig** (`with_matrix`): the suite is the supervisor, as `devmgr` is, with the root resource. Two virtio-pci functions
+//   are brought up and driven by hand (IOMMU-SPEC amendment 2026-11-27 part 2, OD175: no test machine carries a device that reads or
+//   reports memory at a physical address), each with a domain charged to one driver's job that has finite limits (`MATRIX_IO_PAGES`,
+//   `MATRIX_VECTORS`, as `devmgr` sets them), its rings and a buffer mapped and vector 0 granted: the entropy function (slot 4), whose
+//   one descriptor is the target, and the scratch disk (slot 5, `PCI_BLK_SLOT`), whose read of sector 0 puts its data descriptor at
+//   the target (the header and the status byte stay in its own rings page). The hostile driver holds the two drivers' domain handles
+//   (IO_MAP and IO_UNMAP), the two buffers (DMA, READ, WRITE), each device's doorbell page and its rings: it writes the descriptors and
+//   rings the doorbells itself, through its own mappings; the suite keeps the control handles and does only the bring-up, as `devmgr`
+//   resets a function before a claim. Each device row aims one device at a target and checks: the IOMMU took a fault, the device's
+//   domain holds a write record at the target (the other device's domain holds none), the last fault names this device, the targets
+//   and every bystander's memory are intact, no vector fired and no notice or message on an identity with no route reached a hart. No
+//   check reads memory back at a physical address: a refusal is the fault record and the memory left as it was. The message rows (the
+//   entropy function only: the disk's vector is the target of one) are the worst case of Q-IOMMU-MSI 6: the rig holds the function's
+//   MSI-X table, which a real driver never does. The no-disk boot (`OS_DISK=0`) has no second device, and the rig has nothing to do.
 // * **The claim rig** (`with_claimed_hostile`): the scratch disk claimed through `devmgr`'s `ClaimPci` for a driver job, and the
 //   claim's handles (blkd's set: the BAR, the domain handle, the queue memory and the data buffer, two interrupts) moved to the
 //   hostile driver, plus a duplicate of its data buffer without DMA and one without WRITE. The rows with its own handles and the
 //   map-until-refused row run here, against the limits `devmgr` set.
 //
-// The legitimate use of each rig is checked first (the entropy function writes its buffer; the test device writes its buffer and reads
-// the value back at the frame's physical address), so a refusal is not the rig being broken.
+// The legitimate use of each rig is checked first (the entropy function writes its buffer; the disk reads sector 0 into its buffer, with
+// the status OK and the disk's bytes), so a refusal is not the rig being broken.
 
 /// The driver's job limits of the device rig (`devmgr`'s claims set limits of the same kind: `pcicore::claim`).
 const MATRIX_IO_PAGES: u64 = 16;
 const MATRIX_VECTORS: u64 = 4;
-/// `iommu-testdev` at slot 8 (`scripts/os_boot_test.py`, PCI_DEVICES): device id 0x40, and where its configuration page, its BAR and
-/// its buffer are mapped here.
-const TDEV_SLOT: u64 = 8;
-const TDEV_DID: u64 = TDEV_SLOT << 3;
-const TDEV_ID: u32 = 0x0005_1b36;
-const TDEV_CFG_VA: u64 = 0x7d0_0000;
-const TDEV_VA: u64 = 0x7d0_1000;
-const TDEV_BUF_VA: u64 = 0x7d1_0000;
-/// The test device's result register: the write through the IOMMU failed (records note 2026-11-25 section 1).
-const TDEV_REFUSED: u32 = 0xdead_0002;
+/// The device rig's second device, the scratch disk's function: where its configuration page, its rings, its buffer and its BARs are
+/// mapped here (the entropy function has PCI_CFG_VA and PCI_BAR_VA), and where a request's header and status byte are in its rings
+/// page (its own memory: only the data descriptor is aimed).
+const MBLK_CFG_VA: u64 = 0x7d0_0000;
+const MBLK_RINGS_VA: u64 = 0x7d0_1000;
+const MBLK_BUF_VA: u64 = 0x7d1_0000;
+const MBLK_BAR_VA: u64 = 0x7d2_0000;
+const MBLK_AT: PciAt = PciAt {
+    cfg: MBLK_CFG_VA,
+    bars: MBLK_BAR_VA,
+    room: CLAIM_VA - MBLK_BAR_VA,
+};
+const MBLK_HDR: u64 = 0x800;
+const MBLK_STATUS: u64 = 0xa00;
 
 /// A hostile driver: a `crash` child (mode 121) in a driver's job, holding exactly the handles it was sent.
 struct Hostile {
@@ -12056,22 +12063,27 @@ struct MDevAt {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dut {
     Rng,
-    Tdev,
+    Blk,
 }
 
 struct Matrix<'a> {
     drv: Hostile,
+    /// The entropy function and the disk's function, as the suite mapped them.
     f: &'a PciFn,
+    g: &'a PciFn,
+    /// Each device's rings, at their I/O addresses in its own domain.
     rings_io: u64,
+    blk_rings_io: u64,
     rng: MDev,
-    tdev: MDev,
+    blk: MDev,
     /// The pattern frame (another process's memory, as far as the drivers are concerned: neither domain maps it).
     pa: u64,
-    /// Where the hostile driver mapped, in its own space, the entropy function's doorbell (the notify register itself), the test
-    /// device's register BAR and the entropy function's rings: it drives both devices itself through these (`hst`, `hld`).
+    /// Where the hostile driver mapped, in its own space, each device's doorbell (the notify register itself) and each device's rings:
+    /// it drives both devices itself through these (`hst`, `hld`).
     h_notify: u64,
-    h_tdev: u64,
+    h_blk_notify: u64,
     h_rings: u64,
+    h_blk_rings: u64,
 }
 
 impl Matrix<'_> {
@@ -12090,13 +12102,13 @@ impl Matrix<'_> {
     fn dev(&self, d: Dut) -> &MDev {
         match d {
             Dut::Rng => &self.rng,
-            Dut::Tdev => &self.tdev,
+            Dut::Blk => &self.blk,
         }
     }
     fn other(&self, d: Dut) -> &MDev {
         match d {
-            Dut::Rng => &self.tdev,
-            Dut::Tdev => &self.rng,
+            Dut::Rng => &self.blk,
+            Dut::Blk => &self.rng,
         }
     }
     /// The domain of the entropy function as `msi_send` wants it.
@@ -12109,100 +12121,95 @@ impl Matrix<'_> {
     }
 }
 
-fn tdev_rd(off: u64) -> u32 {
-    mmio_rd32(TDEV_VA + off)
-}
-fn tdev_wr(off: u64, v: u32) {
-    mmio_wr32(TDEV_VA + off, v)
-}
-
-/// Map the test device's configuration page and its BAR 0 (assigned by `pci_bus_program`, which `pci_fn_up` ran) and turn memory
-/// decoding on. It needs no bus mastering (records note 2026-11-25 section 1).
-fn tdev_map(res: u64) -> Outcome {
-    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
-    let r = (|| {
-        let cfg = ok(
-            sys::vmo_create_physical(res, PCI_ECAM + (TDEV_SLOT << 15), 4096),
-            "the test device's configuration page",
-        )?
-        .a1 as u64;
-        let m = sys::process_map(me, cfg, TDEV_CFG_VA, 0, 4096, PF_R | PF_W);
-        sys::handle_close(cfg);
-        ensure_eq!(st(m), Some(S::Ok), "map it");
-        ensure_eq!(
-            mmio_rd32(TDEV_CFG_VA),
-            TDEV_ID,
-            "iommu-testdev at slot 8 (scripts/os_boot_test.py, PCI_DEVICES)"
-        );
-        let bar = u64::from(mmio_rd32(TDEV_CFG_VA + 0x10) & !0xf);
-        ensure!(
-            (PCI_MEM32..PCI_MEM32 + PCI_MEM32_LEN).contains(&bar),
-            "the test device's BAR 0 is assigned: {bar:#x}"
-        );
-        let v = ok(
-            sys::vmo_create_physical(res, bar, 4096),
-            "the test device's BAR",
-        )?
-        .a1 as u64;
-        let m = sys::process_map(me, v, TDEV_VA, 0, 4096, PF_R | PF_W);
-        sys::handle_close(v);
-        ensure_eq!(st(m), Some(S::Ok), "map the BAR");
-        mmio_wr16(TDEV_CFG_VA + 4, 1 << 1); // memory decoding
-        Ok(())
-    })();
-    sys::handle_close(me);
-    r
+/// The disk's virtio transport over the suite's mapping of its BARs (the `virtio` crate's, as `pci_blk_read_sector0` drives it).
+fn mblk_transport(g: &PciFn) -> virtio::PciTransport<VaRegs> {
+    virtio::PciTransport::new(
+        VaRegs,
+        virtio::PciLocations {
+            common: g.common,
+            notify: g.notify,
+            notify_len: g.notify_len,
+            notify_multiplier: g.notify_multiplier,
+            isr: g.isr,
+            device: g.device,
+        },
+    )
 }
 
-fn tdev_unmap() {
-    if let Ok(me) = ok(sys::process_self(), "process_self") {
-        let me = me.a1 as u64;
-        // (whichever is mapped: decoding off first)
-        if st(sys::process_unmap(me, TDEV_VA)) == Some(S::Ok) {
-            mmio_wr16(TDEV_CFG_VA + 4, 0);
-        }
-        sys::process_unmap(me, TDEV_CFG_VA);
-        sys::handle_close(me);
-    }
-}
-
-/// The test device's BAR 0 (its physical address).
-fn tdev_bar() -> u64 {
-    u64::from(mmio_rd32(TDEV_CFG_VA + 0x10) & !0xf)
-}
-
-/// One DMA of the test device: it writes 0x12345678 (eight bytes) at I/O address `iova` through the IOMMU, then reads `pa` back
-/// directly and compares. Its result register: 0 for a write that landed at `pa`, TDEV_REFUSED for one the IOMMU refused.
-fn tdev_dma(iova: u64, pa: u64) -> Result<u32, Detail> {
-    tdev_wr(0x04, iova as u32);
-    tdev_wr(0x08, (iova >> 32) as u32);
-    tdev_wr(0x0c, 8);
-    tdev_wr(0x18, 0);
-    tdev_wr(0x1c, pa as u32);
-    tdev_wr(0x20, (pa >> 32) as u32);
-    tdev_wr(0x14, 1); // arm
-    let _ = tdev_rd(0x00); // the read runs it
+/// The supervisor's part of a disk request (`devmgr` resets a function before a claim): reset the disk and bring it to DRIVER_OK with
+/// queue 0 (four entries) at `rings_io` in the entropy function's layout (the descriptors, the available ring at +0x100, the used ring
+/// at +0x200), with no vector for the queue and none for configuration changes (MSI-X stays off and INTx is disabled: the driver
+/// polls). Queue 0's doorbell, as the suite mapped it.
+fn mblk_up(g: &PciFn, rings_io: u64) -> Result<u64, Detail> {
+    use virtio::Transport;
+    let mut t = mblk_transport(g);
     let t0 = sys::clock_get();
-    loop {
-        let r = tdev_rd(0x10);
-        if r != 0xffff_ffff && r != 0xffff_fffe {
-            return Ok(r);
-        }
-        ensure!(
-            sys::clock_get() < t0 + 1000,
-            "the test device did not finish ({r:#x})"
-        );
-        sys::thread_yield();
-    }
+    vio(
+        t.reset(&mut || sys::clock_get() < t0 + 1000),
+        "reset the disk",
+    )?;
+    let got = vio(t.negotiate(virtio::feature::REQUIRED), "negotiate")?;
+    ensure_eq!(
+        got & virtio::feature::REQUIRED,
+        virtio::feature::REQUIRED,
+        "VERSION_1 and ACCESS_PLATFORM accepted"
+    );
+    vio(
+        t.setup_queue(
+            0,
+            4,
+            (rings_io, rings_io + 0x100, rings_io + 0x200),
+            virtio::NO_VECTOR,
+        ),
+        "queue 0",
+    )?;
+    t.driver_ok();
+    t.notify_address(0).ok_or_else(|| msg_at(line!()))
 }
 
-/// The entropy function's lowest memory BAR (its physical address), read from its configuration page (`pci_fn_up` maps it).
-fn rng_bar() -> u64 {
-    (0..6u64)
-        .map(|i| u64::from(cfg_rd32(0x10 + 4 * i) & !0xf))
-        .filter(|&a| (PCI_MEM32..PCI_MEM32 + PCI_MEM32_LEN).contains(&a))
-        .min()
-        .unwrap_or(0)
+/// The stores that make one disk request, into the rings page whose I/O address is `io`, as (offset, width, value): the page's
+/// rings cleared, the header (sector 0, T_IN) at MBLK_HDR, the status byte at MBLK_STATUS set to 0xff, three descriptors (the header,
+/// device-readable; 512 bytes of data at `data`, device-writable; the status byte, device-writable), and the chain's head in the
+/// available ring, no interrupt asked for. The available ring's index comes last.
+fn mblk_request_stores(io: u64, data: u64) -> Vec<(u64, u64, u64)> {
+    const NEXT: u64 = 1;
+    const WRITE: u64 = 2;
+    let mut v: Vec<(u64, u64, u64)> = (0..(0x300 / 8)).map(|i| (8 * i, 8, 0)).collect();
+    let h = virtio::blk::header(virtio::blk::T_IN, 0);
+    for (i, w) in h.as_chunks::<8>().0.iter().enumerate() {
+        v.push((MBLK_HDR + 8 * i as u64, 8, u64::from_le_bytes(*w)));
+    }
+    v.extend([
+        (MBLK_STATUS, 8, 0xff),
+        (0, 8, io + MBLK_HDR),
+        (
+            8,
+            8,
+            u64::from(virtio::blk::HEADER_BYTES) | (NEXT << 32) | (1 << 48),
+        ),
+        (16, 8, data),
+        (
+            24,
+            8,
+            u64::from(virtio::blk::SECTOR) | ((NEXT | WRITE) << 32) | (2 << 48),
+        ),
+        (32, 8, io + MBLK_STATUS),
+        (40, 8, 1 | (WRITE << 32)),
+        (0x100, 2, 1), // VIRTQ_AVAIL_F_NO_INTERRUPT
+        (0x104, 2, 0), // ring[0] = descriptor 0
+        (0x102, 2, 1), // idx 1
+    ]);
+    v
+}
+
+/// The status byte of the disk's last request (in its rings page, as the suite mapped it).
+fn mblk_status() -> u8 {
+    rd8_dma(MBLK_RINGS_VA + MBLK_STATUS)
+}
+
+/// Whether the disk's buffer, mapped at `va`, holds the scratch disk's sector 0 (byte i is (i * 7 + 3) mod 256).
+fn mblk_sector0_at(va: u64) -> bool {
+    (0..512u64).all(|i| rd8_dma(va + i) == ((i * 7 + 3) & 0xff) as u8)
 }
 
 /// Fill a page we have mapped at `va` with the pattern (`salt` makes each page's its own).
@@ -12217,11 +12224,18 @@ fn page_intact(va: u64, salt: u64) -> bool {
 }
 
 /// The device rig (see the section's comment): `body` gets the rig. Afterwards everything is undone and the leak oracles hold: no
-/// domain, mapped page or vector is left, and the driver's job is back to nothing.
+/// domain, mapped page or vector is left, and the driver's job is back to nothing. No disk (the no-disk boot): nothing to do, and the
+/// line `matrix: no disk, device rig skipped`, which the harness refuses in a boot that has the disks.
 fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
+    if !pci_disks_present()? {
+        println!("matrix: no disk, device rig skipped");
+        return Ok(());
+    }
     let doms = (sys::debug_stat(159), sys::debug_stat(160));
     let (live, ids) = (sys::debug_stat(146), sys::debug_stat(141));
-    let r = with_test_function(|res, f, pa| {
+    let second = Some((PCI_BLK_SLOT, PCI_BLK_ID, MBLK_AT));
+    let r = with_functions(IOMMU_TEST_SLOT, PCI_RNG_ID, second, |res, f, g, pa| {
+        let g = g.ok_or_else(|| msg_at(line!()))?;
         let root = root_job()?;
         let dj = job(root, u64::MAX, u64::MAX, u64::MAX);
         sys::handle_close(root);
@@ -12233,14 +12247,15 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
                 sys::job_set_io_limits(dj, MATRIX_IO_PAGES, MATRIX_VECTORS),
                 "the driver's job's I/O limits",
             )?;
-            tdev_map(res)?;
-            // the entropy function's rings first (mapped by the supervisor; the rows do not aim at them), so that the page after its
-            // buffer is the first free one of its domain
+            // each device's rings first (mapped by the supervisor and the driver; the rows do not aim at them), so that the page after
+            // its buffer is the first free one of its domain
             let rings = ok(sys::vmo_create_dma_in(res, 1, dj), "the rings")?.a1 as u64;
             pending.push(rings);
             map_here(rings, RINGS_VA, 1, PF_R | PF_W)?;
-            let mut rings_io = 0;
-            let mut dev = |did: u64, buf_va: u64| -> Result<MDev, Detail> {
+            let brings = ok(sys::vmo_create_dma_in(res, 1, dj), "the disk's rings")?.a1 as u64;
+            pending.push(brings);
+            map_here(brings, MBLK_RINGS_VA, 1, PF_R | PF_W)?;
+            let mut dev = |did: u64, rings: u64, buf_va: u64| -> Result<(MDev, u64), Detail> {
                 let sup = ok(sys::iodomain_create(res, did, dj), "iodomain_create")?.a1 as u64;
                 pending.push(sup);
                 let drv = ok(
@@ -12252,16 +12267,14 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
                 )?
                 .a1 as u64;
                 pending.push(drv);
-                if did == IOMMU_TEST_DID {
-                    rings_io =
-                        ok(sys::iodomain_map(drv, rings, 0, 1, 3), "map the rings")?.a1 as u64;
-                }
+                let rings_io =
+                    ok(sys::iodomain_map(drv, rings, 0, 1, 3), "map the rings")?.a1 as u64;
                 let buf = ok(sys::vmo_create_dma_in(res, 1, dj), "the driver's buffer")?.a1 as u64;
                 pending.push(buf);
                 map_here(buf, buf_va, 1, PF_R | PF_W)?;
                 let buf_io = ok(sys::iodomain_map(drv, buf, 0, 1, 3), "map the buffer")?.a1 as u64;
-                let g = ok(sys::iodomain_grant_vector(sup, 0), "grant vector 0")?;
-                pending.push(g.a1 as u64);
+                let gv = ok(sys::iodomain_grant_vector(sup, 0), "grant vector 0")?;
+                pending.push(gv.a1 as u64);
                 let dup = ok(
                     sys::handle_duplicate(
                         buf,
@@ -12271,77 +12284,87 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
                 )?
                 .a1 as u64;
                 pending.push(dup);
-                Ok(MDev {
-                    did,
-                    sup,
-                    buf,
-                    buf_va,
-                    buf_io,
-                    buf_pa: phys_of(buf_va)?,
-                    irq: g.a1 as u64,
-                    address: g.a2 as u64,
-                    h_dom: drv,
-                    h_buf: dup,
-                })
+                Ok((
+                    MDev {
+                        did,
+                        sup,
+                        buf,
+                        buf_va,
+                        buf_io,
+                        buf_pa: phys_of(buf_va)?,
+                        irq: gv.a1 as u64,
+                        address: gv.a2 as u64,
+                        h_dom: drv,
+                        h_buf: dup,
+                    },
+                    rings_io,
+                ))
             };
-            let mut rng = dev(IOMMU_TEST_DID, BUF_VA)?;
-            let mut tdev = dev(TDEV_DID, TDEV_BUF_VA)?;
-            // and what a driver drives its device with (IOMMU-SPEC 10.1 step 5): the entropy function's doorbell page and the test
-            // device's register BAR (physical VMOs, as a claim hands over the BAR), and the rings (the queue memory)
-            let npa = rng_bar() + (f.notify - PCI_BAR_VA);
-            let nvmo = ok(
-                sys::vmo_create_physical(res, npa & !0xfff, 4096),
-                "the entropy function's doorbell page",
-            )?
-            .a1 as u64;
-            pending.push(nvmo);
-            let tvmo = ok(
-                sys::vmo_create_physical(res, tdev_bar(), 4096),
-                "the test device's register BAR",
-            )?
-            .a1 as u64;
-            pending.push(tvmo);
-            let rdup = ok(
-                sys::handle_duplicate(
-                    rings,
-                    Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::TRANSFER.0,
-                ),
-                "the driver's rings",
-            )?
-            .a1 as u64;
-            pending.push(rdup);
+            let (mut rng, rings_io) = dev(IOMMU_TEST_DID, rings, BUF_VA)?;
+            let (mut blk, blk_rings_io) = dev(PCI_BLK_DID, brings, MBLK_BUF_VA)?;
+            // and what a driver drives its device with (IOMMU-SPEC 10.1 step 5): each device's doorbell page (a physical VMO, as a
+            // claim hands over the BAR; the disk is brought up once to learn where its queue's doorbell is) and its rings (the queue
+            // memory)
+            let blk_notify = mblk_up(g, blk_rings_io)?;
+            let (npa, bnpa) = (f.phys(f.notify), g.phys(blk_notify));
+            let mut doorbell = |pa: u64, what: &str| -> Result<u64, Detail> {
+                let v = ok(sys::vmo_create_physical(res, pa & !0xfff, 4096), what)?.a1 as u64;
+                pending.push(v);
+                Ok(v)
+            };
+            let nvmo = doorbell(npa, "the entropy function's doorbell page")?;
+            let bnvmo = doorbell(bnpa, "the disk's doorbell page")?;
+            let mut rings_for_driver = |r: u64| -> Result<u64, Detail> {
+                let v = ok(
+                    sys::handle_duplicate(
+                        r,
+                        Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0 | Rights::TRANSFER.0,
+                    ),
+                    "the driver's rings",
+                )?
+                .a1 as u64;
+                pending.push(v);
+                Ok(v)
+            };
+            let rdup = rings_for_driver(rings)?;
+            let brdup = rings_for_driver(brings)?;
             // the drivers' handles move to the hostile driver (whatever happens: `Hostile::start` consumes them)
             let moved = [
-                rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf, nvmo, tvmo, rdup,
+                rng.h_dom, rng.h_buf, blk.h_dom, blk.h_buf, nvmo, bnvmo, rdup, brdup,
             ];
             pending.retain(|h| !moved.contains(h));
             let drv = Hostile::start(dj, &moved)?;
-            (rng.h_dom, rng.h_buf, tdev.h_dom, tdev.h_buf) =
+            (rng.h_dom, rng.h_buf, blk.h_dom, blk.h_buf) =
                 (drv.hs[0], drv.hs[1], drv.hs[2], drv.hs[3]);
             // from here the rig owns every handle: its fields say which are still ours
             pending.clear();
             let mut m = Matrix {
                 drv,
                 f,
+                g,
                 rings_io,
+                blk_rings_io,
                 rng,
-                tdev,
+                blk,
                 pa,
                 h_notify: 0,
-                h_tdev: 0,
+                h_blk_notify: 0,
                 h_rings: 0,
+                h_blk_rings: 0,
             };
             let r = (|| {
-                // the driver maps its device's registers and its rings into itself
+                // the driver maps its devices' doorbells and their rings into itself
                 let at = |h: u64, what: &str| -> Result<u64, Detail> {
                     let (s, a, _) = m.drv.op(3, 0, [h, 0, 4096, PF_R | PF_W, 0, 0])?;
                     ensure_eq!(s, Some(S::Ok), "the driver maps {what}");
                     Ok(a)
                 };
                 let h_notify = at(m.drv.hs[4], "its doorbell page")? + (npa & 0xfff);
-                let h_tdev = at(m.drv.hs[5], "the test device's BAR")?;
+                let h_blk_notify = at(m.drv.hs[5], "the disk's doorbell page")? + (bnpa & 0xfff);
                 let h_rings = at(m.drv.hs[6], "its rings")?;
-                (m.h_notify, m.h_tdev, m.h_rings) = (h_notify, h_tdev, h_rings);
+                let h_blk_rings = at(m.drv.hs[7], "the disk's rings")?;
+                (m.h_notify, m.h_blk_notify, m.h_rings, m.h_blk_rings) =
+                    (h_notify, h_blk_notify, h_rings, h_blk_rings);
                 // the rig works: each device writes its own buffer
                 fill_page(m.rng.buf_va, 1);
                 ensure!(
@@ -12352,23 +12375,29 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
                     !page_intact(m.rng.buf_va, 1),
                     "the entropy function's bytes landed in its buffer"
                 );
-                ensure_eq!(
-                    hostile_tdev_dma(&m, m.tdev.buf_io, m.tdev.buf_pa)?,
-                    0,
-                    "the test device writes its buffer and reads it back at the frame's physical address"
+                fill_page(m.blk.buf_va, 2);
+                ensure!(
+                    hostile_blk_request(&m, m.blk.buf_io, 2000)?,
+                    "the disk serves a request into its buffer"
                 );
                 ensure_eq!(
-                    rd64(m.tdev.buf_va),
-                    0x1234_5678_1234_5678,
-                    "the test device's value is in its buffer"
+                    mblk_status(),
+                    virtio::blk::S_OK,
+                    "the disk's request status"
+                );
+                ensure!(
+                    mblk_sector0_at(m.blk.buf_va),
+                    "the disk's sector 0 landed in its buffer"
                 );
                 fill_page(m.rng.buf_va, 1);
-                fill_page(m.tdev.buf_va, 2);
+                fill_page(m.blk.buf_va, 2);
                 drain_domain_faults(m.rng.sup);
-                drain_domain_faults(m.tdev.sup);
+                drain_domain_faults(m.blk.sup);
                 body(&mut m)
             })();
-            mmio_wr8(m.f.common + 0x14, 0); // the function stops before its memory and its domain go
+            // the functions stop before their memory and their domains go
+            mmio_wr8(m.f.common + 0x14, 0);
+            mmio_wr8(m.g.common + 0x14, 0);
             let drv = core::mem::replace(
                 &mut m.drv,
                 Hostile {
@@ -12379,7 +12408,7 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
             );
             drv.end();
             for h in [
-                m.rng.sup, m.rng.buf, m.rng.irq, m.tdev.sup, m.tdev.buf, m.tdev.irq, rings,
+                m.rng.sup, m.rng.buf, m.rng.irq, m.blk.sup, m.blk.buf, m.blk.irq, rings, brings,
             ] {
                 if h != 0 {
                     sys::handle_close(h);
@@ -12390,10 +12419,10 @@ fn with_matrix(body: impl FnOnce(&mut Matrix) -> Outcome) -> Outcome {
         for h in pending {
             sys::handle_close(h);
         }
-        tdev_unmap();
         unmap_here(RINGS_VA);
         unmap_here(BUF_VA);
-        unmap_here(TDEV_BUF_VA);
+        unmap_here(MBLK_RINGS_VA);
+        unmap_here(MBLK_BUF_VA);
         let used = (|| {
             let t0 = sys::clock_get();
             while (sys::job_info(dj, 12).a1, sys::job_info(dj, 13).a1) != (0, 0)
@@ -12449,33 +12478,44 @@ fn hostile_rng_request(m: &Matrix, buf: u64, len: u32, wait_ms: u64) -> Result<b
     Ok(false)
 }
 
-/// `tdev_dma`, driven by the hostile driver through its own mapping of the test device's BAR.
-fn hostile_tdev_dma(m: &Matrix, iova: u64, pa: u64) -> Result<u32, Detail> {
-    let b = m.h_tdev;
-    for (off, v) in [
-        (0x04, iova as u32),
-        (0x08, (iova >> 32) as u32),
-        (0x0c, 8),
-        (0x18, 0),
-        (0x1c, pa as u32),
-        (0x20, (pa >> 32) as u32),
-        (0x14, 1), // arm
-    ] {
-        m.hst(b + off, 4, u64::from(v))?;
+/// A disk request (`mblk_request_stores`: sector 0 into `data`), driven by the hostile driver: it writes the request in its own mapping
+/// of the disk's rings and rings the doorbell in its own mapping; the supervisor's part is the bring-up (`mblk_up`). Whether the
+/// device returned the request within `wait_ms`.
+fn hostile_blk_request(m: &Matrix, data: u64, wait_ms: u64) -> Result<bool, Detail> {
+    let r = m.h_blk_rings;
+    for (off, width, v) in mblk_request_stores(m.blk_rings_io, data) {
+        m.hst(r + off, width, v)?;
     }
-    let _ = m.hld(b, 4)?; // the read runs it
+    mblk_up(m.g, m.blk_rings_io)?;
+    m.hst(m.h_blk_notify, 2, 0)?; // the doorbell: queue 0
     let t0 = sys::clock_get();
-    loop {
-        let r = m.hld(b + 0x10, 4)? as u32;
-        if r != 0xffff_ffff && r != 0xffff_fffe {
-            return Ok(r);
+    while sys::clock_get() < t0 + wait_ms {
+        if m.hld(r + 0x202, 2)? == 1 {
+            return Ok(true);
         }
-        ensure!(
-            sys::clock_get() < t0 + 1000,
-            "the test device did not finish ({r:#x})"
-        );
         sys::thread_yield();
     }
+    Ok(false)
+}
+
+/// `hostile_blk_request` with the suite driving the disk itself, through its own mappings of the rings and the doorbell.
+fn blk_request_by_the_suite(m: &Matrix, data: u64, wait_ms: u64) -> Result<bool, Detail> {
+    for (off, width, v) in mblk_request_stores(m.blk_rings_io, data) {
+        match width {
+            8 => wr64(MBLK_RINGS_VA + off, v),
+            _ => wr16(MBLK_RINGS_VA + off, v as u16),
+        }
+    }
+    let notify = mblk_up(m.g, m.blk_rings_io)?;
+    mmio_wr16(notify, 0);
+    let t0 = sys::clock_get();
+    while sys::clock_get() < t0 + wait_ms {
+        if rd16(MBLK_RINGS_VA + 0x202) == 1 {
+            return Ok(true);
+        }
+        sys::thread_yield();
+    }
+    Ok(false)
 }
 
 /// `dut_write` with the suite driving the device itself (through its own mappings of the BAR and the rings): only for a row whose driver
@@ -12483,29 +12523,48 @@ fn hostile_tdev_dma(m: &Matrix, iova: u64, pa: u64) -> Result<u32, Detail> {
 fn dut_write_by_the_suite(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
     match d {
         Dut::Rng => rng_request(m.f, m.rings_io, target, 64, 300),
-        Dut::Tdev => {
-            let r = tdev_dma(target, 0)?;
-            ensure!(
-                r == 0 || r == TDEV_REFUSED || r == 0xdead_0003 || r == 0xdead_0004,
-                "the test device's result {r:#x}"
-            );
-            Ok(r != TDEV_REFUSED)
-        }
+        Dut::Blk => blk_request_by_the_suite(m, target, 300),
     }
 }
 
-/// Make device `d` write at I/O address `target`, driven by the hostile driver (`hostile_rng_request`, `hostile_tdev_dma`): whether
-/// the device was served (the entropy function returned the request; the test device's write was not refused).
+/// Make device `d` write at I/O address `target` (the entropy function's descriptor, the disk's data descriptor), driven by the hostile
+/// driver (`hostile_rng_request`, `hostile_blk_request`): whether the device returned the request. (A device may return a request
+/// whose write was refused, as QEMU's virtio moves a buffer through a bounce buffer: the fault records and the memory are the oracle of
+/// a refusal, never this answer.)
 fn dut_write(m: &Matrix, d: Dut, target: u64) -> Result<bool, Detail> {
     match d {
         Dut::Rng => hostile_rng_request(m, target, 64, 300),
-        Dut::Tdev => {
-            let r = hostile_tdev_dma(m, target, 0)?;
-            ensure!(
-                r == 0 || r == TDEV_REFUSED || r == 0xdead_0003 || r == 0xdead_0004,
-                "the test device's result {r:#x}"
-            );
-            Ok(r != TDEV_REFUSED)
+        Dut::Blk => hostile_blk_request(m, target, 300),
+    }
+}
+
+/// Make device `d` send its configuration-change message: a memory write of the word `data` at `address` (MSI-X entry 0, which the
+/// rig writes) that needs no fetch from its rings, so a quarantine row shows a write refused, not only a ring read. The entropy
+/// function as `msi_send` does it; the disk brought up (`mblk_up`), its configuration vector on entry 0 and the driver error that
+/// makes a modern virtio device send it (`virtio_message`), then its MSI-X off again once the device has settled.
+fn dut_message(m: &Matrix, d: Dut, address: u64, data: u32) -> Outcome {
+    match d {
+        Dut::Rng => msi_send(m.f, &m.rng_domain(), address, data),
+        Dut::Blk => {
+            let r = (|| {
+                mblk_up(m.g, m.blk_rings_io)?;
+                m.g.msix_on(pcicore::MsixEntry {
+                    address,
+                    data,
+                    masked: false,
+                })?;
+                mmio_wr16(m.g.common + 0x10, 0);
+                ensure_eq!(
+                    mmio_rd16(m.g.common + 0x10),
+                    0,
+                    "the disk's configuration vector took MSI-X entry 0"
+                );
+                virtio_message(m.g);
+                msi_settle();
+                Ok(())
+            })();
+            m.g.msix_off();
+            r
         }
     }
 }
@@ -12521,7 +12580,7 @@ fn bystanders_intact(
     if let Some(i) = pattern_intact() {
         ensure!(false, "{what}: the pattern frame changed at word {i}");
     }
-    for (d, salt) in [(Dut::Rng, 1), (Dut::Tdev, 2)] {
+    for (d, salt) in [(Dut::Rng, 1), (Dut::Blk, 2)] {
         if own != Some(d) {
             ensure!(
                 page_intact(m.dev(d).buf_va, salt),
@@ -12555,14 +12614,9 @@ fn dut_refused(m: &Matrix, d: Dut, target: u64, own: Option<Dut>, what: &str) ->
     let what = alloc::format!("{d:?}: {what}");
     let base = (sys::debug_stat(162), sys::debug_stat(140));
     let before = iommu_faults();
-    let served = dut_write(m, d, target)?;
-    // (the test device's result says whether the IOMMU refused its write; the entropy function returns a request whose write was
-    // refused like any other, as QEMU's virtio does, so for it the fault records below are the oracle)
-    ensure!(
-        d == Dut::Rng || !served,
-        "{what}: the test device's write was not refused"
-    );
-    // (at least one record: the entropy function writes its 64 bytes as several transactions, each refused and recorded)
+    // (whether the device returned the request says nothing: the fault records and the memory below are the oracle)
+    let _ = dut_write(m, d, target)?;
+    // (at least one record: each device writes its bytes as several transactions, each refused and recorded)
     ensure!(
         iommu_wait_faults(before).is_some(),
         "{what}: the IOMMU took no fault"
@@ -12586,7 +12640,7 @@ fn dut_refused(m: &Matrix, d: Dut, target: u64, own: Option<Dut>, what: &str) ->
 /// Each device of the rig, aimed at the target `target(m, d)` gives.
 fn matrix_row(what: &str, target: impl Fn(&Matrix, Dut) -> Result<u64, Detail>) -> Outcome {
     with_matrix(|m| {
-        for d in [Dut::Rng, Dut::Tdev] {
+        for d in [Dut::Rng, Dut::Blk] {
             let t = target(m, d)?;
             dut_refused(m, d, t, None, what)?;
         }
@@ -12612,10 +12666,10 @@ fn hostile_dma_at_another_device_buffer() -> Outcome {
 
 /// Row: a descriptor at another device's BAR (peer to peer: an address the IOMMU does not map is refused like any other).
 fn hostile_dma_at_another_device_bar() -> Outcome {
-    matrix_row("another device's BAR", |_, d| {
+    matrix_row("another device's BAR", |m, d| {
         let bar = match d {
-            Dut::Rng => tdev_bar(),
-            Dut::Tdev => rng_bar(),
+            Dut::Rng => m.g.phys(m.g.common) & !0xfff,
+            Dut::Blk => m.f.phys(m.f.common) & !0xfff,
         };
         ensure!(bar != 0, "the other device's BAR");
         Ok(bar)
@@ -12624,14 +12678,14 @@ fn hostile_dma_at_another_device_bar() -> Outcome {
 
 /// Row: an IMSIC page as DMA: a device write into every hart's supervisor interrupt file (its `seteipnum` register takes the low word
 /// as an identity). Refused as a translation (the files are not in any domain): the fault and the refusal are the check. Neither
-/// device can choose a word that is a live identity (the test device writes 0x12345678, the entropy function random bytes), so "no hart
-/// is interrupted" (the bystander check) is a backstop here, not the oracle.
+/// row chooses a word that is a live identity (the disk writes its sector 0, which begins 0x18110a03, the entropy function random
+/// bytes), so "no hart is interrupted" (the bystander check) is a backstop here, not the oracle.
 fn hostile_dma_at_an_interrupt_file() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let harts = hart_count(res);
     sys::handle_close(res);
     with_matrix(|m| {
-        for d in [Dut::Rng, Dut::Tdev] {
+        for d in [Dut::Rng, Dut::Blk] {
             for h in 0..harts {
                 dut_refused(
                     m,
@@ -12649,10 +12703,12 @@ fn hostile_dma_at_an_interrupt_file() -> Outcome {
 /// Row: its own buffer, one page beyond (the domain's first free page: its mappings are made lowest first, the buffer last).
 fn hostile_dma_one_page_past_its_buffer() -> Outcome {
     matrix_row("one page past its buffer", |m, d| {
-        ensure!(
-            d == Dut::Tdev || m.rings_io < m.rng.buf_io,
-            "the rings are below the buffer"
-        );
+        let rings_io = if d == Dut::Rng {
+            m.rings_io
+        } else {
+            m.blk_rings_io
+        };
+        ensure!(rings_io < m.dev(d).buf_io, "the rings are below the buffer");
         Ok(m.dev(d).buf_io + 4096)
     })
 }
@@ -12661,7 +12717,7 @@ fn hostile_dma_one_page_past_its_buffer() -> Outcome {
 /// there. Its buffer (both mappings name it) is intact.
 fn hostile_dma_through_a_read_only_mapping() -> Outcome {
     with_matrix(|m| {
-        for d in [Dut::Rng, Dut::Tdev] {
+        for d in [Dut::Rng, Dut::Blk] {
             let x = m.dev(d);
             let (s, ro) = m.drv.map(x.h_dom, x.h_buf, rt::abi::iodomain::READ)?;
             ensure_eq!(
@@ -12685,7 +12741,7 @@ fn hostile_dma_through_a_read_only_mapping() -> Outcome {
 /// device writes there again: refused, and the buffer keeps what it held after the first write.
 fn hostile_dma_after_its_own_unmap() -> Outcome {
     with_matrix(|m| {
-        for (d, salt) in [(Dut::Rng, 1), (Dut::Tdev, 2)] {
+        for (d, salt) in [(Dut::Rng, 1), (Dut::Blk, 2)] {
             let x = m.dev(d);
             let (s, io) = m.drv.map(x.h_dom, x.h_buf, 3)?;
             ensure_eq!(s, Some(S::Ok), "{d:?}: the driver maps its buffer again");
@@ -12706,12 +12762,25 @@ fn hostile_dma_after_its_own_unmap() -> Outcome {
     })
 }
 
-/// Row: use after its supervisor destroyed the domain. The device is quarantined (IOMMU-SPEC 6.3, A14): its writes, at its old buffer
-/// address included, are refused and not reported, and the buffer (still the driver's, mapped here) keeps its contents.
+/// Row: use after its supervisor destroyed the domain. The device is quarantined (IOMMU-SPEC 6.3, A14): its requests are refused
+/// and not reported, and the buffer (still the driver's, mapped here) keeps its contents. A request cannot be fetched (its rings are
+/// gone with the domain), so the device's writes are shown by its configuration-change message (`dut_message`), a write that needs no
+/// fetch: first while the domain lives, aimed at its own buffer, where it lands (the rig is not broken), then quarantined, at its old
+/// buffer address and at another frame.
 fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
-    for d in [Dut::Rng, Dut::Tdev] {
+    for d in [Dut::Rng, Dut::Blk] {
         with_matrix(|m| {
             let x = m.dev(d);
+            let salt = if d == Dut::Rng { 1 } else { 2 };
+            dut_message(m, d, x.buf_io, 0x5157_0a1e)?;
+            msi_settle();
+            ensure_eq!(
+                rd64(x.buf_va) as u32,
+                0x5157_0a1e,
+                "{d:?}: its message lands in its buffer while the domain lives"
+            );
+            fill_page(x.buf_va, salt);
+            drain_domain_faults(x.sup);
             let base = (sys::debug_stat(162), sys::debug_stat(140));
             ok(
                 sys::iodomain_destroy(x.sup),
@@ -12724,6 +12793,7 @@ fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
                     !served,
                     "{d:?}: the quarantined device was served at {what}"
                 );
+                dut_message(m, d, target, 0x5157_0a1e)?;
             }
             msi_settle();
             ensure_eq!(
@@ -12732,7 +12802,7 @@ fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
                 "{d:?}: a quarantined device's faults are not reported (A14)"
             );
             ensure!(
-                page_intact(x.buf_va, if d == Dut::Rng { 1 } else { 2 }),
+                page_intact(x.buf_va, salt),
                 "{d:?}: the destroyed domain's buffer changed"
             );
             bystanders_intact(m, None, base, "after the destroy")
@@ -12745,12 +12815,12 @@ fn hostile_dma_after_the_domain_is_destroyed() -> Outcome {
 /// handle (IOMMU-SPEC 4.5: the last handle destroys it), so the device still reaches its buffer and nothing else (a fault, nobody to
 /// read it); when the driver dies too, the domain goes and the device reaches nothing, unreported.
 fn hostile_dma_after_its_supervisor_died() -> Outcome {
-    for d in [Dut::Rng, Dut::Tdev] {
+    for d in [Dut::Rng, Dut::Blk] {
         let domains = sys::debug_stat(159);
         with_matrix(|m| {
             let sup = match d {
                 Dut::Rng => core::mem::take(&mut m.rng.sup),
-                Dut::Tdev => core::mem::take(&mut m.tdev.sup),
+                Dut::Blk => core::mem::take(&mut m.blk.sup),
             };
             let (supervisor, ch) = launch(15)?;
             let w = sys::channel_write(ch, [0u8; 4].as_ptr(), 4, [sup].as_ptr(), 1);
@@ -12820,6 +12890,8 @@ fn hostile_dma_after_its_supervisor_died() -> Outcome {
                 !dut_write_by_the_suite(m, d, x.buf_io)?,
                 "{d:?}: the device reached its old buffer after both died"
             );
+            // (and a write that needs no fetch from the rings: its message, at its old buffer)
+            dut_message(m, d, x.buf_io, 0x5157_0a1e)?;
             msi_settle();
             ensure_eq!(
                 iommu_faults(),
@@ -12854,19 +12926,19 @@ fn msi_refused(m: &Matrix, address: u64, data: u32, cause: Option<u64>, what: &s
     }
     msi_settle();
     ensure!(
-        drain_domain_faults(m.tdev.sup).is_empty(),
-        "{what}: the test device's domain has records"
+        drain_domain_faults(m.blk.sup).is_empty(),
+        "{what}: the disk's domain has records"
     );
     drain_domain_faults(m.rng.sup);
     bystanders_intact(m, Some(Dut::Rng), base, what)
 }
 
-/// Message row: another device's vector page and identity (the test device's granted vector: where the kernel sends its notice, as
+/// Message row: another device's vector page and identity (the disk's granted vector: where the kernel sends its notice, as
 /// `debug_stat` 148 says). Refused as a translation (no domain maps an interrupt file) and the vector does not fire.
 fn hostile_msi_at_another_device_vector() -> Outcome {
     with_matrix(|m| {
-        let route = vector_route(m.tdev.irq);
-        ensure!(route != u64::MAX, "the test device's vector has a route");
+        let route = vector_route(m.blk.irq);
+        ensure!(route != u64::MAX, "the disk's vector has a route");
         let (file, id) = (route >> 16, route & 0xffff);
         msi_refused(
             m,
@@ -13227,7 +13299,7 @@ fn hostile_child_job_is_held_to_the_parents_limits() -> Outcome {
                     "the child's effective limits are the parent's"
                 );
                 let sup = ok(
-                    sys::iodomain_create(res, TDEV_DID, cj),
+                    sys::iodomain_create(res, IOMMU_TEST_DID, cj),
                     "a domain charged to the child",
                 )?
                 .a1 as u64;
@@ -14541,8 +14613,8 @@ fn blk_bus_master(res: u64) -> Result<bool, Detail> {
     Ok(on)
 }
 
-/// IOMMU8, IOMMU9 (IOMMU-SPEC 8, 9): `devmgr` lists bus 0 as the command line built it (the five functions: `iommu-testdev` listed
-/// and not claimable, for want of MSI-X), and hands a driver a claim: the BAR VMO with the virtio structures, the domain with IO_MAP
+/// IOMMU8, IOMMU9 (IOMMU-SPEC 8, 9): `devmgr` lists bus 0 as the command line built it (the four virtio functions, each claimable),
+/// and hands a driver a claim: the BAR VMO with the virtio structures, the domain with IO_MAP
 /// and IO_UNMAP only, the DMA VMOs, one interrupt handle per vector of the class (wait and acknowledge, no duplicate), the driver's
 /// job limited; bus mastering on after the reply. The claim reads the disk through the IOMMU; a second claim is Busy, the host bridge is Refused, a claim without its job is
 /// BadRequest; when the claimant's connection closes the claim is released (bus mastering off, the domain destroyed) and can be
@@ -14557,16 +14629,16 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
     let mut held: Vec<u64> = Vec::new();
     let disks = pci_disks_present()?;
     let r = (|| {
-        // the list: the host bridge and the five functions of the harness (three in the no-disk boot), nothing else, in requester-id
+        // the list: the host bridge and the four functions of the harness (two in the no-disk boot), nothing else, in requester-id
         // order
         let list = pci_list(mine, 1)?;
         let rids: Vec<u16> = list.iter().map(|e| e.rid).collect();
         ensure_eq!(
             rids,
             if disks {
-                vec![0, 0x20, 0x28, 0x30, 0x38, 0x40]
+                vec![0, 0x20, 0x28, 0x30, 0x38]
             } else {
-                vec![0, 0x20, 0x38, 0x40]
+                vec![0, 0x20, 0x38]
             },
             "bus 0: {list:x?}"
         );
@@ -14579,13 +14651,6 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
                         e.flags & dm::PCI_CLAIMABLE,
                         0,
                         "the host bridge is not claimable"
-                    );
-                }
-                0x40 => {
-                    ensure_eq!(
-                        (e.vendor, e.device, e.flags),
-                        (0x1b36, 0x0005, 0),
-                        "iommu-testdev: no MSI-X, not virtio, not claimable"
                     );
                 }
                 rid => {
@@ -14651,9 +14716,6 @@ fn pci_devices_are_found_and_claimed() -> Outcome {
         let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
         let (s, _, _) = pci_claim(c2, 5, 0x48, Some(send))?;
         ensure_eq!(s, D::NoDevice, "no function at 00:09.0");
-        let send = ok(sys::handle_duplicate(dj, Rights::SAME.0), "dup")?.a1 as u64;
-        let (s, _, _) = pci_claim(c2, 5, 0x40, Some(send))?;
-        ensure_eq!(s, D::Refused, "iommu-testdev has no MSI-X (IOMMU-SPEC 8.6)");
         ensure!(
             !blk_bus_master(res)?,
             "bus mastering is off before the claim"
@@ -16535,9 +16597,10 @@ fn hart_count(res: u64) -> u64 {
 // ---- IOMMU5: the IOMMU is on and every device is denied by default (IOMMU-SPEC 2.4, 3.1, 7; IO1) ----------------------------
 //
 // The independent device is a virtio-pci function the harness puts on the command line (`scripts/os_boot_test.py`: `virtio-rng-pci`
-// at slot `IOMMU_TEST_SLOT`, with `iommu_platform=on`). `iommu-testdev` cannot read and cannot choose its data word (IOMMU0 items 1
-// and 14), so the virtio function does both directions here, driven by hand through its registers: a **read** is the device fetching
-// its available ring from an address the test chose (a queue notification), and a **write** is its MSI-X message, whose address and
+// at slot `IOMMU_TEST_SLOT`, with `iommu_platform=on`), driven by hand: no test machine carries a device that reads or reports memory at
+// a physical address (IOMMU-SPEC amendment 2026-11-27 part 2, OD175). It does both directions here, through its registers: a **read**
+// is the device fetching its available ring from an address the test chose (a queue notification), and a **write** is its MSI-X
+// message, whose address and
 // data word the test writes into the MSI-X table and which QEMU's virtio transport sends when the driver writes a value other than 1
 // to `queue_enable` (its configuration-change interrupt, `virtio_error`). No domain exists, so the directory holds no entry for the
 // function: every transaction must be refused and reported (cause 258), and nothing must reach memory or an interrupt file.
@@ -16608,7 +16671,7 @@ struct PciFn {
     isr: u64,
     /// The device configuration (address, length), if the function has one.
     device: Option<(u64, u64)>,
-    /// Its MSI-X capability and table, when the suite drives the function by hand (`pci_fn_up`); a function claimed through
+    /// Its MSI-X capability and table, when the suite drives the function by hand (`pci_fn_map`); a function claimed through
     /// `devmgr` has none here (the manager keeps the table).
     msix: Option<PciMsix>,
 }
@@ -16618,18 +16681,22 @@ struct PciMsix {
     m: pcicore::Msix,
     bars: Vec<pcicore::Bar>,
     maps: Vec<(u8, u64)>,
+    /// Where its configuration page is mapped here, and the physical address of its lowest BAR, mapped here at `bars_va`.
+    cfg: u64,
+    lo: u64,
+    bars_va: u64,
 }
 
-/// `pcicore`'s MSI-X sequence over the hand-driven function: its configuration page at PCI_CFG_VA, its BARs where `pci_fn_up` mapped
-/// them (`pcicore` checks every offset against the BAR's size before it asks).
+/// `pcicore`'s MSI-X sequence over the hand-driven function: its configuration page and its BARs where `pci_fn_map` mapped them
+/// (`pcicore` checks every offset against the BAR's size before it asks).
 struct PciMsixRegs<'a>(&'a PciMsix);
 
 impl pcicore::MsixAccess for PciMsixRegs<'_> {
     fn cfg_read16(&mut self, off: u16) -> u16 {
-        cfg_rd16(u64::from(off))
+        cfgx_rd16(self.0.cfg, u64::from(off))
     }
     fn cfg_write16(&mut self, off: u16, v: u16) {
-        cfg_wr16(u64::from(off), v)
+        cfgx_wr16(self.0.cfg, u64::from(off), v)
     }
     fn bar_read32(&mut self, bar: u8, off: u64) -> u32 {
         self.0
@@ -16664,26 +16731,40 @@ impl PciFn {
 
     /// Whether MSI-X is enabled (message control, read through the configuration page).
     fn msix_enabled(&self) -> bool {
-        self.msix
-            .as_ref()
-            .is_some_and(|x| cfg_rd16(u64::from(x.m.control_offset())) & pcicore::msix::ENABLE != 0)
+        self.msix.as_ref().is_some_and(|x| {
+            cfgx_rd16(x.cfg, u64::from(x.m.control_offset())) & pcicore::msix::ENABLE != 0
+        })
+    }
+
+    /// The physical address of the register at `va` of its BAR window (`pci_fn_map` mapped the window from its lowest BAR).
+    fn phys(&self, va: u64) -> u64 {
+        self.msix.as_ref().map_or(0, |x| x.lo + (va - x.bars_va))
     }
 }
 
 fn cfg_rd32(off: u64) -> u32 {
-    // SAFETY: PCI_CFG_VA maps the function's 4 KiB configuration page (`pci_fn_up`); `off` is an aligned register inside it.
-    unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u32) }
+    cfgx_rd32(PCI_CFG_VA, off)
 }
 fn cfg_rd16(off: u64) -> u16 {
-    // SAFETY: as `cfg_rd32`, a 16-bit register.
-    unsafe { core::ptr::read_volatile((PCI_CFG_VA + off) as *const u16) }
+    cfgx_rd16(PCI_CFG_VA, off)
 }
-fn cfg_wr16(off: u64, v: u16) {
-    // SAFETY: as `cfg_rd16`.
-    unsafe { core::ptr::write_volatile((PCI_CFG_VA + off) as *mut u16, v) }
+/// The configuration register at `off` of the function whose page is mapped at `cfg` (PCI_CFG_VA, or the matrix's MBLK_CFG_VA).
+fn cfgx_rd32(cfg: u64, off: u64) -> u32 {
+    // SAFETY: `cfg` maps a function's 4 KiB configuration page, readable (`pci_fn_map`, `pci_disks_present`, `blk_bus_master`);
+    // `off` is an aligned register inside it.
+    unsafe { core::ptr::read_volatile((cfg + off) as *const u32) }
+}
+fn cfgx_rd16(cfg: u64, off: u64) -> u16 {
+    // SAFETY: as `cfgx_rd32`, a 16-bit register.
+    unsafe { core::ptr::read_volatile((cfg + off) as *const u16) }
+}
+fn cfgx_wr16(cfg: u64, off: u64, v: u16) {
+    // SAFETY: as `cfgx_rd16`; every caller that writes mapped the page writable (`pci_fn_map`).
+    unsafe { core::ptr::write_volatile((cfg + off) as *mut u16, v) }
 }
 fn mmio_wr16(va: u64, v: u16) {
-    // SAFETY: `va` is inside the BAR window mapped at PCI_BAR_VA (`pci_fn_up`), at a register the virtio structure there defines.
+    // SAFETY: `va` is inside a BAR window this process mapped (`pci_fn_map` at PCI_BAR_VA or MBLK_BAR_VA, or a claim's BAR VMO), at a
+    // register the virtio structure there defines.
     unsafe { core::ptr::write_volatile(va as *mut u16, v) }
 }
 fn mmio_rd16(va: u64) -> u16 {
@@ -16807,11 +16888,33 @@ fn pci_bus_program(res: u64) -> Result<(Vec<pcicore::Assignment>, Vec<pcicore::F
     }
 }
 
-/// Map the configuration page of the function at `slot` (whose vendor and device ids are `id`), assign every BAR of bus 0 as
-/// `devmgr` would (`pci_bus_program`), map this function's BARs, and find its virtio structures and MSI-X table. The function is
-/// left with memory decoding and bus mastering on and INTx off.
-fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
-    let (assigned, funcs) = pci_bus_program(res)?;
+/// Where a hand-driven function's configuration page and BAR window are mapped here, and how much room the window has.
+#[derive(Clone, Copy)]
+struct PciAt {
+    cfg: u64,
+    bars: u64,
+    room: u64,
+}
+
+/// The test function's place (`with_function`; `cfg_rd32` and the other accessors read this configuration page).
+const PCI_AT: PciAt = PciAt {
+    cfg: PCI_CFG_VA,
+    bars: PCI_BAR_VA,
+    room: PATTERN_VA - PCI_BAR_VA,
+};
+
+/// Map the configuration page of the function at `slot` (whose vendor and device ids are `id`) and its BARs at `at`, on a bus
+/// `pci_bus_program` has just programmed as `devmgr` would (`assigned`, `funcs`), and find its virtio structures and MSI-X table. The
+/// function is left with memory decoding and bus mastering on and INTx off. A second function is mapped from the same programming
+/// (programming the bus again would turn every function's decoding off).
+fn pci_fn_map(
+    res: u64,
+    slot: u64,
+    id: u32,
+    assigned: &[pcicore::Assignment],
+    funcs: &[pcicore::Function],
+    at: PciAt,
+) -> Result<PciFn, Detail> {
     let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     let cfg = sys::vmo_create_physical(res, PCI_ECAM + (slot << 15), 4096);
     ensure_eq!(
@@ -16820,15 +16923,15 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
         "the test function's configuration page is a device window (the ECAM window is the root resource's)"
     );
     let cfg = cfg.a1 as u64;
-    let m = sys::process_map(me, cfg, PCI_CFG_VA, 0, 4096, PF_R | PF_W);
+    let m = sys::process_map(me, cfg, at.cfg, 0, 4096, PF_R | PF_W);
     sys::handle_close(cfg);
     ensure_eq!(st(m), Some(S::Ok), "map the configuration page");
     ensure_eq!(
-        cfg_rd32(0),
+        cfgx_rd32(at.cfg, 0),
         id,
         "the harness's function at slot {slot} (scripts/os_boot_test.py, PCI_DEVICES)"
     );
-    cfg_wr16(4, 0); // decoding off while the BARs are mapped
+    cfgx_wr16(at.cfg, 4, 0); // decoding off while the BARs are mapped
     let bdf = pcicore::Bdf::new(0, slot as u8, 0).ok_or_else(|| msg_at(line!()))?;
     let mine: Vec<pcicore::Assignment> =
         assigned.iter().filter(|a| a.bdf == bdf).copied().collect();
@@ -16839,7 +16942,7 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
         .max()
         .unwrap_or(PCI_MEM32);
     ensure!(
-        !mine.is_empty() && hi - lo <= PATTERN_VA - PCI_BAR_VA,
+        !mine.is_empty() && hi - lo <= at.room,
         "the function's BARs {mine:x?}"
     );
     let w = sys::vmo_create_physical(res, lo, hi - lo);
@@ -16849,20 +16952,21 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
         "the host's 32-bit memory window is a device window"
     );
     let w = w.a1 as u64;
-    let m = sys::process_map(me, w, PCI_BAR_VA, 0, hi - lo, PF_R | PF_W);
+    let m = sys::process_map(me, w, at.bars, 0, hi - lo, PF_R | PF_W);
     sys::handle_close(w);
     sys::handle_close(me);
     ensure_eq!(st(m), Some(S::Ok), "map the BARs");
     let maps: Vec<(u8, u64)> = mine
         .iter()
-        .map(|a| (a.index, PCI_BAR_VA + (a.addr - lo)))
+        .map(|a| (a.index, at.bars + (a.addr - lo)))
         .collect();
     let va =
         |bar: u8, off: u64| -> u64 { maps.iter().find(|m| m.0 == bar).map_or(0, |m| m.1 + off) };
     // the virtio structures and the MSI-X capability, as `pcicore` read them (the same code as `devmgr`'s)
     let f = funcs
-        .into_iter()
+        .iter()
         .find(|f| f.bdf == bdf)
+        .cloned()
         .ok_or_else(|| msg_at(line!()))?;
     let (Some((_, l)), Some(msix)) = (f.virtio, f.msix) else {
         ensure!(
@@ -16872,7 +16976,7 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
         return Err(msg_at(line!()));
     };
     ensure_eq!(l.notify_multiplier, 4, "the notify multiplier QEMU uses");
-    cfg_wr16(4, (1 << 1) | (1 << 2) | (1 << 10)); // memory decoding, bus mastering, INTx disabled
+    cfgx_wr16(at.cfg, 4, (1 << 1) | (1 << 2) | (1 << 10)); // memory decoding, bus mastering, INTx disabled
     Ok(PciFn {
         common: va(l.bar, l.common.offset),
         notify: va(l.bar, l.notify.offset),
@@ -16884,25 +16988,37 @@ fn pci_fn_up(res: u64, slot: u64, id: u32) -> Result<PciFn, Detail> {
             m: msix,
             bars: f.bars,
             maps,
+            cfg: at.cfg,
+            lo,
+            bars_va: at.bars,
         }),
     })
 }
 
 fn pci_fn_down(f: &PciFn) {
-    mmio_wr8(f.common + 0x14, 0); // virtio reset
-    f.msix_off();
-    cfg_wr16(4, 1 << 10); // no decoding, no bus mastering
-    pci_unmap();
+    pci_fn_down_at(f, PCI_AT)
 }
 
-/// Unmap the configuration page and the BARs, whichever are mapped (the way out of a `pci_fn_up` that failed part way: its device
-/// registers are not touched, since they may not be mapped; the command register is still 0, as `pci_fn_up` wrote it first).
+/// `pci_fn_down` for a function `pci_fn_map` mapped at `at`.
+fn pci_fn_down_at(f: &PciFn, at: PciAt) {
+    mmio_wr8(f.common + 0x14, 0); // virtio reset
+    f.msix_off();
+    cfgx_wr16(at.cfg, 4, 1 << 10); // no decoding, no bus mastering
+    pci_unmap_at(at);
+}
+
+/// Unmap the configuration page and the BARs, whichever are mapped (the way out of a `pci_fn_map` that failed part way: its device
+/// registers are not touched, since they may not be mapped; the command register is still 0, as `pci_fn_map` wrote it first).
 fn pci_unmap() {
+    pci_unmap_at(PCI_AT)
+}
+
+fn pci_unmap_at(at: PciAt) {
     let me = sys::process_self();
     if st(me) == Some(S::Ok) {
         let me = me.a1 as u64;
-        sys::process_unmap(me, PCI_BAR_VA);
-        sys::process_unmap(me, PCI_CFG_VA);
+        sys::process_unmap(me, at.bars);
+        sys::process_unmap(me, at.cfg);
         sys::handle_close(me);
     }
 }
@@ -17038,20 +17154,48 @@ fn with_test_function(body: impl FnOnce(u64, &PciFn, u64) -> Outcome) -> Outcome
 
 /// `with_test_function` for the function at `slot`, whose ids are `id`.
 fn with_function(slot: u64, id: u32, body: impl FnOnce(u64, &PciFn, u64) -> Outcome) -> Outcome {
+    with_functions(slot, id, None, |res, f, _, pa| body(res, f, pa))
+}
+
+/// `with_function`, and when `second` names one (its slot, its ids and where it is mapped here), a second function brought up beside
+/// the first from the same programming of the bus, and taken down after `body` like the first.
+fn with_functions(
+    slot: u64,
+    id: u32,
+    second: Option<(u64, u32, PciAt)>,
+    body: impl FnOnce(u64, &PciFn, Option<&PciFn>, u64) -> Outcome,
+) -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let r = (|| {
         let (dma, pa) = pattern_frame(res)?;
-        let r = match pci_fn_up(res, slot, id) {
-            Ok(f) => {
-                let r = body(res, &f, pa);
-                pci_fn_down(&f);
-                r
-            }
-            Err(e) => {
-                pci_unmap();
-                Err(e)
-            }
-        };
+        let r = (|| {
+            let (assigned, funcs) = pci_bus_program(res)?;
+            let f = match pci_fn_map(res, slot, id, &assigned, &funcs, PCI_AT) {
+                Ok(f) => f,
+                Err(e) => {
+                    pci_unmap();
+                    return Err(e);
+                }
+            };
+            let r = match second {
+                None => body(res, &f, None, pa),
+                Some((slot2, id2, at2)) => {
+                    match pci_fn_map(res, slot2, id2, &assigned, &funcs, at2) {
+                        Ok(g) => {
+                            let r = body(res, &f, Some(&g), pa);
+                            pci_fn_down_at(&g, at2);
+                            r
+                        }
+                        Err(e) => {
+                            pci_unmap_at(at2);
+                            Err(e)
+                        }
+                    }
+                }
+            };
+            pci_fn_down(&f);
+            r
+        })();
         pattern_drop(dma);
         r
     })();
@@ -17201,7 +17345,8 @@ const DIR_READ: u64 = 1;
 const DIR_WRITE: u64 = 2;
 
 fn wr16(va: u64, v: u16) {
-    // SAFETY: `va` is inside one of the DMA VMOs this test mapped read-write at DMA_VA.
+    // SAFETY: `va` is inside a DMA VMO this process mapped read-write: at IODMA_VA (RINGS_VA, BUF_VA, RO_VA, SCRATCH_VA), or the
+    // matrix's MBLK_RINGS_VA and MBLK_BUF_VA.
     unsafe { core::ptr::write_volatile(va as *mut u16, v) }
 }
 fn rd16(va: u64) -> u16 {
@@ -17316,7 +17461,7 @@ const BLK_HDR: u64 = 0;
 const BLK_DATA: u64 = 0x200;
 const BLK_STATUS: u64 = 0x400;
 
-/// The virtio registers by address: the transport's offsets are the addresses `pci_fn_up` (or a claim's BAR mapping) found, which are
+/// The virtio registers by address: the transport's offsets are the addresses `pci_fn_map` (or a claim's BAR mapping) found, which are
 /// inside the mapped BARs.
 struct VaRegs;
 impl virtio::Regs for VaRegs {
