@@ -173,6 +173,8 @@ pub(super) fn teardown(pid: u64) -> i32 {
         // does the teardown.
         return i32::MIN;
     };
+    dying::note(pid, dying::Stage::Taken);
+    crate::chaos::point(crate::chaos::Point::Teardown);
     // A process that vanished without a recorded code is not mistaken for `exit(-1)`.
     let code = process.exit_code.or(process.killed).unwrap_or(i32::MIN);
     // The process is private to this thread now: let the big lock go **completely** for the two long steps. A thread that comes here from a trap holds it at
@@ -182,9 +184,13 @@ pub(super) fn teardown(pid: u64) -> i32 {
     teardown_objects(&mut process, code);
     // (IOMMU6, IOMMU-SPEC 10.2) the device domains whose last handle was the process's are detached and emptied now, before its memory
     // goes: the cleanup begins each destruction under the object lock, the drain completes it with no lock held
+    crate::chaos::point(crate::chaos::Point::Teardown);
+    dying::note(pid, dying::Stage::Iommu);
     super::wake::cleanup_dead();
     crate::iommu::drain();
+    dying::note(pid, dying::Stage::Memory);
     teardown_memory(process);
+    dying::done(pid);
     crate::bkl::reacquire(depth);
     kmem::flush_tlb();
     notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
@@ -370,6 +376,7 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
     // (a big VMO's pages go back in batches, with switch points between: no BKL is held here)
     super::calls::drain_dying();
     // 3. what the process was charged
+    crate::chaos::point(crate::chaos::Point::Teardown);
     let k = kmem::mem();
     let tables: u64 = process.table_charge.values().sum();
     k.jobs.credit(process.job, Resource::Pages, tables);
@@ -450,6 +457,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         if whole {
             p.exit_code.get_or_insert(code);
             p.killed.get_or_insert(code);
+            dying::note(pid, dying::Stage::Ending);
             bump_attention();
             // (siblings spinning in user mode on other harts must be told: with no periodic tick (L13) nothing else would stop them)
             if !cfg!(feature = "fault-skip-kill-ipi") {

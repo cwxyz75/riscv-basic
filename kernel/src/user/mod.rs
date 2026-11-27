@@ -347,7 +347,10 @@ pub fn report_processes() {
         let summary = alloc::format!(
             "leak: live objects {live:?}; process objects (object, pid, ended) {process_objs:?}"
         );
+        // (T278: every process on its way out, in the table or not: how long it has been ending and where its teardown is)
+        let dying = dying::report(|pid| s.procs.contains_key(&pid));
         core::iter::once(summary)
+            .chain(dying)
             .chain(s.procs.iter()
             .map(|(pid, p)| {
                 // (what its handles name, by kind: a fingerprint of which program it is, since a process has no name)
@@ -420,6 +423,7 @@ pub enum LoadError {
 
 mod aslocks;
 mod calls;
+pub(crate) mod dying;
 mod kobjects;
 mod lifecycle;
 mod loader;

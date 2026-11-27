@@ -220,7 +220,7 @@ prints them as `##BENCH irq_off_max`, `bkl_hold_max` and, for the ten worst sysc
 **Schedule perturbation.** `make os-chaos` (overnight) boots the kernel-only shard on the `chaos` kernel, one boot per
 seed in `CHAOS_SEEDS` and per hart count, with delays at lock, IPI, switch and user-return points. A failing seed is
 named and its log kept under `target/chaos/`; `OS_CHAOS_POINTS=<mask>` (1 acquire, 2 release, 4 IPI, 8 switch, 16 user
-return) narrows the point.
+return, 32 copy-out, 64 the stage boundaries of a process teardown) narrows the point.
 
 **The checked release kernel.** `make os-boot-test-checked` (overnight) runs the whole suite at four harts and the
 kernel-only shard at one, two and eight on the `release-checked` profile: optimised, with debug assertions and

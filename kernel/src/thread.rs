@@ -1894,6 +1894,19 @@ pub fn thread_count() -> usize {
     irq::off(|| kernel().threads.len())
 }
 
+/// Threads that have exited and are still in the table (a detached one not yet reaped by the hart that switched away from it, or a joinable
+/// one nobody has joined): each still holds its kernel stack (T227's leak report).
+#[cfg(any(not(feature = "release"), feature = "release-suite"))] // (the leak checks of `user_tests` and the boot self-tests)
+pub fn exited_unreaped() -> usize {
+    irq::off(|| {
+        let k = kernel();
+        k.threads
+            .keys()
+            .filter(|&&t| sched().state(t) == Some(State::Exited))
+            .count()
+    })
+}
+
 /// The ids of every thread in the table (a leak test's snapshot, for [`report_threads`]).
 pub fn tids() -> Vec<Tid> {
     irq::off(|| kernel().threads.keys().copied().collect())

@@ -132,6 +132,21 @@ pub struct Translation {
     pub perms: Perms,
 }
 
+/// What [`PageTable::frames_in_range`] finds: table frames below the root, and the frames the leaves map.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RangeFrames {
+    pub tables: u64,
+    pub pages: u64,
+}
+
+impl RangeFrames {
+    /// Both kinds: the frames the window holds.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: both are frame counts of one table, far below 2^63
+    pub fn total(&self) -> u64 {
+        self.tables + self.pages
+    }
+}
+
 /// What differs between page-table formats (AR1c, KERNEL-V1-SPEC 2.6): the entry encoding, the number of levels, which entries
 /// are leaves, and which addresses are valid. Tables are 4 KiB frames of 512 eight-byte entries, 9 index bits per level, in every
 /// format here; the top half of the root table (entries 256 and up) is the kernel's.
@@ -682,6 +697,60 @@ impl<F: PageTableFormat> PageTable<F> {
             }
         }
         walk::<F, M>(mm, self.root, F::LEVELS.saturating_sub(1), 0, f);
+    }
+
+    /// The frames a walk finds under `[start, end)` (T227's walk oracle: an independent count of what a window of the kernel's table holds,
+    /// against the formulas that derive it from a counter): every table frame below the root whose span meets the range, and every leaf
+    /// in it (a huge leaf counts the frames of its whole span). The root is not counted. `start` and `end` are canonical addresses of one
+    /// half (`end` may be 0 for the top of the upper half); the walk reads only the entries whose span meets the range.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; spans are 1 << (12 + 9 * level) with level < 4; the span's end is computed with wrapping arithmetic and compared as a range end where 0 is the top of the address space
+    pub fn frames_in_range<M: PhysMem>(&self, mm: &Mm<M>, start: u64, end: u64) -> RangeFrames {
+        fn walk<F: PageTableFormat, M: PhysMem>(
+            mm: &Mm<M>,
+            table: Pfn,
+            level: u32,
+            prefix: u64,
+            (start, end): (u64, u64),
+            out: &mut RangeFrames,
+        ) {
+            let shift = 12 + 9 * level;
+            for i in 0..512u64 {
+                let lo = F::extend(prefix | (i << shift));
+                let hi = lo.wrapping_add(1u64 << shift); // (0: the span ends at the top of the address space)
+                let below = end != 0 && lo >= end;
+                let above = hi != 0 && hi <= start;
+                if below || above {
+                    continue;
+                }
+                let pte = mm.mem.read_u64((table << 12) + i * 8);
+                if !F::is_valid(pte) {
+                    continue;
+                }
+                if F::is_leaf(pte, level) {
+                    out.pages += 1u64 << (9 * level);
+                } else if level > 0 {
+                    out.tables += 1;
+                    walk::<F, M>(
+                        mm,
+                        F::pfn_of(pte),
+                        level - 1,
+                        prefix | (i << shift),
+                        (start, end),
+                        out,
+                    );
+                }
+            }
+        }
+        let mut out = RangeFrames::default();
+        walk::<F, M>(
+            mm,
+            self.root,
+            F::LEVELS.saturating_sub(1),
+            0,
+            (start, end),
+            &mut out,
+        );
+        out
     }
 
     /// Free every table frame (the root too). The leaves must be unmapped (or are

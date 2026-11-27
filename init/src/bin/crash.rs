@@ -1227,7 +1227,7 @@ fn churn(seed: u64) -> i32 {
     let buf = [0x42u8; 4096];
     let mut out = [0u8; 4096];
     for _ in 0..1500u32 {
-        match rnd(7) {
+        match rnd(8) {
             0 => {
                 let c = rt::sys::channel_create();
                 if c.status != 0 {
@@ -1336,6 +1336,15 @@ fn churn(seed: u64) -> i32 {
                     rt::sys::handle_close(t.a1 as u64);
                 }
             }
+            6 => {
+                // T265 (T40's process and job churn): a job of its own with one to three processes that never start, each holding a
+                // mapping of committed pages, ended one of three ways: a kill, the close of the last handle (kill on close), or a kill
+                // of the whole job. A never-started process is torn down by the caller, on this hart, while the others churn.
+                let code = job_churn(rnd(3), rnd(3), buf.as_ptr());
+                if code != 0 {
+                    return code;
+                }
+            }
             _ => {
                 rt::sys::thread_yield();
             }
@@ -1349,6 +1358,83 @@ fn churn(seed: u64) -> i32 {
         rt::sys::thread_yield();
     }
     160
+}
+
+/// One round of the churn's process and job churn (`churn`, operation 6): `1 + extra` processes in a new job below the root, each with two
+/// committed pages mapped, ended by `how` (0: `process_kill`, 1: closing the handle, 2: `job_kill`). 0, or 1700 + the step that failed
+/// (1750 + the status of the map that failed).
+fn job_churn(extra: u64, how: u64, page: *const u8) -> i32 {
+    let root = rt::sys::job_root();
+    if root.status != 0 {
+        return 1700;
+    }
+    let root = root.a1 as u64;
+    let j = rt::sys::job_create(root, &[u64::MAX; 6]);
+    rt::sys::handle_close(root);
+    if j.status != 0 {
+        return 1701;
+    }
+    let j = j.a1 as u64;
+    let mut ps = [0u64; 3];
+    let n = 1 + extra as usize;
+    for p in ps.iter_mut().take(n) {
+        let r = rt::sys::process_create_in(j);
+        if r.status != 0 {
+            return 1702;
+        }
+        *p = r.a1 as u64;
+        let v = rt::sys::vmo_create(2);
+        if v.status != 0 {
+            return 1703;
+        }
+        let vmo = v.a1 as u64;
+        if rt::sys::vmo_write(vmo, 0, page, 4096).status != 0
+            || rt::sys::vmo_write(vmo, 4096, page, 4096).status != 0
+        {
+            return 1704;
+        }
+        let m = rt::sys::process_map(
+            *p,
+            vmo,
+            rt::abi::user::STACK_ARENA_END + 0x2_0000_0000,
+            0,
+            2 * 4096,
+            3,
+        );
+        rt::sys::handle_close(vmo);
+        if m.status != 0 {
+            return 1750 + (-(m.status as i64)) as i32;
+        }
+    }
+    match how {
+        0 => {
+            for &p in ps.iter().take(n) {
+                if rt::sys::process_kill(p, 7).status != 0 {
+                    return 1705;
+                }
+                rt::sys::handle_close(p);
+            }
+        }
+        1 => {
+            for &p in ps.iter().take(n) {
+                if rt::sys::handle_close(p).status != 0 {
+                    return 1706;
+                }
+            }
+        }
+        _ => {
+            if rt::sys::job_kill(j, 7).status != 0 {
+                return 1707;
+            }
+            for &p in ps.iter().take(n) {
+                rt::sys::handle_close(p);
+            }
+        }
+    }
+    if rt::sys::handle_close(j).status != 0 {
+        return 1708;
+    }
+    0
 }
 
 // --- floating point (slice A) ----------------------------------------------------------------------

@@ -403,3 +403,97 @@ fn testfmt48_block_entries_are_leaves_above_level_zero() {
     pt.for_each_leaf(&mm, &mut |va, t, level| seen.push((va, t.pfn, level)));
     assert_eq!(seen, vec![(1u64 << 30, 7000, 2)]);
 }
+
+/// T227's walk oracle, its pure part: `frames_in_range` counts what the model says a range holds (the tables whose span meets it, which
+/// are the distinct prefixes of the mapped pages, since empty tables are pruned; and the leaves inside it), over random maps, unmaps and
+/// ranges, in both formats. A range over everything counts every frame the table holds but the root.
+#[test]
+fn the_range_walk_counts_what_the_model_holds_sv39() {
+    range_walk_model::<Sv39>();
+}
+
+#[test]
+fn the_range_walk_counts_what_the_model_holds_testfmt48() {
+    range_walk_model::<TestFmt48>();
+}
+
+/// The model's count of `[start, end)` (`end` 0: the top): for each level of table below the root, the distinct spans of mapped pages
+/// that meet the range, and the mapped pages inside it.
+fn model_range<F: PageTableFormat>(
+    model: &BTreeMap<u64, (u64, Perms)>,
+    start: u64,
+    end: u64,
+) -> (u64, u64) {
+    let meets = |lo: u64, span: u64| {
+        let hi = lo.wrapping_add(span);
+        !(end != 0 && lo >= end) && !(hi != 0 && hi <= start)
+    };
+    let mut tables = 0;
+    for j in 1..F::LEVELS {
+        let shift = 12 + 9 * j;
+        let spans: BTreeSet<u64> = model.keys().map(|va| (va >> shift) << shift).collect();
+        tables += spans.iter().filter(|&&lo| meets(lo, 1u64 << shift)).count() as u64;
+    }
+    let pages = model.keys().filter(|&&va| meets(va, 4096)).count() as u64;
+    (tables, pages)
+}
+
+fn range_walk_model<F: PageTableFormat>() {
+    for seed in 0..SEEDS {
+        let mut rng = Rng::new(seed ^ 0x7227);
+        let mut mm = Mm {
+            db: FrameDb::new(1000, 200),
+            mem: FakeMem::default(),
+        };
+        let baseline = mm.db.free_count();
+        let mut pt = PageTable::<F>::create(&mut mm).unwrap();
+        let mut model: BTreeMap<u64, (u64, Perms)> = BTreeMap::new();
+        for step in 0..STEPS {
+            let va = address::<F>(&mut rng);
+            if rng.below(3) == 0 {
+                if pt.unmap(&mut mm, va).is_some() {
+                    model.remove(&va);
+                }
+            } else if pt
+                .map(&mut mm, va, 5000 + rng.below(100), Perms::RW)
+                .is_ok()
+            {
+                model.insert(va, (0, Perms::RW));
+            }
+            // the whole of each half: every table frame but the root (the leaves' frames are not the frame database's here)
+            let top = F::extend(1u64 << (12 + 9 * F::LEVELS - 1));
+            let lower = pt.frames_in_range(&mm, 0, 1u64 << (12 + 9 * F::LEVELS - 1));
+            let upper = pt.frames_in_range(&mm, top, 0);
+            assert_eq!(
+                (lower.tables + upper.tables) as usize,
+                baseline - mm.db.free_count() - 1,
+                "seed {seed} step {step}: both halves hold every table but the root"
+            );
+            assert_eq!(
+                upper.pages + lower.pages,
+                model.len() as u64,
+                "seed {seed} step {step}: the leaves"
+            );
+            // a random range from two of the model's addresses (or near them): page, 2 MiB and 1 GiB edges
+            for _ in 0..4 {
+                let a = address::<F>(&mut rng);
+                let b = address::<F>(&mut rng);
+                let (lo, hi) = (a.min(b), a.max(b).wrapping_add(4096 << (9 * rng.below(3))));
+                // (one half at a time, as the function asks)
+                if (lo as i64) < 0 && (hi as i64) >= 0 && hi != 0 {
+                    continue;
+                }
+                if (lo as i64) >= 0 && (hi as i64) < 0 {
+                    continue;
+                }
+                let got = pt.frames_in_range(&mm, lo, hi);
+                let want = model_range::<F>(&model, lo, hi);
+                assert_eq!(
+                    (got.tables, got.pages),
+                    want,
+                    "seed {seed} step {step}: [{lo:#x}, {hi:#x})"
+                );
+            }
+        }
+    }
+}

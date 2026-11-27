@@ -530,14 +530,50 @@ pub fn grown_bytes() -> usize {
 /// level-1 table for the window and one level-0 table per 2 MiB).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page counts of a window of HEAP_WINDOW_SIZE bytes
 pub fn frames_held() -> usize {
-    let pages = GROWN_BYTES.load(Ordering::Relaxed) / PAGE_SIZE as usize;
-    let grown = if pages == 0 {
-        0
-    } else {
-        pages + 1 + pages.div_ceil(512)
-    };
-    // (the slabs' frames and the pool's are the heap's too: counting them keeps `free_frames_accounted` constant while the heap caches)
-    grown + with_heaps(|h| h.slab.frames() + h.pool_count)
+    let grown = window_formula(GROWN_BYTES.load(Ordering::Relaxed));
+    // (the slabs' frames and the pool's are the heap's too: counting them keeps `free_frames_accounted` constant while the heap caches;
+    // a frame in hand between the pool and this hart's frame cache is counted by `IN_TRANSIT`, T227)
+    grown + with_heaps(|h| h.slab.frames() + h.pool_count) + IN_TRANSIT.load(Ordering::Acquire)
+}
+
+/// The frames a grown heap of `bytes` holds in its window: its pages, plus the page-table frames under them (one level-1 table for the
+/// window and one level-0 table per 2 MiB). The arithmetic is `kcore::kwindow::heap_window`, proved by Kani against a page-by-page count.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a division by the page size, a non-zero constant
+fn window_formula(bytes: usize) -> usize {
+    usize::try_from(kcore::kwindow::heap_window(
+        (bytes / PAGE_SIZE as usize) as u64,
+    ))
+    .unwrap_or(usize::MAX)
+}
+
+/// T227's walk oracle for the heap window: `(walked, formula)`, the frames the kernel's table holds under the window (tables and leaves)
+/// and what [`frames_held`] derives from the grown size, read under the kernel table's lock (which `grow` holds while it maps and sets the
+/// size). Equal unless a path maps or leaves a frame there that the formula does not count.
+#[cfg(any(not(feature = "release"), feature = "release-suite"))] // (the leak checks of `user_tests` and the boot self-tests)
+pub fn window_frames_walked() -> (usize, usize) {
+    let _kpt = crate::kmem::KPT.lock();
+    let k = crate::kmem::frames();
+    let walked = crate::kmem::kernel_table()
+        .frames_in_range(
+            k.mm,
+            HEAP_WINDOW_BASE,
+            HEAP_WINDOW_BASE.wrapping_add(HEAP_WINDOW_SIZE),
+        )
+        .total();
+    (
+        usize::try_from(walked).unwrap_or(usize::MAX),
+        window_formula(GROWN_BYTES.load(Ordering::Relaxed)),
+    )
+}
+
+/// Frames the pool's rebalance holds in hand (taken from this hart's frame cache and not yet pushed, or popped and not yet given back):
+/// a term of `frames_held`, so the leak oracle's sum does not dip while one is in flight; 0 at a quiet time (T227).
+static IN_TRANSIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// [`IN_TRANSIT`], for a leak report.
+#[cfg(any(not(feature = "release"), feature = "release-suite"))] // (the leak checks of `user_tests` and the boot self-tests)
+pub fn in_transit() -> usize {
+    IN_TRANSIT.load(Ordering::Acquire)
 }
 
 /// Add `bytes` (rounded up to pages) to the grown heap: take frames from the frame database, map them at the end
@@ -624,8 +660,12 @@ fn service_pool() {
 fn rebalance_pool() {
     // (frames come from this hart's cache, which takes `FRAME` only to refill or drain a batch)
     let count = || with_heaps(|h| h.pool_count);
+    // (T227: a frame in hand is counted by `IN_TRANSIT` from before it leaves one count to after it enters the other: the increment comes
+    // before the take and the decrement after the put, so the oracle's sum may read one frame high for an instant, never one low)
     while count() < POOL_TARGET {
+        IN_TRANSIT.fetch_add(1, Ordering::AcqRel);
         let Some(pfn) = crate::kmem::frame_alloc() else {
+            IN_TRANSIT.fetch_sub(1, Ordering::AcqRel);
             POOL_STARVED.store(true, Ordering::Relaxed);
             break;
         };
@@ -638,8 +678,10 @@ fn rebalance_pool() {
             .push(frame);
             note_free(h);
         });
+        IN_TRANSIT.fetch_sub(1, Ordering::AcqRel);
     }
     while count() > POOL_TARGET {
+        IN_TRANSIT.fetch_add(1, Ordering::AcqRel);
         let frame = with_heaps(|h| {
             let f = Pool {
                 head: &mut h.pool_head,
@@ -649,9 +691,13 @@ fn rebalance_pool() {
             note_free(h);
             f
         });
-        let Some(frame) = frame else { break };
+        let Some(frame) = frame else {
+            IN_TRANSIT.fetch_sub(1, Ordering::AcqRel);
+            break;
+        };
         let pfn = (frame as u64 - crate::kmem::direct_base()) >> 12;
         crate::kmem::frame_free_sole(pfn);
+        IN_TRANSIT.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
