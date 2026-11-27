@@ -307,14 +307,26 @@ pub fn start_stack(
             (d.status == 0).then_some(d.a1 as u64)
         };
         let (dm_mine, dm_theirs) = chan().ok()?;
+        // the job the manager makes each driver's job under (IOMMU10): a child of the session's, to make jobs in and nothing more
+        let drivers = sys::job_create(session, &sys::NO_LIMITS);
+        if drivers.status != 0 {
+            return None;
+        }
+        let drivers = drivers.a1 as u64;
+        let for_mgr = sys::handle_duplicate(drivers, Rights::MANAGE.0 | Rights::TRANSFER.0);
+        sys::handle_close(drivers);
+        if for_mgr.status != 0 {
+            return None;
+        }
         start(
             b"devmgr",
             alloc::vec![
                 (Role::Resource, 0),
                 (Role::BootImage, 1),
-                (Role::ServiceDevmgr, 2)
+                (Role::Job, 2),
+                (Role::ServiceDevmgr, 3)
             ],
-            &[dup(res)?, dup(image_vmo)?, dm_theirs],
+            &[dup(res)?, dup(image_vmo)?, for_mgr.a1 as u64, dm_theirs],
         )
         .ok()?;
         sys::handle_close(res);

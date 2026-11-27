@@ -31,12 +31,14 @@ pub enum Role {
     Tty = 9,
     /// A job handle: for the launcher, the job it makes each program's job under.
     Job = 10,
-    /// A block driver's device memory: the virtio-mmio slot (S6b).
+    /// A block driver's device memory (IOMMU10): a VMO over the PCI BAR that holds the function's virtio structures (never its MSI-X
+    /// table where the table has a BAR of its own). The layout inside it travels as the driver's second argument
+    /// (`proto::devmgr::encode_claim_arg`).
     BlkMmio = 11,
-    /// A block driver's DMA buffer (a DMA VMO with the DMA right).
+    /// A block driver's data buffer: a DMA VMO with the DMA right (`vmo_create_dma_in`, charged to the driver's job), which the
+    /// driver maps into its device's domain itself. (13, the old wired interrupt of the virtio-mmio disk, is retired: a PCI disk's
+    /// interrupts are `DeviceIrqConfig` and `DeviceIrqQueue0`.)
     BlkDma = 12,
-    /// A block driver's interrupt object (absent where the machine has no PLIC: poll).
-    BlkIrq = 13,
     /// The channel a block driver serves the block protocol on.
     ServiceBlk = 14,
     /// The root resource (the device manager's authority).
@@ -48,14 +50,17 @@ pub enum Role {
     Stderr = 17,
     /// The channel the service registry serves (`proto::file` as a directory, slice SD).
     ServiceRegistry = 18,
-    /// The network driver's device memory: the virtio-mmio slot (S8).
+    /// The network driver's device memory (IOMMU11): a VMO over the PCI BAR that holds the `virtio-net-pci` function's virtio
+    /// structures, like `BlkMmio`; the layout travels as the driver's second argument (`proto::devmgr::encode_claim_arg`).
     NetMmio = 19,
-    /// The network driver's DMA memory, each with the DMA right: the receive pool, the transmit pool and the virtqueue page(s).
+    /// The network driver's DMA memory, each with the DMA right, which it maps **into its device's domain** (`DeviceDomain`), never
+    /// into its own address space but for the queue memory (IOMMU11; NET-SPEC amendment 2026-11-25): the receive pool (READ and
+    /// WRITE: read-write for the device), the transmit pool (READ, **no WRITE**: it can only be mapped read-only for the device) and
+    /// the virtqueue pages (read-write, and MAP). (23, the old wired interrupt of the virtio-mmio network device, is retired: the
+    /// network function's interrupts are `DeviceIrqConfig`, `DeviceIrqQueue0` (receive) and `DeviceIrqQueue1` (transmit).)
     NetRxDma = 20,
     NetTxDma = 21,
     NetQueueDma = 22,
-    /// The network device's interrupt (absent where the machine has no controller to drive: the driver polls).
-    NetIrq = 23,
     /// The shared ring VMO (control header and the four rings) of the driver/stack data path.
     NetRing = 24,
     /// The two doorbell events: the driver signals `NetEventToStack` (the stack waits on it) and the stack signals
@@ -100,6 +105,54 @@ pub enum Role {
     /// A debug resource (HD4): the authority to write to the kernel's console and read its counters. Given only to the programs that need it; a
     /// program without one cannot print through `debug_write` or forge a `##TEST` line.
     Debug = 43,
+    /// A device driver's interrupt handles (IOMMU9; `proto::devmgr::PciClaim::irqs`): the configuration-change interrupt, and the
+    /// interrupt of queue `n` (`DeviceIrqQueue0` + n, up to [`MAX_DEVICE_IRQ_QUEUES`] queues). The role says what the handle is for
+    /// and so which MSI-X entry the driver maps the event to (`proto::devmgr::irq_entry`: 0 for the configuration change, `n + 1`
+    /// for queue `n`).
+    DeviceIrqConfig = 44,
+    DeviceIrqQueue0 = 45,
+    DeviceIrqQueue1 = 46,
+    DeviceIrqQueue2 = 47,
+    DeviceIrqQueue3 = 48,
+    DeviceIrqQueue4 = 49,
+    DeviceIrqQueue5 = 50,
+    DeviceIrqQueue6 = 51,
+    DeviceIrqQueue7 = 52,
+    /// A device driver's handle to its device's domain (IOMMU10; IOMMU-SPEC 9 step 5): IO_MAP and IO_UNMAP only (and TRANSFER), so the
+    /// driver maps its buffers itself and learns their I/O addresses from the call, and can neither destroy the domain, grant a vector
+    /// nor read its faults.
+    DeviceDomain = 53,
+    /// A block driver's queue memory: the DMA VMO its virtqueue lives in (one page, the DMA right), mapped by the driver like `BlkDma`.
+    BlkQueueDma = 54,
+}
+
+/// The queues a driver's startup message can name an interrupt for.
+pub const MAX_DEVICE_IRQ_QUEUES: u16 = 8;
+
+impl Role {
+    /// The role of the interrupt that means `what` (`proto::devmgr::IRQ_CONFIG` or a queue's index), or `None` past
+    /// [`MAX_DEVICE_IRQ_QUEUES`].
+    pub fn device_irq(what: u16) -> Option<Role> {
+        if what == crate::devmgr::IRQ_CONFIG {
+            return Some(Role::DeviceIrqConfig);
+        }
+        (what < MAX_DEVICE_IRQ_QUEUES)
+            .then(|| Role::from_u32(Role::DeviceIrqQueue0 as u32 + u32::from(what)))
+            .flatten()
+    }
+
+    /// What an interrupt role is for (`proto::devmgr::IRQ_CONFIG` or a queue's index), or `None` for any other role.
+    pub fn device_irq_what(self) -> Option<u16> {
+        match self {
+            Role::DeviceIrqConfig => Some(crate::devmgr::IRQ_CONFIG),
+            r if (Role::DeviceIrqQueue0 as u32..=Role::DeviceIrqQueue7 as u32)
+                .contains(&(r as u32)) =>
+            {
+                Some((r as u32 - Role::DeviceIrqQueue0 as u32) as u16)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Role {
@@ -117,7 +170,6 @@ impl Role {
             10 => Role::Job,
             11 => Role::BlkMmio,
             12 => Role::BlkDma,
-            13 => Role::BlkIrq,
             14 => Role::ServiceBlk,
             15 => Role::Resource,
             16 => Role::ServiceDevmgr,
@@ -127,7 +179,6 @@ impl Role {
             20 => Role::NetRxDma,
             21 => Role::NetTxDma,
             22 => Role::NetQueueDma,
-            23 => Role::NetIrq,
             24 => Role::NetRing,
             25 => Role::NetEventToStack,
             26 => Role::NetEventToDriver,
@@ -148,6 +199,17 @@ impl Role {
             41 => Role::ServiceSpawn,
             42 => Role::SignalChannel,
             43 => Role::Debug,
+            44 => Role::DeviceIrqConfig,
+            45 => Role::DeviceIrqQueue0,
+            46 => Role::DeviceIrqQueue1,
+            47 => Role::DeviceIrqQueue2,
+            48 => Role::DeviceIrqQueue3,
+            49 => Role::DeviceIrqQueue4,
+            50 => Role::DeviceIrqQueue5,
+            51 => Role::DeviceIrqQueue6,
+            52 => Role::DeviceIrqQueue7,
+            53 => Role::DeviceDomain,
+            54 => Role::BlkQueueDma,
             _ => return None,
         })
     }

@@ -1,0 +1,7 @@
+[package]
+name = "pcicore"
+version = "0.1.0"
+edition = "2021"
+description = "OS track IOMMU8: PCI configuration space as pure code (ECAM arithmetic, the type-0 header, the capability walk, BAR sizing and assignment, MSI-X, the virtio capabilities, function-level reset), for devmgr and the suite"
+
+[dependencies]

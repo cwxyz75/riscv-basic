@@ -38,7 +38,7 @@ the harness checks that each shard reported exactly its own tests.
 |---|---|---|
 | `a` | everything not in `b` | no network device |
 | `b` | the `net_*` tests, the C sockets test, the three heaviest stress tests and their prerequisite | network |
-| `k` | the Kernel tests only (`init/ktests.txt`: a test that starts no server and needs no disk, network or console service) and the kernel's own self-tests | no disk, no network |
+| `k` | the Kernel tests only (`init/ktests.txt`: a test that needs no network or console service; the IOMMU tests among them start `devmgr`, and the block rig `blkd` on the PCI disks) and the kernel's own self-tests | the two PCI disks, no network |
 
 A test that starts children carries its prerequisite along into its shard. `os_boot_test.py --selftest-k` proves the
 harness fails a `k` boot that lacks a Kernel test or ran a System test.
@@ -68,9 +68,15 @@ After a passing boot the harness prints the suite's guest time and the six slowe
 commits from the epic's fork point on `origin/main` to `HEAD`, running one make target per step (default `os-ktest-4`).
 It needs a clean tree and leaves the bisect open; `git bisect reset` returns to the branch.
 
+**IOMMU faults.** The suite prints `iofaults: <test> <n>` for each test during which the IOMMU counted faults
+(`debug_stat` 150) and `iofaults: suite <n>` for the whole test run (from the first test to the last; the kernel's own
+boot self-test is outside it). `os_boot_test.py` fails a boot whose faults fall in a test that is not in its
+`DELIBERATE_FAULT_TESTS`, or whose suite total is not the sum of the tests' (a fault between tests), and puts the total
+on its pass line.
+
 **Record and replay.** `OS_RECORD=<dir>` boots under QEMU's record mode and keeps the recording only when the boot
-fails; `OS_REPLAY=<file>` replays it, and `OS_GDB=1` waits for gdb on :1234. Recording needs a boot with no disk and no
-network device, so use `OS_SHARD=k`. Record mode runs the harts in one TCG thread: a race that needs truly parallel
+fails; `OS_REPLAY=<file>` replays it, and `OS_GDB=1` waits for gdb on :1234. Recording needs a boot with no network
+device, so use `OS_SHARD=k` (the PCI disks go through QEMU's `blkreplay` filter). Record mode runs the harts in one TCG thread: a race that needs truly parallel
 harts may not reproduce under it, and its instruction-counted time changes what timing-dependent tests see.
 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the
@@ -142,8 +148,10 @@ code is right.
 
 ## Kernel checks under QEMU
 
-**Instruction counts.** `make os-count` boots the kernel-only shard at one hart under `-icount shift=0`, where the
-guest's retired-instruction counter is deterministic, and compares the suite's `##BENCH count_<name> <n> instr` lines
+**Instruction counts.** `make os-count` boots the kernel-only shard at one hart under `-icount shift=0,sleep=off`, where the
+guest's retired-instruction counter is deterministic, with no disks (`OS_DISK=0`: under `sleep=off` the guest's clock jumps to its next
+timer deadline whenever it idles, so guest time bounds no host disk I/O and a disk test there times out at random; the harness refuses
+`sleep=off` with disks, unless `OS_PCI_TEST=0`), and compares the suite's `##BENCH count_<name> <n> instr` lines
 with `bench/counts.tsv`. A rise of more than 25 % fails (the slack absorbs the runner and unrelated changes, T223); a fall of more than 5 % is printed with a request to record it
 (`make os-count-record`, then read the diff of the file). Record and compare in the same configuration (the `kfast` boot). The file holds the numbers of the CI run (2026-11-20: PL1 moved the test CPU to `rva23s64` and the kernel's code generation to the profile's extensions, and the epic gate's numbers then differed from a laptop's by up to 12 % in either direction, so the recorded values came from the gate's own log): a local `make os-count` is a reproduction, not the check.
 
@@ -173,8 +181,9 @@ overflow checks on.
 **The matrix and the negative controls** (soak): `os-boot-test` (the normal, fail-demo, round-robin and release
 kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`,
 `os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-iommu-neg` (a machine without the platform IOMMU ends in `##PANIC ... no IOMMU`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
-mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`, `os-boot-test-iommu-bare` (`ddtp` Bare: `iommu_is_on_and_denies_by_default` must fail), `os-boot-test-iommu-inval`
-(`fault-iommu-skip-inval`, an unmap without its invalidation and fence: `iodomain_unmap_stops_the_device` must fail),
+mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia` (also the vector twins `fault-vector-no-unmask` and `fault-vector-no-repend`, which `pci_virtio_blk_interrupts_through_msix` must fail, and `fault-msiid-free-at-move`), `os-boot-test-iommu-bare` (`ddtp` Bare: `iommu_is_on_and_denies_by_default` must fail), `os-boot-test-iommu-inval`
+(`fault-iommu-skip-inval`, an unmap without its invalidation and fence: `iodomain_unmap_stops_the_device` and, since IOMMU12,
+the hostile-driver matrix's `hostile_dma_after_its_own_unmap` must fail),
 `os-boot-test-iommu-msi` (`fault-iommu-msi-basic`, basic-translate MSI entries that pass the device's data word to the hart:
 `msi_forgery_faults` must fail; `make os-models` also checks that the host model `iodomain_vectors_model` fails with it).
 

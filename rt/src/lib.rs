@@ -147,6 +147,9 @@ pub mod library {
     };
     /// `sys_raw`: the number in `a6`.
     static RAW: AtomicUsize = AtomicUsize::new(0);
+    /// The stubs of the retired calls (`abi::syscall::RETIRED`, in its order): 0 where the library has none.
+    static STUBS: [AtomicUsize; abi::syscall::RETIRED.len()] =
+        [const { AtomicUsize::new(0) }; abi::syscall::RETIRED.len()];
     /// The base the kernel mapped the library at, and the data page's address.
     static BASE: AtomicUsize = AtomicUsize::new(0);
     static DATA: AtomicUsize = AtomicUsize::new(0);
@@ -179,6 +182,11 @@ pub mod library {
                     .find(|&&(c, _)| libsys::is_wrapper_of(sym.name, c))
                 {
                     ENTRIES[n].store(at, Ordering::Relaxed);
+                } else if let Some(i) = abi::syscall::RETIRED
+                    .iter()
+                    .position(|&(c, _)| libsys::is_wrapper_of(sym.name, c))
+                {
+                    STUBS[i].store(at, Ordering::Relaxed);
                 }
             }
         }
@@ -199,6 +207,27 @@ pub mod library {
             unsafe { core::arch::asm!("unimp", options(noreturn)) }
         }
         f
+    }
+
+    /// The library's stub for the retired call `constant` (`abi::syscall::RETIRED`'s name), or 0 when it has none.
+    pub fn stub(constant: &str) -> usize {
+        abi::syscall::RETIRED
+            .iter()
+            .position(|&(c, _)| c == constant)
+            .map_or(0, |i| STUBS[i].load(Ordering::Relaxed))
+    }
+
+    /// Call the library's stub for the retired call `constant` with `args` (IOMMU-SPEC 4.8: it answers NOT_SUPPORTED without entering the
+    /// kernel). A library without the stub gives NOT_SUPPORTED here too: the call is not made through its old number.
+    pub fn call_stub(constant: &str, args: [usize; 6]) -> crate::Ret {
+        match stub(constant) {
+            0 => crate::Ret {
+                status: abi::status::Status::NotSupported as i32,
+                a1: 0,
+                a2: 0,
+            },
+            f => crate::call(f, 0, args),
+        }
     }
 
     /// A call through the library's raw entry, which takes the number as an argument: for a number the library has no wrapper for (the suite's calls with
@@ -491,14 +520,17 @@ pub mod sys {
             [resource as usize, pa as usize, bytes as usize, 0, 0, 0],
         )
     }
+    /// The two-argument DMA VMO call, retired (IOMMU-SPEC 4.8): the library's stub, which answers NOT_SUPPORTED whatever the arguments
+    /// and does not enter the kernel. `vmo_create_dma_in` is the call.
     pub fn vmo_create_dma(resource: u64, pages: u64) -> Ret {
-        syscall(
-            VMO_CREATE_DMA,
+        crate::library::call_stub(
+            "VMO_CREATE_DMA",
             [resource as usize, pages as usize, 0, 0, 0, 0],
         )
     }
+    /// Retired (IOMMU-SPEC 4.8): no physical address is learnable from user mode. The library's stub answers NOT_SUPPORTED.
     pub fn vmo_phys_addr(vmo: u64) -> Ret {
-        syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
+        crate::library::call_stub("VMO_PHYS_ADDR", [vmo as usize, 0, 0, 0, 0, 0])
     }
     /// A DMA VMO of `pages` zeroed, pinned frames (not promised contiguous), charged to `job` (0: the caller's) (IOMMU-SPEC 4.7).
     pub fn vmo_create_dma_in(resource: u64, pages: u64, job: u64) -> Ret {

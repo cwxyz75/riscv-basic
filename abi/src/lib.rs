@@ -112,7 +112,8 @@ pub mod rights {
         pub const SET_LIMITS: Rights = Rights(1 << 11);
         /// Every assigned right bit.
         pub const ALL: Rights = Rights(0x3_ffff);
-        /// Learn a DMA VMO's physical address (a DMA VMO handle only).
+        /// The VMO may be mapped into a device domain (`iodomain_map`, IOMMU-SPEC 4.1; a DMA VMO handle only). It no longer leads to a
+        /// physical address: no call returns one (IOMMU-SPEC 4.8, IOMMU12).
         pub const DMA: Rights = Rights(1 << 12);
         /// Commit a VMO's pages now (`vmo_commit`): the pages are charged to the VMO's creating job, so a
         /// holder with this right spends the creator's quota (slice V). A creator narrows it away before
@@ -352,8 +353,8 @@ pub mod limits {
     pub const MAX_OBJECTS: usize = 16384;
     /// Largest device tree `resource_dtb` will copy.
     pub const MAX_DTB_BYTES: usize = 256 * 1024;
-    /// Pages in one DMA VMO, and in all DMA VMOs together (S6: a stand-in for per-job DMA quotas).
-    pub const MAX_DMA_PAGES: u64 = 64;
+    /// Pages in all DMA VMOs together before the boot sets the backstop from RAM (RAM / 16, at least this; KERNEL-V1-SPEC 2.5). There is
+    /// no per-object limit since the contiguous kind went (IOMMU12, IOMMU-SPEC 4.7).
     pub const MAX_DMA_TOTAL_PAGES: u64 = 1024;
     /// Most pages one `vmo_commit` call may commit (the kernel zeroes them with the big lock held).
     pub const MAX_COMMIT_PAGES: u64 = 1024;
@@ -444,8 +445,8 @@ pub mod syscall {
         VMO_WRITE = 42,
         VMO_GET_SIZE = 43,
         VMO_CREATE_PHYSICAL = 44,
-        VMO_CREATE_DMA = 45,
-        VMO_PHYS_ADDR = 46,
+        // 45 was `vmo_create_dma` (two arguments) and 46 `vmo_phys_addr`: retired, never reused (IOMMU-SPEC 4.8, IOMMU12). Their
+        // library symbols stay as stubs that answer NOT_SUPPORTED without entering the kernel: `RETIRED`
         VMO_COMMIT = 47,
         /// Give back the committed pages of a range of a VMO (MM6): they read as zeros afterwards.
         VMO_DECOMMIT = 48,
@@ -565,6 +566,16 @@ pub mod syscall {
     }
     /// One more than the largest number in the table.
     pub const LIMIT: usize = 128;
+
+    /// Calls the kernel no longer provides (KERNEL-V1-SPEC 3.1: the library is additive, so a call that goes stays in it as a stub that
+    /// returns NOT_SUPPORTED without entering the kernel): the constant's name, as `TABLE` would have spelled it (the library's symbol is
+    /// `sys_` and the name in lower case), and the number it had, which the kernel refuses (BAD_SYSCALL) and which is never given to
+    /// another call. IOMMU-SPEC 4.8 (IOMMU12): the two-argument `vmo_create_dma`, whose contiguous kind `vmo_create_dma_in` replaced, and
+    /// `vmo_phys_addr`: no physical address is learnable from user mode.
+    pub const RETIRED: &[(&str, usize)] = &[
+        ("VMO_CREATE_DMA", number(45)),
+        ("VMO_PHYS_ADDR", number(46)),
+    ];
 }
 
 /// Pagers (MM9, KERNEL-V1-SPEC 4.4): the request message on a pager's channel.
@@ -755,5 +766,24 @@ mod syscall_table_tests {
         assert!(TABLE
             .iter()
             .all(|&(_, n)| n != number(5) && n != number(60)));
+    }
+
+    /// IOMMU12 (IOMMU-SPEC 4.8): a retired call's number is never given to another call, and its name is not a call any more.
+    #[test]
+    fn retired_numbers_and_names_are_not_calls() {
+        assert_eq!(
+            RETIRED,
+            &[
+                ("VMO_CREATE_DMA", number(45)),
+                ("VMO_PHYS_ADDR", number(46))
+            ]
+        );
+        for &(name, n) in RETIRED {
+            assert!(n < LIMIT);
+            assert!(
+                TABLE.iter().all(|&(c, m)| m != n && c != name),
+                "{name} ({n}) is in the table"
+            );
+        }
     }
 }

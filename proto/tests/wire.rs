@@ -46,6 +46,37 @@ const STARTUP_HEX: &str =
      01 00 00 00 01 00 00 00  02 00 00 00 02 00 00 00";
 
 #[test]
+fn startup_names_a_drivers_interrupts_by_what_they_are_for() {
+    use proto::devmgr::IRQ_CONFIG;
+    assert_eq!(Role::device_irq(IRQ_CONFIG), Some(Role::DeviceIrqConfig));
+    for q in 0..proto::startup::MAX_DEVICE_IRQ_QUEUES {
+        let r = Role::device_irq(q).unwrap();
+        assert_eq!(r.device_irq_what(), Some(q));
+        assert_eq!(Role::from_u32(r as u32), Some(r));
+    }
+    assert_eq!(
+        Role::device_irq(proto::startup::MAX_DEVICE_IRQ_QUEUES),
+        None
+    );
+    assert_eq!(Role::DeviceIrqConfig.device_irq_what(), Some(IRQ_CONFIG));
+    assert_eq!(Role::Debug.device_irq_what(), None);
+    assert_eq!(
+        (Role::DeviceIrqConfig as u32, Role::DeviceIrqQueue7 as u32),
+        (44, 52)
+    );
+    // a driver's startup with its interrupts round-trips
+    let s = Startup {
+        args: vec![b"blkd".to_vec()],
+        roles: vec![(Role::DeviceIrqConfig, 0), (Role::DeviceIrqQueue0, 1)],
+        ..Startup::default()
+    };
+    let b = s.encode().unwrap();
+    let d = Startup::decode(&b, 2).unwrap();
+    assert_eq!(d, s);
+    assert_eq!(d.handle_of(Role::DeviceIrqQueue0), Some(1));
+}
+
+#[test]
 fn startup_golden_bytes() {
     let want = hex(STARTUP_HEX);
     assert_eq!(want.len(), 55);
@@ -82,10 +113,10 @@ fn startup_rejects_every_kind_of_malformation() {
     let mut c = good.clone();
     c[8] = 9;
     assert!(d(&c, 3).is_err());
-    // unknown role (44) and duplicate role (both Stdin)
+    // unknown role (13: the retired BlkIrq) and duplicate role (both Stdin)
     let mut r = good.clone();
     let n = r.len();
-    r[n - 8] = 44;
+    r[n - 8] = 13;
     assert_eq!(d(&r, 3), Err(StartupError::UnknownRole));
     let mut r = good.clone();
     r[n - 8] = 1;
@@ -1055,4 +1086,335 @@ fn terminal_provider_requests_round_trip_and_reject_junk() {
     let mut junk = encode(7, OP_DETACH);
     junk[6] = 1;
     assert_eq!(decode(&junk, 0), None);
+}
+
+// --- devmgr: the PCI operations (IOMMU8; the bytes worked out by hand from the layout in proto/src/devmgr.rs) ---
+
+#[test]
+fn devmgr_list_pci_golden_bytes_and_errors() {
+    use proto::devmgr::*;
+    assert_eq!(encode_list_pci(7), hex("07 00 00 00 06 00 00 00"));
+    assert_eq!(decode_list_pci(&hex("07 00 00 00 06 00 00 00")), Ok(7));
+    assert_eq!(
+        decode_list_pci(&hex("07 00 00 00 06 00 01 00")),
+        Err(Some(7)),
+        "nonzero index"
+    );
+    assert_eq!(decode_list_pci(&encode_claim_pci(7, 0)), Err(Some(7)));
+    let e = [
+        PciEntry {
+            rid: 0x20,
+            vendor: 0x1af4,
+            device: 0x1044,
+            flags: PCI_CLAIMABLE | PCI_MSIX | PCI_VIRTIO | PCI_ACCESS_PLATFORM,
+            class: 0x00ff00,
+        },
+        PciEntry {
+            rid: 0x28,
+            vendor: 0x1af4,
+            device: 0x1042,
+            flags: PCI_MSIX | PCI_VIRTIO | PCI_CLAIMED,
+            class: 0x010000,
+        },
+    ];
+    let r = encode_list_pci_reply(9, &e).unwrap();
+    assert_eq!(
+        r,
+        hex("09 00 00 00 00 00 00 00 02 00 00 00 \
+             20 00 f4 1a 44 10 0f 00 00 ff 00 00 \
+             28 00 f4 1a 42 10 26 00 00 00 01 00")
+    );
+    assert_eq!(decode_list_pci_reply(&r), Some((9, Status::Ok, e.to_vec())));
+    assert_eq!(decode_list_pci_reply(&r[..r.len() - 1]), None, "short");
+    let mut lying = r.clone();
+    lying[8] = 3; // a count the message does not hold
+    assert_eq!(decode_list_pci_reply(&lying), None);
+    lying[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(decode_list_pci_reply(&lying), None);
+    assert_eq!(
+        decode_list_pci_reply(&encode_reply(9, Status::Failed)),
+        Some((9, Status::Failed, vec![]))
+    );
+    assert_eq!(
+        decode_list_pci_reply(&encode_reply(9, Status::Ok)),
+        None,
+        "an Ok is always the long form"
+    );
+    let mut not_ok = r.clone();
+    not_ok[4] = 5;
+    assert_eq!(
+        decode_list_pci_reply(&not_ok),
+        None,
+        "a long reply that is not Ok"
+    );
+    assert_eq!(
+        encode_list_pci_reply(1, &vec![e[0]; MAX_PCI_ENTRIES + 1]),
+        None
+    );
+    assert_eq!(Status::from_i32(6), Some(Status::Refused));
+}
+
+#[test]
+fn devmgr_net_and_rng_claims_golden_bytes() {
+    use proto::devmgr::*;
+    // ClaimNet, ClaimRng and ReclaimNet (IOMMU11): the request layout of OpenBlock with their own op; the reply is ClaimPci's
+    assert_eq!(encode_claim_net(7, 0), hex("07 00 00 00 03 00 00 00"));
+    assert_eq!(encode_claim_rng(7, 0), hex("07 00 00 00 04 00 00 00"));
+    assert_eq!(encode_reclaim_net(7, 0), hex("07 00 00 00 08 00 00 00"));
+    assert_eq!(
+        decode_reclaim_net(&hex("07 00 00 00 08 00 01 00")),
+        Ok((7, 1))
+    );
+    assert_eq!(decode_reclaim_net(&encode_claim_pci(7, 1)), Err(Some(7)));
+    assert_eq!(decode_claim_pci(&encode_reclaim_net(7, 1)), Err(Some(7)));
+    assert_eq!(op_of(&encode_reclaim_net(7, 1)), Some(OP_RECLAIM_NET));
+    assert_eq!((NET_DMA_QUEUE, NET_DMA_RX, NET_DMA_TX), (0, 1, 2));
+}
+
+#[test]
+fn devmgr_claim_pci_golden_bytes_and_errors() {
+    use proto::devmgr::*;
+    assert_eq!(encode_claim_pci(7, 0x28), hex("07 00 00 00 07 00 28 00"));
+    assert_eq!(
+        decode_claim_pci(&hex("07 00 00 00 07 00 28 00")),
+        Ok((7, 0x28))
+    );
+    assert_eq!(decode_claim_pci(&hex("07 00 00 00 07 00 28")), Err(Some(7)));
+    assert_eq!(decode_claim_pci(&encode_claim_net(7, 0x28)), Err(Some(7)));
+    assert_eq!(
+        decode_request(&encode_claim_pci(7, 0)),
+        Err(Some(7)),
+        "OpenBlock refuses it"
+    );
+    let c = PciClaim {
+        vendor: 0x1af4,
+        device: 0x1042,
+        bar_bytes: 0x4000,
+        common: (0, 0x1000),
+        notify: (0x3000, 0x1000),
+        notify_multiplier: 4,
+        isr: (0x1000, 0x1000),
+        device_cfg: (0x2000, 0x1000),
+        dma_pages: vec![1, 4],
+        irqs: vec![
+            PciIrq {
+                entry: 0,
+                what: IRQ_CONFIG,
+            },
+            PciIrq { entry: 1, what: 0 },
+        ],
+    };
+    let r = encode_claim_pci_reply(9, &c).unwrap();
+    assert_eq!(
+        r,
+        hex("09 00 00 00 00 00 00 00 f4 1a 42 10 \
+             00 40 00 00 00 00 00 00 \
+             00 00 00 00 00 10 00 00 \
+             00 30 00 00 00 10 00 00 \
+             04 00 00 00 \
+             00 10 00 00 00 10 00 00 \
+             00 20 00 00 00 10 00 00 \
+             02 00 00 00 01 00 00 00 04 00 00 00 \
+             02 00 00 00 00 00 ff ff 01 00 00 00")
+    );
+    assert_eq!(
+        c.handles(),
+        6,
+        "the BAR, the domain, two DMA VMOs, two interrupts"
+    );
+    assert_eq!(
+        (c.irq(IRQ_CONFIG), c.irq(0), c.irq(1)),
+        (Some((4, 0)), Some((5, 1)), None),
+        "the handle index and entry of each interrupt"
+    );
+    assert_eq!(
+        (irq_entry(IRQ_CONFIG), irq_entry(0), irq_entry(2)),
+        (0, 1, 3)
+    );
+    assert_eq!(
+        decode_claim_pci_reply(&r),
+        Some((9, Status::Ok, Some(c.clone())))
+    );
+    assert_eq!(
+        decode_claim_pci_reply(&r[..r.len() - 4]),
+        None,
+        "an interrupt missing"
+    );
+    let mut lying = r.clone();
+    lying[68] = 17;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "more interrupts than the limit"
+    );
+    let mut lying = r.clone();
+    lying[68] = 1;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "an interrupt count that disagrees with the length"
+    );
+    let mut lying = r.clone();
+    lying[72] = 5;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "an interrupt at an entry its meaning does not have"
+    );
+    let mut lying = r.clone();
+    lying[76..80].copy_from_slice(&[0, 0, 0xff, 0xff]);
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "two interrupts with the same meaning"
+    );
+    for bad in [
+        vec![PciIrq { entry: 0, what: 0 }],
+        vec![PciIrq { entry: 1, what: 0 }, PciIrq { entry: 1, what: 0 }],
+    ] {
+        let bad = PciClaim {
+            irqs: bad,
+            ..c.clone()
+        };
+        assert_eq!(encode_claim_pci_reply(9, &bad), None, "{:?}", bad.irqs);
+    }
+    let mut lying = r.clone();
+    lying[56] = 9;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "more DMA VMOs than the limit"
+    );
+    let mut lying = r.clone();
+    lying[4] = 3;
+    assert_eq!(
+        decode_claim_pci_reply(&lying),
+        None,
+        "a long reply that is not Ok"
+    );
+    assert_eq!(
+        decode_claim_pci_reply(&encode_reply(9, Status::Refused)),
+        Some((9, Status::Refused, None))
+    );
+    // the second message, once bus mastering is on: the plain Ok, which is never a claim reply
+    let started = encode_reply(9, Status::Ok);
+    assert_eq!(started, [9, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(decode_claim_pci_reply(&started), None);
+    assert_eq!(decode_claim_pci_started(&started), Some(9));
+    assert_eq!(
+        decode_claim_pci_started(&encode_reply(9, Status::Refused)),
+        None
+    );
+    assert_eq!(
+        decode_claim_pci_started(&encode_claim_pci_reply(9, &c).unwrap()),
+        None
+    );
+    let many = PciClaim {
+        dma_pages: vec![1; MAX_CLAIM_DMA + 1],
+        ..c.clone()
+    };
+    assert_eq!(encode_claim_pci_reply(9, &many), None);
+    let many = PciClaim {
+        irqs: (0..=MAX_CLAIM_IRQS as u16)
+            .map(|q| PciIrq {
+                entry: q + 1,
+                what: q,
+            })
+            .collect(),
+        ..c
+    };
+    assert_eq!(encode_claim_pci_reply(9, &many), None);
+    // random bytes never panic
+    let mut r = Rng(0x5eed);
+    for _ in 0..20000 {
+        let n = r.below(120) as usize;
+        let b: Vec<u8> = (0..n).map(|_| r.next() as u8).collect();
+        let _ = decode_claim_pci_reply(&b);
+        let _ = decode_claim_pci_started(&b);
+        let _ = decode_list_pci_reply(&b);
+        let _ = decode_claim_pci(&b);
+        let _ = decode_list_pci(&b);
+    }
+}
+
+/// IOMMU10: a block driver's startup carries its claim as an argument (hexadecimal: an argument holds no NUL), and its roles name the
+/// BAR, the domain handle, the two DMA VMOs and the two interrupts; the old wired-interrupt role (13) is gone.
+#[test]
+fn a_drivers_claim_travels_as_its_startup_argument() {
+    use proto::devmgr::*;
+    let c = PciClaim {
+        vendor: 0x1af4,
+        device: 0x1042,
+        bar_bytes: 0x4000,
+        common: (0, 0x1000),
+        notify: (0x3000, 0x1000),
+        notify_multiplier: 4,
+        isr: (0x1000, 0x1000),
+        device_cfg: (0x2000, 0x1000),
+        dma_pages: vec![1, 4],
+        irqs: vec![
+            PciIrq {
+                entry: 0,
+                what: IRQ_CONFIG,
+            },
+            PciIrq { entry: 1, what: 0 },
+        ],
+    };
+    let a = encode_claim_arg(&c).unwrap();
+    // worked out by hand: the reply's bytes with txid 0, two digits each, lower case
+    assert_eq!(
+        &a[..24],
+        b"0000000000000000f41a4210",
+        "txid 0, Ok, vendor and device"
+    );
+    assert_eq!(a.len(), 2 * (PCI_CLAIM_FIXED_LEN + 4 * 2 + 4 + 4 * 2));
+    assert!(!a.contains(&0));
+    assert_eq!(decode_claim_arg(&a), Some(c.clone()));
+    let s = Startup {
+        args: vec![b"blkd".to_vec(), a.clone()],
+        roles: vec![
+            (Role::BlkMmio, 0),
+            (Role::DeviceDomain, 1),
+            (Role::BlkQueueDma, 2),
+            (Role::BlkDma, 3),
+            (Role::DeviceIrqConfig, 4),
+            (Role::DeviceIrqQueue0, 5),
+            (Role::ServiceBlk, 6),
+        ],
+        ..Startup::default()
+    };
+    assert_eq!(Startup::decode(&s.encode().unwrap(), 7).unwrap(), s);
+    assert_eq!(
+        (Role::DeviceDomain as u32, Role::BlkQueueDma as u32),
+        (53, 54)
+    );
+    assert_eq!(Role::from_u32(53), Some(Role::DeviceDomain));
+    assert_eq!(Role::from_u32(54), Some(Role::BlkQueueDma));
+    assert_eq!(
+        Role::from_u32(13),
+        None,
+        "the wired interrupt's role is retired"
+    );
+    assert_eq!(
+        Role::from_u32(23),
+        None,
+        "the network device's wired interrupt's role is retired (IOMMU11)"
+    );
+    // anything else is refused: an odd length, upper case, a digit that is no digit, a reply with another txid or an error
+    let mut odd = a.clone();
+    odd.pop();
+    assert_eq!(decode_claim_arg(&odd), None);
+    assert_eq!(decode_claim_arg(&a.to_ascii_uppercase()), None);
+    let mut junk = a.clone();
+    junk[30] = b'g';
+    assert_eq!(decode_claim_arg(&junk), None);
+    let mut other = a.clone();
+    other[1] = b'1';
+    assert_eq!(decode_claim_arg(&other), None, "txid 1");
+    assert_eq!(
+        decode_claim_arg(b"0000000003000000"),
+        None,
+        "an error reply"
+    );
+    assert_eq!(decode_claim_arg(b""), None);
 }

@@ -986,7 +986,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         loop {
             let pulled = self.pull(h);
             let before = {
-                let mut q = self.lq(h);
+                let (mut q, _) = self.lq_charged(h); // (the designation is made right below, under this lock)
                 if !q.wants_resched() {
                     None
                 } else {
@@ -1186,6 +1186,19 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
     }
 
+    /// Take hart `h`'s run-queue lock with its running thread charged up to the clock source's now, read under that lock (no-op
+    /// without a source). Every change of designation is made under it: the incoming thread is then charged from a time no earlier than
+    /// its last charge anywhere else. A thread pulled or moved here was charged on its old hart (its displacement there) under that
+    /// hart's lock, before it was detached under both; a clock read before this lock (the `charge_now` at the start of a settle, say)
+    /// may be older than that charge, and the stretch between the two would be billed twice, once on each hart (AC1).
+    /// The second value says the charge changed the budgets (what should run here): the caller marks the hart (`mark` is atomics
+    /// only, so after the guard is dropped) unless a settle of this hart follows anyway.
+    fn lq_charged(&self, h: usize) -> (Hq<'_, N, R>, bool) {
+        let mut q = self.lq(h);
+        let look = self.clock.is_some_and(|f| q.charge(f()));
+        (q, look)
+    }
+
     /// Deferred mode on or off (see the field).
     pub fn set_deferred(&self, on: bool) {
         self.deferred.store(on, Ordering::Relaxed);
@@ -1222,38 +1235,41 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Block the current thread of `hart` unless a notification is waiting. Returns whether it blocked.
     pub fn block_on(&self, hart: usize) -> Result<bool, Error> {
-        self.charge_now(hart); // (the outgoing thread's run is charged to it, before the designation changes: PR 273 review)
-        let blocked = {
-            let mut q = self.lq(hart);
+        // (the outgoing thread's run is charged to it, before the designation changes, under the same lock: PR 273 review, AC1)
+        let (blocked, look) = {
+            let (mut q, look) = self.lq_charged(hart);
             let before = q.current();
-            let blocked = q.block_current()?;
-            if let (true, Some(b)) = (blocked, before) {
+            let blocked = q.block_current();
+            if let (Ok(true), Some(b)) = (blocked, before) {
                 self.displaced(hart, &q, b); // (still executing until the switch completes)
             }
-            blocked
+            (blocked, look)
         };
-        if blocked {
+        if blocked == Ok(true) {
             self.settle(hart);
+        } else if look {
+            self.mark(hart); // (the budgets changed what should run here)
         }
-        Ok(blocked)
+        blocked
     }
 
     /// Sleep until `deadline` (nanoseconds on this hart's clock).
     pub fn sleep_until_on(&self, hart: usize, deadline: Time) -> Result<bool, Error> {
-        self.charge_now(hart);
-        let blocked = {
-            let mut q = self.lq(hart);
+        let (blocked, look) = {
+            let (mut q, look) = self.lq_charged(hart);
             let before = q.current();
-            let blocked = q.sleep_until(deadline)?;
-            if let (true, Some(b)) = (blocked, before) {
+            let blocked = q.sleep_until(deadline);
+            if let (Ok(true), Some(b)) = (blocked, before) {
                 self.displaced(hart, &q, b);
             }
-            blocked
+            (blocked, look)
         };
-        if blocked {
+        if blocked == Ok(true) {
             self.settle(hart);
+        } else if look {
+            self.mark(hart);
         }
-        Ok(blocked)
+        blocked
     }
 
     /// Wake `tid` (a blocked thread is placed and queued; a prepared one is notified; anything else is left alone).
@@ -1376,9 +1392,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn yield_on(&self, hart: usize) -> Result<(), Error> {
-        self.charge_now(hart);
         {
-            let mut q = self.lq(hart);
+            let (mut q, _) = self.lq_charged(hart); // (a settle of this hart follows)
             let cur = q.current();
             q.yield_now()?;
             if let Some(c) = cur {
@@ -1390,9 +1405,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn exit_on(&self, hart: usize) -> Result<(), Error> {
-        self.charge_now(hart);
         {
-            let mut q = self.lq(hart);
+            let (mut q, _) = self.lq_charged(hart); // (a settle of this hart follows)
             let before = q.current();
             q.exit_current()?;
             if let Some(b) = before {
@@ -1453,7 +1467,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         {
             let mut q = self.lq(hart);
             let before = q.current();
-            q.tick_to(now);
+            // (the caller read `now` before this lock: a thread attached here since, charged elsewhere up to a later time, would be
+            // designated from the older reading and billed that stretch twice; the clock read under the lock is used, AC1)
+            q.tick_to(self.clock.map_or(now, |f| f().max(now)));
             if let Some(b) = before {
                 self.displaced(hart, &q, b);
             }

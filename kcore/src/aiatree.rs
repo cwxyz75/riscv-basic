@@ -1,6 +1,7 @@
 //! The interrupt controller as the device tree describes it (PL5c, KERNEL-V1-SPEC 2.3): the supervisor-domain APLIC (where it is, how many
 //! sources it has), the order of the harts in its IMSIC (the hart index its message-target registers want), and which of its sources a
-//! process may take: only those the admitted devices (`devwin::admitted`: virtio-mmio and the RTC) name in `interrupts`, so, like the
+//! process may take: only those the admitted devices (`devwin::admitted`: the RTC, since IOMMU12 took the virtio-mmio slots off the
+//! list; a PCI host names its INTx lines in an `interrupt-map`, never in `interrupts`) name in `interrupts`, so, like the
 //! device windows, an interrupt object fails closed. Pure: nodes in, numbers out.
 
 use crate::devwin::admitted;

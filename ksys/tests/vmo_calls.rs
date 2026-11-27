@@ -184,7 +184,7 @@ fn vmo_commit_rows() {
 }
 
 #[test]
-fn physical_and_dma_creation_need_the_resource_and_a_valid_window() {
+fn physical_creation_needs_the_resource_and_the_retired_calls_are_gone() {
     let mut w = world();
     // no resource handle: a VMO handle is the wrong type, a missing one is bad
     assert_eq!(
@@ -196,19 +196,18 @@ fn physical_and_dma_creation_need_the_resource_and_a_valid_window() {
         w.err(nr::VMO_CREATE_PHYSICAL, [v, 0x1000_0000, 4096, 0, 0, 0]),
         Status::WrongType
     );
-    assert_eq!(
-        w.err(nr::VMO_CREATE_DMA, [v, 1, 0, 0, 0, 0]),
-        Status::WrongType
-    );
-    // a DMA address of a plain VMO is the wrong type, and needs the DMA right
-    assert_eq!(
-        w.err(nr::VMO_PHYS_ADDR, [v, 0, 0, 0, 0, 0]),
-        Status::AccessDenied
-    );
-    assert_eq!(
-        w.err(nr::VMO_PHYS_ADDR, [0x999, 0, 0, 0, 0, 0]),
-        Status::BadHandle
-    );
+    // IOMMU12 (IOMMU-SPEC 4.8): the two-argument `vmo_create_dma` and `vmo_phys_addr` are not calls of the kernel any more: no layer
+    // of the syscall code takes their old numbers (the kernel's dispatch answers BAD_SYSCALL for a number nothing takes), whatever the
+    // arguments, a real VMO or resource handle included
+    for &(name, n) in nr::RETIRED {
+        for a in [
+            [v, 1, 0, 0, 0, 0],
+            [0x999, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ] {
+            assert!(w.call(n, a).is_none(), "{name} ({n}) is still a call");
+        }
+    }
     let _ = SAME;
 }
 

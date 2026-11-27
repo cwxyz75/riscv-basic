@@ -1,14 +1,14 @@
 //! Device-memory and DMA VMOs (S6a): hand-derived scenarios plus a random test against an
 //! independent frame-accounting formula. Invariants D1 (a physical VMO never names RAM, so the
-//! frame database never sees its frames), D2 (only a DMA VMO has a physical address) and D4
-//! (frames freed exactly once).
+//! frame database never sees its frames) and D4 (frames freed exactly once). (D2: since IOMMU12 the
+//! store has no way to tell a VMO's physical address at all; the contiguous kind of the old call is gone.)
 //!
 //! IOMMU3 adds the device mapping as a third holder of a DMA VMO (M8, D4): `Vmos::retain_for_io` takes a hold like a region's, and
 //! `create_dma_in` makes the new kind (not contiguous, no per-object limit, charged to a named job), whose large releases go back in
 //! batches.
 mod common;
 mod iodomain_common;
-use abi::limits::{MAX_DMA_PAGES, MAX_DMA_TOTAL_PAGES};
+use abi::limits::MAX_DMA_TOTAL_PAGES;
 use common::{FakeMem, Rng, SEEDS};
 use kcore::aspace::{AddressSpace, IoHoldError, VmoError, VmoKind, Vmos};
 use kcore::frame::FrameDb;
@@ -44,7 +44,6 @@ fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
     let free_before = mm.db.free_count();
     let v = vmos.create_physical(&mut jobs, MMIO_PFN, 2);
     assert_eq!(vmos.kind(v), Some(VmoKind::Device));
-    assert_eq!(vmos.phys_addr(v), None, "D2: only DMA VMOs have an address");
     a.map_region(&mut vmos, BASE, 2, v, 0, rw()).unwrap();
     a.handle_fault(
         &mut mm,
@@ -90,26 +89,22 @@ fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
 }
 
 #[test]
-fn a_dma_vmo_is_contiguous_zeroed_charged_and_freed_exactly() {
+fn a_dma_vmo_is_zeroed_charged_and_freed_exactly() {
     let mut mm = mm(200);
     let mut vmos = Vmos::new();
     let mut jobs = kcore::job::Jobs::new();
     let free = mm.db.free_count();
-    // fragment the free list so contiguity is not an accident
+    // fragment the free list: the frames need not be contiguous (IOMMU-SPEC 4.7), so the hole is used
     let hold: Vec<u64> = (0..7).map(|_| mm.db.alloc().unwrap()).collect();
     mm.db.dec(hold[3]).unwrap();
-    let v = vmos.create_dma(&mut mm, &mut jobs, 8, JobId::ROOT).unwrap();
+    let v = vmos
+        .create_dma_in(&mut mm, &mut jobs, 8, JobId::ROOT)
+        .unwrap();
     assert_eq!(vmos.kind(v), Some(VmoKind::Dma));
-    let pa = vmos.phys_addr(v).unwrap();
     for i in 0..8 {
         let pfn = vmos.frame(v, i).unwrap();
-        assert_eq!(pfn, (pa >> 12) + i, "contiguous");
         assert_eq!(mm.db.refs(pfn), Some(1));
     }
-    assert!(
-        !(0..8).any(|i| (pa >> 12) + i == hold[3]),
-        "the hole of one frame is too small"
-    );
     assert_eq!(mm.db.free_count(), free - 7 + 1 - 8);
     vmos.release(&mut mm, &mut jobs, v).unwrap();
     assert_eq!(
@@ -135,32 +130,39 @@ fn dma_limits_and_failure_leave_nothing_behind() {
     let mut vmos = Vmos::new();
     let mut jobs = kcore::job::Jobs::new();
     assert_eq!(
-        vmos.create_dma(&mut mm, &mut jobs, 0, JobId::ROOT),
+        vmos.create_dma_in(&mut mm, &mut jobs, 0, JobId::ROOT),
         Err(VmoError::OutOfRange)
     );
     assert_eq!(
-        vmos.create_dma(&mut mm, &mut jobs, MAX_DMA_PAGES + 1, JobId::ROOT),
-        Err(VmoError::OutOfRange)
+        vmos.create_dma_in(&mut mm, &mut jobs, MAX_DMA_TOTAL_PAGES + 1, JobId::ROOT),
+        Err(VmoError::OutOfRange),
+        "past the whole backstop"
     );
-    let mut ids = vec![];
-    for _ in 0..MAX_DMA_TOTAL_PAGES / MAX_DMA_PAGES {
+    // no per-object limit: one object may take the whole backstop (64 pages was the old call's limit)
+    let mut ids = vec![vmos
+        .create_dma_in(&mut mm, &mut jobs, 65, JobId::ROOT)
+        .unwrap()];
+    while ids.len() < 15 {
         ids.push(
-            vmos.create_dma(&mut mm, &mut jobs, MAX_DMA_PAGES, JobId::ROOT)
+            vmos.create_dma_in(&mut mm, &mut jobs, 64, JobId::ROOT)
                 .unwrap(),
         );
     }
+    let left = MAX_DMA_TOTAL_PAGES - 65 - 14 * 64;
     assert_eq!(
-        vmos.create_dma(&mut mm, &mut jobs, 1, JobId::ROOT),
-        Err(VmoError::OutOfRange),
+        vmos.create_dma_in(&mut mm, &mut jobs, left + 1, JobId::ROOT),
+        Err(VmoError::NoMemory),
         "the system-wide DMA budget"
     );
     vmos.release(&mut mm, &mut jobs, ids.pop().unwrap())
         .unwrap();
+    vmos.drain_all(&mut mm, &mut jobs);
     assert!(
-        vmos.create_dma(&mut mm, &mut jobs, 1, JobId::ROOT).is_ok(),
+        vmos.create_dma_in(&mut mm, &mut jobs, left + 1, JobId::ROOT)
+            .is_ok(),
         "budget comes back"
     );
-    // no contiguous run left: NoMemory, and the job is not left charged
+    // not enough frames: NoMemory, and nothing is left taken
     let mut small = self::mm(10);
     let hold: Vec<u64> = (0..10).map(|_| small.db.alloc().unwrap()).collect();
     for (i, h) in hold.iter().enumerate() {
@@ -170,7 +172,7 @@ fn dma_limits_and_failure_leave_nothing_behind() {
     }
     let mut v2 = Vmos::new();
     assert_eq!(
-        v2.create_dma(&mut small, &mut jobs, 2, JobId::ROOT),
+        v2.create_dma_in(&mut small, &mut jobs, 6, JobId::ROOT),
         Err(VmoError::NoMemory)
     );
     assert_eq!(small.db.free_count(), 5);
@@ -194,16 +196,16 @@ fn the_jobs_page_charge_follows_dma_exactly() {
         .unwrap();
     let used = |j: &kcore::job::Jobs| j.usage(job).unwrap().get(Resource::Pages);
     assert_eq!(
-        vmos.create_dma(&mut mm, &mut jobs, 7, job),
+        vmos.create_dma_in(&mut mm, &mut jobs, 7, job),
         Err(VmoError::NoMemory),
         "over the job limit"
     );
     assert_eq!(used(&jobs), 0, "a refused creation charges nothing");
     assert_eq!(mm.db.free_count(), 200, "and takes no frames");
-    let a = vmos.create_dma(&mut mm, &mut jobs, 4, job).unwrap();
+    let a = vmos.create_dma_in(&mut mm, &mut jobs, 4, job).unwrap();
     assert_eq!(used(&jobs), 4);
     assert_eq!(
-        vmos.create_dma(&mut mm, &mut jobs, 3, job),
+        vmos.create_dma_in(&mut mm, &mut jobs, 3, job),
         Err(VmoError::NoMemory)
     );
     assert_eq!(used(&jobs), 4);
@@ -230,7 +232,7 @@ fn random_creation_mapping_and_destruction_balance_the_frames() {
             match rng.below(8) {
                 0 => {
                     let n = 1 + rng.below(4);
-                    if let Ok(id) = vmos.create_dma(&mut mm, &mut jobs, n, JobId::ROOT) {
+                    if let Ok(id) = vmos.create_dma_in(&mut mm, &mut jobs, n, JobId::ROOT) {
                         live.push((id, VmoKind::Dma, n));
                     }
                 }
@@ -374,19 +376,6 @@ fn a_dma_in_vmo_is_zeroed_charged_fixed_and_not_promised_contiguous() {
         pfns.windows(2).any(|w| w[1] != w[0] + 1),
         "not contiguous (the scattered frames were used)"
     );
-    assert_eq!(
-        vmos.phys_addr(v),
-        None,
-        "D2: no first address for frames that are not contiguous"
-    );
-    // the kind decides, not the frames that happened to come: one page is "contiguous" and still has no address
-    let one = vmos.create_dma_in(&mut mm, &mut jobs, 1, job).unwrap();
-    assert_eq!(
-        vmos.phys_addr(one),
-        None,
-        "D2, IO6: no physical address for the new kind"
-    );
-    vmos.release(&mut mm, &mut jobs, one).unwrap();
     let used = |j: &kcore::job::Jobs, r| j.usage(job).unwrap().get(r);
     assert_eq!(used(&jobs, Resource::Pages), 20, "charged to the named job");
     assert_eq!(

@@ -451,6 +451,9 @@ fn backstop_stat(s: &UserState, which: u64) -> Option<u64> {
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame just over 1 KiB (the state closure and the test-build arms); T172 shrinks them
 fn debug_stat_call(a: [u64; 6]) -> Reply {
+    if a[1] == 164 {
+        return debug_phys_of(a);
+    }
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
@@ -510,6 +513,41 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
         }
         Ok((Some(thread::wake_stat(a[1])), None))
     })
+}
+
+/// `debug_stat` 164 (IOMMU12, test builds only): the physical address of the page the caller has mapped at user address `a2`, or all ones.
+/// The suite needs it to aim a device or a pattern check at a frame now that no call tells a physical address (IOMMU-SPEC 4.8); it is
+/// behind the debug resource with INSPECT like 100 and 104, which already say where RAM and the kernel are, and a release kernel answers
+/// all ones. The space is read under its own lock, outside the big lock, as the fault path does (AS1).
+fn debug_phys_of(a: [u64; 6]) -> Reply {
+    let aspace = locked_state(|s| -> Result<_, ReplyErr> {
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
+            .map_err(|e| (e, None, None))?;
+        Ok(p.aspace.clone())
+    })?;
+    // (a release kernel has no translate path here at all: the code below is not compiled into it, so the answer cannot depend on a
+    // run-time flag)
+    #[cfg(all(feature = "release", not(feature = "release-suite")))]
+    {
+        let _ = (aspace, a);
+        Ok((Some(u64::MAX), None))
+    }
+    #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+    {
+        if a[2] >= abi::user::TOP {
+            return Ok((Some(u64::MAX), None));
+        }
+        let _as = klock::aslock::AsCell::hold(&aspace);
+        let k = kmem::mem();
+        let at = aspace
+            .held_ref()
+            .table()
+            .translate(k.mm, a[2])
+            .map_or(u64::MAX, |t| (t.pfn << 12) | (a[2] & 0xfff));
+        Ok((Some(at), None))
+    }
 }
 
 /// The attention epoch (L12b): bumped, under the big lock, whenever a process is marked killed or stopped, **after** the mark is set and

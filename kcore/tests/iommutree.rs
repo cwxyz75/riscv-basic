@@ -160,7 +160,7 @@ fn a_pci_host_without_a_map_is_not_behind_the_iommu_and_opens_no_window() {
     assert!(discover(&n).unwrap().pci.is_empty());
     assert!(iommutree::pci_windows(&n).is_empty());
     let w = device_windows(&n, &[CONSOLE], &fdt::memory_ranges(&n));
-    assert_eq!(w, vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)]);
+    assert_eq!(w, vec![(0x10_1000, 0x10_2000)]);
 }
 
 /// A map that leaves some requester ids out, folds them with a mask, or names another IOMMU does not put the whole host behind
@@ -168,7 +168,7 @@ fn a_pci_host_without_a_map_is_not_behind_the_iommu_and_opens_no_window() {
 #[test]
 fn a_pci_host_only_partly_behind_the_iommu_opens_no_window() {
     let only = |n: &[Node]| device_windows(n, &[CONSOLE], &fdt::memory_ranges(n));
-    let closed = vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
+    let closed = vec![(0x10_1000, 0x10_2000)];
     for (what, n) in [
         (
             "half the ids",
@@ -244,7 +244,7 @@ fn qemu_10_2s_map_is_an_iommu_whose_pci_host_misses_one_requester_id() {
     assert!(i.covers(0) && i.covers(0xfffe));
     assert!(!i.covers(0xffff) && !i.covers(0x1_0000));
     assert!(iommutree::pci_windows(&n).is_empty());
-    let closed = vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
+    let closed = vec![(0x10_1000, 0x10_2000)];
     assert_eq!(
         device_windows(&n, &[CONSOLE], &fdt::memory_ranges(&n)),
         closed
@@ -352,7 +352,7 @@ fn a_source_the_kernel_cannot_program_is_the_refusal() {
     }
 }
 
-/// IOMMU-SPEC 2.6: behind the IOMMU, the ECAM window and the two memory windows join the RTC and the virtio slots; the I/O-port
+/// IOMMU-SPEC 2.6: behind the IOMMU, the ECAM window and the two memory windows join the RTC (the virtio slots are no window since IOMMU12); the I/O-port
 /// window, the IOMMU's register page and the interrupt controllers stay out.
 #[test]
 fn the_real_tree_opens_the_pci_windows_and_never_the_iommu() {
@@ -362,7 +362,6 @@ fn the_real_tree_opens_the_pci_windows_and_never_the_iommu() {
         w,
         vec![
             (0x10_1000, 0x10_2000),
-            (0x1000_1000, 0x1000_9000),
             (0x3000_0000, 0x8000_0000),
             (0x4_0000_0000, 0x8_0000_0000),
         ],
@@ -397,5 +396,5 @@ fn the_highest_address_is_the_top_of_the_64_bit_window() {
 #[test]
 fn the_pci_hosts_intx_and_the_iommus_sources_are_never_a_processs() {
     let a = kcore::aiatree::discover(&nodes()).unwrap();
-    assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+    assert_eq!(a.sources, vec![11], "the RTC only (IOMMU12)");
 }

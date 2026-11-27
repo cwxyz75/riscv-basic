@@ -16,6 +16,35 @@ fn the_library_builds_and_passes_its_checks() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// IOMMU12 (IOMMU-SPEC 4.8): `sys_vmo_phys_addr` and the two-argument `sys_vmo_create_dma` are stubs: each is its own symbol, in the code,
+/// and makes no system call (the check refuses a stub with an `ecall`, and one that is missing).
+#[test]
+fn the_retired_calls_are_stubs_that_never_enter_the_kernel() {
+    let dir = std::env::temp_dir().join(format!("libsys-test-stub-{}", std::process::id()));
+    let good = build::build(&dir).unwrap();
+    let len = libsys::image::image_len(&good).unwrap();
+    let img = Image::new(&good[..len]).unwrap();
+    for name in ["sys_vmo_phys_addr", "sys_vmo_create_dma"] {
+        let s = img.lookup(name).unwrap();
+        assert!(s.size >= 4 && s.size <= 16, "{name}: {} bytes", s.size);
+    }
+    assert!(build::source().contains("sys_vmo_phys_addr:\n    li a0, -11\n"));
+    // a stub that traps is refused: put an `ecall` where the phys_addr stub starts
+    let at = img.lookup("sys_vmo_phys_addr").unwrap().value as usize;
+    let mut bad = good.clone();
+    bad[at..at + 4].copy_from_slice(&[0x73, 0, 0, 0]);
+    assert!(build::check(&bad).is_err());
+    // and so is a missing one
+    let mut bad = good.clone();
+    let n = bad
+        .windows(b"sys_vmo_phys_addr".len())
+        .position(|w| w == b"sys_vmo_phys_addr")
+        .unwrap();
+    bad[n + 4] = b'X';
+    assert!(build::check(&bad).is_err());
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn a_check_refuses_a_relocation_tag_and_a_missing_symbol() {
     let dir = std::env::temp_dir().join(format!("libsys-test-neg-{}", std::process::id()));
@@ -74,8 +103,9 @@ fn no_symbol_of_the_previous_release_is_missing() {
         missing(&with_removed, &img),
         vec!["sys_a_call_that_was_removed".to_string()]
     );
-    // and every call of the table is on the list (a new call is added to the list when it is released)
-    for &(name, _) in abi::syscall::TABLE {
+    // and every call of the table is on the list (a new call is added to the list when it is released), and so is every retired
+    // call's stub (IOMMU-SPEC 4.8: the library keeps them)
+    for &(name, _) in abi::syscall::TABLE.iter().chain(abi::syscall::RETIRED) {
         assert!(
             list.lines().any(|l| l == libsys::symbol_name(name)),
             "{name} is not in symbols-v1.txt"

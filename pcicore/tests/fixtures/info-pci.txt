@@ -1,0 +1,31 @@
+  Bus  0, device   0, function 0:
+    Host bridge: PCI device 1b36:0008
+      PCI subsystem 1af4:1100
+      id ""
+  Bus  0, device   1, function 0:
+    SCSI controller: PCI device 1af4:1042
+      PCI subsystem 1af4:1100
+      IRQ 0, pin A
+      BAR1: 32 bit memory at 0x40010000 [0x40010fff]
+      BAR4: 64 bit prefetchable memory at 0x40018000 [0x4001bfff]
+      id ""
+  Bus  0, device   2, function 0:
+    Ethernet controller: PCI device 1af4:1041
+      PCI subsystem 1af4:1100
+      IRQ 0, pin A
+      BAR1: 32 bit memory at 0x40020000 [0x40020fff]
+      BAR4: 64 bit prefetchable memory at 0x40028000 [0x4002bfff]
+      BAR6: 32 bit memory (not mapped)
+      id ""
+  Bus  0, device   3, function 0:
+    Class 0255: PCI device 1af4:1044
+      PCI subsystem 1af4:1100
+      IRQ 0, pin A
+      BAR1: 32 bit memory at 0x40030000 [0x40030fff]
+      BAR4: 64 bit prefetchable memory at 0x40038000 [0x4003bfff]
+      id ""
+  Bus  0, device   4, function 0:
+    Class 0255: PCI device 1b36:0005
+      PCI subsystem 1af4:1100
+      BAR0: 32 bit memory at 0x40044000 [0x40044fff]
+      id ""

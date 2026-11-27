@@ -864,7 +864,6 @@ impl<N: Class> HartRq<N> {
         self.threads.get(&tid)
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
     fn fresh(&mut self, attr: SchedAttr, state: State) -> Result<Tid, Error> {
         if attr.prio > PRIO_MAX {
             return Err(Error::BadPriority);

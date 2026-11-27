@@ -28,7 +28,7 @@ help:
 	@echo "make check      the epic gate (smoke): what CI runs on a pull request into main"
 
 test:
-	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p pcicore -p virtio -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -42,7 +42,7 @@ fmt-check:
 lint: lint-host lint-target
 
 lint-host:
-	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p pcicore -p virtio -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 
 lint-target:
 	cd home/kernel && cargo clippy -- -D warnings
@@ -105,6 +105,8 @@ OS_NOCBZE_ELF := target/os-fault-cbze/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
+OS_VNOUNMASK_ELF := target/os-fault-vunmask/$(KERNEL_TARGET)/debug/kernel
+OS_VNOREPEND_ELF := target/os-fault-vrepend/$(KERNEL_TARGET)/debug/kernel
 OS_NOMSIRETIRE_ELF := target/os-fault-msiid/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
@@ -129,7 +131,7 @@ kernel: kernel-main
 # Host tests of the OS crates: plain, then the same code under the loom and
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
 os-test:
-	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore
+	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock -p iommucore -p pcicore -p virtio
 	$(MAKE) os-models
 
 # AR1 (OD143): the kernel compiles against the AArch64 stub in kernel/src/arch/aarch64 (no code is built or run for it).
@@ -154,7 +156,7 @@ os-models:
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test latch_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test ticket_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --test fp_claim_concurrency --target-dir target/shuttle
-	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --test charge_migrate_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test rq_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test fcache_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test vmofamily_concurrency --target-dir target/shuttle
@@ -190,8 +192,8 @@ os-boot-test-smoke-a: kernel-main
 os-boot-test-smoke-b: kernel-main
 	OS_SHARD=b OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
-# The kernel-only boot (KT1, KERNEL-V1-SPEC 8): the kernel, `init` and the Kernel tests of the suite (`init/ktests.txt`: no server, no
-# disk, no network), as shard `k`. `os-ktest` boots the test build at one, two and four harts; `os-ktest-release` the optimised build
+# The kernel-only boot (KT1, KERNEL-V1-SPEC 8): the kernel, `init` and the Kernel tests of the suite (`init/ktests.txt`: the PCI disks,
+# no network), as shard `k`. `os-ktest` boots the test build at one, two and four harts; `os-ktest-release` the optimised build
 # (debug assertions and overflow checks off, no fat LTO so that the build is short) at four. The harness check proves the shard's
 # required list holds no System test and fails when a Kernel test is missing.
 os-ktest: os-ktest-small os-ktest-4
@@ -305,7 +307,7 @@ os-boot-test-smp: kernel os-interactive
 # serial sessions at four harts. A separate target so CI can run it as its own job: the whole SMP part took
 # about 28 minutes, too close to the job's timeout.
 # The scheduler's negative controls (L11d, SCHED-SMP-SPEC task 11): each kernel breaks one mechanism and the guarding test must fail (or the
-# kernel must stop). Kernel-only boots (shard k): no disk, no network. Part of the soak tier (OD142): the owner starts it.
+# kernel must stop). Kernel-only boots (shard k): no network. Part of the soak tier (OD142): the owner starts it.
 os-boot-test-sched-neg: kernel
 	cd kernel && cargo build --features fault-skip-poke --target-dir ../target/os-fault-poke
 	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --expect-panic "starved thread" $(OS_NOPOKE_ELF)
@@ -336,7 +338,7 @@ os-boot-test-smp-neg: kernel os-interactive
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
 	OS_SMP=4 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 
-# The same suite with no disk attached: the device manager must find no block device and start nothing.
+# The same suite with no disk attached (neither PCI disk): the device manager must find no block device on either bus and start nothing.
 os-boot-test-nodisk: kernel
 	OS_DISK=0 python3 scripts/os_boot_test.py $(OS_ELF)
 
@@ -363,14 +365,16 @@ os-bench: kernel-main
 # KT5: the guest's retired-instruction counts of the main syscall paths (`##BENCH count_<name> <n> instr` lines of the suite's
 # `instruction_counts_report`), booted at one hart under `-icount shift=0`, where they are deterministic. bench/counts.tsv holds the recorded
 # values; a rise of more than 25 % fails (slack for runners and for unrelated changes that move the counts, T223), a fall of more than 5 % is printed (record it: `make os-count-record`).
+# No disks (OS_DISK=0): under `sleep=off` guest time does not bound the host's disk I/O, so the block tests cannot be judged there (the
+# harness refuses the combination); the disk path through the IOMMU is the other Kernel boots' (os-ktest-small, os-ktest-4).
 os-count: kernel-main
 	rm -f target/count.tsv
-	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_DISK=0 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/count.tsv bench/counts.tsv --prefix count_ --max-ratio 1.25
 
 os-count-record: kernel-main
 	rm -f target/count.tsv
-	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_DISK=0 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	awk -F'\t' '$$2 ~ /^count_/' target/count.tsv > bench/counts.tsv
 
 # S9 Q30 (soak tier): the bulk TCP tests (fetch, httpd, echo) with the guest's network behind the lossy relay
@@ -406,6 +410,11 @@ os-boot-test-aia: kernel
 	# (IOMMU4, IO12: an interrupt identity freed at the move instead of after its hart retired it)
 	cd kernel && cargo build --features fault-msiid-free-at-move --target-dir ../target/os-fault-msiid
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOMSIRETIRE_ELF) interrupt_moves_do_not_lose_or_leak
+	# (IOMMU9: the same two controls for an MSI-X vector, D5 through the MRIF)
+	cd kernel && cargo build --features fault-vector-no-unmask --target-dir ../target/os-fault-vunmask
+	OS_SHARD=k python3 scripts/os_boot_test.py --neg $(OS_VNOUNMASK_ELF) pci_virtio_blk_interrupts_through_msix
+	cd kernel && cargo build --features fault-vector-no-repend --target-dir ../target/os-fault-vrepend
+	OS_SHARD=k python3 scripts/os_boot_test.py --neg $(OS_VNOREPEND_ELF) pci_virtio_blk_interrupts_through_msix
 
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.
@@ -493,6 +502,8 @@ OS_IOMMUINVAL_ELF := target/os-fault-iommuinval/$(KERNEL_TARGET)/debug/kernel
 os-boot-test-iommu-inval: kernel-main
 	cd kernel && cargo build --features fault-iommu-skip-inval --target-dir ../target/os-fault-iommuinval
 	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUINVAL_ELF) iodomain_unmap_stops_the_device
+	# (IOMMU12: the hostile-driver matrix's row that uses its own unmapped mapping is a second test the control must fail)
+	OS_SHARD=k OS_SMP=2 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_IOMMUINVAL_ELF) hostile_dma_after_its_own_unmap
 
 # IOMMU7 negative control (TESTING.md rule 9): a kernel that writes basic-translate MSI entries (the device's own data word reaches the
 # hart's file) must fail `msi_forgery_faults` (IO11). Kernel-only boot.
@@ -582,13 +593,15 @@ os-chaos:
 	cd kernel && cargo build --features chaos --target-dir ../target/os-chaos
 	python3 scripts/chaos.py $(OS_CHAOS_ELF) "$(CHAOS_SEEDS)"
 
-# KT10: mutation testing of kcore, klock and iommucore with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
+# KT10: mutation testing of kcore, klock, iommucore, pcicore and virtio with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
 # `make os-mutants` runs the three crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
 # Fails on a surviving mutant that is not in mutants-accepted.txt with a reason. Hours: the owner starts it (OD142).
 os-mutants:
 ifeq ($(PKG),)
 	python3 scripts/mutants.py klock
 	python3 scripts/mutants.py iommucore
+	python3 scripts/mutants.py pcicore
+	python3 scripts/mutants.py virtio
 	python3 scripts/mutants.py kcore
 else
 	python3 scripts/mutants.py $(PKG) $(if $(SHARD),--shard $(SHARD),)

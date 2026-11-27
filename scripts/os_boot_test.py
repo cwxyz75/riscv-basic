@@ -93,7 +93,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "programs_are_placed_at_random", "the_system_library_is_in_every_process", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "caller_stack_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "vector_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "several_waiters_on_one_port_are_woken_in_turn", "a_binding_ends_with_the_handle_it_was_made_through", "a_call_lends_its_priority_to_the_server", "pi_futex_bounds_inversion", "pi_futex_owner_death_poisons", "pi_futex_deadlock_is_refused", "pi_futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "backstops_follow_the_ram_of_the_machine", "reserved_abi_space_is_refused", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "fsd_keeps_files_across_a_restart", "clock_service_reports_the_rtc", "volmgr_serves_volumes_by_the_table", "devd_serves_null_and_zero", "symlinks_are_followed_by_the_client_not_the_server", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "interrupt_identities_above_63_work", "interrupt_moves_do_not_lose_or_leak", "iommu_is_on_and_denies_by_default", "iommu_denies_messages_by_default", "iodomain_maps_exactly_what_was_granted", "iodomain_unmap_stops_the_device", "iodomain_faults_reach_the_supervisor", "iodomain_outlives_its_makers", "iodomain_calls_check_handles_rights_and_arguments", "msi_granted_vector_is_delivered", "msi_ungranted_vector_faults", "msi_forgery_faults", "msi_revoke_stops_the_vector", "msi_destroy_revokes_every_vector", "vector_calls_check_handles_rights_and_arguments", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_many_takes_a_batch_in_order", "port_wait_many_leaves_everything_on_a_bad_buffer", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "fetch_the_conformance_image", "abi_conformance_passes", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_info_counts_the_cpu_time_its_threads_run", "a_runaway_rt_thread_does_not_hang_the_system", "cpu_time_is_counted_per_thread_and_process", "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "a_two_gib_vmo_committed_whole_stays_within_the_latency_bound", "the_heap_gives_memory_back_when_it_is_freed", "runtime_heap_stops_at_its_cap_after_giving_memory_back", "a_decommit_under_way_refuses_the_calls_that_would_race_it", "a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory", "a_two_gib_sparse_vmo_is_mapped_touched_and_given_back", "a_close_that_frees_a_chain_takes_interrupts_between_its_slices", "vmo_decommit_and_resize_from_user_mode", "copy_on_write_children_from_user_mode", "thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written", "a_stopped_thread_can_be_sent_to_a_handler_and_back", "a_thread_started_suspended_runs_only_after_resume_with_registers_written_first", "a_thread_started_suspended_and_resumed_at_once_runs", "suspend_and_state_calls_check_their_arguments_and_rights", "a_handler_thread_can_make_a_faulting_store_succeed_and_retry", "a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction", "next_reaches_the_job_channel_and_closing_the_handle_is_next", "a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped", "a_pager_serves_a_vmo_to_a_reader_in_another_process", "killing_a_reader_waiting_for_a_pager_leaks_nothing", "a_pager_that_dies_fails_the_reader_with_a_pager_fault", "a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry", "pager_calls_check_their_arguments", "fp_and_vector_state_round_trip_through_thread_state", "process_protect_and_range_unmap_from_user_mode", "a_write_to_a_protected_page_ends_the_process", "touching_past_a_shrunk_vmo_ends_the_process_cleanly", "a_confined_program_cannot_hold_much_uncharged_kernel_memory", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "dma_runs_are_allocated_and_freed_repeatedly", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_argument_errors", "thread_interrupt_ends_an_object_wait", "thread_interrupt_ends_a_port_wait", "thread_interrupt_ends_a_futex_wait", "thread_interrupt_ends_a_channel_call", "thread_interrupt_before_the_wait_is_not_lost", "thread_interrupt_is_not_taken_by_a_poll", "thread_interrupt_waits_for_a_wait_that_would_block", "thread_interrupt_polls_leave_the_flag_on_every_wait", "thread_interrupt_is_taken_once", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_tcp_churn", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "programs_are_placed_at_random", "the_system_library_is_in_every_process", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "caller_stack_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "vector_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "no_dma_device_outside_the_iommu", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "several_waiters_on_one_port_are_woken_in_turn", "a_binding_ends_with_the_handle_it_was_made_through", "a_call_lends_its_priority_to_the_server", "pi_futex_bounds_inversion", "pi_futex_owner_death_poisons", "pi_futex_deadlock_is_refused", "pi_futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "backstops_follow_the_ram_of_the_machine", "reserved_abi_space_is_refused", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "fsd_keeps_files_across_a_restart", "clock_service_reports_the_rtc", "volmgr_serves_volumes_by_the_table", "devd_serves_null_and_zero", "symlinks_are_followed_by_the_client_not_the_server", "a_child_has_no_device_authority", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "interrupt_identities_above_63_work", "interrupt_moves_do_not_lose_or_leak", "iommu_is_on_and_denies_by_default", "iommu_denies_messages_by_default", "iodomain_maps_exactly_what_was_granted", "iodomain_unmap_stops_the_device", "iodomain_faults_reach_the_supervisor", "iodomain_outlives_its_makers", "iodomain_calls_check_handles_rights_and_arguments", "msi_granted_vector_is_delivered", "msi_ungranted_vector_faults", "msi_forgery_faults", "msi_revoke_stops_the_vector", "msi_destroy_revokes_every_vector", "vector_calls_check_handles_rights_and_arguments", "hostile_dma_at_a_kernel_address", "hostile_dma_at_another_process_frame", "hostile_dma_at_another_device_buffer", "hostile_dma_at_another_device_bar", "hostile_dma_at_an_interrupt_file", "hostile_dma_one_page_past_its_buffer", "hostile_dma_through_a_read_only_mapping", "hostile_dma_after_its_own_unmap", "hostile_dma_after_the_domain_is_destroyed", "hostile_dma_after_its_supervisor_died", "hostile_msi_at_another_device_vector", "hostile_msi_at_the_inter_hart_identity", "hostile_msi_at_the_iommu_identity", "hostile_msi_on_an_ungranted_vector", "hostile_msi_with_a_wrong_data_word", "hostile_msi_after_the_vector_is_revoked", "hostile_cannot_map_without_the_dma_right", "hostile_cannot_map_writable_without_write", "hostile_cannot_destroy_its_domain", "hostile_cannot_grant_itself_a_vector", "hostile_cannot_read_or_wait_for_its_faults", "hostile_learns_no_physical_address", "hostile_maps_until_its_job_refuses", "hostile_child_job_is_held_to_the_parents_limits", "every_driver_job_has_finite_io_limits", "dma_survives_a_dead_supervisor", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_many_takes_a_batch_in_order", "port_wait_many_leaves_everything_on_a_bad_buffer", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "fetch_the_conformance_image", "abi_conformance_passes", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_info_counts_the_cpu_time_its_threads_run", "a_runaway_rt_thread_does_not_hang_the_system", "cpu_time_is_counted_per_thread_and_process", "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "a_two_gib_vmo_committed_whole_stays_within_the_latency_bound", "the_heap_gives_memory_back_when_it_is_freed", "runtime_heap_stops_at_its_cap_after_giving_memory_back", "a_decommit_under_way_refuses_the_calls_that_would_race_it", "a_decommit_the_job_cannot_pay_the_holes_for_is_no_memory", "a_two_gib_sparse_vmo_is_mapped_touched_and_given_back", "a_close_that_frees_a_chain_takes_interrupts_between_its_slices", "vmo_decommit_and_resize_from_user_mode", "copy_on_write_children_from_user_mode", "thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written", "a_stopped_thread_can_be_sent_to_a_handler_and_back", "a_thread_started_suspended_runs_only_after_resume_with_registers_written_first", "a_thread_started_suspended_and_resumed_at_once_runs", "suspend_and_state_calls_check_their_arguments_and_rights", "a_handler_thread_can_make_a_faulting_store_succeed_and_retry", "a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction", "next_reaches_the_job_channel_and_closing_the_handle_is_next", "a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped", "a_pager_serves_a_vmo_to_a_reader_in_another_process", "killing_a_reader_waiting_for_a_pager_leaks_nothing", "a_pager_that_dies_fails_the_reader_with_a_pager_fault", "a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry", "pager_calls_check_their_arguments", "fp_and_vector_state_round_trip_through_thread_state", "process_protect_and_range_unmap_from_user_mode", "a_write_to_a_protected_page_ends_the_process", "touching_past_a_shrunk_vmo_ends_the_process_cleanly", "a_confined_program_cannot_hold_much_uncharged_kernel_memory", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "dma_runs_are_allocated_and_freed_repeatedly", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_argument_errors", "thread_interrupt_ends_an_object_wait", "thread_interrupt_ends_a_port_wait", "thread_interrupt_ends_a_futex_wait", "thread_interrupt_ends_a_channel_call", "thread_interrupt_before_the_wait_is_not_lost", "thread_interrupt_is_not_taken_by_a_poll", "thread_interrupt_waits_for_a_wait_that_would_block", "thread_interrupt_polls_leave_the_flag_on_every_wait", "thread_interrupt_is_taken_once", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "rng_seeds_through_the_iommu", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_tcp_churn", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_device_cannot_write_the_transmit_pool", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -124,6 +124,182 @@ LAST_IOMMU_FENCES = []
 IOMMU_BOOT = re.compile(r"^kernel: iommu version=(\d+)\.(\d+) mode=(\S+) caps=0x([0-9a-f]+)(?: handover=(\S+))?$", re.M)
 # The bus address of the function the harness puts behind the IOMMU (`-device virtio-rng-pci,...,addr=0x4`, in `run`)
 IOMMU_TEST_DEV = "00:04.0"
+# IOMMU8, IOMMU9: the PCI functions of every boot, in one table (the command line and the check of `devmgr`'s lines both come from
+# it): (slot, QEMU device, vendor:device, what `pci_device` adds, claimable). PCI slots are stable: the
+# suite names the same slots (`IOMMU_TEST_SLOT`, `PCI_BLK_SLOT`, `PCI_BLK2_SLOT`). Every virtio function goes through `pci_device`,
+# which adds `iommu_platform=on` (without it QEMU's virtio device bypasses the IOMMU: IOMMU-SPEC 15.1 L1) and `disable-legacy=on`, and
+# never `vectors=0`: QEMU's defaults give each its MSI-X table (IOMMU0 item 13). The block functions are pinned to one queue: QEMU
+# gives virtio-blk-pci one queue per hart by default and one MSI-X vector more, so its table would otherwise change with OS_SMP.
+# The five devices on one machine (IOMMU9, the bus move): two disks, the network, the entropy source (also the IOMMU tests' function)
+# and `iommu-testdev`, which has no MSI-X capability and so is listed and never claimable (IOMMU-SPEC 8.6, Q-IOMMU-MSI 5). The network
+# function is `netdrv`'s (IOMMU11); it is on QEMU's user network when the boot has the network (`pci_devices`), else it has no
+# backend (the suite's PCI tests still list and claim it). The disks (IOMMU10) are the scratch disk and the
+# second disk, writable, which `blkd` drives through `devmgr`'s claim; OS_DISK=0 leaves both off (`pci_devices`).
+PCI_DEVICES = [
+    (4, "virtio-rng-pci", "1af4:1044", "", True),
+    (5, "virtio-blk-pci", "1af4:1042", ",drive=pd0,num-queues=1", True),
+    (6, "virtio-blk-pci", "1af4:1042", ",drive=pd1,num-queues=1", True),
+    (7, "virtio-net-pci", "1af4:1041", ",mac=52:54:00:12:34:57,romfile=", True),
+    (8, "iommu-testdev", "1b36:0005", None, False),
+]
+PCI_DISK_SLOTS = (5, 6)
+
+
+# IOMMU11: the network function's backend and address when the boot has the network (`net_on`): QEMU's user network `n0`
+# (`net_args`). Without it the function is still there, with no backend and another MAC.
+PCI_NET_SLOT = 7
+PCI_NET_EXTRA = ",netdev=n0,mac=52:54:00:12:34:56,romfile="
+
+
+def net_on():
+    """Whether this boot has the network (S8): not with OS_NET=0, and not in the shards without network tests (`a`, `k`)."""
+    return os.environ.get("OS_NET") != "0" and SHARD not in ("a", "k")
+
+
+def pci_devices():
+    """PCI_DEVICES as this boot has them: without the disks when OS_DISK=0 (the no-disk boot: no disk on either bus), and the
+    network function on QEMU's user network when the boot has it (IOMMU11: virtio-net-pci is the only network device)."""
+    devs = PCI_DEVICES
+    if os.environ.get("OS_DISK") == "0":
+        devs = [d for d in devs if d[0] not in PCI_DISK_SLOTS]
+    if net_on():
+        devs = [(s, m, i, PCI_NET_EXTRA if s == PCI_NET_SLOT else e, c) for s, m, i, e, c in devs]
+    return devs
+
+
+# The host bridge QEMU puts at 00:00.0, which `devmgr` lists too (not claimable).
+PCI_HOST_BRIDGE = ("00:00.0", "1b36:0008")
+# The bus address of the block function (`pci_virtio_*` tests).
+PCI_BLK_DEV = "00:05.0"
+# `## devmgr: pci <bb:dd.f> <vendor>:<device> class=<cccccc> <claimable | not-claimable <why> | refused <why>>`, then
+# `## devmgr: pci functions=<n>` (one enumeration), and `## devmgr: pci <bb:dd.f> reset failed <what>` (a reset that did not complete)
+# or `teardown failed <what>` (a domain that could not be destroyed), or `claim failed <what>` (a claim refused or undone: allowed only for
+# a function PCI_DEVICES says is not claimable, which the suite's refusal checks ask for).
+# A process's `##` line reaches the console as `user: ##...` (the kernel's prefix, so that no program can forge a kernel line).
+DEVMGR_PCI = re.compile(r"^user: ## devmgr: pci (?:([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) (?:([0-9a-f]{4}:[0-9a-f]{4}) class=([0-9a-f]{6}) "
+                        r"(claimable|not-claimable|refused)(?: (.+))?|(reset|teardown|claim) failed (.+))|functions=(\d+))$")
+LAST_DEVMGR_PCI = []
+
+
+def pci_device(slot, model, extra):
+    """The one way a PCI function gets on the command line (see PCI_DEVICES): a virtio function behind the IOMMU, or (`extra`
+    None) a device that is not virtio, with no property added."""
+    if extra is None:
+        return ["-device", f"{model},addr={slot:#x}"]
+    return ["-device", f"{model},iommu_platform=on,disable-legacy=on,addr={slot:#x}{extra}"]
+
+
+def pci_args():
+    """The PCI functions of this boot (`pci_devices`) and the disks' drives: the scratch disk at 00:05.0 and the second disk at
+    00:06.0 (with `OS_PCI_TEST=0`, none: the no-IOMMU boot). Under record and replay the drives go through QEMU's `blkreplay` filter,
+    which block devices need in that mode."""
+    if os.environ.get("OS_PCI_TEST") == "0":
+        return []
+    drive = []
+    if os.environ.get("OS_DISK") != "0":
+        for name, disk in (("pd0", scratch_disk()), ("pd1", second_disk())):
+            if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
+                drive += ["-drive", f"file={disk},if=none,format=raw,id={name}-direct",
+                          "-drive", f"driver=blkreplay,if=none,image={name}-direct,id={name}"]
+            else:
+                drive += ["-drive", f"file={disk},if=none,format=raw,id={name}"]
+    return drive + [a for slot, model, _, extra, _ in pci_devices() for a in pci_device(slot, model, extra)]
+
+
+def devmgr_pci_problems():
+    """Every enumeration `devmgr` printed lists exactly the functions the command line put on bus 0 (and the host bridge); each
+    function PCI_DEVICES says is claimable is, and reported its MSI-X table (`msix=<entries>`, at least one); the test device is not
+    claimable for want of MSI-X; no reset or teardown failed."""
+    found, current = [], []
+    want = {PCI_HOST_BRIDGE[0]: PCI_HOST_BRIDGE[1]}
+    claimable = set()
+    if os.environ.get("OS_PCI_TEST") != "0":
+        want.update({f"00:{slot:02x}.0": ids for slot, _, ids, _, _ in pci_devices()})
+        claimable = {f"00:{slot:02x}.0" for slot, _, _, _, c in pci_devices() if c}
+    for m in LAST_DEVMGR_PCI:
+        if m[7] is not None:  # an enumeration's last line
+            got = {bdf: ids for bdf, ids, _, _, _ in current}
+            if got != want or len(current) != int(m[7]):
+                found.append(f"devmgr listed {sorted(got.items())}, the command line has {sorted(want.items())}")
+            for bdf, ids, _, verdict, why in current:
+                if bdf in claimable:
+                    if verdict != "claimable":
+                        found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: it should be claimable")
+                    elif not re.match(r"msix=[1-9]\d*( table-with-registers)?$", why or ""):
+                        found.append(f"devmgr: {bdf} {ids} is claimable without reporting its MSI-X table ({why!r})")
+                elif bdf != PCI_HOST_BRIDGE[0] and (verdict, why) != ("not-claimable", "no MSI-X capability"):
+                    found.append(f"devmgr: {bdf} {ids} is {verdict} {why or ''}: a function without MSI-X is not claimable")
+            current = []
+        elif m[5] == "claim":
+            if m[0] in claimable:
+                found.append(f"devmgr: a claim of {m[0]} failed: {m[6]}")
+        elif m[5] is not None:
+            found.append(f"devmgr: {m[0]} {m[5]} failed: {m[6]}")
+        else:
+            current.append((m[0], m[1], m[2], m[3], m[4]))
+    if current:
+        found.append("devmgr printed PCI functions without the closing 'functions=' line")
+    return found
+# IOMMU10: the suite's tests that make the IOMMU fault on purpose (a device aimed outside its domain, an ungranted or forged message,
+# a function with no domain at all). Every other test must take none, and nothing between the tests may either: the suite prints
+# `iofaults: <test> <n>` for each test that saw any and `iofaults: suite <n>` for the whole run.
+DELIBERATE_FAULT_TESTS = {
+    "iommu_is_on_and_denies_by_default",
+    "iommu_denies_messages_by_default",
+    "iodomain_maps_exactly_what_was_granted",
+    "iodomain_unmap_stops_the_device",
+    "iodomain_faults_reach_the_supervisor",
+    "iodomain_outlives_its_makers",
+    "msi_ungranted_vector_faults",
+    "msi_forgery_faults",
+    "msi_revoke_stops_the_vector",
+    "msi_destroy_revokes_every_vector",
+    "pci_virtio_outside_its_mapping_faults",
+    "pci_driver_cannot_forge_through_devmgr",
+    "blk_driver_cannot_reach_outside",
+    "net_device_cannot_write_the_transmit_pool",
+    # IOMMU12: the hostile-driver matrix's device and message rows (the wrong-data-word row faults by design not at all)
+    "hostile_dma_at_a_kernel_address",
+    "hostile_dma_at_another_process_frame",
+    "hostile_dma_at_another_device_buffer",
+    "hostile_dma_at_another_device_bar",
+    "hostile_dma_at_an_interrupt_file",
+    "hostile_dma_one_page_past_its_buffer",
+    "hostile_dma_through_a_read_only_mapping",
+    "hostile_dma_after_its_own_unmap",
+    "hostile_dma_after_the_domain_is_destroyed",
+    "hostile_dma_after_its_supervisor_died",
+    "hostile_msi_at_another_device_vector",
+    "hostile_msi_at_the_inter_hart_identity",
+    "hostile_msi_at_the_iommu_identity",
+    "hostile_msi_on_an_ungranted_vector",
+    "hostile_msi_after_the_vector_is_revoked",
+    "dma_survives_a_dead_supervisor",
+}
+
+
+def iofault_problems(text, tests_run):
+    """The suite's `iofaults:` lines: faults only in DELIBERATE_FAULT_TESTS, and the suite's total is their sum (none between tests).
+    A boot whose suite did not finish has no total, and says nothing here (its failure is reported elsewhere)."""
+    per, total = {}, None
+    for l in text.split("\n"):
+        m = re.match(r"^iofaults: (\S+) (\d+)$", l)
+        if m and m[1] == "suite":
+            total = int(m[2])
+        elif m:
+            per[m[1]] = int(m[2])
+    if total is None:
+        # (a suite that reached its end always says its total: a missing line must not switch the check off)
+        if re.search(r"^init: \d+ of \d+ user tests failed$", text, re.M):
+            return ["the suite finished without its 'iofaults: suite <n>' line"]
+        return []
+    found = [f"IOMMU faults in {n} ({c}), which does not fault on purpose" for n, c in per.items()
+             if n not in DELIBERATE_FAULT_TESTS]
+    if total != sum(per.values()):
+        found.append(f"IOMMU faults outside any test: the suite saw {total}, its tests {sum(per.values())}")
+    return found
+
+
 # `##FF <name>=<value> ...` (T189): what the kernel understood of an `ff=` boot argument (test builds), so a run meant to start counters near their end cannot pass on a typo
 LAST_FF = []
 
@@ -134,10 +310,14 @@ LAST_DISK2 = [None]
 
 def check_disk(path):
     """The independent oracle for the block-driver tests (T44): after QEMU exits, look at the image
-    itself. Expected (see `blk_round_trip` / `blk_driver_restart` in init/src/bin/suite.rs): sector 0
-    untouched; sectors 100..227, 4000..4063, 7000..7031 and the last sector hold pattern(s, i) =
-    (s*31 + i*7 + 5) mod 256; sectors 5000..5015 hold zeros or the in-flight write's data
-    ((j*13 + 1) mod 256 at byte j of the 8 KiB); every other sector is zero. Returns problems."""
+    itself. Expected (see `blk_round_trip`, `blk_driver_restart`, `blk_driver_killed_mid_write` and
+    `blk_driver_cannot_reach_outside` in init/src/bin/suite.rs): sector 0 untouched; sectors 100..227,
+    4000..4063, 7000..7031 (zeros too in the kernel-only boot, which does not run the devmgr test),
+    9000..9015, 9100..9115 and the last sector hold pattern(s, i) = (s*31 + i*7 + 5) mod 256 (9300 that
+    or zeros: the hostile requests aimed at it moved what the IOMMU refused);
+    sectors 5000..5015 hold zeros or the in-flight write's data ((j*13 + 1) mod 256 at byte j of the
+    8 KiB); sector 9200 holds (i*17 + 9) mod 256 (the write whose buffer's handles were closed); every
+    other sector is zero. Returns problems."""
     SECTORS = 16 * 1024 * 2
     try:
         data = open(path, "rb").read()
@@ -152,8 +332,15 @@ def check_disk(path):
         got = data[s * 512:(s + 1) * 512]
         if s == 0:
             want = [bytes((i * 7 + 3) & 0xFF for i in range(512))]
-        elif 100 <= s < 228 or 4000 <= s < 4064 or 7000 <= s < 7032 or s == SECTORS - 1:
+        elif 7000 <= s < 7032 and SHARD == "k":
+            want = [pat(s), zero]
+        elif s == 9300:  # (the real driver's data, or the zeros of a transfer the IOMMU refused)
+            want = [pat(s), zero]
+        elif (100 <= s < 228 or 4000 <= s < 4064 or 7000 <= s < 7032 or 9000 <= s < 9016 or 9100 <= s < 9116
+              or s == SECTORS - 1):
             want = [pat(s)]
+        elif s == 9200:
+            want = [bytes((i * 17 + 9) & 0xFF for i in range(512))]
         elif 5000 <= s < 5016:
             j = (s - 5000) * 512
             want = [zero, bytes(((j + i) * 13 + 1) & 0xFF for i in range(512))]
@@ -792,9 +979,22 @@ SHARD = os.environ.get("OS_SHARD", "")
 if SHARD not in ("", "a", "b", "k"):
     sys.exit(f"OS_SHARD must be a, b or k, not {SHARD!r}")
 if SHARD == "k":
-    # the kernel-only boot (KT1, KERNEL-V1-SPEC 8): the Kernel tests of `init/ktests.txt` and the kernel's own, no disk, no network
-    os.environ["OS_DISK"] = "0"
+    # the kernel-only boot (KT1, KERNEL-V1-SPEC 8): the Kernel tests of `init/ktests.txt` and the kernel's own, no network. The PCI
+    # disks stay (IOMMU10: the block rig's tests are Kernel tests, at one, two and four harts); OS_DISK=0 still removes them.
     os.environ["OS_NET"] = "0"
+if os.environ.get("OS_NET") == "0" and SHARD in ("", "b"):
+    # IOMMU11: the network function is always on the bus (the suite's PCI tests list and claim it), so a boot without the network
+    # has no way to make the network tests skip: they would run against a function with no backend and fail. Run shard a or k.
+    sys.exit("OS_NET=0 needs OS_SHARD=a or k (the network tests run in shard b and the whole suite)")
+if (any(o.strip() in ("sleep=off", "sleep=no", "sleep=false") for o in os.environ.get("OS_ICOUNT", "").split(","))
+        and not (os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"))  # (record and replay use their own -icount)
+        and os.environ.get("OS_DISK") != "0" and os.environ.get("OS_PCI_TEST") != "0"):
+    # Under `-icount sleep=off` the guest's clock jumps to its next timer deadline as soon as the guest idles (QEMU's
+    # `icount_start_warp_timer`), so a disk request the host completes asynchronously (its block layer's thread pool: a flush is
+    # an fsync) can take any amount of guest time: `blkd`'s two-second TIMEOUT and the suite's waits for a disk's interrupt expire
+    # before the host has finished. Guest time bounds no host I/O there, so no test of a disk can pass or fail on its merits: such a
+    # boot leaves the disks off (the instruction counts, `make os-count`; the disk path is the other Kernel boots' to prove).
+    sys.exit("OS_ICOUNT with sleep=off needs OS_DISK=0: guest time does not bound the host's disk I/O in that mode")
 
 
 def _read_lines(path):
@@ -1017,13 +1217,10 @@ def net_args():
         netdev = lossy_start(port, tcp_port)
     else:
         netdev = user
+    # (IOMMU11: the device on `n0` is the PCI network function at 00:07.0, `pci_devices`; the random service seeds from the PCI
+    # entropy function at 00:04.0, with QEMU's default backend)
     return [
-        "-global", "virtio-mmio.force-legacy=false",
         "-netdev", netdev,
-        "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56",
-        # the entropy device the random service seeds from (S9 step 5)
-        "-object", "rng-random,filename=/dev/urandom,id=rng0",
-        "-device", "virtio-rng-device,rng=rng0",
         "-object", f"filter-dump,id=f0,netdev=n0,file={pcap}",
     ]
 
@@ -1032,14 +1229,14 @@ LAST_RECORD = [None]
 
 
 def rr_args():
-    """The QEMU arguments of record/replay mode (KT2), or []. Recording needs no disk and no network device (they would need
-    block and network replay filters): run it with OS_SHARD=k, or OS_DISK=0 OS_NET=0. Record mode runs the harts in one TCG thread
-    (deterministic), so a race that needs true parallel harts may not reproduce under it (TESTING.md)."""
+    """The QEMU arguments of record/replay mode (KT2), or []. Recording needs no network device (it would need a network replay
+    filter): run it with OS_SHARD=k (or OS_SHARD=a, OS_NET=0). The PCI disks go through QEMU's `blkreplay` filter (`pci_args`). Record mode runs the harts in one TCG thread (deterministic), so a race
+    that needs true parallel harts may not reproduce under it (TESTING.md)."""
     rec, rep = os.environ.get("OS_RECORD"), os.environ.get("OS_REPLAY")
     if not rec and not rep:
         return []
-    if os.environ.get("OS_DISK") != "0" or os.environ.get("OS_NET") != "0":
-        sys.exit("OS_RECORD / OS_REPLAY need a boot with no disk and no network: OS_SHARD=k (or OS_DISK=0 OS_NET=0)")
+    if os.environ.get("OS_NET") != "0":
+        sys.exit("OS_RECORD / OS_REPLAY need a boot with no network: OS_SHARD=k (or OS_SHARD=a, OS_NET=0)")
     shift = "shift=auto"
     if rep:
         LAST_RECORD[0] = None
@@ -1083,28 +1280,20 @@ def run(kernel: str, extra=()):
         "-cpu", os.environ.get("OS_CPU", "rva23s64"),  # PL1: the profile CPU is the only test CPU (only the negative control overrides it)
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
-        # IOMMU5: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and this virtio-pci function sits behind
-        # it at 00:04.0 (`iommu_platform=on`: its DMA and its MSI-X messages go through the IOMMU). Nothing drives it but the suite's
-        # `iommu_*` tests, which program it by hand to show that a function with no domain can neither reach memory nor interrupt.
-        *([] if os.environ.get("OS_PCI_TEST") == "0" else [
-            "-device", "virtio-rng-pci,iommu_platform=on,disable-legacy=on,addr=0x4"]),
+        # IOMMU5, IOMMU8, IOMMU9: the platform IOMMU is on the machine (`iommu-sys=on` in DEFAULT_MACHINE) and the functions of
+        # PCI_DEVICES sit behind it (`iommu_platform=on`: their DMA and their MSI-X messages go through the IOMMU): the entropy function
+        # at 00:04.0, which the suite's `iommu_*`, `iodomain_*` and `msi_*` tests program by hand, the block functions at 00:05.0 and
+        # 00:06.0, which the `pci_*` tests drive (by hand, and through `devmgr`'s claim), the network function at 00:07.0, and
+        # `iommu-testdev` at 00:08.0. `devmgr` enumerates them all.
+        *pci_args(),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
-        # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off
+        # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off OS_DISK=0
         *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") and not rr_args() else []),
         # Record and replay (KT2, TESTING.md): `OS_RECORD=<dir>` boots under QEMU's record mode and the harness keeps the recording only
         # when the boot fails; `OS_REPLAY=<file>` replays one (add OS_GDB=1 to wait for gdb on :1234 first)
         *rr_args(),
-        # The scratch disk (S6): a virtio block device on the modern transport. The kernel itself
-        # never touches it; OS_DISK=0 leaves it off.
-        *([] if os.environ.get("OS_DISK") == "0" else [
-            "-global", "virtio-mmio.force-legacy=false",
-            # (QEMU gives the first device the highest virtio-mmio slot and the device tree lists the
-            # slots lowest first, so the second disk is attached first: the 16 MiB scratch disk is
-            # then device 0 for the suite, and the small one is device 1)
-            "-drive", f"file={second_disk()},if=none,format=raw,id=hd1",
-            "-device", "virtio-blk-device,drive=hd1",
-            "-drive", f"file={scratch_disk()},if=none,format=raw,id=hd0",
-            "-device", "virtio-blk-device,drive=hd0"]),
+        # (no virtio-mmio device: since IOMMU12 the kernel admits none, as their DMA is outside the IOMMU; every disk, the network and
+        # the entropy source are PCI functions, `pci_args`. The wired-interrupt tests use the RTC.)
         *(["-append", " ".join(a for a in ("bench=full" if os.environ.get("OS_BENCH_FULL") == "1" else "",
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
                                            f"shard={SHARD}" if SHARD else "",
@@ -1119,7 +1308,7 @@ def run(kernel: str, extra=()):
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
         # capture of everything the guest and slirp exchange. OS_NET=0 leaves it off; OS_NET_PCAP names the capture;
         # OS_NET_HOSTPORT names the forwarded host port (otherwise a free one is chosen).
-        *([] if os.environ.get("OS_NET") == "0" or SHARD in ("a", "k") else net_args()),
+        *(net_args() if net_on() else []),
         *extra, "-kernel", kernel,
     ]
     if os.environ.get("OS_PROFILE"):
@@ -1130,7 +1319,8 @@ def run(kernel: str, extra=()):
         finally:
             lossy_stop()
     text = out.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    return [l for l in text.split("\n") if l.startswith("##")], status, timed_out, text
+    # (the kernel's `##` lines, and `devmgr`'s, which reach the console behind the kernel's `user: ` prefix: DEVMGR_PCI)
+    return [l for l in text.split("\n") if l.startswith("##") or l.startswith("user: ## devmgr: ")], status, timed_out, text
 
 
 def parse(lines):
@@ -1140,6 +1330,7 @@ def parse(lines):
     LAST_FF.clear()
     LAST_IOMMU_FAULTS.clear()
     LAST_IOMMU_FENCES.clear()
+    LAST_DEVMGR_PCI.clear()
     for line in lines:
         if line.startswith("##FF "):
             LAST_FF.append(line)
@@ -1147,6 +1338,8 @@ def parse(lines):
             LAST_IOMMU_FAULTS.append((int(m[1]), m[2], int(m[3], 16), m[4]))
         elif m := IOMMU_FENCE.match(line):
             LAST_IOMMU_FENCES.append(m[1])
+        elif m := DEVMGR_PCI.match(line):
+            LAST_DEVMGR_PCI.append(m.groups())
         elif m := BOOT.match(line):
             boot = m.groups()
         elif m := TEST.match(line):
@@ -1381,8 +1574,21 @@ def main() -> int:
                     if not any(f[3] == want and f[0] == 258 for f in mine):
                         found.append(f"no '## iommu: fault cause=258 dev={IOMMU_TEST_DEV} ... {want}' line "
                                      f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
-        # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (strict and os.environ.get("OS_DISK") != "0"
+            # IOMMU8: the negative test of the block function (IOMMU-SPEC 15.1 L1) shows on the console as a fault naming it
+            if (any(n == "pci_virtio_outside_its_mapping_faults" and ok for n, ok, _ in tests_run)
+                    and os.environ.get("OS_DISK") != "0"):
+                if not any(f[1] == PCI_BLK_DEV for f in LAST_IOMMU_FAULTS):
+                    found.append(f"no '## iommu: fault ... dev={PCI_BLK_DEV}' line from pci_virtio_outside_its_mapping_faults "
+                                 f"(the IOMMU's lines: {LAST_IOMMU_FAULTS[:8]})")
+            # IOMMU8: `devmgr` listed the bus the command line built, every time it enumerated it
+            found += devmgr_pci_problems()
+            # IOMMU10: no unexpected IOMMU fault over the boot
+            found += iofault_problems(text, tests_run)
+            if SHARD != "k" and strict and not RELEASE_SUITE and not LAST_DEVMGR_PCI and os.environ.get("OS_PCI_TEST") != "0":
+                found.append("devmgr printed no '## devmgr: pci' lines (pci_devices_are_found_and_claimed starts it)")
+        # The interrupt-object test must have run its full path (the RTC's alarm, an interrupt), not skipped: every boot that runs it
+        # (the Kernel tests and shard a; IOMMU12 moved it from the virtio-mmio disk to the RTC, which every machine here has).
+        if (strict and SHARD != "b"
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
         # The block-driver tests must have found the disk and run, with interrupts.
@@ -1391,7 +1597,8 @@ def main() -> int:
             found.append("the block-driver tests did not run with interrupts")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
         # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
-        if strict and os.environ.get("OS_DISK") != "0":
+        # (`device_interrupts_arrive_where_asked` is a System test after the wired-source tests: shard a and the whole suite)
+        if strict and SHARD not in ("b", "k"):
             m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
             if not m:
                 found.append("the kernel did not report the device interrupt counts")
@@ -1405,7 +1612,7 @@ def main() -> int:
         if (strict and not found and os.environ.get("OS_DISK") != "0"
                 and LAST_DISK[0]):
             found += check_disk(LAST_DISK[0])
-            if LAST_DISK2[0]:
+            if LAST_DISK2[0] and SHARD != "k":  # (the kernel-only boot does not run the filesystem tests that format it)
                 found += fsck_second_disk()
         # The device manager found the disk (or, with OS_DISK=0, found none and started nothing).
         if strict and SHARD != "k":  # (the servers these checks look for are System tests: a kernel-only boot has none)
@@ -1447,7 +1654,9 @@ def main() -> int:
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)
             print("--- serial output ---", text, sep="\n", file=sys.stderr)
         else:
-            print(f"os boot test passed: {label} ({len(parse(lines)[1])} tests, exit status {status})")
+            m = re.search(r"^iofaults: suite (\d+)$", text, re.M)
+            faults = f", IOMMU faults {m[1]}, all in deliberate-fault tests" if m else ""
+            print(f"os boot test passed: {label} ({len(parse(lines)[1])} tests, exit status {status}{faults})")
             # where the time goes (guest milliseconds per test, from the suite's `tt:` lines): the smoke budget is watched from here
             tts = []
             for l in text.split("\n"):

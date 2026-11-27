@@ -189,6 +189,7 @@ pub fn app_main() -> i32 {
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
+        121 => return hostile_driver(),
         26 => {
             // take a socket end from the bootstrap channel and drain it to the end of the
             // stream; the exit code is how many bytes arrived
@@ -389,16 +390,25 @@ pub fn app_main() -> i32 {
             if rt::sys::resource_root().status == -3 {
                 code |= 1;
             }
-            if rt::sys::vmo_create_physical(77, 0x1000_1000, 4096).status == -1
-                && rt::sys::vmo_create_dma(77, 1).status == -1
+            // (the RTC's page is a device window; `vmo_create_dma_in` is the DMA call since IOMMU12)
+            if rt::sys::vmo_create_physical(77, 0x10_1000, 4096).status == -1
+                && rt::sys::vmo_create_dma_in(77, 1, 0).status == -1
             {
                 code |= 2;
             }
             let ev = rt::sys::event_create().a1 as u64;
-            if rt::sys::vmo_create_physical(ev, 0x1000_1000, 4096).status == -2
-                && rt::sys::vmo_create_dma(ev, 1).status == -2
+            if rt::sys::vmo_create_physical(ev, 0x10_1000, 4096).status == -2
+                && rt::sys::vmo_create_dma_in(ev, 1, 0).status == -2
             {
                 code |= 4;
+            }
+            // IOMMU8: nor the PCI host's configuration space, a BAR in its memory window, or a function's domain
+            if [(77, -1), (ev, -2)].iter().all(|&(h, e)| {
+                rt::sys::vmo_create_physical(h, 0x3000_0000, 4096).status == e
+                    && rt::sys::vmo_create_physical(h, 0x4000_0000, 4096).status == e
+                    && rt::sys::iodomain_create(h, 0x28, 0).status == e
+            }) {
+                code |= 8;
             }
             return code;
         }
@@ -684,6 +694,120 @@ pub fn app_main() -> i32 {
         _ => {}
     }
     0
+}
+
+/// IOMMU12, the hostile-driver matrix: a driver process that holds exactly the handles it is sent (a device claim's, in the driver's
+/// job) and makes the calls the suite asks for with them, nothing of its own. The first message carries the handles; the reply is
+/// their numbers here (8 bytes each). Then each request is eight words: an operation (0 a system call by number, 1 the library's
+/// `sys_vmo_phys_addr`, 2 its two-argument `sys_vmo_create_dma`, 3 map one of its handles into itself anywhere (handle, offset,
+/// bytes, permissions; `a1` the address), 4 a store to its own memory or device mapping (address, width 1, 2, 4 or 8, value), 5 a load
+/// (address, width; `a1` the value), anything else exit), the number and six arguments; the reply is three words, the status
+/// (sign-extended), `a1` and `a2`. A closed channel ends it too. With 3 to 5 it drives its device itself: it writes the descriptors
+/// in its rings and rings the doorbell in its own mapping of the register BAR it was given.
+fn hostile_driver() -> i32 {
+    let rd = |m: &mut [u8], h: &mut [u64]| {
+        if rt::sys::object_wait(
+            rt::BOOTSTRAP,
+            rt::abi::signals::READABLE | rt::abi::signals::PEER_CLOSED,
+            u64::MAX,
+        )
+        .status
+            != 0
+        {
+            return None;
+        }
+        let r = rt::sys::channel_read(
+            rt::BOOTSTRAP,
+            m.as_mut_ptr(),
+            m.len(),
+            h.as_mut_ptr(),
+            h.len(),
+        );
+        (r.status == 0).then_some((r.a1, r.a2))
+    };
+    let mut m = [0u8; 64];
+    let mut hs = [0u64; 16];
+    let Some((_, n)) = rd(&mut m, &mut hs) else {
+        return 100;
+    };
+    let mut out = [0u8; 128];
+    for (i, h) in hs[..n].iter().enumerate() {
+        out[8 * i..8 * i + 8].copy_from_slice(&h.to_le_bytes());
+    }
+    rt::sys::channel_write(rt::BOOTSTRAP, out.as_ptr(), 8 * n, core::ptr::null(), 0);
+    loop {
+        let Some((len, _)) = rd(&mut m, &mut []) else {
+            return 0;
+        };
+        if len != 64 {
+            return 101;
+        }
+        let w = |i: usize| u64::from_le_bytes(m[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
+        let args = [w(2), w(3), w(4), w(5), w(6), w(7)].map(|a| a as usize);
+        let r = match w(0) {
+            0 => rt::syscall(w(1) as usize, args),
+            1 => rt::sys::vmo_phys_addr(w(2)),
+            2 => rt::sys::vmo_create_dma(w(2), w(3)),
+            3 => {
+                let me = rt::sys::process_self();
+                if me.status != 0 {
+                    me
+                } else {
+                    let r = rt::sys::process_map(
+                        me.a1 as u64,
+                        w(2),
+                        0,
+                        w(3),
+                        w(4),
+                        w(5) | rt::abi::map_flags::ANYWHERE,
+                    );
+                    rt::sys::handle_close(me.a1 as u64);
+                    r
+                }
+            }
+            4 => {
+                let a = w(2) as usize;
+                // SAFETY: none in the usual sense: this process is a deliberately hostile driver that stores wherever the suite tells it
+                // to (its own mappings, by the protocol); a wrong address faults the process, which the suite sees as a dead driver.
+                unsafe {
+                    match w(3) {
+                        1 => core::ptr::write_volatile(a as *mut u8, w(4) as u8),
+                        2 => core::ptr::write_volatile(a as *mut u16, w(4) as u16),
+                        4 => core::ptr::write_volatile(a as *mut u32, w(4) as u32),
+                        _ => core::ptr::write_volatile(a as *mut u64, w(4)),
+                    }
+                }
+                rt::Ret {
+                    status: 0,
+                    a1: 0,
+                    a2: 0,
+                }
+            }
+            5 => {
+                let a = w(2) as usize;
+                // SAFETY: as for 4, a load.
+                let v = unsafe {
+                    match w(3) {
+                        1 => u64::from(core::ptr::read_volatile(a as *const u8)),
+                        2 => u64::from(core::ptr::read_volatile(a as *const u16)),
+                        4 => u64::from(core::ptr::read_volatile(a as *const u32)),
+                        _ => core::ptr::read_volatile(a as *const u64),
+                    }
+                };
+                rt::Ret {
+                    status: 0,
+                    a1: v as usize,
+                    a2: 0,
+                }
+            }
+            _ => return 0,
+        };
+        let mut rep = [0u8; 24];
+        rep[..8].copy_from_slice(&(i64::from(r.status) as u64).to_le_bytes());
+        rep[8..16].copy_from_slice(&(r.a1 as u64).to_le_bytes());
+        rep[16..].copy_from_slice(&(r.a2 as u64).to_le_bytes());
+        rt::sys::channel_write(rt::BOOTSTRAP, rep.as_ptr(), 24, core::ptr::null(), 0);
+    }
 }
 
 #[repr(align(16))]

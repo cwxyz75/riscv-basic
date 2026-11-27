@@ -1,14 +1,31 @@
-//! `netdrv`: the virtio-net driver (S8, NET-SPEC 5). It moves frames between the device and the stack through the
-//! shared rings and **never maps a packet pool** (the stack owns packet memory; the driver knows only slot numbers and
-//! lengths, and the device's physical addresses). It negotiates only VERSION_1 and MAC.
+//! `netdrv`: the virtio-net driver (S8, NET-SPEC 5, as amended 2026-11-25; IOMMU11), on a `virtio-net-pci` function behind the
+//! IOMMU. It moves frames between the device and the stack through the shared rings and **never maps a packet pool** into its own
+//! address space (the stack owns packet memory; the driver knows only slot numbers and lengths, and the pools' I/O addresses). It
+//! negotiates `VIRTIO_F_VERSION_1`, `VIRTIO_F_ACCESS_PLATFORM` (without which the device would bypass the IOMMU) and
+//! `VIRTIO_NET_F_MAC`, and refuses every other feature the PCI device offers (checksum offload, GSO, mergeable receive buffers,
+//! which would change the header's size, the control queue).
 //!
-//! Handles (startup message): `NetMmio`, `NetRxDma`, `NetTxDma`, `NetQueueDma` (DMA right), optionally `NetIrq`,
-//! `NetRing`, the two doorbell events and the control channel `NetCtl`.
+//! Handles (startup message, all from its supervisor `netsup`, which claimed the function from `devmgr`): `NetMmio` (a VMO over the
+//! BAR with the virtio structures; their layout is the second argument, `proto::devmgr::encode_claim_arg`), `DeviceDomain` (the
+//! device's domain with IO_MAP and IO_UNMAP only), `NetRxDma` (DMA, READ, WRITE), `NetTxDma` (DMA and READ, **no WRITE**),
+//! `NetQueueDma` (DMA, READ, WRITE, MAP), the interrupts `DeviceIrqConfig`, `DeviceIrqQueue0` (receive) and `DeviceIrqQueue1`
+//! (transmit), `NetRing`, the two doorbell events and the control channel `NetCtl`. It holds no physical address, no control right
+//! on its domain, no MSI-X table and no configuration space.
+//!
+//! **The driver maps** (IOMMU-SPEC 4.1, 9): every time it starts it maps the three DMA VMOs into its device's domain itself, the
+//! queue memory and the receive pool read-write for the device and the **transmit pool read-only** for the device (its handle has
+//! no WRITE, so nothing else is possible: a device can never overwrite a frame the stack is sending), and programs the queues with
+//! the I/O addresses `iodomain_map` returned. A restarted driver has a new domain (its supervisor re-claimed the function), so it
+//! learns the addresses afresh. On its way out it resets the device and unmaps what it mapped (IOMMU-SPEC 10.1).
 //!
 //! Lifecycle (5.6): reset the device, bring it up, zero the rings, bump the generation, post every receive slot, set
 //! `state = DRIVER_READY` and send READY; the stack answers ATTACH{generation} and `state` becomes STACK_ATTACHED. A DETACH or
 //! the control channel closing ends the driver (exit 0): the supervisor starts a fresh one, which is a re-attach with
 //! `generation + 1`. A violation by the peer ends it with code 30; a device that is not usable with 20 to 24 (no restart).
+//!
+//! Wake sources: the device's three vectors (there is no mode without interrupts), the stack's doorbell, the control channel, and the
+//! safety poll of 5.5 (every 10 ms). Device work that only the safety poll found (a timeout with work in a used ring and no vector
+//! signalled) is counted (`stat::POLL_FOUND`): a quiet run must count none, or a vector is broken.
 #![no_std]
 #![no_main]
 
@@ -22,43 +39,33 @@ use netring::{
     SLOTS, SLOT_SIZE,
 };
 use netshm::Shm;
+use proto::devmgr::{self, PciClaim};
 use proto::startup::Role;
 use rt::abi::signals;
 use rt::abi::status::Status as Sys;
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
+use virtio::Transport;
 
-const MMIO_VA: u64 = 0x600_0000;
+/// Where the BAR, the queue memory and the ring VMO are mapped in this process.
+const BAR_VA: u64 = 0x600_0000;
 const QUEUE_VA: u64 = 0x500_0000;
 const RING_VA: u64 = 0x510_0000;
 const PF_RW: u64 = 3;
+/// The largest BAR this driver maps (a virtio-net-pci BAR is 16 KiB on QEMU).
+const MAX_BAR: u64 = 1 << 20;
+/// `iodomain_map`'s access: the device may read (1), or read and write (3).
+const IO_R: u64 = 1;
+const IO_RW: u64 = 3;
+const PAGE: u64 = 4096;
+/// The pools' and the queue memory's sizes (NET-SPEC 5.1): the claim says the same, and a handle of another size is refused.
+const POOL_PAGES: u64 = (SLOTS * SLOT_SIZE) as u64 / PAGE;
+const QUEUE_PAGES: u64 = 2;
 
-// virtio-mmio registers (modern transport, version 2)
-const MAGIC: usize = 0x000;
-const VERSION: usize = 0x004;
-const DEVICE_ID: usize = 0x008;
-const DEVICE_FEATURES: usize = 0x010;
-const DEVICE_FEATURES_SEL: usize = 0x014;
-const DRIVER_FEATURES: usize = 0x020;
-const DRIVER_FEATURES_SEL: usize = 0x024;
-const QUEUE_SEL: usize = 0x030;
-const QUEUE_NUM_MAX: usize = 0x034;
-const QUEUE_NUM: usize = 0x038;
-const QUEUE_READY: usize = 0x044;
-const QUEUE_NOTIFY: usize = 0x050;
-const INTERRUPT_STATUS: usize = 0x060;
-const INTERRUPT_ACK: usize = 0x064;
-const STATUS: usize = 0x070;
-const QUEUE_DESC: usize = 0x080;
-const QUEUE_DRIVER: usize = 0x090;
-const QUEUE_DEVICE: usize = 0x0a0;
-const CONFIG: usize = 0x100;
-
-const S_ACK: u32 = 1;
-const S_DRIVER: u32 = 2;
-const S_DRIVER_OK: u32 = 4;
-const S_FEATURES_OK: u32 = 8;
-const F_MAC: u32 = 1 << 5;
+/// VIRTIO_NET_F_MAC (VIRTIO 1.x 5.1.3): the one device feature asked for (the transport adds VERSION_1 and ACCESS_PLATFORM).
+const F_MAC: u64 = 1 << 5;
+/// How long a reset may take to read back 0 (ticks).
+const RESET_MS: u64 = 1000;
 
 // virtqueue layout inside each queue's page
 const QSIZE: u16 = 128;
@@ -79,13 +86,56 @@ const EXIT_CTL: i32 = 31;
 /// The safety poll (5.5): the loops re-poll at least this often (ticks of 1 ms).
 const POLL_TICKS: u64 = 10;
 
-fn rd(off: usize) -> u32 {
-    // SAFETY: MMIO_VA maps the device's 4 KiB register page for this process.
-    unsafe { core::ptr::read_volatile((MMIO_VA as usize + off) as *const u32) }
+/// The BAR's registers, mapped at BAR_VA for `span` bytes: an access outside it, or not aligned, is not made (a read gives all
+/// ones).
+struct Bar {
+    span: u64,
 }
-fn wr(off: usize, v: u32) {
-    // SAFETY: as in `rd`.
-    unsafe { core::ptr::write_volatile((MMIO_VA as usize + off) as *mut u32, v) }
+
+impl Bar {
+    fn at(&self, off: u64, width: u64) -> Option<u64> {
+        (off.is_multiple_of(width) && off.checked_add(width)? <= self.span).then_some(BAR_VA + off)
+    }
+}
+
+impl virtio::Regs for Bar {
+    fn read8(&self, off: u64) -> u8 {
+        // SAFETY: BAR_VA maps the BAR VMO (`span` bytes, device memory) read-write for as long as the driver runs (`app_main`), and
+        // `at` gives an address only when the access lies inside it and is aligned.
+        self.at(off, 1).map_or(u8::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u8)
+        })
+    }
+    fn read16(&self, off: u64) -> u16 {
+        // SAFETY: as `read8`.
+        self.at(off, 2).map_or(u16::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u16)
+        })
+    }
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: as `read8`.
+        self.at(off, 4).map_or(u32::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u32)
+        })
+    }
+    fn write8(&mut self, off: u64, v: u8) {
+        if let Some(a) = self.at(off, 1) {
+            // SAFETY: as `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u8, v) }
+        }
+    }
+    fn write16(&mut self, off: u64, v: u16) {
+        if let Some(a) = self.at(off, 2) {
+            // SAFETY: as `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u16, v) }
+        }
+    }
+    fn write32(&mut self, off: u64, v: u32) {
+        if let Some(a) = self.at(off, 4) {
+            // SAFETY: as `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u32, v) }
+        }
+    }
 }
 fn q16(off: usize) -> u16 {
     // SAFETY: QUEUE_VA maps the two-page queue area; callers pass offsets inside it.
@@ -116,10 +166,16 @@ fn qbase(q: usize) -> usize {
     q * 4096
 }
 
+/// The device's three interrupts, in `Drv::irqs`: the configuration change (0), receive (queue 0) and transmit (queue 1).
+const IRQ_RX: usize = 1;
+const IRQ_TX: usize = 2;
+
 struct Drv {
     shm: Shm,
-    tx_pa: u64,
-    irq: Option<u64>,
+    t: virtio::PciTransport<Bar>,
+    /// The transmit pool's I/O address (read-only for the device).
+    tx_io: u64,
+    irqs: [u64; 3],
     ev_stack: u64,
     ev_me: u64,
     ctl: u64,
@@ -158,9 +214,9 @@ impl Drv {
         w16(qbase(0) + AVAIL + 2, self.rx_avail);
     }
 
-    fn kick(&self, q: u32) {
+    fn kick(&mut self, q: u16) {
         fence();
-        wr(QUEUE_NOTIFY, q);
+        self.t.notify(q);
     }
 
     /// One pass over everything that can move; `Err(code)` is an exit code.
@@ -270,7 +326,7 @@ impl Drv {
                     .mv(e.slot, Slot::StackFree, Slot::DeviceHas)
                     .map_err(|_| self.violation("tx_ready named a slot the stack did not own"))?;
                 let d = qbase(1) + DESC + 16 * e.slot as usize;
-                w64(d, self.tx_pa + u64::from(e.slot) * SLOT_SIZE as u64);
+                w64(d, self.tx_io + u64::from(e.slot) * SLOT_SIZE as u64);
                 w32(d + 8, (HDR_LEN + usize::from(e.len)) as u32);
                 w16(d + 12, 0);
                 w16(d + 14, 0);
@@ -334,87 +390,144 @@ impl Drv {
         }
         let r = sys::port_wait(self.port, sys::clock_get() + POLL_TICKS);
         netring::Mem::store(&self.shm, ctl::DRV_WAITING, 0);
-        if r.status() == Some(Sys::Ok) {
-            match r.a1 as u64 {
+        match r.status() {
+            Some(Sys::Ok) => match r.a1 as u64 {
                 1 => {
                     let _ = sys::event_signal(self.ev_me, 1 << 24 | 1 << 25, 0);
                 }
-                2 => {
-                    // quiet the device's line, then let the kernel unmask the source
-                    wr(INTERRUPT_ACK, rd(INTERRUPT_STATUS));
-                    if let Some(irq) = self.irq {
+                // a vector fired: acknowledge it (an MSI-X vector needs nothing quietened on the device); the work loop reads the
+                // used rings next. The configuration change asks for nothing: the link is reported up from the start.
+                k @ 4..=6 => {
+                    if let Some(&irq) = self.irqs.get((k - 4) as usize) {
                         sys::interrupt_ack(irq);
                     }
                 }
                 _ => {}
+            },
+            Some(Sys::TimedOut) => {
+                // the safety poll: device work no vector announced is counted (a quiet run must find none)
+                fence();
+                let rx_moved = q16(qbase(0) + USED + 2) != self.rx_seen;
+                let tx_moved = q16(qbase(1) + USED + 2) != self.tx_seen;
+                // each queue that moved is checked against its own vector (another queue's pending message proves nothing). The
+                // device writes the used ring before it sends the message, so a timeout can fall between the two: the vector gets a
+                // grace of 10 ms (a working one arrives within microseconds) before the work counts as found only by the poll
+                for (moved, i) in [(rx_moved, IRQ_RX), (tx_moved, IRQ_TX)] {
+                    let irq = self.irqs[i];
+                    if moved
+                        && sys::object_wait(irq, signals::INTERRUPT, sys::clock_get() + 10).status
+                            != 0
+                    {
+                        self.shm.count(stat::POLL_FOUND);
+                    }
+                }
             }
+            _ => {}
         }
     }
 }
 
-/// Reset the device and wait until it says it is done.
-fn device_reset() -> Result<(), i32> {
-    wr(STATUS, 0);
-    let mut spins = 0u32;
-    while rd(STATUS) != 0 {
-        spins += 1;
-        if spins > 1_000_000 {
-            return Err(EXIT_RESET);
-        }
-    }
-    Ok(())
+/// The device's handles and where they go.
+struct Handles {
+    dom: u64,
+    rx: u64,
+    tx: u64,
+    q: u64,
 }
 
-fn device_init(queue_pa: u64) -> Result<[u8; 6], i32> {
-    if rd(MAGIC) != 0x7472_6976 || rd(VERSION) != 2 || rd(DEVICE_ID) != 1 {
-        return Err(EXIT_NO_DEVICE);
+/// The I/O addresses of the three mappings (queue memory, receive pool, transmit pool), once made.
+struct Mapped {
+    q: u64,
+    rx: u64,
+    tx: u64,
+}
+
+/// The pages of a VMO, if it is a whole number of them.
+fn pages_of(vmo: u64) -> Option<u64> {
+    let r = sys::vmo_get_size(vmo);
+    let bytes = r.a1 as u64;
+    (r.status() == Some(Sys::Ok) && bytes > 0 && bytes.is_multiple_of(PAGE)).then_some(bytes / PAGE)
+}
+
+/// Map the three DMA VMOs into the device's domain: the queue memory and the receive pool read-write for the device, the
+/// transmit pool read-only (its handle has no WRITE: a read-write map would be ACCESS_DENIED). Anything mapped before a failure is
+/// unmapped again.
+fn map_into_domain(h: &Handles) -> Result<Mapped, i32> {
+    let mut made: [(u64, u64); 3] = [(0, 0); 3];
+    for (n, (vmo, pages, access)) in [
+        (h.q, QUEUE_PAGES, IO_RW),
+        (h.rx, POOL_PAGES, IO_RW),
+        (h.tx, POOL_PAGES, IO_R),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = sys::iodomain_map(h.dom, vmo, 0, pages, access);
+        if r.status() != Some(Sys::Ok) {
+            for &(io, p) in &made[..n] {
+                let _ = sys::iodomain_unmap(h.dom, io, p);
+            }
+            return Err(5);
+        }
+        made[n] = (r.a1 as u64, pages);
     }
-    wr(STATUS, S_ACK);
-    wr(STATUS, S_ACK | S_DRIVER);
-    wr(DEVICE_FEATURES_SEL, 0);
-    let low = rd(DEVICE_FEATURES);
-    wr(DEVICE_FEATURES_SEL, 1);
-    if rd(DEVICE_FEATURES) & 1 == 0 {
-        return Err(EXIT_NO_VERSION_1);
+    Ok(Mapped {
+        q: made[0].0,
+        rx: made[1].0,
+        tx: made[2].0,
+    })
+}
+
+fn unmap_from_domain(h: &Handles, m: &Mapped) {
+    for (io, pages) in [(m.q, QUEUE_PAGES), (m.rx, POOL_PAGES), (m.tx, POOL_PAGES)] {
+        let _ = sys::iodomain_unmap(h.dom, io, pages);
     }
-    if low & F_MAC == 0 {
+}
+
+/// Bring the device up on the queue memory at I/O address `q_io` (the virtio initialisation of VIRTIO 1.x 3.1.1, through the
+/// transport): the features, the configuration vector, the two queues with their vectors, DRIVER_OK; the MAC from the device's
+/// configuration. `Err` is an exit code.
+fn device_init(
+    t: &mut virtio::PciTransport<Bar>,
+    claim: &PciClaim,
+    q_io: u64,
+) -> Result<[u8; 6], i32> {
+    let entry = |what: u16| claim.irq(what).map(|(_, e)| e).ok_or(3);
+    let (config, rx, tx) = (entry(devmgr::IRQ_CONFIG)?, entry(0)?, entry(1)?);
+    let accepted = t.negotiate(F_MAC).map_err(|e| match e {
+        virtio::Error::MissingFeature(_) => EXIT_NO_VERSION_1,
+        _ => EXIT_FEATURES,
+    })?;
+    // only VERSION_1, ACCESS_PLATFORM and MAC: no checksum offload, no GSO, no mergeable buffers, no control queue
+    if accepted != F_MAC | virtio::feature::REQUIRED {
         return Err(EXIT_FEATURES);
     }
-    // only VERSION_1 and MAC: no checksum offload, no GSO, no mergeable buffers, no control queue
-    wr(DRIVER_FEATURES_SEL, 0);
-    wr(DRIVER_FEATURES, F_MAC);
-    wr(DRIVER_FEATURES_SEL, 1);
-    wr(DRIVER_FEATURES, 1);
-    wr(STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
-    if rd(STATUS) & S_FEATURES_OK == 0 {
-        return Err(EXIT_FEATURES);
-    }
-    for q in 0..2usize {
-        wr(QUEUE_SEL, q as u32);
-        if rd(QUEUE_READY) != 0 || rd(QUEUE_NUM_MAX) < u32::from(QSIZE) {
+    t.set_config_vector(config).map_err(|_| EXIT_QUEUE)?;
+    for (q, vector) in [(0u16, rx), (1, tx)] {
+        if t.queue_max(q) < QSIZE {
             return Err(EXIT_QUEUE);
         }
-        wr(QUEUE_NUM, u32::from(QSIZE));
-        let base = queue_pa + qbase(q) as u64;
-        for (reg, at) in [
-            (QUEUE_DESC, DESC),
-            (QUEUE_DRIVER, AVAIL),
-            (QUEUE_DEVICE, USED),
-        ] {
-            let pa = base + at as u64;
-            wr(reg, pa as u32);
-            wr(reg + 4, (pa >> 32) as u32);
-        }
-        wr(QUEUE_READY, 1);
+        let base = q_io + qbase(usize::from(q)) as u64;
+        t.setup_queue(
+            q,
+            QSIZE,
+            (base + DESC as u64, base + AVAIL as u64, base + USED as u64),
+            vector,
+        )
+        .map_err(|_| EXIT_QUEUE)?;
     }
-    wr(STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
+    t.driver_ok();
     let mut mac = [0u8; 6];
     for (i, m) in mac.iter_mut().enumerate() {
-        // config space bytes
-        // SAFETY: MMIO_VA maps the register page; the config space starts at CONFIG.
-        *m = unsafe { core::ptr::read_volatile((MMIO_VA as usize + CONFIG + i) as *const u8) };
+        *m = t.config_read8(i as u64).ok_or(EXIT_FEATURES)?;
     }
     Ok(mac)
+}
+
+fn reset(t: &mut virtio::PciTransport<Bar>) -> Result<(), i32> {
+    let until = sys::clock_get() + RESET_MS;
+    t.reset(&mut || sys::clock_get() < until)
+        .map_err(|_| EXIT_RESET)
 }
 
 #[no_mangle]
@@ -424,58 +537,76 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
+    let Some(claim) = env
+        .startup
+        .args
+        .get(1)
+        .and_then(|a| devmgr::decode_claim_arg(a))
+    else {
+        return 3;
+    };
+    let h = |r| env.handle(r);
     let (
-        Some(mmio),
-        Some(rx_dma),
-        Some(tx_dma),
-        Some(q_dma),
+        Some(bar),
+        Some(dom),
+        Some(rx),
+        Some(tx),
+        Some(q),
+        Some(irq_config),
+        Some(irq_rx),
+        Some(irq_tx),
         Some(ring),
         Some(ev_stack),
         Some(ev_me),
         Some(ctl_ch),
     ) = (
-        env.handle(Role::NetMmio),
-        env.handle(Role::NetRxDma),
-        env.handle(Role::NetTxDma),
-        env.handle(Role::NetQueueDma),
-        env.handle(Role::NetRing),
-        env.handle(Role::NetEventToStack),
-        env.handle(Role::NetEventToDriver),
-        env.handle(Role::NetCtl),
+        h(Role::NetMmio),
+        h(Role::DeviceDomain),
+        h(Role::NetRxDma),
+        h(Role::NetTxDma),
+        h(Role::NetQueueDma),
+        h(Role::DeviceIrqConfig),
+        h(Role::DeviceIrqQueue0),
+        h(Role::DeviceIrqQueue1),
+        h(Role::NetRing),
+        h(Role::NetEventToStack),
+        h(Role::NetEventToDriver),
+        h(Role::NetCtl),
     )
     else {
         return 3;
     };
-    let irq = env.handle(Role::NetIrq);
+    if (claim.vendor, claim.device) != (0x1af4, 0x1041) {
+        return EXIT_NO_DEVICE; // not a modern virtio-net-pci function
+    }
+    if claim.bar_bytes == 0 || claim.bar_bytes > MAX_BAR || !claim.bar_bytes.is_multiple_of(PAGE) {
+        return 3;
+    }
+    if pages_of(q) != Some(QUEUE_PAGES)
+        || pages_of(rx) != Some(POOL_PAGES)
+        || pages_of(tx) != Some(POOL_PAGES)
+    {
+        return 3;
+    }
     let me = sys::process_self().a1 as u64;
-    for (vmo, va, pages) in [
-        (mmio, MMIO_VA, 1u64),
-        (q_dma, QUEUE_VA, 2),
-        (ring, RING_VA, 2),
+    for (vmo, va, bytes) in [
+        (bar, BAR_VA, claim.bar_bytes),
+        (q, QUEUE_VA, QUEUE_PAGES * PAGE),
+        (ring, RING_VA, 2 * PAGE),
     ] {
-        if sys::process_map(me, vmo, va, 0, pages * 4096, PF_RW).status != 0 {
+        if sys::process_map(me, vmo, va, 0, bytes, PF_RW).status != 0 {
             return 4;
         }
     }
-    let (rx_r, tx_r, q_r) = (
-        sys::vmo_phys_addr(rx_dma),
-        sys::vmo_phys_addr(tx_dma),
-        sys::vmo_phys_addr(q_dma),
-    );
-    if rx_r.status != 0 || tx_r.status != 0 || q_r.status != 0 {
-        return 4;
-    }
-    let (rx_pa, tx_pa, q_pa) = (rx_r.a1 as u64, tx_r.a1 as u64, q_r.a1 as u64);
+    let mut t = transport(&claim);
     let shm = Shm {
         base: RING_VA as usize,
     };
     // the stack must stop reading the rings before anything below changes them
     netring::Mem::store(&shm, ctl::STATE, netring::state::NONE);
-    // the queue memory may hold a dead driver's queues: reset the device first (nothing writes it after that), then clean it
-    if rd(MAGIC) != 0x7472_6976 || rd(VERSION) != 2 || rd(DEVICE_ID) != 1 {
-        return EXIT_NO_DEVICE;
-    }
-    if let Err(code) = device_reset() {
+    // the queue memory may hold a dead driver's queues: reset the device first (the supervisor did at the re-claim, and a driver
+    // starts from a known state; nothing writes the queues after it), then clean it
+    if let Err(code) = reset(&mut t) {
         return code;
     }
     for q in 0..2usize {
@@ -483,14 +614,64 @@ pub fn app_main() -> i32 {
             w32(qbase(q) + 4 * i, 0);
         }
     }
-    let mac = match device_init(q_pa) {
+    let handles = Handles { dom, rx, tx, q };
+    // the buffers go into the domain here, at addresses the kernel chooses: the device is programmed with what came back
+    let io = match map_into_domain(&handles) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let code = run(
+        &env,
+        t,
+        &claim,
+        &io,
+        shm,
+        [irq_config, irq_rx, irq_tx],
+        (ev_stack, ev_me, ctl_ch),
+    );
+    // a clean exit (IOMMU-SPEC 10.1 step 1): the device stopped, then the buffers out of the domain
+    let mut t = transport(&claim);
+    let _ = reset(&mut t);
+    unmap_from_domain(&handles, &io);
+    code
+}
+
+/// The transport over the BAR mapped at BAR_VA, where the claim says the virtio structures are.
+fn transport(claim: &PciClaim) -> virtio::PciTransport<Bar> {
+    virtio::PciTransport::new(
+        Bar {
+            span: claim.bar_bytes,
+        },
+        virtio::PciLocations {
+            common: u64::from(claim.common.0),
+            notify: u64::from(claim.notify.0),
+            notify_len: u64::from(claim.notify.1),
+            notify_multiplier: claim.notify_multiplier,
+            isr: u64::from(claim.isr.0),
+            device: (claim.device_cfg.1 != 0)
+                .then(|| (u64::from(claim.device_cfg.0), u64::from(claim.device_cfg.1))),
+        },
+    )
+}
+
+/// The driver from bring-up to exit; the exit code.
+fn run(
+    env: &startup::Env,
+    mut t: virtio::PciTransport<Bar>,
+    claim: &PciClaim,
+    io: &Mapped,
+    shm: Shm,
+    irqs: [u64; 3],
+    (ev_stack, ev_me, ctl_ch): (u64, u64, u64),
+) -> i32 {
+    let mac = match device_init(&mut t, claim, io.q) {
         Ok(m) => m,
         Err(code) => return code,
     };
     // static descriptors: every receive slot is posted with its fixed buffer
     for i in 0..SLOTS {
         let d = qbase(0) + DESC + 16 * i;
-        w64(d, rx_pa + (i * SLOT_SIZE) as u64);
+        w64(d, io.rx + (i * SLOT_SIZE) as u64);
         w32(d + 8, SLOT_SIZE as u32);
         w16(d + 12, DESC_WRITE);
         w16(d + 14, 0);
@@ -514,14 +695,15 @@ pub fn app_main() -> i32 {
     }
     let port = p.a1 as u64;
     let _ = sys::port_bind(port, ev_me, 1 << 24, 1);
-    if let Some(i) = irq {
-        let _ = sys::port_bind(port, i, signals::INTERRUPT, 2);
+    for (k, &i) in irqs.iter().enumerate() {
+        let _ = sys::port_bind(port, i, signals::INTERRUPT, 4 + k as u64);
     }
     let _ = sys::port_bind(port, ctl_ch, signals::READABLE | signals::PEER_CLOSED, 3);
     let mut d = Drv {
         shm,
-        tx_pa,
-        irq,
+        t,
+        tx_io: io.tx,
+        irqs,
         ev_stack,
         ev_me,
         ctl: ctl_ch,
@@ -541,7 +723,7 @@ pub fn app_main() -> i32 {
         d.post_rx(i);
     }
     d.kick(0);
-    netring::Mem::store(&shm, ctl::STATE, netring::state::DRIVER_READY);
+    netring::Mem::store(&d.shm, ctl::STATE, netring::state::DRIVER_READY);
     let ready = msg::encode_ready(d.txid, generation, mac, true);
     if sys::channel_write(ctl_ch, ready.as_ptr(), ready.len(), core::ptr::null(), 0).status != 0 {
         return EXIT_CTL;
