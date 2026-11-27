@@ -609,3 +609,13 @@ this amendment says what it supersedes here. Section numbers and line numbers ar
 9. **Section 4.1 (Frames).** "Contiguous allocation (DMA) is an ordinary higher-order allocation." Superseded for DMA: a DMA VMO's frames are
    not promised contiguous and are taken as ordinary single frames (IOMMU-SPEC 4.7); a device sees a contiguous range of I/O addresses whatever
    the frames are. Higher-order allocation stands for what the kernel itself needs contiguous (among them a device domain's 16 KiB root table).
+
+## Amendment 2026-11-27 (Q-KONLY-SERVERS): the kernel-only boot may start the device servers its tests need
+
+Amendment authorized by the owner, 2026-11-27 (answers Q-KONLY-SERVERS; OD176).
+
+Section 8, tier 1: "a **kernel-only boot**: the kernel, `init` and the kernel-facing tests of the suite, with no servers". The
+boot starts **no system servers** (no file system, no network stack, no session). A kernel-facing test **may start the device
+servers it needs** (`devmgr` and the driver under test) and must tear them down itself before it ends. Such tests exercise kernel
+paths (device domains, vector grants, the teardown order) that a real driver reaches only through its supervisor, and the
+end-of-session leak oracles still find nothing live.

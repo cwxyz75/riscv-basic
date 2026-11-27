@@ -1149,3 +1149,33 @@ self-test stays a counted skip until it works". IOMMU5 (#581) established it: on
 `tr_req_iova` and `tr_req_ctl` completes, and its response agrees with `iommucore::iopt` for mapped, read-only and unmapped pages.
 **A11 holds as observed.** `iommu_translation_matches_the_tables` is therefore a real check at every kernel-only boot, not a
 counted skip; the skip (which the boot script refuses, section 13) remains only for an IOMMU that does not report the interface.
+
+## Amendment 2026-11-27: the fault line's direction, and no test device that reads physical memory (Q-IOMMU-FAULTDIR, T282)
+
+### 1. "A message is a write" means an MSI (OD174)
+
+Amendment authorized by the owner, 2026-11-27 (answers Q-IOMMU-FAULTDIR).
+
+The last sentence of 7.2, "A message is a write.", reads: **"An MSI is reported as a write."** It covers a faulting MSI only (an
+MSI is a memory write on the bus). It says nothing about the other transactions the IOMMU classes as messages (ATS and page
+requests), which this kernel does not enable (section 14). No code changes: the decoder already reports a faulting MSI as `write`.
+
+### 2. The test machines carry no device that reads physical memory (OD175)
+
+Amendment authorized by the owner, 2026-11-27 (answers T282).
+
+QEMU's `iommu-testdev` verifies the word it wrote at a **physical** address, outside the IOMMU, and its BAR lies in the admitted
+PCI memory window, so the holder of the root resource could use it to probe physical memory, the kernel's included. A test
+machine that can do that contradicts section 1 and D2 however few programs can reach it. It is therefore **removed**:
+
+1. **No test machine and no boot starts `iommu-testdev`**, in any build, and the boot script refuses a command line that names it.
+   This is a limit of the machine like L1, and 15.1 gains: **L7. No device of a test machine reads or reports memory at a
+   physical address.** A device that can be commanded to is not added to a test machine.
+2. **Section 13's independent device, A10, and the 2026-11-25 amendment, point 4.** "QEMU's IOMMU test device where it can do
+   what the check needs, otherwise a virtio-pci function driven by hand" becomes: **a virtio-pci function driven by hand**, for
+   memory and for messages. Its result in the machine is read from the IOMMU's fault queue and the domain's fault records, from the
+   memory the device was or was not allowed to write (targets and bystanders intact), and, for translation, from the IOMMU's debug
+   translation interface (A11). A10 is closed: nothing depends on what `iommu-testdev` can be commanded to do.
+3. **Checks that aimed a device at a frame's physical address** (`iodomain_maps_exactly_what_was_granted`, the hostile-driver
+   matrix) aim the hand-driven virtio-pci function there instead, and show the refusal by the fault record and the intact
+   memory, not by a read-back at the physical address.
