@@ -883,12 +883,15 @@ fn big_messages_are_copied_outside_the_call() {
     );
     assert_eq!(r.unwrap().unwrap(), (Some(4096), Some(0)));
     let d = d.expect("a big message is left for the caller");
-    assert_eq!((d.bytes_at, d.data, d.handles.len()), (at, msg.clone(), 0));
+    assert_eq!((d.bytes_at, &d.data, d.nhandles), (at, &msg, 0));
     assert_eq!(
         w.peek(at, 16),
         vec![0u8; 16],
         "nothing was copied by the call"
     );
+    // (OD161) nothing was taken either: the caller copies, then commits
+    assert_eq!(w.finish(&d), Some(Ok((Some(4096), Some(0)))));
+    assert_eq!(w.peek(at, 4096), msg);
     // a small message is copied by the call itself
     w.poke(BASE, b"small");
     w.ok(nr::CHANNEL_WRITE, [x, BASE, 5, 0, 0, 0]);

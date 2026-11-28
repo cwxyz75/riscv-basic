@@ -400,6 +400,21 @@ impl HandleTable {
         Ok(entry)
     }
 
+    /// Undo an `insert` whose handle the caller never saw (OD161: a read whose copy of the handle numbers failed puts the message's handles back):
+    /// the slot is freed and its reference moves back to the caller, whatever the rights. The barriers are those of `remove_for_transfer`.
+    pub fn take_back<T: Object>(
+        &mut self,
+        reg: &mut Registry<T>,
+        h: Handle,
+    ) -> Result<Entry, Status> {
+        let slot = self.decode(h).ok_or(Status::BadHandle)?;
+        let entry = self.remove(slot);
+        reg.shade(entry.obj);
+        reg.touch_forced(entry.obj);
+        reg.handle_gone(entry.obj, self.id, h.0);
+        Ok(entry)
+    }
+
     /// Check that `h` is live and transferable without removing it.
     pub fn check_transferable(&self, h: Handle) -> Result<Entry, Status> {
         let entry = self.get(h)?;

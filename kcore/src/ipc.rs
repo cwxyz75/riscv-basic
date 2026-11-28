@@ -24,6 +24,9 @@ pub struct Message {
     /// call among the caller's, so that a request left queued by an earlier call, read later, is not mistaken for the live one): the thread that reads
     /// it is lent the caller's priority.
     pub caller: Option<(u64, u64)>,
+    /// This message's number among those its endpoint has queued (OD161): a read that copies it out with no lock held names it by this, so
+    /// its commit takes exactly the message it copied, or finds it gone.
+    serial: u64,
 }
 
 /// Kernel memory a queued message costs beyond its bytes (the queue node and the `Message`).
@@ -51,6 +54,8 @@ pub struct Channel {
     /// Messages written by the peer, waiting to be read from this end.
     queue: VecDeque<Message>,
     peer_closed: bool,
+    /// The serial the next queued message gets (OD161).
+    next_serial: u64,
 }
 
 pub struct Event {
@@ -116,6 +121,9 @@ pub struct SocketEnd {
     peer_closed: bool,
     /// This end called `socket_shutdown`: it writes no more, its peer reads end-of-stream.
     shut: bool,
+    /// How many bytes have been read from this end, ever (OD161): a read that copies with no lock held names the bytes it copied by this
+    /// count, so its commit removes exactly those, or finds that another read took them first.
+    taken: u64,
 }
 
 /// An interrupt object (IOMMU-SPEC 8.3): of the kind *wired source* (`irq`, an APLIC source: when it fires the kernel masks the source
@@ -415,6 +423,7 @@ pub fn channel_create_in(
         peer: None,
         queue: VecDeque::new(),
         peer_closed: false,
+        next_serial: 0,
     };
     let (a_end, b_end) = (end(), end());
     let a = reg.create_charged(KObj::Channel(a_end), q.job);
@@ -558,30 +567,72 @@ pub fn channel_write_from(
         reg.debug_assert_not_white(e.obj);
     }
     if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
+        let serial = p.next_serial;
+        p.next_serial = serial.wrapping_add(1);
         p.queue.push_back(Message {
             data: bytes,
             handles: entries,
             caller,
+            serial,
         });
         reg.meter_add(cost);
     }
     Ok(())
 }
 
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: `me` was resolved to a live channel by the caller in the same call
-fn read_at(
-    reg: &mut Kobjs,
-    table: &mut HandleTable,
-    me: ObjId,
-    pick: impl Fn(&VecDeque<Message>) -> Option<usize>,
+/// What a read will take, named so that the read can copy it out first and take it after (OD161: peek, copy, commit). For a channel it is
+/// the endpoint and the message's serial; for a socket, the end and its read count when the bytes were looked at. The object id carries its
+/// slot's generation, so a claim never names an object that reuses the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadClaim {
+    obj: ObjId,
+    mark: u64,
+}
+
+/// Why a commit took nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitError {
+    /// What the claim named is no longer there to take: another read took it between the claim and the commit (or the handle names another
+    /// object now). The read is made again from the start.
+    Moved,
+    /// The commit was refused (the handle, the rights, the table's room, or the writer of the handle numbers failed); nothing was taken.
+    Status(Status),
+}
+
+impl From<Status> for CommitError {
+    fn from(s: Status) -> Self {
+        CommitError::Status(s)
+    }
+}
+
+/// The index of the message a read would take: the oldest, or the oldest with `txid` in its first four bytes.
+#[allow(clippy::indexing_slicing)] // INVARIANT: the length test precedes the slice
+fn pick(q: &VecDeque<Message>, txid: Option<u32>) -> Option<usize> {
+    match txid {
+        Some(t) => q
+            .iter()
+            .position(|m| m.data.len() >= 4 && m.data[..4] == t.to_le_bytes()),
+        None => (!q.is_empty()).then_some(0),
+    }
+}
+
+/// What `channel_read` / `channel_read_txid` would take right now, without taking it: a claim on the message and its sizes (bytes,
+/// handles), or the error the read returns (including BUFFER_TOO_SMALL with the sizes, and NO_MEMORY for a full table). The syscall layer
+/// checks the destinations against the *actual* message, copies the bytes out (`claimed_bytes`), and only then takes it (`channel_commit`).
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: `me` was resolved to a live channel just above; `pick` returns an index in the queue
+pub fn channel_claim(
+    reg: &Kobjs,
+    table: &HandleTable,
+    ch: Handle,
+    txid: Option<u32>,
     max_bytes: usize,
     max_handles: usize,
-    jobs: &mut Jobs,
-) -> Result<Received, ReadError> {
+) -> Result<(ReadClaim, usize, usize), ReadError> {
+    let me = channel_of(reg, table, ch, Rights::READ)?;
     let KObj::Channel(c) = reg.get(me).expect("resolved") else {
         unreachable!()
     };
-    let Some(i) = pick(&c.queue) else {
+    let Some(i) = pick(&c.queue, txid) else {
         // Nothing to deliver. If the peer is gone nothing more can ever arrive, so say so,
         // even when other, non-matching messages remain queued (a `txid` read).
         return Err(if c.peer_closed {
@@ -601,40 +652,117 @@ fn read_at(
     if table.room() < msg.handles.len() {
         return Err(Status::NoMemory.into());
     }
-    let KObj::Channel(c) = reg.get_mut(me).expect("resolved") else {
+    Ok((
+        ReadClaim {
+            obj: me,
+            mark: msg.serial,
+        },
+        msg.data.len(),
+        msg.handles.len(),
+    ))
+}
+
+/// The bytes of the message `claim` names, while it is still queued (`None` once it has gone).
+pub fn claimed_bytes<'a>(reg: &'a Kobjs, claim: &ReadClaim) -> Option<&'a [u8]> {
+    let Some(KObj::Channel(c)) = reg.get(claim.obj) else {
+        return None;
+    };
+    c.queue
+        .iter()
+        .find(|m| m.serial == claim.mark)
+        .map(|m| m.data.as_slice())
+}
+
+/// Take the message `claim` names (OD161: the commit of peek, copy, commit): its handles go into the caller's table, `put` writes their
+/// numbers to the caller's buffer, and only when that succeeded does the message leave the queue. A `put` that fails takes the handles out of
+/// the table again and leaves the message as it was, so a failed copy loses nothing. `Moved`: the message is gone (another read took it after
+/// the claim); the read starts again. Everything that can fail for lack of memory is done before anything moves.
+#[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: `me` was resolved to a live channel just above; `i` was found in the queue just above and nothing removes from it in between; room was reserved for every handle
+pub fn channel_commit(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    claim: &ReadClaim,
+    jobs: &mut Jobs,
+    put: impl FnOnce(&[Handle], &mut Jobs) -> Result<(), Status>,
+) -> Result<Received, CommitError> {
+    let me = channel_of(reg, table, ch, Rights::READ)?;
+    if me != claim.obj {
+        return Err(CommitError::Moved);
+    }
+    let KObj::Channel(c) = reg.get(me).expect("resolved") else {
         unreachable!()
     };
-    // Everything that can fail for lack of memory is done before the message leaves the queue: the table's room and the result vector.
-    let n = c.queue[i].handles.len();
+    let Some(i) = c.queue.iter().position(|m| m.serial == claim.mark) else {
+        return Err(CommitError::Moved);
+    };
+    let n = c.queue.get(i).map_or(0, |m| m.handles.len());
+    if table.room() < n {
+        return Err(Status::NoMemory.into());
+    }
     table.reserve(n)?;
     let mut handles = Vec::new();
     handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
-    let msg = c.queue.remove(i).expect("picked");
-    if let Some((caller, call)) = msg.caller {
-        // a call's request was read: its reader is lent the caller's priority (the kernel does it after the call, L22)
-        reg.note_dequeued_call(caller, call);
+    let mut list: Vec<Entry> = Vec::new();
+    list.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
+    if let Some(KObj::Channel(c)) = reg.get(me) {
+        if let Some(m) = c.queue.get(i) {
+            list.extend_from_slice(&m.handles);
+        }
     }
-    reg.meter_sub(msg.cost());
-    credit_bytes(reg, jobs, me, msg.cost());
-    for e in &msg.handles {
+    // The handles go into the table (each takes over the message's reference), their numbers are written out, and the message is removed
+    // only after both: if anything fails before that, the references are the message's again.
+    for e in &list {
         handles.push(
             table
                 .insert(reg, e.obj, e.rights)
                 .expect("room was checked"),
         );
     }
+    if let Err(st) = put(&handles, jobs) {
+        for &h in &handles {
+            let _ = table.take_back(reg, h);
+        }
+        return Err(st.into());
+    }
+    let KObj::Channel(c) = reg.get_mut(me).expect("resolved") else {
+        unreachable!()
+    };
+    let msg = c.queue.remove(i).expect("found");
+    if let Some((caller, call)) = msg.caller {
+        // a call's request was read: its reader is lent the caller's priority (the kernel does it after the call, L22)
+        reg.note_dequeued_call(caller, call);
+    }
+    reg.meter_sub(msg.cost());
+    credit_bytes(reg, jobs, me, msg.cost());
+    // (the entries' references now belong to the table: the message's list is dropped without releasing them)
     Ok(Received {
         data: msg.data,
         handles,
     })
 }
 
+/// Claim and commit in one step, for a caller that holds every lock across both (the kernel's own reads, the tests).
+fn read_now(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    txid: Option<u32>,
+    max_bytes: usize,
+    max_handles: usize,
+    jobs: &mut Jobs,
+) -> Result<Received, ReadError> {
+    let (claim, _, _) = channel_claim(reg, table, ch, txid, max_bytes, max_handles)?;
+    channel_commit(reg, table, ch, &claim, jobs, |_, _| Ok(())).map_err(|e| match e {
+        CommitError::Status(st) => ReadError::Status(st),
+        // (not reached: nothing runs between this claim and its commit)
+        CommitError::Moved => ReadError::Status(Status::BadState),
+    })
+}
+
 /// What `channel_read` / `channel_read_txid` would do right now, without doing it: the
 /// sizes (bytes, handles) of the message they would deliver, or the error they would
 /// return (including BUFFER_TOO_SMALL with the sizes, and NO_MEMORY for a full table).
-/// The syscall layer uses it to validate the destination buffers against the *actual*
-/// message before dequeuing anything.
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: `me` was resolved to a live channel by the caller in the same call
 pub fn channel_peek(
     reg: &Kobjs,
     table: &HandleTable,
@@ -643,36 +771,7 @@ pub fn channel_peek(
     max_bytes: usize,
     max_handles: usize,
 ) -> Result<(usize, usize), ReadError> {
-    let me = channel_of(reg, table, ch, Rights::READ)?;
-    let KObj::Channel(c) = reg.get(me).expect("resolved") else {
-        unreachable!()
-    };
-    let pos = match txid {
-        Some(t) => c
-            .queue
-            .iter()
-            .position(|m| m.data.len() >= 4 && m.data[..4] == t.to_le_bytes()),
-        None => (!c.queue.is_empty()).then_some(0),
-    };
-    let Some(i) = pos else {
-        return Err(if c.peer_closed {
-            Status::PeerClosed
-        } else {
-            Status::ShouldWait
-        }
-        .into());
-    };
-    let msg = &c.queue[i];
-    if msg.data.len() > max_bytes || msg.handles.len() > max_handles {
-        return Err(ReadError::TooSmall {
-            bytes: msg.data.len(),
-            handles: msg.handles.len(),
-        });
-    }
-    if table.room() < msg.handles.len() {
-        return Err(Status::NoMemory.into());
-    }
-    Ok((msg.data.len(), msg.handles.len()))
+    channel_claim(reg, table, ch, txid, max_bytes, max_handles).map(|(_, b, h)| (b, h))
 }
 
 /// Read the oldest message. Handles arrive in the caller's table.
@@ -684,20 +783,10 @@ pub fn channel_read_in(
     max_handles: usize,
     jobs: &mut Jobs,
 ) -> Result<Received, ReadError> {
-    let me = channel_of(reg, table, ch, Rights::READ)?;
-    read_at(
-        reg,
-        table,
-        me,
-        |q| (!q.is_empty()).then_some(0),
-        max_bytes,
-        max_handles,
-        jobs,
-    )
+    read_now(reg, table, ch, None, max_bytes, max_handles, jobs)
 }
 
 /// Read the oldest message whose first four bytes (little endian) are `txid`.
-#[allow(clippy::indexing_slicing)] // INVARIANT: the length test precedes the slice
 pub fn channel_read_txid_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -707,12 +796,7 @@ pub fn channel_read_txid_in(
     max_handles: usize,
     jobs: &mut Jobs,
 ) -> Result<Received, ReadError> {
-    let me = channel_of(reg, table, ch, Rights::READ)?;
-    let pick = |q: &VecDeque<Message>| {
-        q.iter()
-            .position(|m| m.data.len() >= 4 && m.data[..4] == txid.to_le_bytes())
-    };
-    read_at(reg, table, me, pick, max_bytes, max_handles, jobs)
+    read_now(reg, table, ch, Some(txid), max_bytes, max_handles, jobs)
 }
 
 /// A new event with all user signals clear.
@@ -935,6 +1019,7 @@ pub fn socket_create_in(
         buf: VecDeque::new(),
         peer_closed: false,
         shut: false,
+        taken: 0,
     };
     let a = reg.create_charged(KObj::Socket(end()), q.job);
     let b = reg.create_charged(KObj::Socket(end()), q.job);
@@ -1031,6 +1116,17 @@ pub fn socket_peek(
     h: Handle,
     max: usize,
 ) -> Result<usize, Status> {
+    socket_claim(reg, table, h, max).map(|(_, n)| n)
+}
+
+/// What `socket_read` would take for `max`, without taking it (OD161): a claim on the bytes and how many there are, or the error the read
+/// gives. The syscall layer copies them out (`claimed_stream`) and then takes them (`socket_commit`).
+pub fn socket_claim(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    max: usize,
+) -> Result<(ReadClaim, usize), Status> {
     let me = socket_of(reg, table, h, Rights::READ)?;
     if max > SOCKET_BUFFER {
         return Err(Status::TooBig);
@@ -1038,8 +1134,12 @@ pub fn socket_peek(
     let Some(KObj::Socket(s)) = reg.get(me) else {
         return Err(Status::BadHandle);
     };
+    let claim = ReadClaim {
+        obj: me,
+        mark: s.taken,
+    };
     if max == 0 {
-        return Ok(0);
+        return Ok((claim, 0));
     }
     if s.buf.is_empty() {
         let peer_shut = matches!(s.peer.and_then(|p| reg.get(p)), Some(KObj::Socket(p)) if p.shut);
@@ -1049,7 +1149,56 @@ pub fn socket_peek(
             Status::ShouldWait
         });
     }
-    Ok(max.min(s.buf.len()))
+    Ok((claim, max.min(s.buf.len())))
+}
+
+/// The first `n` bytes `claim` names, as the buffer's two halves (`None` once another read has taken from the end since the claim).
+pub fn claimed_stream<'a>(
+    reg: &'a Kobjs,
+    claim: &ReadClaim,
+    n: usize,
+) -> Option<(&'a [u8], &'a [u8])> {
+    let Some(KObj::Socket(s)) = reg.get(claim.obj) else {
+        return None;
+    };
+    if s.taken != claim.mark || s.buf.len() < n {
+        return None;
+    }
+    let (a, b) = s.buf.as_slices();
+    let first = n.min(a.len());
+    Some((a.get(..first)?, b.get(..n.saturating_sub(first))?))
+}
+
+/// Take the `n` bytes `claim` names (the commit of peek, copy, commit). `Moved`: another read took from this end after the claim, so the
+/// bytes copied out are not the ones at the front any more; the read starts again.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: `taken` counts bytes, and no stream carries 2^64 of them
+pub fn socket_commit(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    claim: &ReadClaim,
+    n: usize,
+    jobs: &mut Jobs,
+) -> Result<(), CommitError> {
+    let me = socket_of(reg, table, h, Rights::READ)?;
+    if me != claim.obj {
+        return Err(CommitError::Moved);
+    }
+    let Some(KObj::Socket(s)) = reg.get_mut(me) else {
+        return Err(Status::BadHandle.into());
+    };
+    if s.taken != claim.mark || s.buf.len() < n {
+        return Err(CommitError::Moved);
+    }
+    s.buf.drain(..n);
+    s.taken += n as u64;
+    if s.buf.is_empty() {
+        // give the memory back: an idle socket holds nothing
+        s.buf = VecDeque::new();
+    }
+    reg.meter_sub(n);
+    credit_bytes(reg, jobs, me, n);
+    Ok(())
 }
 
 /// Remove and return up to `max` bytes (see [`socket_peek`]).
@@ -1060,21 +1209,19 @@ pub fn socket_read_in(
     max: usize,
     jobs: &mut Jobs,
 ) -> Result<Vec<u8>, Status> {
-    let n = socket_peek(reg, table, h, max)?;
-    let me = socket_of(reg, table, h, Rights::READ)?;
-    let Some(KObj::Socket(s)) = reg.get_mut(me) else {
-        return Err(Status::BadHandle);
-    };
+    let (claim, n) = socket_claim(reg, table, h, max)?;
     // (the result is allocated before anything leaves the buffer, so a failed allocation loses no data)
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
-    out.extend(s.buf.drain(..n));
-    if s.buf.is_empty() {
-        // give the memory back: an idle socket holds nothing
-        s.buf = VecDeque::new();
+    if let Some((a, b)) = claimed_stream(reg, &claim, n) {
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
     }
-    reg.meter_sub(n);
-    credit_bytes(reg, jobs, me, n);
+    socket_commit(reg, table, h, &claim, n, jobs).map_err(|e| match e {
+        CommitError::Status(st) => st,
+        // (not reached: nothing runs between this claim and its commit)
+        CommitError::Moved => Status::BadState,
+    })?;
     Ok(out)
 }
 

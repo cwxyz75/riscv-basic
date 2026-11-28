@@ -72,7 +72,7 @@ use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs, ReadError};
 use kcore::job::{JobId, Jobs};
 use kcore::pagetable::PhysMem;
-use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
+use kcore::usercopy::{copy_from_user, copy_to_user, verify_writable};
 use kcore::Mm;
 
 /// The failure half of a syscall's reply: the status and the two result registers some errors carry.
@@ -121,13 +121,29 @@ pub struct Staged {
     pub handles: Vec<u8>,
 }
 
-/// A message a read call took and left for its caller to copy out (T215): the destinations were checked against the message before it was taken.
+/// A big read that a call claimed and left for its caller to finish (T215, OD161): the destinations were checked against what it will take,
+/// `data` is a copy of those bytes, and nothing has been taken yet. The caller copies `data` out with the object lock let go
+/// (`deferred_copy`), then takes the object lock again and commits (`deferred_commit`).
 pub struct Deferred {
     pub bytes_at: u64,
     pub data: Vec<u8>,
     pub handles_at: u64,
-    /// The handles the message carried, which the caller's buffer receives as 8-byte little-endian words.
-    pub handles: Vec<Handle>,
+    /// How many handles the message carries (their numbers are written at the commit, when they are in the table).
+    pub nhandles: usize,
+    pub read: DeferredRead,
+}
+
+/// What a deferred read claimed.
+#[derive(Clone, Copy, Debug)]
+pub enum DeferredRead {
+    /// The message `claim` names, on the channel `ch` names.
+    Channel { ch: Handle, claim: ipc::ReadClaim },
+    /// The first `n` bytes of the socket `h` names, as `claim` saw them.
+    Socket {
+        h: Handle,
+        claim: ipc::ReadClaim,
+        n: usize,
+    },
 }
 
 /// Messages and stream writes of at least this many bytes are copied outside the object lock (T215): below it the extra lock round trip costs more than the copy.
@@ -268,24 +284,38 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         }
         nr::SOCKET_READ => {
             let max = a[2] as usize;
-            // What a read would deliver, checked against the destination before anything is
-            // removed, so a bad pointer never loses data.
-            let n = ipc::socket_peek(objs, handles, h(0), max).map_err(|e| (e, None, None))?;
+            // Peek, copy, commit (OD161): what a read would deliver is checked against the destination and copied out before anything is
+            // removed, so a bad pointer or a failed copy never loses data.
+            let (claim, n) =
+                ipc::socket_claim(objs, handles, h(0), max).map_err(|e| (e, None, None))?;
             verify_writable(aspace, mm, vmos, jobs, a[1], n).map_err(|e| (e, None, None))?;
-            let data =
-                ipc::socket_read_in(objs, handles, h(0), max, jobs).map_err(|e| (e, None, None))?;
-            if *defer_out && data.len() >= OUTSIDE_COPY_MIN {
-                let got = data.len() as u64;
+            if *defer_out && n >= OUTSIDE_COPY_MIN {
+                let mut data: Vec<u8> = Vec::new();
+                data.try_reserve_exact(n)
+                    .map_err(|_| (Status::NoMemory, None, None))?;
+                if let Some((x, y)) = ipc::claimed_stream(objs, &claim, n) {
+                    data.extend_from_slice(x);
+                    data.extend_from_slice(y);
+                }
                 *deferred = Some(Deferred {
                     bytes_at: a[1],
                     data,
                     handles_at: 0,
-                    handles: Vec::new(),
+                    nhandles: 0,
+                    read: DeferredRead::Socket { h: h(0), claim, n },
                 });
-                return Ok((Some(got), None));
+                return Ok((Some(n as u64), None));
             }
-            copy_to_user_verified(aspace, mm, a[1], &data).map_err(|e| (e, None, None))?;
-            Ok((Some(data.len() as u64), None))
+            if let Some((x, y)) = ipc::claimed_stream(objs, &claim, n) {
+                copy_to_user(aspace, mm, vmos, jobs, a[1], x).map_err(|e| (e, None, None))?;
+                copy_to_user(aspace, mm, vmos, jobs, a[1] + x.len() as u64, y)
+                    .map_err(|e| (e, None, None))?;
+            }
+            match commit_socket(objs, handles, jobs, h(0), &claim, n) {
+                Committed::Done(r) => r,
+                // (not reached: the object lock was held from the claim to here)
+                Committed::Moved => fail(Status::BadState),
+            }
         }
         nr::SOCKET_SHUTDOWN => ipc::socket_shutdown(objs, handles, h(0))
             .map(|()| (None, None))
@@ -374,67 +404,201 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 max_bytes.min(MAX_MSG_BYTES),
                 max_handles.min(MAX_MSG_HANDLES),
             );
-            // Find out what this read would deliver, and check the destinations against the
-            // *actual* message (not the declared capacity) before dequeuing anything, so a
-            // bad pointer can never lose a message and a generous `max_bytes` needs no
-            // generous mapping.
-            let (nbytes, nhandles) = match ipc::channel_peek(objs, handles, h(0), txid, mb, mh) {
-                Ok(sizes) => sizes,
-                Err(ReadError::TooSmall { bytes, handles }) => {
-                    return Err((
-                        Status::BufferTooSmall,
-                        Some(bytes as u64),
-                        Some(handles as u64),
-                    ))
-                }
-                Err(ReadError::Status(st)) => return fail(st),
-            };
-            verify_writable(aspace, mm, vmos, jobs, bytes_at, nbytes)
-                .map_err(|e| (e, None, None))?;
-            verify_writable(aspace, mm, vmos, jobs, handles_at, nhandles * 8)
-                .map_err(|e| (e, None, None))?;
-            let got = match txid {
-                None => ipc::channel_read_in(objs, handles, h(0), mb, mh, jobs),
-                Some(t) => ipc::channel_read_txid_in(objs, handles, h(0), t, mb, mh, jobs),
-            };
-            match got {
-                Ok(r) if *defer_out && r.data.len() >= OUTSIDE_COPY_MIN => {
-                    let counts = (r.data.len() as u64, r.handles.len() as u64);
-                    // (nothing here allocates: the message has been taken, and it must not be lost to a failed allocation, T10)
-                    *deferred = Some(Deferred {
-                        bytes_at,
-                        data: r.data,
-                        handles_at,
-                        handles: r.handles,
-                    });
-                    Ok((Some(counts.0), Some(counts.1)))
-                }
-                Ok(r) => {
-                    // The destinations were verified: these writes allocate nothing (T10), and the handle numbers go out one at a time from the
-                    // stack, so nothing here can fail for lack of memory after the message has been taken (KT9).
-                    copy_to_user_verified(aspace, mm, bytes_at, &r.data)
-                        .map_err(|e| (e, None, None))?;
-                    for (i, h) in r.handles.iter().enumerate() {
-                        copy_to_user_verified(
-                            aspace,
-                            mm,
-                            handles_at + (i as u64) * 8,
-                            &h.0.to_le_bytes(),
-                        )
-                        .map_err(|e| (e, None, None))?;
-                    }
-                    Ok((Some(r.data.len() as u64), Some(r.handles.len() as u64)))
-                }
-                Err(ReadError::TooSmall { bytes, handles }) => Err((
-                    Status::BufferTooSmall,
-                    Some(bytes as u64),
-                    Some(handles as u64),
-                )),
-                Err(ReadError::Status(st)) => Err((st, None, None)),
-            }
+            read_message(
+                objs,
+                handles,
+                aspace,
+                mm,
+                vmos,
+                jobs,
+                h(0),
+                txid,
+                bytes_at,
+                mb,
+                handles_at,
+                mh,
+                *defer_out,
+                deferred,
+            )
         }
         // (not reached: the guard above returned `None` for every call that is not one of these)
         _ => fail(Status::BadSyscall),
     })();
     Some(r)
+}
+
+/// What a commit came to (OD161): the call's reply, or `Moved` when what the read claimed was taken by another read after the claim, and
+/// the read must be made again from the start.
+pub enum Committed {
+    Done(Reply),
+    Moved,
+}
+
+/// A channel read, claim to commit (OD161: peek, copy, commit). The destinations are checked against the *actual* message (not the declared
+/// capacity) after the read's status is known and before anything is taken, so BUFFER_TOO_SMALL and SHOULD_WAIT win over a bad pointer and a
+/// generous `max_bytes` needs no generous mapping. A small message is copied out and taken here, under the caller's locks; a big one with
+/// `defer_out` is copied into `deferred` (allocating now, before anything is taken) for the caller to copy out with the object lock let go
+/// and then commit (`deferred_commit`). A copy that fails takes nothing: the message stays queued. `channel_call`'s reply uses it too.
+#[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES, so nhandles * 8 is small
+pub(crate) fn read_message<M: PhysMem>(
+    objs: &mut Kobjs,
+    handles: &mut HandleTable,
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    ch: Handle,
+    txid: Option<u32>,
+    bytes_at: u64,
+    max_bytes: usize,
+    handles_at: u64,
+    max_handles: usize,
+    defer_out: bool,
+    deferred: &mut Option<Deferred>,
+) -> Reply {
+    let (claim, nbytes, nhandles) =
+        match ipc::channel_claim(objs, handles, ch, txid, max_bytes, max_handles) {
+            Ok(c) => c,
+            Err(ReadError::TooSmall { bytes, handles }) => {
+                return Err((
+                    Status::BufferTooSmall,
+                    Some(bytes as u64),
+                    Some(handles as u64),
+                ))
+            }
+            Err(ReadError::Status(st)) => return fail(st),
+        };
+    verify_writable(aspace, mm, vmos, jobs, bytes_at, nbytes).map_err(|e| (e, None, None))?;
+    verify_writable(aspace, mm, vmos, jobs, handles_at, nhandles * 8)
+        .map_err(|e| (e, None, None))?;
+    if defer_out && nbytes >= OUTSIDE_COPY_MIN {
+        let mut data: Vec<u8> = Vec::new();
+        data.try_reserve_exact(nbytes)
+            .map_err(|_| (Status::NoMemory, None, None))?;
+        data.extend_from_slice(ipc::claimed_bytes(objs, &claim).unwrap_or(&[]));
+        *deferred = Some(Deferred {
+            bytes_at,
+            data,
+            handles_at,
+            nhandles,
+            read: DeferredRead::Channel { ch, claim },
+        });
+        return Ok((Some(nbytes as u64), Some(nhandles as u64)));
+    }
+    let bytes = ipc::claimed_bytes(objs, &claim).unwrap_or(&[]);
+    copy_to_user(aspace, mm, vmos, jobs, bytes_at, bytes).map_err(|e| (e, None, None))?;
+    match commit_channel(
+        objs, handles, aspace, mm, vmos, jobs, ch, &claim, handles_at,
+    ) {
+        Committed::Done(r) => r,
+        // (not reached: the object lock was held from the claim to here)
+        Committed::Moved => fail(Status::BadState),
+    }
+}
+
+/// Write a received message's handle numbers to `at`, as 8-byte little-endian words, in one copy (from the stack: nothing allocates but the
+/// copy's own page list, and a failure there is reported before the message is taken).
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < n <= MAX_MSG_HANDLES, so every slice is inside `words`
+fn put_handle_words<M: PhysMem>(
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    at: u64,
+    hs: &[Handle],
+) -> Result<(), Status> {
+    let mut words = [0u8; MAX_MSG_HANDLES * 8];
+    let n = hs.len().min(MAX_MSG_HANDLES);
+    for (i, h) in hs.iter().take(n).enumerate() {
+        words[i * 8..i * 8 + 8].copy_from_slice(&h.0.to_le_bytes());
+    }
+    copy_to_user(aspace, mm, vmos, jobs, at, &words[..n * 8])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_channel<M: PhysMem>(
+    objs: &mut Kobjs,
+    handles: &mut HandleTable,
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    ch: Handle,
+    claim: &ipc::ReadClaim,
+    handles_at: u64,
+) -> Committed {
+    match ipc::channel_commit(objs, handles, ch, claim, jobs, |hs, jobs| {
+        put_handle_words(aspace, mm, vmos, jobs, handles_at, hs)
+    }) {
+        Ok(r) => Committed::Done(Ok((
+            Some(r.data.len() as u64),
+            Some(r.handles.len() as u64),
+        ))),
+        Err(ipc::CommitError::Moved) => Committed::Moved,
+        Err(ipc::CommitError::Status(st)) => Committed::Done(fail(st)),
+    }
+}
+
+fn commit_socket(
+    objs: &mut Kobjs,
+    handles: &HandleTable,
+    jobs: &mut Jobs,
+    h: Handle,
+    claim: &ipc::ReadClaim,
+    n: usize,
+) -> Committed {
+    match ipc::socket_commit(objs, handles, h, claim, n, jobs) {
+        Ok(()) => Committed::Done(Ok((Some(n as u64), None))),
+        Err(ipc::CommitError::Moved) => Committed::Moved,
+        Err(ipc::CommitError::Status(st)) => Committed::Done(fail(st)),
+    }
+}
+
+/// Copy `len` bytes of a deferred read's copy, from offset `at`, to the caller's buffer (OD161, the copy of peek, copy, commit): the caller
+/// holds the address-space lock and the memory locks, not the object lock, and copies a big message in pieces. A failure takes nothing:
+/// the message (or the bytes) stays queued and the call reports the copy's status.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: at + len <= d.data.len() (the slice's own bound), and bytes_at + at stays in the range verify_writable checked
+pub fn deferred_copy<M: PhysMem>(
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    d: &Deferred,
+    at: usize,
+    len: usize,
+) -> Result<(), Status> {
+    let part = d
+        .data
+        .get(at..at.saturating_add(len))
+        .ok_or(Status::InvalidArgs)?;
+    copy_to_user(aspace, mm, vmos, jobs, d.bytes_at + at as u64, part)
+}
+
+/// The commit of a deferred read (OD161), with the object lock taken again after the copy: the message the claim named is taken (its handles
+/// put in the table and their numbers written out first), or the bytes removed. `Moved`: another read took them in between, and the caller
+/// makes the read again from the start (its buffer then holds whatever that read delivers).
+#[allow(clippy::too_many_arguments)]
+pub fn deferred_commit<M: PhysMem>(
+    objs: &mut Kobjs,
+    handles: &mut HandleTable,
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    d: &Deferred,
+) -> Committed {
+    match d.read {
+        DeferredRead::Channel { ch, claim } => commit_channel(
+            objs,
+            handles,
+            aspace,
+            mm,
+            vmos,
+            jobs,
+            ch,
+            &claim,
+            d.handles_at,
+        ),
+        DeferredRead::Socket { h, claim, n } => commit_socket(objs, handles, jobs, h, &claim, n),
+    }
 }

@@ -19,7 +19,7 @@ pub enum Point {
     Schedule,
     /// Before the trap handler returns to user mode.
     ReturnToUser,
-    /// Between a big read's locked section and its copy-out (T266, T233-a: `finish_out`, after the message was taken): no lock is held,
+    /// Between a big read's claim and its copy-out (T266, T233-a; OD161: `finish_read`, the message claimed and not yet taken): no lock is held,
     /// interrupts are on, and a delay here also **yields**, so another thread (of another process, perhaps) runs and returns to user
     /// mode on this hart before the reader copies out.
     CopyOut,
@@ -92,7 +92,7 @@ mod on {
                 core::hint::spin_loop();
             }
             if matches!(p, Point::CopyOut) {
-                // (the one point where no lock is held and the thread may be switched out: `kernel/src/user/trap.rs`, before `finish_out`)
+                // (the one point where no lock is held and the thread may be switched out: `kernel/src/user/trap.rs`, before `finish_read`)
                 crate::thread::yield_now();
             }
         }
