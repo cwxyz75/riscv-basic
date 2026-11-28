@@ -1230,6 +1230,22 @@ def run(kernel: str, extra=()):
             fixtures.close()
 
 
+def oversubscribed_note():
+    """A line for a failed boot that had more harts than the host has cores (T266, 2026-11-28): the big kernel lock is a FIFO ticket
+    lock, so each hand-over waits until the host runs the hart whose turn it is, and lock-heavy tests slow by a thousand times (the
+    exclusion test 116 ms -> 139 s, `smp_churn_stress` seconds -> 20 minutes, measured at eight harts beside sixteen CPU hogs on ten
+    cores). Other boots running at the same time on the host count too (`chaos.py --jobs`), and this cannot see them."""
+    harts = int(os.environ.get("OS_SMP", "1") or "1")
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 1
+    if harts <= cores:
+        return []
+    return [f"note: {harts} harts on a host with {cores} cores: a hand-over of the big lock waits for the host to run the next hart "
+            "in line, so lock-heavy tests run up to a thousand times slower and timing tests fail (T266, 2026-11-28)"]
+
+
 def run_with(kernel, extra, fixtures):
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", DEFAULT_MACHINE), "-bios", "default",
@@ -1643,6 +1659,7 @@ def main() -> int:
             found += c_transcript_problems(text)
             found += lua_transcript_problems(text)
         if found:
+            found += oversubscribed_note()
             failed = 1
             # (the log goes to a file too, for CI to keep as an artifact and for a person to read: KT2)
             try:
