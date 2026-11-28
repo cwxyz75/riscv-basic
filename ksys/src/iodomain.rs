@@ -389,6 +389,7 @@ pub fn iodomain_closed<P: PhysMem64, R: Regs>(
 // ---- iodomain_create -------------------------------------------------------------------------------------------------------------
 
 /// `iodomain_create(resource, device_id, job) -> domain` (4.2).
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn iodomain_create<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     // (an old domain of the device whose destruction is still pending is finished first)
     drain_destructions(e);
@@ -479,6 +480,7 @@ fn create_in<E: IoEnv>(e: &mut E, a: [u64; 6], job: JobId) -> Reply {
 // ---- iodomain_map ----------------------------------------------------------------------------------------------------------------
 
 /// `iodomain_map(domain, vmo, vmo_offset, pages, access) -> io_address` (4.3, amendment part 1).
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn iodomain_map<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let (offset, pages, access) = (a[2], a[3], a[4]);
     let writes = access & io::WRITE != 0;
@@ -751,6 +753,7 @@ fn settle_pending<E: IoEnv>(e: &mut E, p: Pending) {
 // ---- iodomain_unmap --------------------------------------------------------------------------------------------------------------
 
 /// `iodomain_unmap(domain, io_address, pages)` (4.4, amendment parts 1 and 3).
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn iodomain_unmap<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let d = e.obj(|o| ipc::iodomain_of(o.objs, o.handles, Handle(a[0]), Rights::IO_UNMAP));
     let d = match d.unwrap_or(Err(Status::BadState)) {
@@ -795,6 +798,7 @@ fn unmap_in<E: IoEnv>(e: &mut E, d: DomainId, io_address: u64, pages: u64) -> Re
 
 /// `iodomain_destroy(domain)` (4.5): 6.3 step 1 in the same section as the object's mark (OBJ, then IOMMU), then steps 2 to 4 with no
 /// lock held. A destroyed domain's destroy is OK and does nothing.
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn iodomain_destroy<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let started = e.obj_iommu(
         |objs, handles, s, mem, regs| -> Result<Option<Destroying>, Status> {
@@ -825,6 +829,7 @@ pub fn iodomain_destroy<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
 
 /// `iodomain_fault_read(domain) -> (cause | direction << 16 | dropped << 32, io_address)` (7.4). The ring and the DEVICE_FAULT signal
 /// change in one section (OBJ, then IOMMU), so a fault stored meanwhile is never hidden.
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn iodomain_fault_read<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     e.obj_iommu(|objs, handles, s, _, _| -> Reply {
         let d = ipc::iodomain_of(objs, handles, Handle(a[0]), Rights::INSPECT)
@@ -853,6 +858,7 @@ pub fn iodomain_fault_read<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
 
 /// `vmo_create_dma_in(resource, pages, job) -> vmo` (4.7; amendment part 1 point 5: the frames are taken and zeroed `RANGE_STEP` at a
 /// time under `FRAME` only, while no handle names the VMO).
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     // (the build stays in this one place from its beginning to its end: it is not copied through the steps' frames, KT13)
     let mut slot = None;
@@ -991,6 +997,7 @@ fn wait_until<E: IoEnv>(e: &mut E, mut ready: impl FnMut(&mut E) -> bool) -> boo
 /// `iodomain_grant_vector(domain, index) -> (interrupt, msi_address)` (8.3; the MSI-X data word is always `abi::iodomain::MSI_DATA`,
 /// 1). The order of 11.2: under `OBJ` (with `IOMMU` inside for the index's state) the handle, the charge (`JOBS` under `OBJ`) and an
 /// identity; its hart opens it; under `OBJ` then `IOMMU` the entry; the fence waited for with no lock held; under `OBJ` the object.
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn iodomain_grant_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let index = a[1];
     let begun = e.irq_iommu(
@@ -1274,6 +1281,7 @@ pub fn settle_moves<E: IoEnv>(e: &mut E) {
 
 /// `interrupt_ack` on an interrupt object (8.5): for a vector, the file protocol under `OBJ` and, the first time, the move to the
 /// calling hart with no lock held; `None` for a wired source (the kernel's own path).
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn interrupt_ack_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Option<Reply> {
     let r = e.irq(
         |c, mem| -> Option<Result<(u64, Option<VectorRef>), Status>> {
@@ -1306,6 +1314,7 @@ pub fn interrupt_ack_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Option<Reply> {
 
 /// `interrupt_deliver_here(interrupt)` on a vector (8.5): needs the acknowledge right (MANAGE); BAD_STATE for a dead vector, NO_MEMORY
 /// when the calling hart has no free identity. `None` for a wired source (the kernel re-aims it as an acknowledgement does).
+#[inline(never)] // (KT13: each call a frame of its own, not folded into the kernel's router)
 pub fn interrupt_deliver_here_vector<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Option<Reply> {
     let r = e.irq(|c, _| -> Option<Result<VectorRef, Status>> {
         let Some((handles, _)) = c.caller else {

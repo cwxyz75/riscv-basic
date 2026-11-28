@@ -48,7 +48,9 @@ fn world() -> W {
                 1,
                 AddressSpace::new(PageTable::new_with_kernel_half(&mut mm, &kernel).unwrap()),
             )),
-            handles: HandleTable::new(64),
+            handles: kcore::fbox::FBox::try_new(HandleTable::new(64))
+                .ok()
+                .expect("a handle table"),
             tag: kcore::asid::AsTag { asid: 1, gen: 1 },
             vmos: Vec::new(),
             entry: 0,

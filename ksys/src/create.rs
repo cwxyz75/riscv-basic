@@ -45,7 +45,7 @@ pub fn process_create<M: PhysMem>(
         return Err(Status::NoMemory);
     };
     // (KT9, T177: everything that can fail for want of memory comes first, before the object exists; what follows allocates nothing. The cell comes from the
-    // pool, the record is one fallible box, the table has room)
+    // pool, the record and its handle table are fallible boxes, the table has room)
     let tag = us.asids.alloc();
     let record = match make_record(us, tag, job, stack_hint) {
         Ok(r) => r,

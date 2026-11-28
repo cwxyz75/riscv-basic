@@ -69,7 +69,9 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId, pid: u64) -> Pr
     Process {
         live_tids: Default::default(),
         aspace: std::sync::Arc::new(klock::aslock::AsCell::new(pid, space)),
-        handles: HandleTable::new(64),
+        handles: kcore::fbox::FBox::try_new(HandleTable::new(64))
+            .ok()
+            .expect("a handle table"),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
         entry: 0,
