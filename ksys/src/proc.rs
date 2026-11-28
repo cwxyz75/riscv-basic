@@ -484,15 +484,26 @@ pub struct UnmapCall {
 pub const UNMAP_STEP_PTES: u64 = 64;
 
 /// The process a call on `a0` (a process handle with MANAGE) acts on: its id. A frame of its own (KT13).
-#[inline(never)]
 fn managed_target(
     objs: &kcore::ipc::Kobjs,
     procs: &ProcTable,
     me: u64,
     a0: u64,
 ) -> Result<u64, Status> {
+    target_with(objs, procs, me, a0, Rights::MANAGE)
+}
+
+/// The process the caller's handle `a0` names, which must carry `rights`: its id. A frame of its own (KT13).
+#[inline(never)]
+fn target_with(
+    objs: &kcore::ipc::Kobjs,
+    procs: &ProcTable,
+    me: u64,
+    a0: u64,
+    rights: Rights,
+) -> Result<u64, Status> {
     let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a0), Rights::MANAGE)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a0), rights)?;
     Ok(tpid)
 }
 
@@ -939,30 +950,67 @@ fn process_map<M: PhysMem, X: Machine>(
     a: &[u64; 6],
     c: &mut PCtx<'_, M, X>,
 ) -> Result<(Option<u64>, Option<u64>), Status> {
+    let (tpid, vid, max_perms, caller_job) = map_handles(c.objs, c.procs, c.me, a)?;
+    ready_target(c.procs, c.jobs, tpid)?;
+    let (anywhere, perms) = map_flags(c.vmos, vid, a)?;
     let PCtx {
-        objs,
         procs,
         mm,
         vmos,
         jobs,
         machine,
-        me,
         ..
     } = c;
-    let me = *me;
-    let (ph, vh) = (Handle(a[0]), Handle(a[1]));
-    let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
-    let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let (tpid, vid, max_perms) = resolve_map_args(objs, caller, ph, vh, flags)?;
-    let caller_job = caller.job;
     let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
-    target
-        .aspace
-        .held_mut()
-        .set_region_limit(jobs.region_limit(target.job));
-    if target.exit_code.is_some() || target.killed.is_some() {
-        return Err(Status::BadState);
-    }
+    let length = a[4];
+    let vaddr = if anywhere {
+        map_place(target, &mut **machine, length)?
+    } else {
+        a[2]
+    };
+    map_commit(
+        target,
+        mm,
+        vmos,
+        jobs,
+        caller_job,
+        (vid, vaddr, a[3], length),
+        (perms, max_perms),
+    )?;
+    Ok((anywhere.then_some(vaddr), None))
+}
+
+/// `process_map`'s handles: the target process, the VMO and the most the mapping may be raised to, and the caller's job.
+#[inline(never)]
+fn map_handles(
+    objs: &Kobjs,
+    procs: &ProcTable,
+    me: u64,
+    a: &[u64; 6],
+) -> Result<(u64, u64, Perms, JobId), Status> {
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (tpid, vid, max_perms) = resolve_map_args(objs, caller, Handle(a[0]), Handle(a[1]), a[5])?;
+    Ok((tpid, vid, max_perms, caller.job))
+}
+
+/// Where an ANYWHERE mapping of `length` bytes goes in `target` (at random among the places that fit in the mapping arena: MM7). NO_MEMORY:
+/// none fits.
+#[inline(never)]
+fn map_place<X: Machine>(target: &Process, machine: &mut X, length: u64) -> Result<u64, Status> {
+    place_anywhere(
+        &mut |n| machine.random_below(n),
+        target.aspace.held_ref(),
+        length,
+    )
+    .ok_or(Status::NoMemory)
+}
+
+/// `process_map`'s checks of its flags and its range (after the handles and the target): whether the kernel places the mapping (ANYWHERE), and
+/// its permissions. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the VMO's size in bytes is below the user limit
+#[inline(never)]
+fn map_flags(vmos: &Vmos, vid: u64, a: &[u64; 6]) -> Result<(bool, Perms), Status> {
+    let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
     let aligned = |x: u64| x.is_multiple_of(4096);
     // ANYWHERE (MM7): the flag asks the kernel to choose a free place (`vaddr` must be 0), at random among those that fit in the
     // mapping arena. Every other argument is checked first (with the arena's start standing in for the address), so a refused
@@ -996,18 +1044,31 @@ fn process_map<M: PhysMem, X: Machine>(
     {
         return Err(Status::InvalidArgs);
     }
-    let vaddr = if anywhere {
-        match place_anywhere(
-            &mut |n| machine.random_below(n),
-            target.aspace.held_ref(),
-            length,
-        ) {
-            Some(at) => at,
-            None => return Err(Status::NoMemory),
-        }
-    } else {
-        vaddr
-    };
+    Ok((
+        anywhere,
+        Perms {
+            read: true,
+            write: flags & PF_W != 0,
+            exec: flags & PF_X != 0,
+            user: true,
+        },
+    ))
+}
+
+/// `process_map`'s mapping of `length` bytes of VMO `vid` from `offset` at `vaddr` in `target`, with the page-table charge, after its last checks
+/// (V1: a stranger's VMO is committed and not being shrunk). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: vaddr + length and offset + length were checked against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4
+#[inline(never)]
+fn map_commit<M: PhysMem>(
+    target: &mut Process,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    caller_job: JobId,
+    (vid, vaddr, offset, length): (u64, u64, u64, u64),
+    (perms, max_perms): (Perms, Perms),
+) -> Result<(), Status> {
     // A VMO charged to a job that is neither the caller's nor the address space owner's must already be committed over the
     // range (slice V, INVARIANTS V1): its pages are paid for, so a touch can neither fail nor charge a stranger, and a
     // process cannot be killed by a VMO it was handed. A parent mapping its own VMO, or one charged to the child's job,
@@ -1023,12 +1084,6 @@ fn process_map<M: PhysMem, X: Machine>(
     if vmo_job != Some(target.job) && vmos.is_busy(vid) {
         return Err(Status::ShouldWait);
     }
-    let perms = Perms {
-        read: true,
-        write: flags & PF_W != 0,
-        exec: flags & PF_X != 0,
-        user: true,
-    };
     // Page tables for this region, worst case: one leaf table per 512 pages it spans (plus one for each end not aligned to
     // them) and two interior ones.
     let tables = length / 4096 / 512 + 4;
@@ -1059,7 +1114,7 @@ fn process_map<M: PhysMem, X: Machine>(
         .aspace
         .held_mut()
         .merge_near(mm, vmos, jobs, vaddr, vaddr + length);
-    Ok((anywhere.then_some(vaddr), None))
+    Ok(())
 }
 
 /// `proc_call`'s `nr::VMO_CREATE_CHILD` (a frame of its own: KT13).
@@ -1070,17 +1125,6 @@ fn vmo_create_child<M: PhysMem, X: Machine>(
     a: &[u64; 6],
     c: &mut PCtx<'_, M, X>,
 ) -> Result<(Option<u64>, Option<u64>), Status> {
-    let PCtx {
-        objs,
-        procs,
-        mm,
-        vmos,
-        jobs,
-        machine,
-        me,
-        ..
-    } = c;
-    let me = *me;
     use kcore::aspace::{ChildMode, VmoError};
     let (offset, bytes, job_handle, flags) = (a[1], a[2], a[3], a[4]);
     let mode = match flags {
@@ -1091,39 +1135,52 @@ fn vmo_create_child<M: PhysMem, X: Machine>(
     if !offset.is_multiple_of(4096) || !bytes.is_multiple_of(4096) || bytes == 0 {
         return Err(Status::InvalidArgs);
     }
-    let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::READ)?;
-    let caller_job = caller.job;
-    let job = if job_handle == 0 {
-        caller_job
-    } else {
-        ipc::job_of(objs, &caller.handles, Handle(job_handle), Rights::MANAGE)?
-    };
-    if mode == ChildMode::Snapshot {
-        // the pages never change payer (COW2)
-        let vmo_job = vmos.job_of(id).ok_or(Status::BadHandle)?;
-        if vmo_job != job {
-            return Err(Status::AccessDenied);
-        }
-        // V1: a process of another job maps the source on the promise that a write never fails on the VMO's job; a SNAPSHOT
-        // would make its next write a copy charged to that job
-        if vmos.maps_other_job(id, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job)) {
-            return Err(Status::BadState);
-        }
-    }
+    let (id, job, caller_job) =
+        child_source(c.objs, c.procs, c.vmos, c.me, (a[0], job_handle), mode)?;
     // everything that can fail comes before the source changes: the handle's room, the quota, the bookkeeping
-    vmos.reserve_n(2)?;
-    let child = match vmos.child_prepare(jobs, id, offset / 4096, bytes / 4096, job, mode) {
-        Ok(c) => c,
-        Err(VmoError::Gone) => return Err(Status::BadHandle),
-        Err(VmoError::JobMismatch) => return Err(Status::AccessDenied),
-        Err(VmoError::TooDeep) => return Err(Status::BadState),
-        Err(VmoError::NotCopyable) => return Err(Status::NotSupported),
-        Err(VmoError::NoMemory) => return Err(Status::NoMemory),
-        Err(VmoError::Busy) => return Err(Status::ShouldWait),
-        Err(_) => return Err(Status::InvalidArgs),
-    };
-    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    c.vmos.reserve_n(2)?;
+    let child = c
+        .vmos
+        .child_prepare(c.jobs, id, offset / 4096, bytes / 4096, job, mode)
+        .map_err(|x| match x {
+            VmoError::Gone => Status::BadHandle,
+            VmoError::JobMismatch => Status::AccessDenied,
+            VmoError::TooDeep => Status::BadState,
+            VmoError::NotCopyable => Status::NotSupported,
+            VmoError::NoMemory => Status::NoMemory,
+            VmoError::Busy => Status::ShouldWait,
+            _ => Status::InvalidArgs,
+        })?;
+    let handle = child_publish(
+        c,
+        caller_job,
+        child,
+        (id, offset / 4096, bytes / 4096),
+        mode,
+    )?;
+    Ok((Some(handle), None))
+}
+
+/// The end of `vmo_create_child`: the child's object and the caller's handle to it (without them the child goes again), then the child attached
+/// to its source (nothing can fail since `child_prepare`), and a SNAPSHOT's source write-protected (COW1). A frame of its own (KT13).
+#[inline(never)]
+fn child_publish<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    caller_job: JobId,
+    child: u64,
+    (id, first, pages): (u64, u64, u64),
+    mode: kcore::aspace::ChildMode,
+) -> Result<u64, Status> {
+    let PCtx {
+        objs,
+        procs,
+        mm,
+        vmos,
+        jobs,
+        machine,
+        me,
+    } = c;
+    let caller = procs.get_mut(me).ok_or(Status::BadState)?;
     let handle = match ipc::vmo_object_create_in(
         objs,
         &mut caller.handles,
@@ -1139,11 +1196,43 @@ fn vmo_create_child<M: PhysMem, X: Machine>(
             return Err(x);
         }
     };
-    vmos.child_attach(jobs, child, id, offset / 4096, bytes / 4096, mode);
-    if mode == ChildMode::Snapshot {
+    vmos.child_attach(jobs, child, id, first, pages, mode);
+    if mode == kcore::aspace::ChildMode::Snapshot {
         snapshot_protect(procs, mm, &mut **machine, id);
     }
-    Ok((Some(handle.0), None))
+    Ok(handle.0)
+}
+
+/// `vmo_create_child`'s source VMO (READ) and the job the child is charged to (MANAGE; the caller's own for handle 0), with the caller's job. A
+/// SNAPSHOT's pages never change payer (COW2), and are refused while a process of another job maps the source (V1: that mapping was made on the
+/// promise that a write never fails on the VMO's job; a SNAPSHOT would make its next write a copy charged to that job). A frame of its own (KT13).
+#[inline(never)]
+fn child_source(
+    objs: &Kobjs,
+    procs: &ProcTable,
+    vmos: &Vmos,
+    me: u64,
+    (vh, job_handle): (u64, u64),
+    mode: kcore::aspace::ChildMode,
+) -> Result<(u64, JobId, JobId), Status> {
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let id = ipc::vmo_of(objs, &caller.handles, Handle(vh), Rights::READ)?;
+    let caller_job = caller.job;
+    let job = if job_handle == 0 {
+        caller_job
+    } else {
+        ipc::job_of(objs, &caller.handles, Handle(job_handle), Rights::MANAGE)?
+    };
+    if mode == kcore::aspace::ChildMode::Snapshot {
+        let vmo_job = vmos.job_of(id).ok_or(Status::BadHandle)?;
+        if vmo_job != job {
+            return Err(Status::AccessDenied);
+        }
+        if vmos.maps_other_job(id, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job)) {
+            return Err(Status::BadState);
+        }
+    }
+    Ok((id, job, caller_job))
 }
 
 /// `proc_call`'s `nr::PROCESS_CLONE_REGION` (a frame of its own: KT13).
@@ -1154,28 +1243,126 @@ fn process_clone_region<M: PhysMem, X: Machine>(
     a: &[u64; 6],
     c: &mut PCtx<'_, M, X>,
 ) -> Result<(Option<u64>, Option<u64>), Status> {
-    let PCtx {
-        objs,
-        procs,
-        mm,
-        vmos,
-        jobs,
-        machine,
-        me,
-        ..
-    } = c;
-    let me = *me;
-    use kcore::aspace::{ChildMode, VmoError};
     let (vaddr, mode) = (a[2], a[3]);
     if (mode != abi::clone_mode::SHARE && mode != abi::clone_mode::SNAPSHOT)
         || !vaddr.is_multiple_of(4096)
     {
         return Err(Status::InvalidArgs);
     }
-    let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let (_, spid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
-    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[1]), Rights::MANAGE)?;
-    let caller_job = caller.job;
+    let snapshot = mode == abi::clone_mode::SNAPSHOT;
+    let cl = clone_check(c.objs, c.procs, c.vmos, c.jobs, c.me, a, snapshot)?;
+    clone_do(c, &cl)?;
+    Ok((None, None))
+}
+
+/// A `process_clone_region` call, checked (`clone_check`).
+struct CloneCall {
+    tpid: u64,
+    vaddr: u64,
+    region: kcore::aspace::RegionInfo,
+    end: u64,
+    vmo_job: JobId,
+    target_job: JobId,
+    snapshot: bool,
+}
+
+/// `process_clone_region` after its checks: the page-table charge, the VMO to map (`clone_source`), the mapping (`clone_map`) and a SNAPSHOT
+/// child's attach (`clone_attach`). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the page-table estimate is pages / 512 + 4
+#[inline(never)]
+fn clone_do<M: PhysMem, X: Machine>(c: &mut PCtx<'_, M, X>, cl: &CloneCall) -> Result<(), Status> {
+    let tables = cl.region.pages / 512 + 4;
+    c.jobs
+        .charge(cl.target_job, Resource::Pages, tables)
+        .map_err(crate::job_status)?;
+    let (map_vmo, map_page, child) =
+        match clone_source(c.vmos, c.jobs, &cl.region, cl.vmo_job, cl.snapshot) {
+            Ok(x) => x,
+            Err(x) => {
+                c.jobs.credit(cl.target_job, Resource::Pages, tables);
+                return Err(x);
+            }
+        };
+    clone_map(
+        c,
+        cl.tpid,
+        &cl.region,
+        (cl.vaddr, cl.end, tables, cl.target_job),
+        (map_vmo, map_page, child),
+    )?;
+    if let Some(ch) = child {
+        clone_attach(c, ch, &cl.region);
+    }
+    Ok(())
+}
+
+/// A SNAPSHOT clone's child joins the family only now (nothing could fail since `child_prepare`); the region holds its own reference, and the
+/// source is write-protected (COW1).
+#[inline(never)]
+fn clone_attach<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    ch: u64,
+    region: &kcore::aspace::RegionInfo,
+) {
+    let PCtx {
+        procs,
+        mm,
+        vmos,
+        jobs,
+        machine,
+        ..
+    } = c;
+    vmos.child_attach(
+        jobs,
+        ch,
+        region.vmo,
+        region.vmo_page,
+        region.pages,
+        kcore::aspace::ChildMode::Snapshot,
+    );
+    let _ = vmos.release(mm, jobs, ch);
+    snapshot_protect(procs, mm, &mut **machine, region.vmo);
+}
+
+/// `process_clone_region`'s checks, before anything is charged: the source's region that starts at `a[2]` (the target has no region in its
+/// range and room for one more), the VMO's job and the target's (V1, as `vmo_create_child` and `process_map`). The target, the region, its end,
+/// and the two jobs. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's page count was checked when it was mapped
+#[inline(never)]
+fn clone_check(
+    objs: &Kobjs,
+    procs: &ProcTable,
+    vmos: &Vmos,
+    jobs: &Jobs,
+    me: u64,
+    a: &[u64; 6],
+    snapshot: bool,
+) -> Result<CloneCall, Status> {
+    let vaddr = a[2];
+    let (spid, tpid, caller_job) = clone_procs(objs, procs, me, a)?;
+    let (region, end, target_job) = clone_region_of(procs, jobs, (spid, tpid), vaddr)?;
+    let vmo_job = clone_v1(procs, vmos, &region, (caller_job, target_job), snapshot)?;
+    Ok(CloneCall {
+        tpid,
+        vaddr,
+        region,
+        end,
+        vmo_job,
+        target_job,
+        snapshot,
+    })
+}
+
+/// The source's region that starts at `vaddr` (both processes running; the target has no region in its range and room for one more): the
+/// region, its end, and the target's job.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's page count was checked when it was mapped
+#[inline(never)]
+fn clone_region_of(
+    procs: &ProcTable,
+    jobs: &Jobs,
+    (spid, tpid): (u64, u64),
+    vaddr: u64,
+) -> Result<(kcore::aspace::RegionInfo, u64, JobId), Status> {
     let source = procs.get(&spid).ok_or(Status::BadState)?;
     let target = procs.get(&tpid).ok_or(Status::BadState)?;
     if source.exit_code.is_some()
@@ -1191,12 +1378,19 @@ fn process_clone_region<M: PhysMem, X: Machine>(
         .region_at_or_after(vaddr)
         .filter(|r| r.start == vaddr)
         .ok_or(Status::InvalidArgs)?;
-    let length = region.pages * 4096;
-    let end = vaddr.checked_add(length).ok_or(Status::InvalidArgs)?;
+    let end = target_room(target, jobs, vaddr, region.pages)?;
+    Ok((region, end, target.job))
+}
+
+/// The target of a clone of `pages` pages at `vaddr`: no region of its own in the range, and room for one more (so that the mapping cannot fail
+/// for want of a region slot). The range's end.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's page count was checked when it was mapped
+#[inline(never)]
+fn target_room(target: &Process, jobs: &Jobs, vaddr: u64, pages: u64) -> Result<u64, Status> {
+    let end = vaddr.checked_add(pages * 4096).ok_or(Status::InvalidArgs)?;
     if target.aspace.held_ref().has_region_in(vaddr, end) {
         return Err(Status::InvalidArgs);
     }
-    // (the mapping below cannot fail for want of a region slot)
     if target.aspace.held_ref().region_count() as u64
         >= jobs
             .region_limit(target.job)
@@ -1204,10 +1398,34 @@ fn process_clone_region<M: PhysMem, X: Machine>(
     {
         return Err(Status::NoMemory);
     }
-    let target_job = target.job;
+    Ok(end)
+}
+
+/// The source and the target of `process_clone_region` (both handles need MANAGE), and the caller's job.
+#[inline(never)]
+fn clone_procs(
+    objs: &Kobjs,
+    procs: &ProcTable,
+    me: u64,
+    a: &[u64; 6],
+) -> Result<(u64, u64, JobId), Status> {
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (_, spid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[1]), Rights::MANAGE)?;
+    Ok((spid, tpid, caller.job))
+}
+
+/// `clone_check`'s V1 checks of the region's VMO (as `vmo_create_child` for a SNAPSHOT, as `process_map` for a SHARE): the VMO's job.
+#[inline(never)]
+fn clone_v1(
+    procs: &ProcTable,
+    vmos: &Vmos,
+    region: &kcore::aspace::RegionInfo,
+    (caller_job, target_job): (JobId, JobId),
+    snapshot: bool,
+) -> Result<JobId, Status> {
     let vid = region.vmo;
     let vmo_job = vmos.job_of(vid).ok_or(Status::BadHandle)?;
-    let snapshot = mode == abi::clone_mode::SNAPSHOT;
     if snapshot {
         // a fork child runs in its parent's job: the copy is charged to the source's job, which must be the target's
         if vmo_job != target_job {
@@ -1227,51 +1445,75 @@ fn process_clone_region<M: PhysMem, X: Machine>(
     if vmo_job != target_job && vmos.is_busy(vid) {
         return Err(Status::ShouldWait);
     }
-    let tables = region.pages / 512 + 4;
-    jobs.charge(target_job, Resource::Pages, tables)
-        .map_err(crate::job_status)?;
-    let undo = |jobs: &mut Jobs| jobs.credit(target_job, Resource::Pages, tables);
-    let (map_vmo, map_page, child) = if snapshot {
-        if let Err(x) = vmos.reserve_n(2) {
-            undo(jobs);
-            return Err(x);
-        }
-        match vmos.child_prepare(
-            jobs,
-            vid,
-            region.vmo_page,
-            region.pages,
-            vmo_job,
-            ChildMode::Snapshot,
-        ) {
-            Ok(c) => (c, 0, Some(c)),
-            Err(x) => {
-                undo(jobs);
-                return Err(match x {
-                    VmoError::TooDeep => Status::BadState,
-                    VmoError::JobMismatch => Status::AccessDenied,
-                    VmoError::Gone => Status::BadHandle,
-                    VmoError::NotCopyable => Status::NotSupported,
-                    VmoError::Busy => Status::ShouldWait,
-                    VmoError::NoMemory => Status::NoMemory,
-                    _ => Status::InvalidArgs,
-                });
-            }
-        }
-    } else {
-        (vid, region.vmo_page, None)
-    };
+    Ok(vmo_job)
+}
+
+/// What `process_clone_region` maps: the source's VMO window as it is (SHARE), or a SNAPSHOT child of it, prepared (not yet attached: the
+/// call can still fail). (The VMO, its first page, and the child.) A frame of its own (KT13).
+#[inline(never)]
+fn clone_source(
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    region: &kcore::aspace::RegionInfo,
+    vmo_job: JobId,
+    snapshot: bool,
+) -> Result<(u64, u64, Option<u64>), Status> {
+    use kcore::aspace::VmoError;
+    if !snapshot {
+        return Ok((region.vmo, region.vmo_page, None));
+    }
+    vmos.reserve_n(2)?;
+    match vmos.child_prepare(
+        jobs,
+        region.vmo,
+        region.vmo_page,
+        region.pages,
+        vmo_job,
+        kcore::aspace::ChildMode::Snapshot,
+    ) {
+        Ok(c) => Ok((c, 0, Some(c))),
+        Err(x) => Err(match x {
+            VmoError::TooDeep => Status::BadState,
+            VmoError::JobMismatch => Status::AccessDenied,
+            VmoError::Gone => Status::BadHandle,
+            VmoError::NotCopyable => Status::NotSupported,
+            VmoError::Busy => Status::ShouldWait,
+            VmoError::NoMemory => Status::NoMemory,
+            _ => Status::InvalidArgs,
+        }),
+    }
+}
+
+/// `process_clone_region`'s mapping in the target, with the page-table charge's records (KT9: their room before the mapping); on a failure the
+/// child (if any) goes and the charge is credited. A frame of its own (KT13).
+#[inline(never)]
+fn clone_map<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    tpid: u64,
+    region: &kcore::aspace::RegionInfo,
+    (vaddr, end, tables, target_job): (u64, u64, u64, JobId),
+    (map_vmo, map_page, child): (u64, u64, Option<u64>),
+) -> Result<(), Status> {
+    let PCtx {
+        procs,
+        mm,
+        vmos,
+        jobs,
+        ..
+    } = c;
     let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
     target
         .aspace
         .held_mut()
         .set_region_limit(jobs.region_limit(target.job));
-    // (KT9: the room for the charge's records before the mapping; with none the call undoes what it did and says NO_MEMORY)
-    if let Err(x) = target.reserve_charge() {
+    let undo = |mm: &mut Mm<M>, vmos: &mut Vmos, jobs: &mut Jobs| {
         if let Some(c) = child {
             let _ = vmos.release(mm, jobs, c);
         }
-        undo(jobs);
+        jobs.credit(target_job, Resource::Pages, tables);
+    };
+    if let Err(x) = target.reserve_charge() {
+        undo(mm, vmos, jobs);
         return Err(x);
     }
     if let Err(x) = target.aspace.held_mut().map_region_max(
@@ -1283,10 +1525,7 @@ fn process_clone_region<M: PhysMem, X: Machine>(
         region.perms,
         region.max_perms,
     ) {
-        if let Some(c) = child {
-            let _ = vmos.release(mm, jobs, c);
-        }
-        undo(jobs);
+        undo(mm, vmos, jobs);
         return Err(match x {
             kcore::aspace::RegionError::TooMany => Status::NoMemory,
             _ => Status::InvalidArgs,
@@ -1297,20 +1536,7 @@ fn process_clone_region<M: PhysMem, X: Machine>(
         .aspace
         .held_mut()
         .merge_near(mm, vmos, jobs, vaddr, end);
-    if let Some(c) = child {
-        // the child is part of the family only now (nothing could fail since `child_prepare`); the region holds its own reference
-        vmos.child_attach(
-            jobs,
-            c,
-            vid,
-            region.vmo_page,
-            region.pages,
-            ChildMode::Snapshot,
-        );
-        let _ = vmos.release(mm, jobs, c);
-        snapshot_protect(procs, mm, &mut **machine, vid);
-    }
-    Ok((None, None))
+    Ok(())
 }
 
 /// `proc_call`'s `nr::PROCESS_MAP_INFO` (a frame of its own: KT13).
@@ -1332,17 +1558,27 @@ fn process_map_info<M: PhysMem, X: Machine>(
     } = c;
     let me = *me;
     let (vaddr, buf) = (a[1], a[2]);
-    let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)?;
+    let tpid = target_with(objs, procs, me, a[0], Rights::INSPECT)?;
     let target = procs.get(&tpid).ok_or(Status::BadState)?;
+    let mut bytes = [0u8; 48];
+    let next = map_record(target.aspace.held_ref(), vaddr, &mut bytes);
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    kcore::usercopy::copy_to_user(caller.aspace.held_mut(), mm, vmos, jobs, buf, &bytes)
+        .map_err(|_| Status::InvalidArgs)?;
+    Ok((Some(next), None))
+}
+
+/// `process_map_info`'s record of the region at or after `vaddr` in `aspace` (none: a zeroed record), as six little-endian words in `bytes`
+/// (no allocation: `concat` would make a vector, which cannot fail here, T177); and the start of the region after it (0: none). A frame of its
+/// own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's pages were checked when it was mapped
+#[inline(never)]
+fn map_record(aspace: &AddressSpace, vaddr: u64, bytes: &mut [u8; 48]) -> u64 {
     let bits = |p: Perms| u64::from(p.read) | u64::from(p.write) << 1 | u64::from(p.exec) << 2;
-    // the region at or after `vaddr`; none: a zeroed record and 0
-    let (record, next) = match target.aspace.held_ref().region_at_or_after(vaddr) {
+    let (record, next) = match aspace.region_at_or_after(vaddr) {
         Some(r) => {
             let len = r.pages * 4096;
-            let next = target
-                .aspace
-                .held_ref()
+            let next = aspace
                 .region_at_or_after(r.start + len)
                 .map_or(0, |n| n.start);
             (
@@ -1359,15 +1595,10 @@ fn process_map_info<M: PhysMem, X: Machine>(
         }
         None => ([0; 6], 0),
     };
-    // (no allocation: `concat` would make a vector, which cannot fail here (T177))
-    let mut bytes = [0u8; 48];
     for (out, w) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(record.iter()) {
         *out = w.to_le_bytes();
     }
-    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
-    kcore::usercopy::copy_to_user(caller.aspace.held_mut(), mm, vmos, jobs, buf, &bytes)
-        .map_err(|_| Status::InvalidArgs)?;
-    Ok((Some(next), None))
+    next
 }
 
 /// `proc_call`'s `nr::PROCESS_INFO if a[1] == 1` (a frame of its own: KT13).
@@ -1614,28 +1845,39 @@ fn process_self<M: PhysMem, X: Machine>(
                 .expect("room was checked");
             Ok((Some(h.0), None))
         }
-        None => {
-            let job = p.job;
-            let (h, obj) = ipc::process_object_create_in(
-                objs,
-                &mut p.handles,
-                me,
-                false,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            )?;
-            // narrow the default rights: a self handle cannot be sent away (a table whose last free slot is on its last
-            // generation refuses the replace: give the new object back)
-            let Ok(h) = p.handles.replace(objs, h, rights) else {
-                let _ = p.handles.close(objs, h);
-                return Err(Status::NoMemory);
-            };
-            if own.is_none() {
-                p.obj = Some(obj);
-            }
-            Ok((Some(h.0), None))
-        }
+        None => self_view(objs, p, jobs, (me, rights), own.is_none()).map(|h| (Some(h), None)),
     }
+}
+
+/// `process_self`'s separate view object of process `me` (`p`), with `rights` (`first`: the process has no object of its own yet, and this one
+/// becomes it). A frame of its own (KT13).
+#[inline(never)]
+fn self_view(
+    objs: &mut Kobjs,
+    p: &mut Process,
+    jobs: &mut Jobs,
+    (me, rights): (u64, Rights),
+    first: bool,
+) -> Result<u64, Status> {
+    let job = p.job;
+    let (h, obj) = ipc::process_object_create_in(
+        objs,
+        &mut p.handles,
+        me,
+        false,
+        &mut ipc::Quota {
+            jobs,
+            job: Some(job),
+        },
+    )?;
+    // narrow the default rights: a self handle cannot be sent away (a table whose last free slot is on its last
+    // generation refuses the replace: give the new object back)
+    let Ok(h) = p.handles.replace(objs, h, rights) else {
+        let _ = p.handles.close(objs, h);
+        return Err(Status::NoMemory);
+    };
+    if first {
+        p.obj = Some(obj);
+    }
+    Ok(h.0)
 }
