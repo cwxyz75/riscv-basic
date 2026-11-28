@@ -457,8 +457,9 @@ TIMED_OUT (the deadline passed first; the reply may still arrive and can be read
 `channel_read_txid`), BUFFER_TOO_SMALL (the reply is too big for the capacity; it stays queued
 and the sizes come back in `nbytes`, `nhandles`), INVALID_ARGS (the reply buffer or reply handles
 buffer is not writable, or stops being writable during the copy; the reply stays queued), NO_MEMORY (the reply carries handles and the
-table has no room, or there is no memory to commit a page of the reply buffers; it stays queued). The reply is removed only after it has
-been copied (OD161).
+table has no room, or there is no memory to commit a page of the reply buffers or for the kernel's copy of a reply of 1 KiB or more; it
+stays queued). The reply is removed only after it has been copied (OD161); if another thread reads the reply off the channel while the call
+copies it, the call waits again for a reply with its transaction id, to its deadline.
 The kernel does not donate priority to the server yet (OS-ARCHITECTURE 5.3): the call is
 where that attaches.
 Tests: `channel_call_*` in `init`.
@@ -1036,7 +1037,7 @@ Remove up to `max` bytes from the own buffer into `buffer`. Rights: READ. `max` 
 `SOCKET_BUFFER`. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG; then, if
 `max` > 0 and the buffer is empty: PEER_CLOSED (the peer is gone: end of stream) or
 SHOULD_WAIT; INVALID_ARGS (the destination is not writable user memory; nothing is removed); NO_MEMORY (no memory to
-commit a page of the destination; nothing is removed); SHOULD_WAIT (a page of the destination in a pager's VMO, see `pager_create_vmo`).
+commit a page of the destination, or for the kernel's copy of a read of 1 KiB or more; nothing is removed); SHOULD_WAIT (a page of the destination in a pager's VMO, see `pager_create_vmo`).
 The bytes are removed only after they have been copied (OD161, "Copying from and to user memory"): a failed copy, at any point, leaves
 every byte queued, and a stream is never reordered.
 `max` 0 is OK with `read` 0.

@@ -590,15 +590,18 @@ fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
             ksys::channel_call_ready(s, pid, &call, interrupted)
         })
     };
-    commit_wake();
-    thread::wait_deadline_registered(
-        ready,
-        || register_call_wait(me, call.ch, call.txid),
-        call.deadline,
-    );
-    locked_state(|s| s.waits.forget(me));
     // the reply (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
+    let mut wait = true;
     loop {
+        if core::mem::take(&mut wait) {
+            commit_wake();
+            thread::wait_deadline_registered(
+                &ready,
+                || register_call_wait(me, call.ch, call.txid),
+                call.deadline,
+            );
+            locked_state(|s| s.waits.forget(me));
+        }
         let mut deferred = None;
         let mut r = locked_state(|s| {
             let _as = AsLocks::caller(s);
@@ -624,7 +627,12 @@ fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
             crate::chaos::point(crate::chaos::Point::CopyOut);
             match super::trap::finish_read(&d) {
                 Some(done) => r = done,
-                None => continue,
+                None => {
+                    // (another thread of the caller read the reply off the channel in between: the call waits again, to its deadline, rather than
+                    // report TIMED_OUT before the deadline has passed)
+                    wait = true;
+                    continue;
+                }
             }
         }
         // (MM9) a reply buffer in a page of a pager's VMO that is not there: the reply stays queued; wait for the page here and take the reply

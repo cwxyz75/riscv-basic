@@ -1,5 +1,6 @@
 //! Peek, copy, commit (OD161, T285) under shuttle, over the real `kcore::ipc` queue: two readers of one endpoint that claim under the
-//! object lock, copy with it let go (a yield point, where the copy may fail), and commit under it again, against a writer, a killer that
+//! object lock, copy with it let go (a yield point, where the copy may fail), and commit under it again, against a writer (the channel's
+//! last message, the stream's second half), a killer that
 //! closes the readers' handle (what a process teardown does to the table) and a peer that closes. Whatever the interleaving: every message
 //! and every stream byte is delivered exactly once, in the queue's order, a failed copy loses nothing, the bytes a reader copied are the
 //! bytes its commit removed, and when everything is closed nothing is left alive (H4, H7). Run with
@@ -8,7 +9,8 @@
 //!
 //! The negative controls are the protocol as it was before OD161 (take at the claim, then copy: a failed copy loses the message) and a
 //! commit that does not name what it copied (it removes whatever is at the front: a second reader makes it deliver bytes it did not
-//! remove); shuttle must find a violating schedule for each.
+//! remove); shuttle must find a violating schedule for each. (A txid read claims by the same serial; it is covered on the host,
+//! `ksys/tests/read_commit.rs`, and the write of the handle numbers failing, which runs inside one lock section, there too.)
 #![cfg(shuttle)]
 
 use abi::status::Status;
@@ -97,7 +99,8 @@ fn channel_model(p: Protocol, msgs: u8, closer: bool) {
     let ry = table
         .duplicate(&mut reg, y, abi::rights::Rights::CHANNEL)
         .unwrap();
-    for id in 0..msgs {
+    // (all but the last now; the writer thread sends the last while the readers run)
+    for id in 0..msgs - 1 {
         let e = ipc::event_create(&mut reg, &mut table).unwrap();
         ipc::channel_write(&mut reg, &mut table, x, &[id; 8], &[e]).unwrap();
     }
@@ -123,21 +126,29 @@ fn channel_model(p: Protocol, msgs: u8, closer: bool) {
             let _ = table.close(reg, ry);
         })
     };
-    let closer = closer.then(|| {
+    // the writer: the last message, then (when `closer`) the peer's close
+    let closer = {
         let d = d.clone();
         thread::spawn(move || {
-            let mut g = d.lock().unwrap();
-            let Dom { reg, table, .. } = &mut *g;
-            let _ = table.close(reg, x);
+            {
+                let mut g = d.lock().unwrap();
+                let Dom { reg, table, .. } = &mut *g;
+                let e = ipc::event_create(reg, table).unwrap();
+                ipc::channel_write(reg, table, x, &[msgs - 1; 8], &[e]).unwrap();
+            }
+            if closer {
+                thread::yield_now();
+                let mut g = d.lock().unwrap();
+                let Dom { reg, table, .. } = &mut *g;
+                let _ = table.close(reg, x);
+            }
         })
-    });
+    };
     for t in readers {
         t.join().unwrap();
     }
     killer.join().unwrap();
-    if let Some(c) = closer {
-        c.join().unwrap();
-    }
+    closer.join().unwrap();
     let mut g = d.lock().unwrap();
     let Dom {
         reg,
