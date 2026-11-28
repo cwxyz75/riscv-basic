@@ -16177,8 +16177,7 @@ fn volmgr_retries_a_busy_device_and_publishes_only_mounted_volumes() -> Outcome 
     sys::handle_close(res);
     r?;
     sys::debug_write(
-        b"fs: volmgr retried a device that was busy and published only mounted volumes
-",
+        b"fs: volmgr retried a device that was busy and published only mounted volumes\n",
     );
     Ok(())
 }
