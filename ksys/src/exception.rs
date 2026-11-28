@@ -89,26 +89,67 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
         jobs,
         job: Some(job),
     };
-    // the thread: its object if it has one (the handle takes a reference of its own, so closing it never destroys the spawner's object), else one
-    // made now (a thread started by `process_start` has none, or its object is gone)
+    let Some((th, tobj, made_obj)) = offer_thread(objs, ktable, threads, (pid, tid), &mut q) else {
+        return false;
+    };
+    let Some((eh, eobj)) = offer_exception(objs, ktable, (pid, tid, f, l, serial), &mut q) else {
+        let _ = ktable.close(objs, th);
+        return false;
+    };
+    if !offer_send(objs, ktable, chan, (f, tid), (th, eh, eobj), q.jobs) {
+        return false;
+    }
+    if made_obj {
+        if let Some(t) = threads.get_mut(&tid) {
+            t.obj = Some(tobj);
+            ipc::thread_set_tid(objs, tobj, tid);
+        }
+    }
+    us.next_exc = serial.saturating_add(1);
+    if let Some(t) = us.threads.get_mut(&tid) {
+        t.exc_pending = Some(serial);
+    }
+    true
+}
+
+/// The handle to the faulting thread that `offer` sends: to its object if it has one (the handle takes a reference of its own, so closing it
+/// never destroys the spawner's object), else to one made now (a thread started by `process_start` has none, or its object is gone; `true`:
+/// made). `None`: no memory, nothing kept. A frame of its own (KT13).
+#[inline(never)]
+fn offer_thread(
+    objs: &mut ipc::Kobjs,
+    ktable: &mut kcore::handle::HandleTable,
+    threads: &crate::state::Threads,
+    (pid, tid): (u64, Tid),
+    q: &mut Quota<'_>,
+) -> Option<(Handle, ObjId, bool)> {
     let existing = threads
         .get(&tid)
         .and_then(|t| t.obj)
         .filter(|&obj| objs.retain(obj));
-    let (th, tobj) = match existing {
+    match existing {
         Some(obj) => match ktable.insert(objs, obj, Rights::THREAD) {
-            Ok(h) => (h, obj),
+            Ok(h) => Some((h, obj, false)),
             Err(_) => {
                 objs.release(obj);
-                return false;
+                None
             }
         },
-        None => match ipc::thread_object_create_in(objs, ktable, pid, &mut q) {
-            Ok(x) => x,
-            Err(_) => return false,
-        },
-    };
-    let made_obj = existing.is_none();
+        None => ipc::thread_object_create_in(objs, ktable, pid, q)
+            .ok()
+            .map(|(h, o)| (h, o, true)),
+    }
+}
+
+/// The exception object `offer` sends (for fault `f` of thread `tid` of process `pid`, at level `l`, numbered `serial`), and its handle. `None`: no
+/// memory. A frame of its own (KT13).
+#[inline(never)]
+fn offer_exception(
+    objs: &mut ipc::Kobjs,
+    ktable: &mut kcore::handle::HandleTable,
+    (pid, tid, f, l, serial): (u64, Tid, &Fault, ExcLevel, u64),
+    q: &mut Quota<'_>,
+) -> Option<(Handle, ObjId)> {
     let e = ExceptionObj {
         pid,
         tid,
@@ -120,15 +161,21 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
         serial,
         resolved: false,
     };
-    let (eh, eobj) = match ipc::exception_object_create_in(objs, ktable, e, &mut q) {
-        Ok(x) => x,
-        Err(_) => {
-            let _ = ktable.close(objs, th);
-            return false;
-        }
-    };
-    // five little-endian words
-    // (an array, not a vector: a fault is delivered with memory short, and this must not allocate: T248)
+    ipc::exception_object_create_in(objs, ktable, e, q).ok()
+}
+
+/// Write the exception message on `chan`: five little-endian words (an array, not a vector: a fault is delivered with memory short, and this must not
+/// allocate: T248) and the two handles. When the write fails the handles are still ours: they and their objects go (the exception object is
+/// resolved first, so that its death is not taken for a close by a handler), and `false`. A frame of its own (KT13).
+#[inline(never)]
+fn offer_send(
+    objs: &mut ipc::Kobjs,
+    ktable: &mut kcore::handle::HandleTable,
+    chan: Handle,
+    (f, tid): (&Fault, Tid),
+    (th, eh, eobj): (Handle, Handle, ObjId),
+    jobs: &mut Jobs,
+) -> bool {
     let mut msg = [0u8; 40];
     for (chunk, w) in
         msg.as_chunks_mut::<8>()
@@ -138,23 +185,9 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
     {
         *chunk = w.to_le_bytes();
     }
-    match ipc::channel_write_in(objs, ktable, chan, &msg, &[th, eh], q.jobs) {
-        Ok(()) => {
-            if made_obj {
-                if let Some(t) = threads.get_mut(&tid) {
-                    t.obj = Some(tobj);
-                    ipc::thread_set_tid(objs, tobj, tid);
-                }
-            }
-            us.next_exc = serial.saturating_add(1);
-            if let Some(t) = us.threads.get_mut(&tid) {
-                t.exc_pending = Some(serial);
-            }
-            true
-        }
+    match ipc::channel_write_in(objs, ktable, chan, &msg, &[th, eh], jobs) {
+        Ok(()) => true,
         Err(_) => {
-            // (the handles are still ours: they and their objects go; the exception object is resolved first, so that its death is not taken
-            // for a close by a handler)
             ipc::exception_set_resolved(objs, eobj);
             let _ = ktable.close(objs, th);
             let _ = ktable.close(objs, eh);
@@ -286,22 +319,29 @@ pub fn exception_channel(
     me: u64,
     target: Target,
 ) -> Result<u64, Status> {
+    let (existing, job, pid_or_job) = exc_target(us, me, target)?;
+    exc_make(us, jobs, me, (existing, job, pid_or_job))
+}
+
+/// What an exception channel is made for: the target's current channel (whose user end must have closed), the job the channel is charged to,
+/// and the process (`Ok`) or the job (`Err`) it serves; with room made for the caller's handle and a job's entry first, so that the inserts of
+/// `exc_make` cannot fail and strand the user end (T248). A frame of its own (KT13).
+#[allow(clippy::type_complexity)]
+#[inline(never)]
+fn exc_target(
+    us: &mut UserState,
+    me: u64,
+    target: Target,
+) -> Result<
+    (
+        Option<Handle>,
+        kcore::job::JobId,
+        Result<u64, kcore::job::JobId>,
+    ),
+    Status,
+> {
+    let (existing, job, pid_or_job) = exc_of(us, me, target)?;
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
-    let (existing, job, pid_or_job) = match target {
-        Target::Process(h) => {
-            let (_, tpid, terminated, _) =
-                ipc::process_of(&us.objs, &caller.handles, Handle(h), Rights::MANAGE)?;
-            let p = us.procs.get(&tpid).ok_or(Status::BadState)?;
-            if terminated || p.exit_code.is_some() || p.killed.is_some() {
-                return Err(Status::BadState);
-            }
-            (p.exc_channel, p.job, Ok(tpid))
-        }
-        Target::Job(h) => {
-            let job = ipc::job_of(&us.objs, &caller.handles, Handle(h), Rights::MANAGE)?;
-            (us.job_exc.get(&job).copied(), job, Err(job))
-        }
-    };
     if caller.handles.room() < 1 {
         return Err(Status::NoMemory);
     }
@@ -320,6 +360,57 @@ pub fn exception_channel(
     if pid_or_job.is_err() {
         us.job_exc.reserve(1).map_err(|_| Status::NoMemory)?;
     }
+    Ok((existing, job, pid_or_job))
+}
+
+/// The target of an exception channel call (a process or a job, MANAGE; a process that is ending is BAD_STATE): its current channel, its job,
+/// and the process (`Ok`) or the job (`Err`).
+#[allow(clippy::type_complexity)]
+#[inline(never)]
+fn exc_of(
+    us: &UserState,
+    me: u64,
+    target: Target,
+) -> Result<
+    (
+        Option<Handle>,
+        kcore::job::JobId,
+        Result<u64, kcore::job::JobId>,
+    ),
+    Status,
+> {
+    let caller = us.procs.get(&me).ok_or(Status::BadState)?;
+    match target {
+        Target::Process(h) => {
+            let (_, tpid, terminated, _) =
+                ipc::process_of(&us.objs, &caller.handles, Handle(h), Rights::MANAGE)?;
+            let p = us.procs.get(&tpid).ok_or(Status::BadState)?;
+            if terminated || p.exit_code.is_some() || p.killed.is_some() {
+                return Err(Status::BadState);
+            }
+            Ok((p.exc_channel, p.job, Ok(tpid)))
+        }
+        Target::Job(h) => {
+            let job = ipc::job_of(&us.objs, &caller.handles, Handle(h), Rights::MANAGE)?;
+            Ok((us.job_exc.get(&job).copied(), job, Err(job)))
+        }
+    }
+}
+
+/// The exception channel, made: the caller gets its user end (a new handle, returned), the old channel's kernel end goes, and the target takes the
+/// new one. A frame of its own (KT13).
+#[allow(clippy::type_complexity)]
+#[inline(never)]
+fn exc_make(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    me: u64,
+    (existing, job, pid_or_job): (
+        Option<Handle>,
+        kcore::job::JobId,
+        Result<u64, kcore::job::JobId>,
+    ),
+) -> Result<u64, Status> {
     let UserState {
         objs,
         ktable,
