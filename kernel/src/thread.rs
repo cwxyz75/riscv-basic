@@ -1192,19 +1192,22 @@ pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
     irq::off(|| sched().park_state(tid))
 }
 
-/// Block until woken (or return at once if a wake already arrived after `prepare_block`).
+/// Block until woken (or return at once if a wake already arrived after `prepare_block`). Returns whether it blocked: false when
+/// the wake had already arrived (a test reads it, `wake_before_block_is_not_lost`: a fact about the call, not about the clock).
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
-pub fn block() {
+pub fn block() -> bool {
     // (EX1) a thread that was suspended after it entered the call has stopped where it is
     crate::user::suspend_blocks();
     // (MM8) a page the call made visible or replaced may be shown stale through other mappings until the call ends; a thread that sleeps
     // inside it would leave them so for as long as it sleeps
     crate::user::cow_sync();
     irq::off(|| {
-        if sched().block_on(hart()).expect("running thread") {
+        let blocked = sched().block_on(hart()).expect("running thread");
+        if blocked {
             reschedule();
         }
-    });
+        blocked
+    })
 }
 
 /// Wake a thread: a blocked one runs again; one that has prepared to wait will not block; otherwise nothing happens
@@ -1214,6 +1217,16 @@ pub fn wake(tid: Tid) {
         let _ = sched().wake_on(hart(), tid);
         note_resched();
     });
+}
+
+/// `wake`, saying whether the wake counted: the thread was blocked (now runnable) or prepared (now notified). A test hook
+/// (`wake_before_block_is_not_lost`: a waker that repeats only the wakes that found nobody waiting).
+pub fn wake_counted(tid: Tid) -> bool {
+    irq::off(|| {
+        let counted = sched().wake_counted_on(hart(), tid) == Ok(true);
+        note_resched();
+        counted
+    })
 }
 
 /// Sleep for `ns` nanoseconds (or until woken): the same as `sleep_ticks`, at the clock's own resolution.
