@@ -664,7 +664,6 @@ impl Vmos {
         s.vmo.as_mut()
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
     /// Take the VMO `id` names out of its slot and drop it (`take` in a frame of its own, so that its caller holds no copy of a `Vmo`: KT13).
     /// Whether there was one.
     #[inline(never)]
@@ -715,6 +714,7 @@ impl Vmos {
         committed
     }
 
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
     fn take(&mut self, id: u64) -> Option<Vmo> {
         let (i, retire) = self.end_slot(id)?;
         let v = self.slots.get_mut(i).and_then(|s| s.vmo.take());

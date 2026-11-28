@@ -137,6 +137,10 @@ def file_problems(rel, text):
                 bad.append(f"{rel}:{i + 1}: an allow of clippy::large_stack_frames on an `impl`, `mod` or `trait` (KT13): put it on the function")
     for n, func, note in allows_in(rel, text):
         if note.startswith(CONST_NOTE):
+            # (only on a `const fn`: a run-time function cannot be relabelled to pass)
+            sig = next((l for l in lines[n - 1 : n + 11] if FN.match(l)), "")
+            if not re.search(r"\bconst\s+(unsafe\s+)?fn\b", sig):
+                bad.append(f"{rel}:{n}: `{func}` is marked a const fn but is not one (KT13)")
             continue
         if note.startswith(BOOT_NOTE):
             if not TEST_FILE.search(rel) and (rel, func) not in BOOT:
@@ -195,6 +199,7 @@ def self_test():
     planted["the left marker in the kernel"] = ("kernel/src/user/trap.rs", f"#[allow(clippy::large_stack_frames)] // {left}\nfn syscall() {{}}\n")
     planted["the left marker in kcore"] = ("kcore/src/aspace.rs", f"    #[allow(clippy::large_stack_frames)] // {left} (see work/T289.md)\n    fn page_for() {{}}\n")
     planted["an audited allow in ksys"] = ("ksys/src/proc.rs", "#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB\npub fn proc_call() {}\n")
+    planted["a run-time fn labelled const"] = ("ksys/src/thread.rs", f"#[allow(clippy::large_stack_frames)] // {CONST_NOTE}\npub fn thread_spawn() {{}}\n")
     planted["a ksys production frame relabelled"] = ("ksys/src/thread.rs", f"#[allow(clippy::large_stack_frames)] // {BOOT_NOTE}\npub fn thread_spawn() {{}}\n")
     for what, (rel, text) in planted.items():
         assert file_problems(rel, text), f"stack_allows self-test: {what} was not refused"
