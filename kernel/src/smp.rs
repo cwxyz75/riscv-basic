@@ -207,12 +207,16 @@ pub const WORK_BKL_PROBE: u32 = 2;
 /// read-modify-write, so only mutual exclusion keeps it exact.
 pub static LOCK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// When the lock-exclusion test's harts stop (`time` counter cycles; `WORK_BKL_COUNT` and the boot hart's loop both read it): the test
-/// is bounded in time as well as in count. The big lock is a FIFO ticket lock, and on a host with fewer cores than emulated harts a
-/// hand-over to a waiter whose host thread is not running waits for the host to run it: the test's 160,000 hand-overs at eight harts
-/// on a four-core runner took more than 180 s, every secondary hart with its interrupts off and nothing printed (the overnight
-/// checked boot of 2026-11-28, run 46098760953).
+/// When the lock-exclusion test's harts may stop (`time` counter cycles; `WORK_BKL_COUNT` and the boot hart's loop both read it;
+/// `u64::MAX` outside the test): the test is bounded in time as well as in count. On a host with fewer cores than emulated harts a
+/// hand-over of the big lock (a FIFO ticket lock) waits until the host runs the hart whose turn it is: the test's 160,000 hand-overs
+/// at eight harts on a four-core runner took more than 180 s, every secondary hart with its interrupts off and nothing printed (the
+/// overnight checked boot of 2026-11-28, run 46098760953).
 pub static BKL_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The increments each hart makes in the exclusion test whatever the time bound says (so a cut-short run still has every hart
+/// contending for the lock at once, and a hart that took its interrupt after the bound still counts).
+pub const BKL_MIN: u64 = 200;
 
 /// Add one to `LOCK_COUNTER` the racy way (a pause between the load and the store).
 pub fn racy_increment() {
@@ -221,14 +225,19 @@ pub fn racy_increment() {
     LOCK_COUNTER.store(v + 1, Ordering::Relaxed);
 }
 
+/// Whether the exclusion test's loop is done after `done` of `max` increments (`BKL_MIN` at least, then until `BKL_UNTIL`).
+pub fn bkl_count_done(done: u64, max: u64, until: u64) -> bool {
+    done >= max || (done >= BKL_MIN && timer::now() >= until)
+}
+
 fn do_work(me: &percpu::PerHart) {
     let arg = me.work_arg.load(Ordering::SeqCst);
     match me.work_kind.load(Ordering::SeqCst) {
         WORK_BKL_COUNT => {
-            // up to `arg` increments, until `BKL_UNTIL`; the result is how many were made (the test sums them)
+            // up to `arg` increments, `BKL_MIN` at least and then until `BKL_UNTIL`; the result is how many were made (the test sums them)
             let until = BKL_UNTIL.load(Ordering::SeqCst);
             let mut done = 0;
-            while done < arg && timer::now() < until {
+            while !bkl_count_done(done, arg, until) {
                 crate::bkl::lock();
                 racy_increment();
                 crate::bkl::unlock();

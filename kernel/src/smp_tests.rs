@@ -597,10 +597,11 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
     Ok(())
 }
 
-/// Every hart increments one counter the racy way under the big lock, at most `BKL_M` times each and for at most `BKL_BUDGET_MS`: the
-/// count must be exact. The time bound (`smp::BKL_UNTIL`) keeps the test's length in proportion on a host with fewer cores than harts;
-/// a run the bound ended says so on the log with each hart's share, and is still a full check of the exclusion (every increment made is
-/// counted, and every hart must have made some).
+/// Every hart increments one counter the racy way under the big lock, at most `BKL_M` times each, at least `smp::BKL_MIN` times each,
+/// and beyond that for at most `BKL_BUDGET_MS`: the count must be exact. The time bound (`smp::BKL_UNTIL`) keeps the test's length in
+/// proportion on a host with fewer cores than harts; the floor keeps a cut-short run a test of exclusion (every hart contends at once
+/// for at least `BKL_MIN` hand-overs, so the run has at least `BKL_MIN * harts` of them). A run the bound ended says so on the log with
+/// each hart's share.
 fn bkl_is_exclusive_under_contention() -> Result<(), String> {
     use crate::bkl;
     let n = smp::started().min(percpu::MAX_HARTS);
@@ -609,9 +610,12 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
     }
     smp::LOCK_COUNTER.store(0, Ordering::SeqCst);
     let start = crate::timer::now();
-    let until = start + BKL_BUDGET_MS * (crate::timer::timebase() / 1000);
+    let until = start + crate::timer::cycles_from_ns(BKL_BUDGET_MS * 1_000_000);
     smp::BKL_UNTIL.store(until, Ordering::SeqCst);
-    if let Some(i) = bkl_run(n, until) {
+    let unfinished = bkl_run(n, until);
+    // (no other user of the work sees a bound in the past)
+    smp::BKL_UNTIL.store(u64::MAX, Ordering::SeqCst);
+    if let Some(i) = unfinished {
         return Err(bkl_failure(BklFail::Unfinished(i), n));
     }
     let want: u64 = BKL_DONE.iter().map(|d| d.load(Ordering::SeqCst)).sum();
@@ -625,7 +629,7 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
     if let Some(i) = BKL_DONE
         .iter()
         .take(n)
-        .position(|d| d.load(Ordering::SeqCst) == 0)
+        .position(|d| d.load(Ordering::SeqCst) < smp::BKL_MIN)
     {
         return Err(bkl_failure(BklFail::Idle(i), n));
     }
@@ -636,22 +640,24 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
     Ok(())
 }
 
-/// The exclusion test's increments: the other harts in their IPI handlers, this one through the kernel's critical section, until
-/// `until`; each hart's count goes to `BKL_DONE`. Returns the first hart that did not report within 5 s (out of line, KT13).
+/// The exclusion test's increments: the other harts in their IPI handlers, this one through the kernel's critical section, as
+/// `smp::bkl_count_done` says; each hart's count goes to `BKL_DONE`. Returns the first hart that did not report within
+/// `BKL_WAIT_S` (out of line, KT13).
 #[inline(never)]
 fn bkl_run(n: usize, until: u64) -> Option<usize> {
     for i in 1..n {
         smp::start_work(i, smp::WORK_BKL_COUNT, BKL_M);
     }
     let mut mine = 0u64;
-    while mine < BKL_M && crate::timer::now() < until {
+    while !smp::bkl_count_done(mine, BKL_M, until) {
         crate::irq::without(smp::racy_increment);
         mine += 1;
     }
     BKL_DONE[0].store(mine, Ordering::SeqCst);
     for (i, d) in BKL_DONE.iter().enumerate().take(n).skip(1) {
-        // (a hart stops at `BKL_M` or at the bound, a few hand-overs after it)
-        match smp::wait_work(i, 5 * crate::timer::timebase()) {
+        // (a hart stops at `BKL_M`, or at the bound once it has made `BKL_MIN`: on a host short of cores that floor alone can take
+        // seconds)
+        match smp::wait_work(i, BKL_WAIT_S * crate::timer::timebase()) {
             Some(r) => d.store(r, Ordering::SeqCst),
             None => return Some(i),
         }
@@ -662,17 +668,19 @@ fn bkl_run(n: usize, until: u64) -> Option<usize> {
 /// The exclusion test's increments per hart, and its bounds.
 const BKL_M: u64 = 20_000;
 const BKL_BUDGET_MS: u64 = 2_000;
+/// How long the boot hart waits for each other hart's report once its own loop is done.
+const BKL_WAIT_S: u64 = 60;
 /// The increments each hart made in the exclusion test (static: the test's frame stays small, KT13).
 static BKL_DONE: [core::sync::atomic::AtomicU64; percpu::MAX_HARTS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; percpu::MAX_HARTS];
 
 /// How the exclusion test failed.
 enum BklFail {
-    /// The hart did not report within 5 s.
+    /// The hart did not report within `BKL_WAIT_S`.
     Unfinished(usize),
     /// The counter's value.
     Count(u64),
-    /// The hart made no increment.
+    /// The hart made fewer than `smp::BKL_MIN` increments.
     Idle(usize),
 }
 
@@ -694,7 +702,7 @@ fn bkl_failure(how: BklFail, n: usize) -> String {
     match how {
         BklFail::Unfinished(i) => format!("hart {i} did not finish its increments (each hart's so far: {done:?})"),
         BklFail::Count(got) => format!("{got} increments counted of {want} made (each hart's: {done:?}): the lock did not exclude"),
-        BklFail::Idle(i) => format!("hart {i} made no increment within the time bound (each hart's: {done:?})"),
+        BklFail::Idle(i) => format!("hart {i} made fewer than its {} increments (each hart's: {done:?})", smp::BKL_MIN),
     }
 }
 
@@ -1206,7 +1214,7 @@ static CHURN_PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static CHURN_WATCH_STOP: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// While [`smp_churn_stress`] runs: every 10 s past the first, a line saying where the test is and how often each hart took the big lock
+/// While [`smp_churn_stress`] runs: every 10 s of clock, a line saying where the test is and how often each hart took the big lock
 /// in those 10 s. The test prints nothing else until it ends, and on a host with fewer cores than harts the big lock's hand-overs (a FIFO
 /// ticket lock waits for the host to run the waiter whose turn it is) slow it from seconds to many minutes: without this line that was a
 /// silent stall the harness could not tell from a hang (2026-11-28, the overnight checked boot and the chaos pieces). The line allocates
@@ -1218,12 +1226,17 @@ fn churn_watch(_: usize) {
             Ordering::Relaxed,
         );
     }
-    let mut tenths = 0u64;
+    let start = crate::timer::now_ns();
+    let mut last = start;
     while !CHURN_WATCH_STOP.load(Ordering::SeqCst) {
         thread::sleep_ticks(100);
-        tenths += 1;
-        if tenths.is_multiple_of(100) {
-            churn_watch_line(tenths / 10);
+        let now = crate::timer::now_ns();
+        if now.saturating_sub(last) >= 10_000_000_000 {
+            churn_watch_line(
+                now.saturating_sub(start) / 1_000_000_000,
+                now.saturating_sub(last) / 1_000_000_000,
+            );
+            last = now;
         }
     }
 }
@@ -1232,25 +1245,33 @@ fn churn_watch(_: usize) {
 static CHURN_LAST_TAKES: [core::sync::atomic::AtomicU64; percpu::MAX_HARTS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; percpu::MAX_HARTS];
 
-/// [`churn_watch`]'s line (out of line, KT13).
+/// Each hart's big-lock takes since [`churn_watch`]'s last line, written as one list (and taken as the new mark as it is written).
+struct TakesSince;
+
+impl core::fmt::Display for TakesSince {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (h, l) in CHURN_LAST_TAKES.iter().enumerate().take(smp::started()) {
+            let now = percpu::hart(h).bkl_takes.load(Ordering::Relaxed);
+            write!(f, " {}", now.saturating_sub(l.swap(now, Ordering::Relaxed)))?;
+        }
+        Ok(())
+    }
+}
+
+/// [`churn_watch`]'s line, in one write so no other output lands inside it (out of line, KT13).
 #[cold]
 #[inline(never)]
-fn churn_watch_line(secs: u64) {
+fn churn_watch_line(secs: u64, window: u64) {
     use core::fmt::Write as _;
-    let mut c = crate::console::Console;
-    let _ = write!(
-        c,
+    let _ = writeln!(
+        crate::console::Console,
         "smp_churn_stress: still running after {secs} s (phase {}: 0 kernel threads, 1 the process churn, 2 + i finishing churn process \
-         i; process churn rounds {}/{PROC_CHURN_WANT}, kernel threads run {}/300); big-lock takes per hart in the last 10 s:",
+         i; process churn rounds {}/{PROC_CHURN_WANT}, kernel threads run {}/300); big-lock takes per hart in the last {window} s:{}",
         CHURN_PHASE.load(Ordering::SeqCst),
         PROC_CHURN_ROUNDS.load(Ordering::SeqCst),
         HI_DONE.load(Ordering::SeqCst),
+        TakesSince,
     );
-    for (h, l) in CHURN_LAST_TAKES.iter().enumerate().take(smp::started()) {
-        let now = percpu::hart(h).bkl_takes.load(Ordering::Relaxed);
-        let _ = write!(c, " {}", now.saturating_sub(l.swap(now, Ordering::Relaxed)));
-    }
-    let _ = writeln!(c);
 }
 
 /// Several processes churn objects, memory, mappings and threads at once on different harts,

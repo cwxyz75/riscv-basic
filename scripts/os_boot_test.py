@@ -1235,7 +1235,10 @@ def oversubscribed_note():
     lock, so each hand-over waits until the host runs the hart whose turn it is, and lock-heavy tests slow by a thousand times (the
     exclusion test 116 ms -> 139 s, `smp_churn_stress` seconds -> 20 minutes, measured at eight harts beside sixteen CPU hogs on ten
     cores). Other boots running at the same time on the host count too (`chaos.py --jobs`), and this cannot see them."""
-    harts = int(os.environ.get("OS_SMP", "1") or "1")
+    try:
+        harts = int(os.environ.get("OS_SMP", "1") or "1")
+    except ValueError:
+        return []  # (a topology such as `4,sockets=1`: no note)
     try:
         cores = len(os.sched_getaffinity(0))
     except AttributeError:
