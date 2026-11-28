@@ -205,10 +205,11 @@ that pass: its fault ends the process, which is the right answer, and the proces
 `KALLOC_SCENARIO=<name>` and `KALLOC_MAX=<n>` run one scenario; `KALLOC_CHILD=<scenario>:<n>[:persist]` replays one case.
 
 **Bounded proofs (Kani, by hand, OD177, OD182).** `cargo kani -p kcore` proves the window formulas (`kcore::kwindow`); `cargo kani -p klock`
-(about 90 s) proves the lock-order table and the held stack: the class order is strict and total and `Class::ALL` lists it, no sequence of
-five takes and out-of-order releases lets `Held` accept a descending take or hold a class more often than it may, a release finds exactly the
-held entries, and an unheld release panics for every class but `UART` (`klock/src/lib.rs`, `mod proofs`; under `cfg(kani)` the held stack is
-8 deep, which no sequence of the proofs fills). Not in CI.
+(about 75 s) proves the lock-order table and the held stack: the class order is strict and total and `Class::ALL` lists it; no sequence of
+five operations (takes of any class and instance, and releases of any held entry, out of order too) lets `Held` accept a descending take or
+hold a class more often than it may; and a release (`Held::release`, which `pop` asserts) succeeds exactly for a held entry or a `UART` one,
+removing just that entry (`klock/src/lib.rs`, `mod proofs`; under `cfg(kani)` the held stack is 8 deep, which no sequence of the proofs
+fills). Not in CI.
 
 **Mutation testing.** `make os-mutants` (overnight; cargo-mutants) mutates `kcore`, `klock` and `iommucore` with their host tests as
 the oracle. A survivor that is not in `mutants-accepted.txt` with a reason fails the run. `PKG=` and `SHARD=` run a slice.

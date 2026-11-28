@@ -28,11 +28,50 @@ fn every_pair_of_classes_follows_the_hierarchy() {
 /// rather than read from `Class`: the table below is the oracle the checker is held to.
 const TWO: [Class; 4] = [Class::As, Class::Tt, Class::Rq, Class::Kstack];
 const REENTRANT: [Class; 2] = [Class::Obj, Class::Uart];
+/// The order of SCHED-SMP-SPEC 3.3 as amended (OBJ for the old LEGACY, L20; IOMMU between KSTACK and FRAME, IOMMU-SPEC 11.1), written
+/// out: the oracle's order, not `Class`'s.
+const ORDER: [Class; 15] = [
+    Class::Obj,
+    Class::As,
+    Class::Procs,
+    Class::Futex,
+    Class::Vmo,
+    Class::Jobs,
+    Class::Pi,
+    Class::Tt,
+    Class::Rq,
+    Class::Kstack,
+    Class::Iommu,
+    Class::Frame,
+    Class::Heap,
+    Class::Entropy,
+    Class::Uart,
+];
+/// How many of a two-at-a-time class one hart may hold: 64 address spaces (AS1), three stack locks (T224), two of the others.
+fn most(c: Class) -> usize {
+    match c {
+        Class::As => 64,
+        Class::Kstack => 3,
+        _ => 2,
+    }
+}
+
+fn rank(c: Class) -> usize {
+    ORDER.iter().position(|&d| d == c).unwrap()
+}
+
+#[test]
+fn the_order_is_the_written_one() {
+    assert_eq!(Class::ALL, ORDER);
+    for &c in &TWO {
+        assert_eq!(c.most_at_once(), most(c), "{c:?}");
+    }
+}
 
 /// SCHED-SMP-SPEC 3.3 and 3.4: holding `(a, ia)`, taking `(b, ib)` is legal when `b` comes later, or it is the same class and the
 /// class is reentrant (a recursive take), or the same class held two at a time and a greater instance.
 fn the_table_allows((a, ia): (Class, u32), (b, ib): (Class, u32)) -> bool {
-    (b as u8) > (a as u8) || (b == a && (REENTRANT.contains(&b) || (TWO.contains(&b) && ib > ia)))
+    rank(b) > rank(a) || (b == a && (REENTRANT.contains(&b) || (TWO.contains(&b) && ib > ia)))
 }
 
 #[test]
@@ -84,7 +123,7 @@ fn every_ordered_pair_under_a_held_chain_matches_the_table() {
                     let mut want = the_table_allows((b, 1), (c, ic));
                     if a == b && c == b && TWO.contains(&c) {
                         // "two means two": a third of the class is refused, except the address spaces and the stack locks
-                        want &= Class::most_at_once(c) > 2;
+                        want &= most(c) > 2;
                     }
                     assert_eq!(
                         h.check(c, ic).is_ok(),

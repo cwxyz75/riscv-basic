@@ -683,10 +683,13 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
     }
     let n = Class::ALL.len() as u32;
     let two = Class::ALL.iter().filter(|c| c.allows_two()).count() as u32;
-    if probes != n * n + two {
-        return Err(order_short(probes, n * n + two));
-    }
+    let reentrant = Class::ALL.iter().filter(|c| c.reentrant()).count() as u32;
+    // (every descending pair, and every class taken again at the same instance unless it is reentrant: 105 + 13 of the 15 classes)
+    let want = n * (n - 1) / 2 + (n - reentrant);
     order_count(probes, n, flagged);
+    if probes != n * n + two || flagged != want {
+        return Err(order_short(probes, flagged, want));
+    }
     let real = crate::bkl::VIOLATIONS.load(Ordering::SeqCst);
     if real != 0 {
         return Err(order_real(real));
@@ -696,8 +699,8 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
 
 #[cold]
 #[inline(never)]
-fn order_short(probes: u32, want: u32) -> String {
-    format!("{probes} pairs probed, the table has {want}")
+fn order_short(probes: u32, flagged: u32, want: u32) -> String {
+    format!("{probes} pairs probed, {flagged} flagged; the table flags {want}")
 }
 
 #[cold]

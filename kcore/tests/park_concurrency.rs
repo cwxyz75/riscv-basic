@@ -1,8 +1,12 @@
 //! The park protocol (SCHED-SMP-SPEC 3.7, PK1) under the concurrency checkers, **without the big kernel lock**: two waiters, each
 //! waiting twice on one condition (a wait structure and its condition under one lock, as a futex bucket keeps them), and two wakers
-//! (a condition waker that makes the condition true twice and wakes everyone registered each time, and a timer that times out the
-//! first waiter's wait, whichever round it is in), with one run-queue lock (T85 (6)). PK1: a waiter that blocks after its
-//! registration is woken, so no waiter is left blocked once the wakers have finished; every wait ends. Three negative controls, each
+//! (a condition waker that makes the condition true twice and wakes everyone registered each time, and a timer, in a structure and
+//! under a lock of its own, that times out the first waiter's wait in whichever round it is armed for, racing the condition waker
+//! for it), with one run-queue lock (T85 (6)). Step c runs under the lock of the structure the waker took the thread from, and step
+//! 9 leaves both structures under their locks. A round is one `block` of a caller that waits again until its own condition holds or
+//! its own timeout fired (3.7's step 9, "go to 1"): a late step d from a waker of the round before can wake a later block, and the
+//! right protocol's test checks that the checkers reach that case. PK1: a waiter that blocks after its registration is woken, so no
+//! waiter is left blocked once the wakers have finished; every wait ends. Three negative controls, each
 //! of which the checkers must catch: prepare *after* registering; read `park` outside the run-queue lock; look at the thread's
 //! state without the run-queue lock.
 //!   RUSTFLAGS="--cfg loom"    cargo test -p kcore --release --test park_concurrency
@@ -62,6 +66,12 @@ struct World {
     /// A blocked thread sleeps on this (with `rq`) until a step d makes it runnable or the last waker finishes.
     switched: Condvar,
     q: Mutex<Queue>,
+    /// The timer's own structure (waiter 0's timeout), under its own lock: the round it is armed for, 0 for none.
+    timer: Mutex<u32>,
+    /// The round the timer fired for (0: not yet), written under `timer`.
+    fired: AtomicU32,
+    /// Wakes that ended a wait for neither its condition nor its timeout (allowed: the round waits again).
+    spurious: AtomicU32,
     /// Wakers that have finished (after their last step d).
     wakers_done: AtomicU32,
     v: Variant,
@@ -79,64 +89,91 @@ fn register(w: &World, me: usize, r: u32) -> bool {
 }
 
 fn waiter(w: Arc<World>, me: usize) {
-    let t = &w.w[me];
     for r in 1..=ROUNDS {
-        // steps 1 to 3
-        let registered = if w.v == Variant::PrepareAfterRegister {
-            let reg = register(&w, me, r);
-            thread::yield_now();
-            t.park.prepare();
-            reg
-        } else {
-            t.park.prepare();
-            register(&w, me, r)
-        };
-        if !registered {
-            t.park.cancel(); // (step 3: the condition was already true)
-            continue;
+        // a round is one `block` of the caller's: it goes back to step 1 until its own condition holds or its own timeout fired
+        // (step 9's "go to 1 or return"); a wake that was for neither (a waker that took the thread out of a structure in an
+        // earlier round and makes it runnable late) is spurious and the round waits again
+        while !wait_once(&w, me, r) {
+            w.spurious.fetch_add(1, Ordering::SeqCst);
         }
-        // steps 6 to 8
-        let blocked = if w.v == Variant::CheckParkOutsideLock {
-            if t.park.take_notified() {
-                false
-            } else {
-                let _g = w.rq.lock().unwrap();
-                t.state.store(BLOCKED, Ordering::SeqCst);
-                true
-            }
-        } else {
-            let _g = w.rq.lock().unwrap();
-            if t.park.take_notified() {
-                false
-            } else {
-                thread::yield_now(); // (inside the critical section: the right waker holds the lock, so no waker is between its check and its enqueue)
-                t.state.store(BLOCKED, Ordering::SeqCst);
-                true
-            }
-        };
-        // switched away until a waker makes the thread runnable
-        if blocked {
-            let mut g = w.rq.lock().unwrap();
-            while t.state.load(Ordering::SeqCst) == BLOCKED {
-                // (under the run-queue lock, after every waker's step d: nobody can make it runnable any more)
-                assert!(
-                    w.wakers_done.load(Ordering::SeqCst) < WAKERS,
-                    "PK1: a wake after the registration was lost (waiter {me}, round {r})"
-                );
-                g = w.switched.wait(g).unwrap();
-            }
-            t.state.store(RUNNING, Ordering::SeqCst);
-        }
-        t.park.cancel(); // step 9: the wait is over
     }
 }
 
-/// Steps c and d for a waiter the waker took out of the wait structure.
+/// Steps 1 to 9 once, for round `r`. True: the round is over (its condition held, or its timeout fired).
+fn wait_once(w: &World, me: usize, r: u32) -> bool {
+    let t = &w.w[me];
+    // steps 1 to 5
+    let registered = if w.v == Variant::PrepareAfterRegister {
+        let reg = register(w, me, r);
+        thread::yield_now();
+        t.park.prepare();
+        reg
+    } else {
+        t.park.prepare();
+        register(w, me, r)
+    };
+    if !registered {
+        t.park.cancel(); // (step 3: the condition was already true)
+        return true;
+    }
+    if me == 0 && w.fired.load(Ordering::SeqCst) == 0 {
+        *w.timer.lock().unwrap() = r; // (a wait with a deadline: the timer is armed in its own structure)
+    }
+    // steps 6 to 8
+    let blocked = if w.v == Variant::CheckParkOutsideLock {
+        if t.park.take_notified() {
+            false
+        } else {
+            let _g = w.rq.lock().unwrap();
+            t.state.store(BLOCKED, Ordering::SeqCst);
+            true
+        }
+    } else {
+        let _g = w.rq.lock().unwrap();
+        if t.park.take_notified() {
+            false
+        } else {
+            thread::yield_now(); // (inside the critical section: the right waker holds the lock, so no waker is between its check and its enqueue)
+            t.state.store(BLOCKED, Ordering::SeqCst);
+            true
+        }
+    };
+    // switched away until a waker makes the thread runnable
+    if blocked {
+        let mut g = w.rq.lock().unwrap();
+        while t.state.load(Ordering::SeqCst) == BLOCKED {
+            // (under the run-queue lock, after every waker's step d: nobody can make it runnable any more)
+            assert!(
+                w.wakers_done.load(Ordering::SeqCst) < WAKERS,
+                "PK1: a wake after the registration was lost (waiter {me}, round {r})"
+            );
+            g = w.switched.wait(g).unwrap();
+        }
+        t.state.store(RUNNING, Ordering::SeqCst);
+    }
+    // step 9: park := Idle, leave both structures (under their locks: a waker that still finds a registration has done its step c
+    // by now), and say why the wait ended
+    t.park.cancel();
+    let ready = {
+        let mut q = w.q.lock().unwrap();
+        q.reg[me] = 0;
+        q.cond >= r
+    };
+    let timed_out = me == 0 && {
+        *w.timer.lock().unwrap() = 0;
+        w.fired.load(Ordering::SeqCst) == r
+    };
+    ready || timed_out
+}
+
+/// Step c, under the lock of the structure the waker took the waiter out of: true if this wake counted.
+fn notify(w: &World, i: usize) -> bool {
+    w.w[i].park.notify()
+}
+
+/// Step d, after a step c that counted.
 fn wake(w: &World, i: usize) {
     let t = &w.w[i];
-    if !t.park.notify() {
-        return;
-    }
     if w.v == Variant::WakerSkipsLock {
         if t.state.load(Ordering::SeqCst) == BLOCKED {
             let _g = w.rq.lock().unwrap();
@@ -167,10 +204,11 @@ fn condition_waker(w: Arc<World>) {
         {
             let mut q = w.q.lock().unwrap();
             q.cond = k;
-            for (i, reg) in q.reg.iter_mut().enumerate() {
-                if *reg != 0 && *reg <= k {
-                    *reg = 0;
-                    woken[i] = true;
+            for i in 0..WAITERS {
+                let r = q.reg[i];
+                if r != 0 && r <= k {
+                    q.reg[i] = 0;
+                    woken[i] = notify(&w, i);
                 }
             }
         }
@@ -183,13 +221,17 @@ fn condition_waker(w: Arc<World>) {
     waker_done(&w);
 }
 
-/// The timer: waiter 0's timeout fires once, in whichever round it is waiting (or finds it not waiting and does nothing).
+/// The timer: waiter 0's timeout fires once, in whichever round it is armed for (or finds it disarmed and does nothing). It races
+/// the condition waker for the same wait: both may find it, and only one step c counts.
 fn timer(w: Arc<World>) {
     let fired = {
-        let mut q = w.q.lock().unwrap();
-        let r = q.reg[0];
-        q.reg[0] = 0;
-        r != 0
+        let mut armed = w.timer.lock().unwrap();
+        let r = *armed;
+        *armed = 0;
+        if r != 0 {
+            w.fired.store(r, Ordering::SeqCst); // (the deadline has passed: the round times out, whether or not this wake counts)
+        }
+        r != 0 && notify(&w, 0)
     };
     if fired {
         wake(&w, 0);
@@ -215,6 +257,9 @@ fn model(v: Variant) {
             cond: 0,
             reg: [0; WAITERS],
         }),
+        timer: Mutex::new(0),
+        fired: AtomicU32::new(0),
+        spurious: AtomicU32::new(0),
         wakers_done: AtomicU32::new(0),
         v,
     });
@@ -237,6 +282,9 @@ fn model(v: Variant) {
     }
     c.join().unwrap();
     k.join().unwrap();
+    if v == Variant::Right && w.spurious.load(Ordering::SeqCst) > 0 {
+        LATE_WAKES_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     // every wait ended: nobody is left blocked, nobody is still registered
     for (i, t) in w.w.iter().enumerate() {
         assert_eq!(
@@ -247,10 +295,14 @@ fn model(v: Variant) {
     }
 }
 
+/// Executions of the right protocol in which a wait was woken late by a waker from an earlier round (outside the models: a plain
+/// counter over the whole exploration).
+static LATE_WAKES_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn explore(v: Variant) {
     #[cfg(loom)]
     {
-        // (four threads: exhaustive up to two preemptions, which every negative control needs at most one of)
+        // (four threads and the main one, loom's limit of five: exhaustive up to two preemptions, which every negative control needs at most one of)
         let mut b = loom::model::Builder::new();
         b.preemption_bound = Some(2);
         b.check(move || model(v));
@@ -278,6 +330,9 @@ fn is_caught(v: Variant) -> bool {
 #[test]
 fn the_protocol_loses_no_wake() {
     explore(Variant::Right);
+    // (the checkers reached the case the second round is for: a late wake from round 1 that lands on round 2's block, which the
+    // round survives by waiting again)
+    assert!(LATE_WAKES_SEEN.load(std::sync::atomic::Ordering::SeqCst) > 0);
 }
 
 #[test]

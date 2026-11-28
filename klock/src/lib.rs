@@ -200,28 +200,30 @@ impl Held {
     /// Record a release. Locks are normally released in reverse order, but any held lock may go (a guard can be
     /// dropped out of order); a lock that is not held (never taken, released twice, or another instance) is a bug and
     /// panics, for every class but the console.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i is the position of a held entry, below len; len >= 1 when an entry was found
     pub fn pop(&mut self, class: Class, instance: u32) {
-        if let Some(i) = self.position(class, instance) {
-            self.stack.copy_within(i + 1..self.len, i);
-            self.len -= 1;
-        } else {
-            // (a reentrant class is released only at its outermost take, so it is held then too. The console is the one lenient
-            // class: a panic breaks its lock (`console::break_lock`) while another hart may be inside it, and that hart's nested
-            // take then counts as an outermost one and releases the entry early, so its outer release finds nothing: T85 (5))
-            assert!(
-                class == Class::Uart,
-                "released a {class:?} lock the hart does not hold"
-            );
-        }
+        assert!(
+            self.release(class, instance),
+            "released a {class:?} lock the hart does not hold"
+        );
     }
 
-    /// Where `(class, instance)` is on the stack (the last such entry), if the hart holds it.
-    #[allow(clippy::indexing_slicing)] // INVARIANT: len <= MAX_HELD; the slice is of the entries in use
-    fn position(&self, class: Class, instance: u32) -> Option<usize> {
-        self.stack[..self.len]
+    /// The release `pop` makes: removes `(class, instance)` if held. False (and nothing changed) when it is not held and the class
+    /// is not the console's. (A reentrant class is released only at its outermost take, so it is held then too. The console is the
+    /// one lenient class: a panic breaks its lock (`console::break_lock`) while another hart may be inside it, and that hart's nested
+    /// take then counts as an outermost one and releases the entry early, so its outer release finds nothing: T85 (5).)
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i is the position of a held entry, below len; len >= 1 when an entry was found
+    fn release(&mut self, class: Class, instance: u32) -> bool {
+        let at = self.stack[..self.len]
             .iter()
-            .rposition(|&(c, i)| c == class && i == instance)
+            .rposition(|&(c, i)| c == class && i == instance);
+        match at {
+            Some(i) => {
+                self.stack.copy_within(i + 1..self.len, i);
+                self.len -= 1;
+                true
+            }
+            None => class == Class::Uart,
+        }
     }
 }
 
@@ -493,13 +495,13 @@ mod proofs {
         }
     }
 
-    /// A release of a lock the hart does not hold panics, for every class but the console, whatever is held (T85 (5)). `pop`
-    /// releases what `position` finds and otherwise asserts the class is the console, so this proves, for every stack the takes
-    /// can build and every `(class, instance)`, that `position` finds exactly the held entries: an unheld one is never released
-    /// quietly. (`#[kani::should_panic]` would show only that some unheld release panics, not that every one does.)
+    /// A release of a lock the hart does not hold panics, for every class but the console, whatever is held (T85 (5)): for every
+    /// stack the takes can build and every `(class, instance)`, `release` (which `pop` asserts) succeeds exactly when the entry is
+    /// held or the class is the console's; a successful release of a held entry removes that one entry and keeps the rest in order,
+    /// and a console release of nothing changes nothing.
     #[kani::proof]
     #[kani::unwind(6)]
-    fn a_release_finds_exactly_the_held_entries() {
+    fn a_release_succeeds_exactly_for_a_held_lock_or_the_console() {
         let mut h = Held::new();
         let mut step = 0;
         while step < 4 {
@@ -511,56 +513,29 @@ mod proofs {
             step += 1;
         }
         let (c, i): (Class, u32) = (any_class(), kani::any());
+        let before = h;
         let mut held = false;
         let mut k = 0;
-        while k < h.len {
-            held |= h.stack[k] == (c, i);
+        while k < before.len {
+            held |= before.stack[k] == (c, i);
             k += 1;
         }
-        match h.position(c, i) {
-            Some(at) => assert!(held && at < h.len && h.stack[at] == (c, i)),
-            None => assert!(!held),
-        }
-    }
-
-    /// End to end: a release of an unheld lock of any class but the console reaches the panic. (`should_panic`: a panic is
-    /// found and every failure found is one; the harness above is the "every" half.)
-    #[kani::proof]
-    #[kani::unwind(5)]
-    #[kani::should_panic]
-    fn a_release_of_an_unheld_lock_panics() {
-        let mut h = Held::new();
-        let mut step = 0;
-        while step < 3 {
-            let (c, i): (Class, u32) = (any_class(), kani::any());
-            kani::assume(i < INSTANCES);
-            if h.check(c, i).is_ok() {
-                h.push(c, i);
+        let ok = h.release(c, i);
+        assert_eq!(ok, held || c == Class::Uart);
+        if held {
+            // the entry is gone (a legal stack holds it once), the others are as they were, in order
+            assert_eq!(h.len, before.len - 1);
+            let (mut x, mut y) = (0, 0);
+            while x < before.len {
+                if before.stack[x] != (c, i) {
+                    assert!(h.stack[y] == before.stack[x]);
+                    y += 1;
+                }
+                x += 1;
             }
-            step += 1;
+            assert_eq!(y, h.len);
+        } else {
+            assert_eq!(h.len, before.len);
         }
-        let (c, i): (Class, u32) = (any_class(), kani::any());
-        kani::assume(c != Class::Uart);
-        kani::assume(!h.stack[..h.len].iter().any(|&e| e == (c, i)));
-        h.pop(c, i);
-    }
-
-    /// ... and for the console it leaves the stack as it was.
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn a_release_of_an_unheld_console_lock_changes_nothing() {
-        let mut h = Held::new();
-        let mut step = 0;
-        while step < 3 {
-            let (c, i): (Class, u32) = (any_class(), kani::any());
-            kani::assume(i < INSTANCES && c != Class::Uart);
-            if h.check(c, i).is_ok() {
-                h.push(c, i);
-            }
-            step += 1;
-        }
-        let before = h.len;
-        h.pop(Class::Uart, 0);
-        assert_eq!(h.len, before);
     }
 }
