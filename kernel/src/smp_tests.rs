@@ -628,50 +628,82 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
     Ok(())
 }
 
+/// The order test's failure text (out of line: the formatting's temporaries stay out of the loop's frame, KT13).
+#[cold]
+#[inline(never)]
+fn order_mismatch(
+    held: crate::bkl::Class,
+    probe: crate::bkl::Class,
+    instance: u32,
+    legal: bool,
+) -> String {
+    format!(
+        "holding {held:?} 0, taking {probe:?} {instance}: expected flagged={}",
+        !legal
+    )
+}
+
+/// The order test's count line, on the serial log (out of line, as above).
+#[inline(never)]
+fn order_count(probes: u32, classes: u32, flagged: u32) {
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        crate::console::Console,
+        "lock order: {probes} ordered pairs of {classes} classes probed, {flagged} flagged"
+    );
+}
+
 fn lock_order_violations_are_detected() -> Result<(), String> {
     use crate::bkl::{order_check, Class};
-    // the order is BKL, then HEAP, then UART: taking an earlier class while holding a later one
-    // is flagged, taking a later one while holding an earlier one is not
-    for (held, probe, bad) in [
-        (Class::Heap, Class::Obj, true),
-        (Class::Uart, Class::Obj, true),
-        (Class::Uart, Class::Heap, true),
-        (Class::Obj, Class::Heap, false),
-        (Class::Obj, Class::Uart, false),
-        (Class::Heap, Class::Uart, false),
-        // the planned classes, through the same checker (the pure table is in `klock/tests/order.rs`)
-        (Class::Heap, Class::Frame, true),
-        (Class::Frame, Class::Heap, false),
-        // the memory locks (L16 part b): none may be held when the big lock is taken, nor taken in the wrong order
-        (Class::Vmo, Class::Obj, true),
-        (Class::Jobs, Class::Obj, true),
-        (Class::Frame, Class::Obj, true),
-        (Class::Jobs, Class::Vmo, true),
-        (Class::Frame, Class::Jobs, true),
-        (Class::Vmo, Class::Jobs, false),
-        (Class::Jobs, Class::Frame, false),
-        (Class::Procs, Class::Futex, false),
-        (Class::Futex, Class::Procs, true),
-        // the IOMMU (IOMMU-SPEC 11.1): after OBJ and the memory locks, before FRAME
-        (Class::Obj, Class::Iommu, false),
-        (Class::Iommu, Class::Frame, false),
-        (Class::Frame, Class::Iommu, true),
-        (Class::Iommu, Class::Vmo, true),
-        (Class::Iommu, Class::Obj, true),
-    ] {
-        if order_check(held, probe) != bad {
-            return Err(format!(
-                "holding {held:?}, taking {probe:?}: expected flagged={bad}"
-            ));
+    // every ordered pair of the classes (SCHED-SMP-SPEC 3.3, T85 (3)), generated from `Class::ALL`: holding one at instance 0, taking
+    // another at instance 0, and for a class held two at a time a second instance above the first. The expected answer is the table
+    // (a later class, a reentrant class again, a greater instance of a class that allows two); the take goes through the kernel's own
+    // path for OBJ, HEAP and UART and through the checker for the rest (the same pairs are proved on the host, `klock/tests/order.rs`).
+    let mut probes = 0u32;
+    let mut flagged = 0u32;
+    for &held in &Class::ALL {
+        for &probe in &Class::ALL {
+            let instances: &[u32] = if probe == held && probe.allows_two() {
+                &[0, 1]
+            } else {
+                &[0]
+            };
+            for &instance in instances {
+                let legal = probe > held
+                    || (probe == held
+                        && (probe.reentrant() || (probe.allows_two() && instance > 0)));
+                let bad = order_check(held, probe, instance);
+                if bad == legal {
+                    return Err(order_mismatch(held, probe, instance, legal));
+                }
+                probes += 1;
+                flagged += u32::from(bad);
+            }
         }
     }
-    if crate::bkl::VIOLATIONS.load(Ordering::SeqCst) != 0 {
-        return Err(format!(
-            "{} lock-order violations in the real run so far",
-            crate::bkl::VIOLATIONS.load(Ordering::SeqCst)
-        ));
+    let n = Class::ALL.len() as u32;
+    let two = Class::ALL.iter().filter(|c| c.allows_two()).count() as u32;
+    if probes != n * n + two {
+        return Err(order_short(probes, n * n + two));
+    }
+    order_count(probes, n, flagged);
+    let real = crate::bkl::VIOLATIONS.load(Ordering::SeqCst);
+    if real != 0 {
+        return Err(order_real(real));
     }
     Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn order_short(probes: u32, want: u32) -> String {
+    format!("{probes} pairs probed, the table has {want}")
+}
+
+#[cold]
+#[inline(never)]
+fn order_real(real: u32) -> String {
+    format!("{real} lock-order violations in the real run so far")
 }
 
 static STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

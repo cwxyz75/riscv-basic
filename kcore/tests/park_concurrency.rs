@@ -1,8 +1,10 @@
-//! The park protocol (SCHED-SMP-SPEC 3.7, PK1) under the concurrency checkers, **without the big kernel lock**: one
-//! waiter, two wakers (a condition wake and a timer), the run-queue lock modelled as a mutex. PK1: after a wake that
-//! follows the waiter's registration has run, the waiter is not left Blocked. Three negative controls, each of which
-//! the checkers must catch: prepare *after* registering; read `park` outside the run-queue lock; look at the
-//! thread's state without the run-queue lock.
+//! The park protocol (SCHED-SMP-SPEC 3.7, PK1) under the concurrency checkers, **without the big kernel lock**: two waiters, each
+//! waiting twice on one condition (a wait structure and its condition under one lock, as a futex bucket keeps them), and two wakers
+//! (a condition waker that makes the condition true twice and wakes everyone registered each time, and a timer that times out the
+//! first waiter's wait, whichever round it is in), with one run-queue lock (T85 (6)). PK1: a waiter that blocks after its
+//! registration is woken, so no waiter is left blocked once the wakers have finished; every wait ends. Three negative controls, each
+//! of which the checkers must catch: prepare *after* registering; read `park` outside the run-queue lock; look at the thread's
+//! state without the run-queue lock.
 //!   RUSTFLAGS="--cfg loom"    cargo test -p kcore --release --test park_concurrency
 //!   RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test park_concurrency
 #![cfg(any(loom, shuttle))]
@@ -12,12 +14,12 @@ use kcore::sync::{AtomicU32, Ordering};
 
 #[cfg(loom)]
 use loom::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
 };
 #[cfg(shuttle)]
 use shuttle::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
 };
 
@@ -36,101 +38,223 @@ const RUNNING: u32 = 0;
 const BLOCKED: u32 = 1;
 const RUNNABLE: u32 = 2;
 
-struct World {
+const WAITERS: usize = 2;
+/// Each waiter waits this many times; the condition waker makes the condition true this many times.
+const ROUNDS: u32 = 2;
+const WAKERS: u32 = 2;
+
+struct Waiter {
     park: Park,
     /// The thread's scheduler state, written under `rq` (an atomic so a variant can read it without the lock).
     state: AtomicU32,
+}
+
+/// The wait structure: the condition (how many times it has been made true) and each waiter's registration (the round it waits
+/// in, 0 for none), under one lock.
+struct Queue {
+    cond: u32,
+    reg: [u32; WAITERS],
+}
+
+struct World {
+    w: [Waiter; WAITERS],
     rq: Mutex<()>,
-    registered: AtomicU32,
-    /// How many wakers ran their wake after seeing the registration.
-    woke_after: AtomicU32,
+    /// A blocked thread sleeps on this (with `rq`) until a step d makes it runnable or the last waker finishes.
+    switched: Condvar,
+    q: Mutex<Queue>,
+    /// Wakers that have finished (after their last step d).
+    wakers_done: AtomicU32,
     v: Variant,
 }
 
-fn waiter(w: Arc<World>) {
-    if w.v == Variant::PrepareAfterRegister {
-        w.registered.store(1, Ordering::SeqCst);
-        thread::yield_now();
-        w.park.prepare();
-    } else {
-        w.park.prepare();
-        w.registered.store(1, Ordering::SeqCst);
+/// Steps 2 and 3 under the wait structure's lock: register for round `r`, unless the condition already holds for it. True:
+/// registered (the waiter goes on to block).
+fn register(w: &World, me: usize, r: u32) -> bool {
+    let mut q = w.q.lock().unwrap();
+    if q.cond >= r {
+        return false;
     }
-    // steps 6 to 8
-    if w.v == Variant::CheckParkOutsideLock {
-        if w.park.take_notified() {
-            return;
-        }
-        let _g = w.rq.lock().unwrap();
-        w.state.store(BLOCKED, Ordering::SeqCst);
-        return;
-    }
-    let _g = w.rq.lock().unwrap();
-    if w.park.take_notified() {
-        return;
-    }
-    thread::yield_now(); // (inside the critical section: the right waker holds the lock, so no waker is between its check and its enqueue)
-    w.state.store(BLOCKED, Ordering::SeqCst);
+    q.reg[me] = r;
+    true
 }
 
-fn waker(w: Arc<World>) {
-    if w.registered.load(Ordering::SeqCst) == 0 {
-        return; // before the registration: a wake the protocol does not promise to deliver
+fn waiter(w: Arc<World>, me: usize) {
+    let t = &w.w[me];
+    for r in 1..=ROUNDS {
+        // steps 1 to 3
+        let registered = if w.v == Variant::PrepareAfterRegister {
+            let reg = register(&w, me, r);
+            thread::yield_now();
+            t.park.prepare();
+            reg
+        } else {
+            t.park.prepare();
+            register(&w, me, r)
+        };
+        if !registered {
+            t.park.cancel(); // (step 3: the condition was already true)
+            continue;
+        }
+        // steps 6 to 8
+        let blocked = if w.v == Variant::CheckParkOutsideLock {
+            if t.park.take_notified() {
+                false
+            } else {
+                let _g = w.rq.lock().unwrap();
+                t.state.store(BLOCKED, Ordering::SeqCst);
+                true
+            }
+        } else {
+            let _g = w.rq.lock().unwrap();
+            if t.park.take_notified() {
+                false
+            } else {
+                thread::yield_now(); // (inside the critical section: the right waker holds the lock, so no waker is between its check and its enqueue)
+                t.state.store(BLOCKED, Ordering::SeqCst);
+                true
+            }
+        };
+        // switched away until a waker makes the thread runnable
+        if blocked {
+            let mut g = w.rq.lock().unwrap();
+            while t.state.load(Ordering::SeqCst) == BLOCKED {
+                // (under the run-queue lock, after every waker's step d: nobody can make it runnable any more)
+                assert!(
+                    w.wakers_done.load(Ordering::SeqCst) < WAKERS,
+                    "PK1: a wake after the registration was lost (waiter {me}, round {r})"
+                );
+                g = w.switched.wait(g).unwrap();
+            }
+            t.state.store(RUNNING, Ordering::SeqCst);
+        }
+        t.park.cancel(); // step 9: the wait is over
     }
-    w.woke_after.fetch_add(1, Ordering::SeqCst);
-    if !w.park.notify() {
+}
+
+/// Steps c and d for a waiter the waker took out of the wait structure.
+fn wake(w: &World, i: usize) {
+    let t = &w.w[i];
+    if !t.park.notify() {
         return;
     }
     if w.v == Variant::WakerSkipsLock {
-        if w.state.load(Ordering::SeqCst) == BLOCKED {
+        if t.state.load(Ordering::SeqCst) == BLOCKED {
             let _g = w.rq.lock().unwrap();
-            w.state.store(RUNNABLE, Ordering::SeqCst);
+            t.state.store(RUNNABLE, Ordering::SeqCst);
+            w.switched.notify_all();
         }
         return;
     }
     let _g = w.rq.lock().unwrap();
-    if w.state.load(Ordering::SeqCst) == BLOCKED {
-        w.state.store(RUNNABLE, Ordering::SeqCst);
+    if t.state.load(Ordering::SeqCst) == BLOCKED {
+        t.state.store(RUNNABLE, Ordering::SeqCst);
+        w.switched.notify_all();
     }
+}
+
+/// A waker has finished: under the run-queue lock, so a blocked waiter that looks next sees it (and one that sleeps is told).
+fn waker_done(w: &World) {
+    let _g = w.rq.lock().unwrap();
+    w.wakers_done.fetch_add(1, Ordering::SeqCst);
+    w.switched.notify_all();
+}
+
+/// The condition waker: makes the condition true for round `k` (step a) and takes every waiter registered for it or earlier out of
+/// the wait structure (step b), under its lock; then wakes them.
+fn condition_waker(w: Arc<World>) {
+    for k in 1..=ROUNDS {
+        let mut woken = [false; WAITERS];
+        {
+            let mut q = w.q.lock().unwrap();
+            q.cond = k;
+            for (i, reg) in q.reg.iter_mut().enumerate() {
+                if *reg != 0 && *reg <= k {
+                    *reg = 0;
+                    woken[i] = true;
+                }
+            }
+        }
+        for (i, &b) in woken.iter().enumerate() {
+            if b {
+                wake(&w, i);
+            }
+        }
+    }
+    waker_done(&w);
+}
+
+/// The timer: waiter 0's timeout fires once, in whichever round it is waiting (or finds it not waiting and does nothing).
+fn timer(w: Arc<World>) {
+    let fired = {
+        let mut q = w.q.lock().unwrap();
+        let r = q.reg[0];
+        q.reg[0] = 0;
+        r != 0
+    };
+    if fired {
+        wake(&w, 0);
+    }
+    waker_done(&w);
 }
 
 fn model(v: Variant) {
     let w = Arc::new(World {
-        park: Park::new(),
-        state: AtomicU32::new(RUNNING),
+        w: [
+            Waiter {
+                park: Park::new(),
+                state: AtomicU32::new(RUNNING),
+            },
+            Waiter {
+                park: Park::new(),
+                state: AtomicU32::new(RUNNING),
+            },
+        ],
         rq: Mutex::new(()),
-        registered: AtomicU32::new(0),
-        woke_after: AtomicU32::new(0),
+        switched: Condvar::new(),
+        q: Mutex::new(Queue {
+            cond: 0,
+            reg: [0; WAITERS],
+        }),
+        wakers_done: AtomicU32::new(0),
         v,
     });
-    let t = {
+    let ts: Vec<_> = (0..WAITERS)
+        .map(|i| {
+            let w = w.clone();
+            thread::spawn(move || waiter(w, i))
+        })
+        .collect();
+    let c = {
         let w = w.clone();
-        thread::spawn(move || waiter(w))
+        thread::spawn(move || condition_waker(w))
     };
-    let k1 = {
+    let k = {
         let w = w.clone();
-        thread::spawn(move || waker(w))
+        thread::spawn(move || timer(w))
     };
-    let k2 = {
-        let w = w.clone();
-        thread::spawn(move || waker(w))
-    };
-    t.join().unwrap();
-    k1.join().unwrap();
-    k2.join().unwrap();
-    // PK1: a wake followed the registration, so the thread must not be left Blocked
-    if w.woke_after.load(Ordering::SeqCst) > 0 {
-        assert_ne!(
-            w.state.load(Ordering::SeqCst),
-            BLOCKED,
-            "PK1: a wake after the registration was lost"
+    for t in ts {
+        t.join().unwrap();
+    }
+    c.join().unwrap();
+    k.join().unwrap();
+    // every wait ended: nobody is left blocked, nobody is still registered
+    for (i, t) in w.w.iter().enumerate() {
+        assert_eq!(
+            t.state.load(Ordering::SeqCst),
+            RUNNING,
+            "PK1: waiter {i} was left blocked"
         );
     }
 }
 
 fn explore(v: Variant) {
     #[cfg(loom)]
-    loom::model(move || model(v));
+    {
+        // (four threads: exhaustive up to two preemptions, which every negative control needs at most one of)
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(2);
+        b.check(move || model(v));
+    }
     #[cfg(shuttle)]
     shuttle::check_random(move || model(v), 5000);
 }
@@ -146,7 +270,7 @@ fn is_caught(v: Variant) -> bool {
                 .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_default();
             // (loom and shuttle re-raise the model's panic, sometimes wrapped: look for the assertion's own words)
-            msg.contains("PK1") || msg.contains("lost")
+            msg.contains("PK1")
         }
     }
 }

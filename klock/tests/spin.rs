@@ -2,7 +2,7 @@
 #![cfg(not(any(loom, shuttle)))]
 use klock::{Class, Machine, Spin};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 thread_local! {
     static IRQ_ON: RefCell<bool> = const { RefCell::new(true) };
@@ -17,10 +17,10 @@ impl Machine for Host {
     fn irq_restore(was: bool) {
         IRQ_ON.with(|i| *i.borrow_mut() = was);
     }
-    fn hart() -> u32 {
+    fn hart() -> usize {
         // one id per OS thread
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        thread_local!(static ME: u32 = NEXT.fetch_add(1, Ordering::Relaxed));
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        thread_local!(static ME: usize = NEXT.fetch_add(1, Ordering::Relaxed));
         ME.with(|m| *m)
     }
     fn relax() {

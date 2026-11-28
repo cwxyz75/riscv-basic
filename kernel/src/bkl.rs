@@ -93,11 +93,12 @@ pub fn lock_released(class: Class) {
     note_release(class, 0);
 }
 
-/// Test support: pretend the calling hart holds `held`, then really take `probe` through the
-/// code the kernel uses, with the checker counting instead of panicking, and report whether it
-/// flagged the order. (So a lock site that forgot to call the checker, or a checker that never
-/// fires, fails the test; the real BKL/heap/UART take paths are exercised, not just a predicate.)
-pub fn order_check(held: Class, probe: Class) -> bool {
+/// Test support: pretend the calling hart holds `held` (instance 0), then really take `probe` (at `instance`; OBJ, HEAP and UART
+/// have only instance 0) through the code the kernel uses, with the checker counting instead of panicking, and report whether it
+/// flagged the order. (So a lock site that forgot to call the checker, or a checker that never fires, fails the test; the real
+/// BKL/heap/UART take paths are exercised, not just a predicate.) The calling hart's own held stack is put back afterwards.
+#[inline(never)] // (its saved copy of the held stack stays out of the caller's frame, KT13)
+pub fn order_check(held: Class, probe: Class, instance: u32) -> bool {
     let was = crate::irq::save_and_disable();
     PANIC_ON_VIOLATION.store(false, Ordering::SeqCst);
     let me = percpu::this();
@@ -122,7 +123,7 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             crate::console::with_uart_for_test();
         }
         // (the other classes are probed by pretending to hold them; the pure pair table is in `klock/tests/order.rs`)
-        other => note_acquire(other, 0),
+        other => note_acquire(other, instance),
     }
     let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;
     VIOLATIONS.store(before, Ordering::SeqCst);
@@ -335,8 +336,8 @@ impl klock::Machine for Machine {
     fn irq_restore(was: bool) {
         crate::irq::restore(was);
     }
-    fn hart() -> u32 {
-        who()
+    fn hart() -> usize {
+        percpu::this().index.load(Ordering::Relaxed)
     }
     fn relax() {
         core::hint::spin_loop();

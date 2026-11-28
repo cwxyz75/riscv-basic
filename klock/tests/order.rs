@@ -24,6 +24,134 @@ fn every_pair_of_classes_follows_the_hierarchy() {
     }
 }
 
+/// The classes of SCHED-SMP-SPEC 3.3 that may be held twice (ascending instance), and the two that are reentrant, written out here
+/// rather than read from `Class`: the table below is the oracle the checker is held to.
+const TWO: [Class; 4] = [Class::As, Class::Tt, Class::Rq, Class::Kstack];
+const REENTRANT: [Class; 2] = [Class::Obj, Class::Uart];
+
+/// SCHED-SMP-SPEC 3.3 and 3.4: holding `(a, ia)`, taking `(b, ib)` is legal when `b` comes later, or it is the same class and the
+/// class is reentrant (a recursive take), or the same class held two at a time and a greater instance.
+fn the_table_allows((a, ia): (Class, u32), (b, ib): (Class, u32)) -> bool {
+    (b as u8) > (a as u8) || (b == a && (REENTRANT.contains(&b) || (TWO.contains(&b) && ib > ia)))
+}
+
+#[test]
+fn every_ordered_pair_matches_the_table() {
+    // every class held, every class taken, at the instances that tell the equal-class rules apart (the same, above, below)
+    let mut pairs = 0;
+    for &a in &Class::ALL {
+        for ia in 0..3u32 {
+            let h = held_with(&[(a, ia)]);
+            for &b in &Class::ALL {
+                for ib in 0..3u32 {
+                    let want = the_table_allows((a, ia), (b, ib));
+                    assert_eq!(
+                        h.check(b, ib).is_ok(),
+                        want,
+                        "holding {a:?} {ia}, taking {b:?} {ib}"
+                    );
+                    if let Err(v) = h.check(b, ib) {
+                        // the report names the pair
+                        assert_eq!(
+                            (v.held, v.held_instance, v.taking, v.instance),
+                            (a, ia, b, ib)
+                        );
+                    }
+                    pairs += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(pairs, 15 * 15 * 9);
+    // and the class's own answers are the table's
+    for &c in &Class::ALL {
+        assert_eq!(c.allows_two(), TWO.contains(&c), "{c:?} allows two");
+        assert_eq!(c.reentrant(), REENTRANT.contains(&c), "{c:?} reentrant");
+    }
+}
+
+#[test]
+fn every_ordered_pair_under_a_held_chain_matches_the_table() {
+    // two held (any legal pair), a third taken: the check is against everything held, which for a legal stack is its top
+    for &a in &Class::ALL {
+        for &b in &Class::ALL {
+            if !the_table_allows((a, 0), (b, 1)) || a == b && REENTRANT.contains(&a) {
+                continue;
+            }
+            let h = held_with(&[(a, 0), (b, 1)]);
+            for &c in &Class::ALL {
+                for ic in 0..3u32 {
+                    let mut want = the_table_allows((b, 1), (c, ic));
+                    if a == b && c == b && TWO.contains(&c) {
+                        // "two means two": a third of the class is refused, except the address spaces and the stack locks
+                        want &= Class::most_at_once(c) > 2;
+                    }
+                    assert_eq!(
+                        h.check(c, ic).is_ok(),
+                        want,
+                        "holding {a:?} 0, {b:?} 1, taking {c:?} {ic}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Run `f` and say whether it panicked.
+fn panics(f: impl FnOnce() + std::panic::UnwindSafe) -> bool {
+    std::panic::catch_unwind(f).is_err()
+}
+
+#[test]
+fn a_release_of_an_unheld_lock_panics_for_every_class_but_the_console() {
+    // (T85 (5): the release was lenient for the reentrant classes while the big lock's hand-overs made an exact count hard; they ended
+    // with L20, so only the console stays lenient: a panic breaks its lock with the line half written, T240)
+    for &c in &Class::ALL {
+        let lenient = c == Class::Uart;
+        assert_eq!(
+            panics(move || Held::new().pop(c, 0)),
+            !lenient,
+            "{c:?} released, never taken"
+        );
+        assert_eq!(
+            panics(move || {
+                let mut h = held_with(&[(c, 0)]);
+                h.pop(c, 0);
+                h.pop(c, 0);
+            }),
+            !lenient,
+            "{c:?} released twice"
+        );
+        assert_eq!(
+            panics(move || {
+                let mut h = held_with(&[(c, 1)]);
+                h.pop(c, 2);
+            }),
+            !lenient,
+            "{c:?} released at another instance"
+        );
+        if REENTRANT.contains(&c) {
+            // a recursive take is not pushed again, so it is released once: the second release is one too many
+            assert_eq!(
+                panics(move || {
+                    let mut h = held_with(&[(c, 0)]);
+                    h.check(c, 0).unwrap();
+                    h.push(c, 0);
+                    h.pop(c, 0);
+                    assert!(h.is_empty());
+                    h.pop(c, 0);
+                }),
+                !lenient,
+                "{c:?} taken twice, released twice"
+            );
+        }
+    }
+    // the lenient one leaves the stack as it was
+    let mut h = held_with(&[(Class::Obj, 0), (Class::Heap, 0)]);
+    h.pop(Class::Uart, 0);
+    assert_eq!(h.len(), 2);
+}
+
 #[test]
 fn the_run_queue_class_may_be_taken_twice_in_ascending_instance_order() {
     let h = held_with(&[(Class::Rq, 1)]);
@@ -61,7 +189,7 @@ fn two_run_queues_means_two() {
 #[should_panic(expected = "does not hold")]
 fn releasing_a_lock_that_is_not_held_is_a_bug() {
     let mut h = Held::new();
-    h.pop(Class::Vmo, 0);
+    h.pop(Class::Obj, 0);
 }
 
 #[test]

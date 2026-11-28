@@ -19,7 +19,7 @@ use kcore::aspace::AddressSpace;
 pub struct Hooks {
     pub irq_save: fn() -> bool,
     pub irq_restore: fn(bool),
-    pub hart: fn() -> u32,
+    pub hart: fn() -> usize,
     pub relax: fn(),
     pub acquired: fn(Class, u32),
     pub released: fn(Class, u32),
@@ -29,7 +29,7 @@ fn no_irq() -> bool {
     false
 }
 fn no_restore(_: bool) {}
-fn hart0() -> u32 {
+fn hart0() -> usize {
     0
 }
 fn nothing() {}
@@ -68,7 +68,7 @@ impl Machine for HookMachine {
     fn irq_restore(was: bool) {
         (hooks().irq_restore)(was)
     }
-    fn hart() -> u32 {
+    fn hart() -> usize {
         (hooks().hart)()
     }
     fn relax() {
