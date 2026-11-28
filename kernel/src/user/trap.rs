@@ -543,6 +543,18 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
             #[cfg(all(feature = "release", not(feature = "release-suite")))]
             return Ok((Some(0), None));
         }
+        // 219 (T226, OD160; test kernels and the release-suite kernel, like 216 to 218; a release kernel answers 0 and does nothing): the next
+        // user thread the calling thread creates is placed only on the hart it is created on (a test-only pin: with a priority below
+        // its creator's it cannot run before the creator blocks, which makes "killed before it ran" deterministic). Answers 1 when set.
+        if a[1] == 219 {
+            #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+            {
+                thread::pin_next_spawn();
+                return Ok((Some(1), None));
+            }
+            #[cfg(all(feature = "release", not(feature = "release-suite")))]
+            return Ok((Some(0), None));
+        }
         // 132 (T243, debug builds): print every hart's scheduler state, the record of every thread that is not idle and the processes that are not
         // finished, for a test that failed; the user state is the one this closure holds (`dump_state` opening it again would be two live `&mut`, T239)
         if a[1] == 132 {

@@ -72,6 +72,7 @@ pub mod testlog;
 pub mod ticket;
 pub mod timebase;
 pub mod usercopy;
+pub mod usync;
 pub mod wait;
 pub mod watchdog;
 

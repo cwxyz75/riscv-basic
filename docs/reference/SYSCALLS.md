@@ -311,7 +311,11 @@ interrupt it arms a sentinel 1 ms ahead until the handler arms its next event.
   microseconds. It returns whether a **pause of the host** covered the window: at least two harts (the one hart, on a one-hart machine)
   took a timer interrupt more than `a3` late whose late span (from its due time to when it was taken) meets the window, as (hart << 48) |
   microseconds late of the worst, or 0. One hart late alone is not a pause: a hart that ran with interrupts off or waited for a lock in
-  its timer handler looks the same, and a pause of the emulator stops every vCPU at once.
+  its timer handler looks the same, and a pause of the emulator stops every vCPU at once. A hart that is late **now** counts too (T287):
+  an online hart other than the caller's whose armed interrupt fell due more than `a3` ago and has not been taken (the window ends now,
+  so its span meets it), since a hart the host still has stopped when the window is judged has taken nothing that would record it. Like a
+  late sample, an overdue hart may instead be one running with interrupts off (a big-lock holder and a hart spinning for it): two such
+  harts are counted as a pause, the blind spot of the two-hart rule, which only the three-in-a-row rule catches.
 - 217: `a2` as for 216; how long the harts were not taking their timer interrupts inside the window, summed over the harts, counting
   only samples at least 2 ms late (microseconds).
 - 218 is the one selector with an effect, kept small and bounded (the debug resource is the trusted boot-time suite's, HD4; its handle
@@ -319,6 +323,12 @@ interrupt it arms a sentinel 1 ms ahead until the handler arms its next event.
   stops it) every hart keeps its timer deadline at most 1 ms ahead (the other harts are told at once by a reschedule
   interrupt), so that a hart the host stops is late for an interrupt whatever it was running. A timing test turns it on while it
   measures, and off after.
+
+- 219 is not part of the detector but sits beside it (T226, OD160; the same kernels as 216 to 218, a release kernel answers 0 and does nothing): a **test-only pin**. The next user
+  thread the calling thread creates (`thread_spawn`, `process_start`) is placed only on the hart it is created on, instead of anywhere;
+  the slot is one, consumed by the caller's next `thread_spawn` or `process_start` whatever its outcome. Answers 1. With a priority below its creator's, such a thread cannot run before its creator
+  blocks, which makes "a thread killed before it ran" deterministic at any hart count. It is not a CPU-affinity call (a user-visible one
+  is a candidate for the scheduler overhaul, T268): the suite is its only caller.
 
 The timing tests take a window that a pause later than their bound covered again (three in a row fail them), so a wake the scheduler
 delayed after an interrupt taken on time, and a hart held with interrupts off, still fail them. Read under the object lock, like every

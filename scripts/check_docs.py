@@ -406,6 +406,7 @@ ATOMICS = {
     "kcore/src/msiid.rs": (3, "`IdSet`, the identities a hart claimed from its IMSIC file and has not yet delivered: kept in the hart's own record (not on the trap stack, KT13), written by that hart's trap and emptied by its delivery under the lock; atomic only so a shared `PerHart` can hold it, never touched by another hart"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/pause.rs": (6, "T284 pause detector ring: one writer (the hart, interrupts off), any reader, one word per sample so no reader sees half of one"),
+    "kcore/src/usync.rs": (6, "T287: the user semaphore protocol, one count word shared by posters and takers (the futex compares it under its table lock); modelled under loom and shuttle over a model futex (usync_concurrency)"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
     "kernel/src/arch/aarch64/mod.rs": (4, "the AArch64 stub (AR1): the two statistics the riscv64 layer has (T206), never run"),
