@@ -23,3 +23,9 @@ for o in aia iommu-sys; do
 done
 qemu-system-riscv64 -cpu help | grep -w rva23s64 >/dev/null || { echo "::error::this QEMU has no rva23s64 CPU"; exit 1; }
 qemu-system-riscv64 -machine none -netdev help | grep -x user >/dev/null || { echo "::error::this QEMU has no user network backend (slirp)"; exit 1; }
+# the block drivers the fault disks of the kernel-only boot use (T286): `blkdebug` (a read that fails on cue) under `raw`; the throttle
+# is in the block layer itself
+fmts=$(qemu-system-riscv64 -machine none -drive format=help)
+for f in blkdebug raw file; do
+  grep -qw "$f" <<<"$fmts" || { echo "::error::this QEMU has no $f block driver"; exit 1; }
+done

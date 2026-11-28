@@ -23,6 +23,7 @@ exits with pass or fail. Its switches are environment variables:
 | `OS_PROFILE=<file>` | append host seconds and guest ticks per test to a TSV |
 | `OS_RECORD=<dir>`, `OS_REPLAY=<file>`, `OS_GDB=1` | record and replay (below) |
 | `OS_HOST_STALL=<ms>[:<period ms>[:<seed>]]` | the host-stall injector (below): stop the emulator for `<ms>` at seeded moments about every `<period>` |
+| `OS_DISK_THROTTLE=<drive>:<options>[;...]` | QEMU block throttling on a disk, by hand (below, "A slow or failing disk on cue") |
 
 **A boot is judged on progress, not on total time.** A loaded host slows a healthy suite several times over, so the
 harness fails a boot that prints nothing for the stall window, not one that is slow. A test must not assume the boot is
@@ -114,6 +115,19 @@ to say nothing about whether that happened. Two tools now say it:
 On the development machine (macOS) the detector also showed the emulator taking a timer interrupt programmed T ahead about T / 2 late,
 every time, with the hart running and interrupts on (a 3 ms sleep about 1.6 ms, a 10 ms slice end 5.04 to 5.09 ms): a host lateness that
 the heartbeat keeps under a millisecond while a test measures.
+
+**A slow or failing disk on cue** (T286). Storage timing is made deterministic with QEMU's own block features rather than a loaded
+host. The kernel-only boot (`OS_SHARD=k`, with the disks) carries two fault disks besides the scratch and second disks: at `00:08.0` a
+read-only disk of 1 MiB (`readonly=on`, so the device offers `VIRTIO_BLK_F_RO`) whose reads of sector 64 fail with EIO (a `blkdebug`
+rule under `raw`), and at `00:09.0` a disk throttled to 2 KiB/s (`throttling.bps-total`: a request right after another waits about four
+seconds, past `blkd`'s two, while the emulator runs on; a device reset drains a throttled request at once).
+`blk_reports_read_only_io_errors_and_timeouts` asserts `ReadOnly`, `IoError` and `Timeout` on them and kills a driver while the device
+holds its request; the harness fails a kernel-only boot that did not reach its end. Only that boot has them, and not under record
+and replay (`blkreplay` reads its image node directly, past a drive's throttle, and the throttle's timers run on the host's clock): a System test (the
+volume manager, a session) probes every disk and would pay the throttled one's seconds. By hand, `OS_DISK_THROTTLE=<drive>:<options>`
+(`pd0` to `pd3`, several separated by `;`) adds `throttling.<option>` to a drive, e.g. `OS_DISK_THROTTLE=pd1:iops-total=4` makes the
+second disk a slow one for the filesystem and volume-manager tests of shard a. `.github/actions/install-qemu/check-qemu.sh` checks
+that CI's QEMU has the `blkdebug` driver.
 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the
 serial log of every failing run in `target/repeat/`. Over a soak target this is a soak run (`TESTING.md` rule 6). The overnight

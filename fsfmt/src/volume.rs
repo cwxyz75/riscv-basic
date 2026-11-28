@@ -138,17 +138,33 @@ fn owner(uuid: &[u8; 16]) -> u64 {
     sb::owner_of(uuid)
 }
 
+/// What [`probe_volume`] found on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// A doofs volume: the newest plausible superblock.
+    Volume(Superblock),
+    /// Every slot was read and none holds a plausible superblock (or the device is too small to hold a volume): not a volume.
+    NotVolume,
+    /// No plausible superblock among the slots that could be read, and at least one could not be: the device did not answer, so
+    /// whether it holds a volume is not known (T286: a driver that timed out or was winding down is not a verdict on the disk).
+    Unreadable,
+}
+
 /// Is this device a doofs volume? The newest superblock slot that decodes, with a plausible geometry and a printable label, and
-/// no walk of the tree (a hostile device costs eight block reads). Used by `volmgr`; mount does the real checking.
-pub fn probe<D: Device>(dev: &mut D) -> Option<Superblock> {
+/// no walk of the tree (a hostile device costs eight block reads). Used by `volmgr`; mount does the real checking. A slot that
+/// cannot be read is skipped; if no slot gives a superblock and any read failed, the answer is [`Probe::Unreadable`], not
+/// [`Probe::NotVolume`].
+pub fn probe_volume<D: Device>(dev: &mut D) -> Probe {
     let blocks = dev.blocks();
     if blocks < MIN_BLOCKS {
-        return None;
+        return Probe::NotVolume;
     }
     let mut best: Option<Superblock> = None;
+    let mut unread = false;
     for i in 0..SLOTS {
         let mut b = [0u8; BLOCK];
         if dev.read(sb::slot_addr(i, blocks), &mut b).is_err() {
+            unread = true;
             continue;
         }
         let Ok(s) = Superblock::decode(&b) else {
@@ -162,7 +178,19 @@ pub fn probe<D: Device>(dev: &mut D) -> Option<Superblock> {
             best = Some(s);
         }
     }
-    best
+    match best {
+        Some(s) => Probe::Volume(s),
+        None if unread => Probe::Unreadable,
+        None => Probe::NotVolume,
+    }
+}
+
+/// [`probe_volume`]'s superblock, if it found a volume.
+pub fn probe<D: Device>(dev: &mut D) -> Option<Superblock> {
+    match probe_volume(dev) {
+        Probe::Volume(s) => Some(s),
+        Probe::NotVolume | Probe::Unreadable => None,
+    }
 }
 
 /// Read all slots, and walk each readable slot's tree. Changes nothing.

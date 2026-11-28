@@ -343,3 +343,86 @@ fn probe_recognises_a_volume_and_refuses_everything_else() {
         }
     }
 }
+
+/// T286: a device whose reads fail is not called "not a volume" (`volmgr` would ignore a disk for good on a read that timed out): the
+/// probe says Unreadable when no slot gave a superblock and a read failed, NotVolume only when every slot was read, and still finds
+/// the volume when some slots fail and another holds it.
+#[test]
+fn probe_tells_an_unreadable_device_from_one_that_is_not_a_volume() {
+    use fsfmt::{probe_volume, DevError, Probe};
+    struct Reads<'a> {
+        inner: &'a mut MemDevice,
+        /// Which slot-address reads fail.
+        fail: &'a dyn Fn(u64) -> bool,
+    }
+    impl Device for Reads<'_> {
+        fn blocks(&self) -> u64 {
+            self.inner.blocks()
+        }
+        fn read(&mut self, a: u64, b: &mut [u8; BLOCK]) -> Result<(), DevError> {
+            if (self.fail)(a) {
+                return Err(DevError::Io);
+            }
+            self.inner.read(a, b)
+        }
+        fn write(&mut self, a: u64, d: &[u8; BLOCK]) -> Result<(), DevError> {
+            self.inner.write(a, d)
+        }
+        fn flush(&mut self) -> Result<(), DevError> {
+            self.inner.flush()
+        }
+    }
+    let all = |_: u64| true;
+    let none = |_: u64| false;
+    let first = |a: u64| a == slot_addr(0, 200);
+    let mut vol = fresh(200);
+    let mut blank = MemDevice::new(200);
+    // every read fails: unknown, whatever the disk holds
+    for d in [&mut vol, &mut blank] {
+        let p = probe_volume(&mut Reads {
+            inner: d,
+            fail: &all,
+        });
+        assert_eq!(p, Probe::Unreadable);
+    }
+    // every read works: the volume, or not a volume
+    assert!(matches!(
+        probe_volume(&mut Reads { inner: &mut vol, fail: &none }),
+        Probe::Volume(s) if s.uuid == UUID
+    ));
+    assert_eq!(
+        probe_volume(&mut Reads {
+            inner: &mut blank,
+            fail: &none
+        }),
+        Probe::NotVolume
+    );
+    // one slot fails: a blank disk is unknown (that slot might have held it), a volume is still found in the others
+    assert_eq!(
+        probe_volume(&mut Reads {
+            inner: &mut blank,
+            fail: &first
+        }),
+        Probe::Unreadable
+    );
+    assert!(matches!(
+        probe_volume(&mut Reads { inner: &mut vol, fail: &first }),
+        Probe::Volume(s) if s.uuid == UUID
+    ));
+    // too small to hold a volume: not a volume without reading anything
+    let mut tiny = MemDevice::new(5);
+    assert_eq!(
+        probe_volume(&mut Reads {
+            inner: &mut tiny,
+            fail: &all
+        }),
+        Probe::NotVolume
+    );
+    assert_eq!(tiny.reads, 0);
+    // and `probe` is the volume or nothing
+    assert!(fsfmt::probe(&mut Reads {
+        inner: &mut vol,
+        fail: &all
+    })
+    .is_none());
+}

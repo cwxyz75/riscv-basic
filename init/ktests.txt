@@ -166,6 +166,7 @@ dma_survives_a_dead_supervisor
 blk_round_trip
 blk_driver_restart
 blk_driver_killed_mid_write
+blk_reports_read_only_io_errors_and_timeouts
 blk_driver_cannot_reach_outside
 socket_ends_travel_over_channels
 a_child_reads_a_socket_to_the_end
