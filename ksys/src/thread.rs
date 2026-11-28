@@ -607,9 +607,8 @@ fn spawn_register(
 }
 
 /// `process_start(process, entry, sp, channel, arg)` (SYSCALLS.md): move the bootstrap channel end into a Created process as its handle 1 and register
-/// its first thread. The caller spawns the kernel thread `token` names at `prio`. On any error nothing has changed.
-#[allow(clippy::expect_used, clippy::panic)]
-// INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists; a Created process's table is empty, so the moved handle is handle 1
+/// its first thread. The caller spawns the kernel thread `token` names at `prio`. On any error nothing has changed. Each step is a frame of its own
+/// (KT13).
 #[inline(never)]
 pub fn process_start(
     us: &mut UserState,
@@ -618,8 +617,40 @@ pub fn process_start(
     me: u64,
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
+    let a = &a;
+    let tpid = start_target(us, me, a)?;
+    // (KT9: the first thread's record, start and register image are made before anything changes)
+    let image = new_image()?;
+    us.reserve_thread(tpid)?;
+    let tjob = start_entry(us, tpid, a)?;
+    // The thread's charge comes before anything changes: a refusal must leave the caller's handle with the caller and the process exactly as it
+    // was (SYSCALLS.md: on any error nothing changes), or a retry would find handle 1 taken.
+    charge_thread(jobs, tjob).map_err(crate::job_status)?;
+    start_rest(us, jobs, map, (me, tpid, tjob), a, image)
+}
+
+/// `process_start` once the thread is charged: the library (`start_lib`), the commit (`start_commit`) and the first thread's start.
+#[inline(never)]
+fn start_rest(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    map: &mut dyn crate::StartMap,
+    (me, tpid, tjob): (u64, u64, JobId),
+    a: &[u64; 6],
+    image: kcore::fbox::FBox<[u64; 32]>,
+) -> Result<Spawn, Status> {
+    let (lib, span, tables) = start_lib(us, jobs, map, (tpid, tjob))?;
+    start_commit(us, jobs, map, (me, tpid, tjob), a, (lib, span, tables))?;
+    Ok(start_register(us, jobs, (tpid, tjob), a, lib, image))
+}
+
+/// `process_start`'s checks before anything is made: the two handles (a process with MANAGE, a channel with TRANSFER), the reserved `features`
+/// word (HD5: the named mechanisms are not there, NOT_SUPPORTED; anything else is not a feature, INVALID_ARGS), the target's state (Created),
+/// and the thread backstop. The target. A frame of its own (KT13).
+#[inline(never)]
+fn start_target(us: &UserState, me: u64, a: &[u64; 6]) -> Result<u64, Status> {
     let (ph, bh) = (Handle(a[0]), Handle(a[3]));
-    let (entry, sp, arg, features) = (a[1], a[2], a[4], a[5]);
+    let features = a[5];
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let pe = caller.handles.get(ph)?;
     let be = caller.handles.get(bh)?;
@@ -633,13 +664,19 @@ pub fn process_start(
     if !pe.rights.contains(Rights::MANAGE) || !be.rights.contains(Rights::TRANSFER) {
         return Err(Status::AccessDenied);
     }
-    // HD5: the `features` word is reserved: the named mechanisms are not there (NOT_SUPPORTED), anything else is not a feature (INVALID_ARGS)
     if features & !abi::start_features::ALL != 0 {
         return Err(Status::InvalidArgs);
     }
     if features != 0 {
         return Err(Status::NotSupported);
     }
+    start_ready(us, tpid)?;
+    Ok(tpid)
+}
+
+/// `process_start`'s target is Created and not ending, and the thread backstop has room.
+#[inline(never)]
+fn start_ready(us: &UserState, tpid: u64) -> Result<(), Status> {
     let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
     if target.state != crate::ProcState::Created
         || target.exit_code.is_some()
@@ -650,9 +687,13 @@ pub fn process_start(
     if total_threads(us) >= us.backstops.user_threads {
         return Err(Status::NoMemory);
     }
-    // (KT9: the first thread's record, start and register image are made before anything changes)
-    let mut image = kcore::fbox::FBox::try_new([0u64; 32]).map_err(|_| Status::NoMemory)?;
-    us.reserve_thread(tpid)?;
+    Ok(())
+}
+
+/// `process_start`'s entry (in an executable region of the target) and stack pointer (16-byte aligned, in the user range): the target's job.
+#[inline(never)]
+fn start_entry(us: &UserState, tpid: u64, a: &[u64; 6]) -> Result<JobId, Status> {
+    let (entry, sp) = (a[1], a[2]);
     let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
     let entry_ok = target
         .aspace
@@ -663,32 +704,33 @@ pub fn process_start(
     if !entry_ok || !sp_ok {
         return Err(Status::InvalidArgs);
     }
-    let tjob = target.job;
-    // The thread's charge comes before anything changes: a refusal must leave the caller's handle with the caller and the process exactly as it
-    // was (SYSCALLS.md: on any error nothing changes), or a retry would find handle 1 taken.
-    charge_thread(jobs, tjob).map_err(crate::job_status)?;
-    // (room in the target's table first, in memory: the handle is moved only when its arrival cannot fail)
-    {
-        let t = us.procs.get_mut(&tpid).expect("target exists");
-        // (and, KT9, the records of the library's page-table charge: made after the mapping, with nothing to allocate)
-        if let Err(e) = t.handles.reserve(1).and_then(|()| t.reserve_charge()) {
+    Ok(target.job)
+}
+
+/// `process_start`'s room in the target's table (in memory: the handle is moved only when its arrival cannot fail) and, KT9, the records of the
+/// library's page-table charge; then the system library mapped (AB7: now, while an error can still undo it) and its page tables charged as the
+/// mappings of `process_map` are (its span's worth: a leaf table per 512 pages and four more). On `Err` the thread's charge is credited and the
+/// library unmapped. (The library, its span, and the tables charged.) A frame of its own (KT13).
+#[allow(clippy::expect_used)] // INVARIANT: the target was looked up under the same lock
+#[inline(never)]
+fn start_lib(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    map: &mut dyn crate::StartMap,
+    (tpid, tjob): (u64, JobId),
+) -> Result<(crate::LibRange, u64, u64), Status> {
+    let t = us.procs.get_mut(&tpid).expect("target exists");
+    if let Err(e) = t.handles.reserve(1).and_then(|()| t.reserve_charge()) {
+        credit_thread(jobs, tjob);
+        return Err(e);
+    }
+    let (lib, span) = match map.map(t.aspace.held_mut(), jobs) {
+        Ok(x) => x,
+        Err(e) => {
             credit_thread(jobs, tjob);
             return Err(e);
         }
-    }
-    // AB7: the system library goes into the address space now, while an error can still undo it (the charge for its page tables as the mappings of
-    // `process_map` are charged: its span's worth, recorded like theirs).
-    let (lib, span) = {
-        let t = us.procs.get_mut(&tpid).expect("target exists");
-        match map.map(t.aspace.held_mut(), jobs) {
-            Ok(x) => x,
-            Err(e) => {
-                credit_thread(jobs, tjob);
-                return Err(e);
-            }
-        }
     };
-    // (as `process_map`'s estimate: a leaf table per 512 pages and four more; the span is a few pages)
     let tables = if span == 0 {
         0
     } else {
@@ -696,13 +738,28 @@ pub fn process_start(
     };
     if tables > 0 {
         if let Err(x) = jobs.charge(tjob, Resource::Pages, tables) {
-            let t = us.procs.get_mut(&tpid).expect("target exists");
             map.unmap(t.aspace.held_mut(), jobs, lib, span);
             credit_thread(jobs, tjob);
             return Err(crate::job_status(x));
         }
     }
-    // Commit: the channel end moves into the new process as its handle 1.
+    Ok((lib, span, tables))
+}
+
+/// `process_start`'s commit: the channel end moves into the new process as its handle 1 (a failure to take it from the caller undoes the
+/// library, its charge and the thread's), and the process gets its entry, argument, stack pointer and library, and is Running with one thread.
+#[allow(clippy::expect_used, clippy::panic)]
+// INVARIANT: the caller and the target were looked up under the same lock; a Created process's table is empty and its room was reserved, so the moved handle is handle 1
+#[inline(never)]
+fn start_commit(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    map: &mut dyn crate::StartMap,
+    (me, tpid, tjob): (u64, u64, JobId),
+    a: &[u64; 6],
+    (lib, span, tables): (crate::LibRange, u64, u64),
+) -> Result<(), Status> {
+    let bh = Handle(a[3]);
     let first_gen = us.first_handle_gen;
     let UserState { procs, objs, .. } = us;
     let caller = procs.get_mut(&me).expect("caller exists");
@@ -710,13 +767,47 @@ pub fn process_start(
         Ok(m) => m,
         Err(e) => {
             let t = procs.get_mut(&tpid).expect("target exists");
-            map.unmap(t.aspace.held_mut(), jobs, lib, span);
-            jobs.credit(tjob, Resource::Pages, tables);
-            credit_thread(jobs, tjob);
+            undo_lib(t, jobs, map, tjob, (lib, span, tables));
             return Err(e);
         }
     };
     let target = procs.get_mut(&tpid).expect("target exists");
+    insert_bootstrap(target, objs, moved, first_gen);
+    target.entry = a[1];
+    target.arg = a[4];
+    target.start_sp = a[2];
+    target.libsys = lib;
+    if tables > 0 {
+        target.add_charge(lib.base, tables, lib.base.saturating_add(span));
+    }
+    target.state = crate::ProcState::Running;
+    target.threads_alive = 1;
+    Ok(())
+}
+
+/// Undo `start_lib`: the library unmapped, its page-table charge and the thread's credited.
+#[inline(never)]
+fn undo_lib(
+    t: &mut crate::Process,
+    jobs: &mut Jobs,
+    map: &mut dyn crate::StartMap,
+    tjob: JobId,
+    (lib, span, tables): (crate::LibRange, u64, u64),
+) {
+    map.unmap(t.aspace.held_mut(), jobs, lib, span);
+    jobs.credit(tjob, Resource::Pages, tables);
+    credit_thread(jobs, tjob);
+}
+
+/// The channel end `moved` arrives in the new process `target` as its handle 1 (a Created process's table is empty and its room was reserved).
+#[allow(clippy::expect_used, clippy::panic)] // INVARIANT: as `start_commit`
+#[inline(never)]
+fn insert_bootstrap(
+    target: &mut crate::Process,
+    objs: &mut kcore::ipc::Kobjs,
+    moved: kcore::handle::Entry,
+    first_gen: u64,
+) {
     let first = target
         .handles
         .insert(objs, moved.obj, moved.rights)
@@ -728,26 +819,27 @@ pub fn process_start(
     );
     // (AB3, test builds: the generations the later handles start at; the bootstrap handle above is value 1 by the ABI)
     target.handles.set_first_generation(first_gen);
-    target.entry = entry;
-    target.arg = arg;
-    target.start_sp = sp;
-    target.libsys = lib;
-    if tables > 0 {
-        target.add_charge(lib.base, tables, lib.base.saturating_add(span));
-    }
-    target.state = crate::ProcState::Running;
-    target.threads_alive = 1;
-    // the first thread of a process starts at the default priority, clamped to its job's maximum
+}
+
+/// The end of `process_start`: the first thread's start (at the default priority, clamped to its job's maximum; the system library's base in
+/// `a2`: AB7) and its register image.
+#[inline(never)]
+fn start_register(
+    us: &mut UserState,
+    jobs: &Jobs,
+    (tpid, tjob): (u64, JobId),
+    a: &[u64; 6],
+    lib: crate::LibRange,
+    mut image: kcore::fbox::FBox<[u64; 32]>,
+) -> Spawn {
+    let (entry, sp, arg) = (a[1], a[2], a[4]);
     let prio = clamp_prio(jobs, tjob, 10);
     let token = new_start(us, tpid, entry, sp, arg, None);
     if let Some(t) = us.starts.get_mut(&token) {
         t.a2 = lib.base;
     }
-    *image = initial_general(entry, sp, arg, 0, 0);
-    if let Some(w) = image.get_mut(11) {
-        *w = lib.base; // (`a2`: the system library's base, AB7)
-    }
-    Ok(Spawn {
+    fill_image(&mut image, (entry, sp, arg, 0, 0), lib.base);
+    Spawn {
         token,
         handle: 0,
         prio,
@@ -758,7 +850,7 @@ pub fn process_start(
         rr: false,
         spawned: false,
         image: Some(image),
-    })
+    }
 }
 
 // ---- EX1: thread_suspend, thread_resume, thread state ----
