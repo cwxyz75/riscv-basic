@@ -3,7 +3,8 @@
 //! * [`Class`] is the planned hierarchy: a hart holding class *n* may take only classes numbered above *n*. A class
 //!   may be taken twice only where the table says so ([`Class::allows_two`]), in ascending instance order.
 //! * [`Held`] is the checker's per-hart stack (`MAX_HELD` deep: enough for every process's address space and the locks after them) of what the hart holds, and the pure rule
-//!   [`Held::check`] that the kernel's lock sites call through [`Machine::acquired`].
+//!   [`Held::check`] that the kernel's lock sites call through [`Machine::acquired`]. A release of a lock the hart does not hold
+//!   panics ([`Held::pop`]), for every class but the console's.
 //! * [`Spin`] is a fair (ticket) spinlock over [`kcore::ticket`] that saves and restores the interrupt state through a
 //!   [`Machine`], tells the checker, and hands out a guard. It is **not** reentrant (the legacy lock and the console
 //!   lock keep their own reentrancy).
@@ -105,7 +106,12 @@ pub struct Violation {
 }
 
 /// The most locks one hart may hold at once.
+#[cfg(not(kani))]
 pub const MAX_HELD: usize = 72;
+/// (Under Kani the stack is 8 deep: the proofs' sequences hold at most five locks, so the capacity never decides an outcome, and
+/// the smaller array keeps every symbolic index into it small.)
+#[cfg(kani)]
+pub const MAX_HELD: usize = 8;
 
 /// What one hart holds: a stack of `(class, instance)`.
 #[derive(Clone, Copy, Debug)]
@@ -192,22 +198,31 @@ impl Held {
     }
 
     /// Record a release. Locks are normally released in reverse order, but any held lock may go (a guard can be
-    /// dropped out of order); a lock that is not held is a bug.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i is the position of a held entry, below len; len >= 1 when an entry was found
+    /// dropped out of order); a lock that is not held (never taken, released twice, or another instance) is a bug and
+    /// panics, for every class but the console.
     pub fn pop(&mut self, class: Class, instance: u32) {
+        assert!(
+            self.release(class, instance),
+            "released a {class:?} lock the hart does not hold"
+        );
+    }
+
+    /// The release `pop` makes: removes `(class, instance)` if held. False (and nothing changed) when it is not held and the class
+    /// is not the console's. (A reentrant class is released only at its outermost take, so it is held then too. The console is the
+    /// one lenient class: a panic breaks its lock (`console::break_lock`) while another hart may be inside it, and that hart's nested
+    /// take then counts as an outermost one and releases the entry early, so its outer release finds nothing: T85 (5).)
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i is the position of a held entry, below len; len >= 1 when an entry was found
+    fn release(&mut self, class: Class, instance: u32) -> bool {
         let at = self.stack[..self.len]
             .iter()
             .rposition(|&(c, i)| c == class && i == instance);
-        if let Some(i) = at {
-            self.stack.copy_within(i + 1..self.len, i);
-            self.len -= 1;
-        } else {
-            // (a reentrant class is released only at its outermost take, so it is held then too; only the legacy lock
-            // and the console are lenient, as the kernel's hand-overs of the big lock make an exact count hard to prove)
-            assert!(
-                class.reentrant(),
-                "released a {class:?} lock the hart does not hold"
-            );
+        match at {
+            Some(i) => {
+                self.stack.copy_within(i + 1..self.len, i);
+                self.len -= 1;
+                true
+            }
+            None => class == Class::Uart,
         }
     }
 }
@@ -218,8 +233,8 @@ pub trait Machine {
     fn irq_save() -> bool;
     /// Restore the state `irq_save` returned.
     fn irq_restore(was: bool);
-    /// This hart's index.
-    fn hart() -> u32;
+    /// This hart's index (below the kernel's `MAX_HARTS`).
+    fn hart() -> usize;
     /// Between looks at a held lock.
     fn relax();
     /// The checker: the hart is about to take `(class, instance)` (it panics on a violation) ...
@@ -227,6 +242,18 @@ pub trait Machine {
     fn acquired(class: Class, instance: u32);
     /// ... and has released it.
     fn released(class: Class, instance: u32);
+}
+
+/// The calling hart's index as the ticket lock's owner id (`kcore::ticket` keeps `id + 1` in a `u32`, 0 meaning free). Panics
+/// on an index that does not fit, which no machine with `MAX_HARTS` harts has: two harts must never share an id (T135, T155).
+fn owner_id<M: Machine>() -> u32 {
+    let hart = M::hart();
+    match u32::try_from(hart) {
+        Ok(id) if id < u32::MAX => id,
+        #[allow(clippy::panic)]
+        // INVARIANT: hart indices are below MAX_HARTS (64); an index past u32::MAX - 1 is a kernel bug
+        _ => panic!("hart index {hart} has no ticket owner id"),
+    }
 }
 
 /// A spinlock of a class, protecting a `T`.
@@ -271,7 +298,7 @@ impl<T, M: Machine> Spin<T, M> {
     pub fn lock(&self) -> Guard<'_, T, M> {
         let was = M::irq_save();
         M::acquired(self.class, self.instance);
-        let me = M::hart();
+        let me = owner_id::<M>();
         assert!(
             !self.ticket.held_by(me),
             "recursive take of a {:?} lock",
@@ -290,7 +317,7 @@ impl<T, M: Machine> Spin<T, M> {
     /// Take the lock only if it is free right now.
     pub fn try_lock(&self) -> Option<Guard<'_, T, M>> {
         let was = M::irq_save();
-        let me = M::hart();
+        let me = owner_id::<M>();
         let depth = Depth::new();
         if self.ticket.held_by(me) || !self.ticket.try_lock(me, &depth) {
             M::irq_restore(was);
@@ -309,7 +336,7 @@ impl<T, M: Machine> Spin<T, M> {
 
     /// Does the calling hart hold the lock?
     pub fn held_by_this_hart(&self) -> bool {
-        self.ticket.held_by(M::hart())
+        self.ticket.held_by(owner_id::<M>())
     }
 
     /// The value's address, for a holder that proved it holds the lock (`aslock`).
@@ -362,9 +389,153 @@ impl<T, M: Machine> DerefMut for Guard<'_, T, M> {
 
 impl<T, M: Machine> Drop for Guard<'_, T, M> {
     fn drop(&mut self) {
-        let me = M::hart();
+        let me = owner_id::<M>();
         M::released(self.lock.class, self.lock.instance);
         self.lock.ticket.unlock(me, &self.depth);
         M::irq_restore(self.was);
+    }
+}
+
+/// Bounded proofs of the order table and the held stack (T288; `cargo kani -p klock`, by hand: OD177, OD182). The host tests in
+/// `tests/order.rs` check every pair and chain of three at chosen instances; these check every class, every instance below a bound
+/// and every interleaving of takes and out-of-order releases up to a depth.
+#[cfg(kani)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::panic
+)] // INVARIANT: proof harnesses over bounded values (indices below the class count and the stack's length)
+mod proofs {
+    use super::*;
+
+    /// How many operations a sequence has, and the instances it uses (below the bound: equal, above and below each other).
+    const STEPS: usize = 5;
+    const INSTANCES: u32 = 3;
+
+    fn any_class() -> Class {
+        let i: usize = kani::any();
+        kani::assume(i < Class::ALL.len());
+        Class::ALL[i]
+    }
+
+    /// A legal stack: the classes never descend; equal neighbours are of a class that allows two, in ascending instance; no class is
+    /// held more often than it may be. So the top is the greatest entry, which is why `check` may look at the top only.
+    fn legal(h: &Held) -> bool {
+        let s = &h.stack[..h.len];
+        let mut ok = true;
+        let mut k = 1;
+        while k < s.len() {
+            let ((a, ia), (b, ib)) = (s[k - 1], s[k]);
+            ok &= a < b || (a == b && a.allows_two() && ia < ib);
+            k += 1;
+        }
+        for &(c, _) in s {
+            let n = s.iter().filter(|&&(d, _)| d == c).count();
+            ok &= n == 1 || (c.allows_two() && n <= c.most_at_once());
+        }
+        ok
+    }
+
+    /// The order on the classes is a strict total order, and `ALL` lists them in it, numbered 1 to 15 (the kernel's masks rely on
+    /// the numbers).
+    #[kani::proof]
+    fn the_classes_are_strictly_and_totally_ordered() {
+        let (i, j, k): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        let n = Class::ALL.len();
+        kani::assume(i < n && j < n && k < n);
+        let (a, b, c) = (Class::ALL[i], Class::ALL[j], Class::ALL[k]);
+        assert_eq!(a as usize, i + 1);
+        // trichotomy, irreflexivity, transitivity, and the order of `ALL`
+        assert!(u8::from(a < b) + u8::from(a == b) + u8::from(b < a) == 1);
+        assert!(!(a < a));
+        if a < b && b < c {
+            assert!(a < c);
+        }
+        assert_eq!(a < b, i < j);
+    }
+
+    /// Any sequence of takes (of any class and instance, pushed when `check` allows them) and releases (of any held entry, out of
+    /// order too) keeps the stack legal, and no take that `check` accepts is below anything held: the checker never accepts a
+    /// descending acquisition, whatever was released before it.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn the_held_stack_never_accepts_a_descending_acquisition() {
+        let mut h = Held::new();
+        let mut step = 0;
+        while step < STEPS {
+            if kani::any() || h.len == 0 {
+                let class = any_class();
+                let instance: u32 = kani::any();
+                kani::assume(instance < INSTANCES);
+                let again = class.reentrant() && h.holds(class);
+                if h.check(class, instance).is_ok() {
+                    for &(c, i) in &h.stack[..h.len] {
+                        if again {
+                            // a recursive take of a reentrant class: nothing above it but itself
+                            assert!(c <= class);
+                        } else {
+                            assert!(
+                                c < class || (c == class && class.allows_two() && i < instance)
+                            );
+                        }
+                    }
+                    let before = h.len;
+                    h.push(class, instance);
+                    assert_eq!(h.len, if again { before } else { before + 1 });
+                }
+            } else {
+                let at: usize = kani::any();
+                kani::assume(at < h.len);
+                let (c, i) = h.stack[at];
+                h.pop(c, i);
+            }
+            assert!(legal(&h));
+            step += 1;
+        }
+    }
+
+    /// A release of a lock the hart does not hold panics, for every class but the console, whatever is held (T85 (5)): for every
+    /// stack the takes can build and every `(class, instance)`, `release` (which `pop` asserts) succeeds exactly when the entry is
+    /// held or the class is the console's; a successful release of a held entry removes that one entry and keeps the rest in order,
+    /// and a console release of nothing changes nothing.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn a_release_succeeds_exactly_for_a_held_lock_or_the_console() {
+        let mut h = Held::new();
+        let mut step = 0;
+        while step < 4 {
+            let (c, i): (Class, u32) = (any_class(), kani::any());
+            kani::assume(i < INSTANCES);
+            if h.check(c, i).is_ok() {
+                h.push(c, i);
+            }
+            step += 1;
+        }
+        let (c, i): (Class, u32) = (any_class(), kani::any());
+        let before = h;
+        let mut held = false;
+        let mut k = 0;
+        while k < before.len {
+            held |= before.stack[k] == (c, i);
+            k += 1;
+        }
+        let ok = h.release(c, i);
+        assert_eq!(ok, held || c == Class::Uart);
+        if held {
+            // the entry is gone (a legal stack holds it once), the others are as they were, in order
+            assert_eq!(h.len, before.len - 1);
+            let (mut x, mut y) = (0, 0);
+            while x < before.len {
+                if before.stack[x] != (c, i) {
+                    assert!(h.stack[y] == before.stack[x]);
+                    y += 1;
+                }
+                x += 1;
+            }
+            assert_eq!(y, h.len);
+        } else {
+            assert_eq!(h.len, before.len);
+        }
     }
 }

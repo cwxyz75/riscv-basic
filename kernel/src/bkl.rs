@@ -22,10 +22,9 @@ static OWNER: AtomicUsize = AtomicUsize::new(0);
 static OWNER_SITE: core::sync::atomic::AtomicPtr<core::panic::Location<'static>> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 static ENFORCED: AtomicBool = AtomicBool::new(false);
-/// Violations of the lock order seen (the checker counts instead of panicking while a test is
-/// deliberately provoking one).
+/// Violations of the lock order seen in the real run (each one also panics; the order test's own probes are counted per hart
+/// instead, `PerHart::order_probe_hits`).
 pub static VIOLATIONS: AtomicU32 = AtomicU32::new(0);
-static PANIC_ON_VIOLATION: AtomicBool = AtomicBool::new(true);
 
 fn me() -> usize {
     percpu::this().index.load(Ordering::Relaxed) + 1
@@ -53,14 +52,24 @@ pub fn violates(class: Class) -> bool {
 /// just the ones that reach the lock.
 pub fn check_use(class: Class) {
     if let Err(v) = percpu::this().held.with(|h| h.check(class, 0)) {
-        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
-        if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
-            panic!(
-                "lock order violation: taking {:?} while holding {:?}",
-                v.taking, v.held
-            );
-        }
+        violation(v);
     }
+}
+
+/// A violation the checker found on this hart: counted for the order test while it probes this hart (`order_check`), else counted and
+/// a panic.
+#[track_caller]
+fn violation(v: klock::Violation) {
+    let me = percpu::this();
+    if me.order_probing.load(Ordering::Relaxed) {
+        me.order_probe_hits.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+    panic!(
+        "lock order violation: taking {:?} while holding {:?}",
+        v.taking, v.held
+    );
 }
 
 #[track_caller]
@@ -71,13 +80,7 @@ fn note_acquire(class: Class, instance: u32) {
         bad
     });
     if let Err(v) = bad {
-        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
-        if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
-            panic!(
-                "lock order violation: taking {:?} while holding {:?}",
-                v.taking, v.held
-            );
-        }
+        violation(v);
     }
 }
 
@@ -93,17 +96,22 @@ pub fn lock_released(class: Class) {
     note_release(class, 0);
 }
 
-/// Test support: pretend the calling hart holds `held`, then really take `probe` through the
-/// code the kernel uses, with the checker counting instead of panicking, and report whether it
-/// flagged the order. (So a lock site that forgot to call the checker, or a checker that never
-/// fires, fails the test; the real BKL/heap/UART take paths are exercised, not just a predicate.)
-pub fn order_check(held: Class, probe: Class) -> bool {
+/// Test support: pretend the calling hart holds `held` (instance 0), then really take `probe` (at `instance`; OBJ, HEAP and UART
+/// have only instance 0) through the code the kernel uses, with the checker counting instead of panicking, and report whether it
+/// flagged the order. (So a lock site that forgot to call the checker, or a checker that never fires, fails the test; the real
+/// BKL/heap/UART take paths are exercised, not just a predicate.) The pretence starts from an empty stack, whatever the hart holds,
+/// and the hart's own stack is put back afterwards; only this hart counts instead of panicking meanwhile.
+#[inline(never)] // (its saved copy of the held stack stays out of the caller's frame, KT13)
+pub fn order_check(held: Class, probe: Class, instance: u32) -> bool {
     let was = crate::irq::save_and_disable();
-    PANIC_ON_VIOLATION.store(false, Ordering::SeqCst);
     let me = percpu::this();
     let saved = me.held.with(|h| *h);
-    me.held.with(|h| h.push(held, 0));
-    let before = VIOLATIONS.load(Ordering::SeqCst);
+    me.held.with(|h| {
+        *h = klock::Held::new();
+        h.push(held, 0);
+    });
+    me.order_probe_hits.store(0, Ordering::Relaxed);
+    me.order_probing.store(true, Ordering::Relaxed);
     match probe {
         Class::Obj => {
             lock();
@@ -122,12 +130,11 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             crate::console::with_uart_for_test();
         }
         // (the other classes are probed by pretending to hold them; the pure pair table is in `klock/tests/order.rs`)
-        other => note_acquire(other, 0),
+        other => note_acquire(other, instance),
     }
-    let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;
-    VIOLATIONS.store(before, Ordering::SeqCst);
+    me.order_probing.store(false, Ordering::Relaxed);
+    let flagged = me.order_probe_hits.load(Ordering::Relaxed) > 0;
     me.held.with(|h| *h = saved);
-    PANIC_ON_VIOLATION.store(true, Ordering::SeqCst);
     crate::irq::restore(was);
     flagged
 }
@@ -153,13 +160,7 @@ pub fn lock() {
         !LOCK.held_by(me),
         "the object lock taken by a hart that holds it (L20)"
     );
-    // the order check: a path that holds HEAP or UART and then takes the lock is taking it in the wrong order
-    if violates(Class::Obj) {
-        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
-        if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
-            panic!("lock order violation: taking the BKL while holding a later lock");
-        }
-    }
+    // the order check: a path that holds a later lock (HEAP, UART, ...) and then takes this one is taking it in the wrong order
     note_acquire(Class::Obj, 0);
     #[cfg(feature = "latency-trace")]
     let asked = crate::timer::now();
@@ -335,8 +336,8 @@ impl klock::Machine for Machine {
     fn irq_restore(was: bool) {
         crate::irq::restore(was);
     }
-    fn hart() -> u32 {
-        who()
+    fn hart() -> usize {
+        percpu::this().index.load(Ordering::Relaxed)
     }
     fn relax() {
         core::hint::spin_loop();

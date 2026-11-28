@@ -75,6 +75,10 @@ pub struct PerHart {
     pub bkl_depth: kcore::ticket::Depth,
     /// What this hart holds (a stack of lock classes), for the lock-order checker.
     pub held: HeldCell,
+    /// The order test is probing on this hart (`bkl::order_check`): a violation the checker finds here is counted in
+    /// `order_probe_hits` instead of panicking. Per hart, so a real violation on another hart still panics meanwhile.
+    pub order_probing: core::sync::atomic::AtomicBool,
+    pub order_probe_hits: AtomicU32,
     /// The device identities this hart claimed from its interrupt file and has not delivered yet (IOMMU4): here, not on the trap's stack
     /// (KT13). Only this hart touches it, in its trap path with interrupts off.
     pub claimed: kcore::msiid::IdSet,
@@ -281,6 +285,8 @@ impl PerHart {
             tp_seen: AtomicUsize::new(0),
             bkl_depth: kcore::ticket::Depth::new(),
             held: HeldCell(core::cell::UnsafeCell::new(klock::Held::new())),
+            order_probing: core::sync::atomic::AtomicBool::new(false),
+            order_probe_hits: AtomicU32::new(0),
             claimed: kcore::msiid::IdSet::new(),
             work_kind: AtomicU32::new(0),
             work_arg: AtomicU64::new(0),
