@@ -200,10 +200,11 @@ pub fn plan(table: &[Entry], found: &[Found]) -> Vec<(Found, Decision)> {
 ///
 /// - The device manager answers `Busy` while the device's previous driver winds down: open again, for up to [`discovery::BUSY_MS`]
 ///   from the first open.
-/// - A probe that could not read the device ([`discovery::Probed::Unreadable`]) after a `Busy` is the old driver's last moments,
-///   not a verdict on the disk: open and probe again, for up to [`discovery::PROBE_RETRY_MS`] from that first failure (a `Busy`
-///   meanwhile is waited for inside the same window). An unreadable device that was never `Busy` is a failing device and is
-///   ignored, as is one still unreadable when the window closes. A readable device with no volume
+/// - A probe that could not read the device ([`discovery::Probed::Unreadable`]), or an open the device manager could not complete
+///   ([`discovery::Opened::Failed`]: a claim refused while the old driver's domain or vectors are still being taken down), after a
+///   `Busy` is the old driver's last moments, not a verdict on the disk: open and probe again, for up to
+///   [`discovery::PROBE_RETRY_MS`] from that first failure (a `Busy` meanwhile is waited for inside the same window). A device that
+///   fails so without ever being `Busy` is a failing device and is ignored, as is one still failing when the window closes. A readable device with no volume
 ///   ([`discovery::Probed::NotVolume`]) is never probed again: a hostile device costs one probe.
 /// - Nothing is asked of the device manager later than [`discovery::DEVICE_BOUND_MS`] after the first open: one device costs at
 ///   most that, plus the open or probe under way when it passes.
@@ -295,7 +296,7 @@ pub mod discovery {
             match r {
                 Opened::Ok => Next::Probe,
                 Opened::NoDevice => Next::End,
-                Opened::Failed => Next::Ignore,
+                Opened::Failed => self.failed(now),
                 Opened::Busy => {
                     self.busy = true;
                     if now < self.busy_until() {
@@ -312,17 +313,21 @@ pub mod discovery {
             match p {
                 Probed::Volume => Next::Use,
                 Probed::NotVolume => Next::Ignore,
-                Probed::Unreadable => {
-                    if !self.busy {
-                        return Next::Ignore;
-                    }
-                    let first = *self.first_failure.get_or_insert(now);
-                    if now < first.saturating_add(PROBE_RETRY_MS).min(self.cap()) {
-                        Next::OpenAgain
-                    } else {
-                        Next::Ignore
-                    }
-                }
+                Probed::Unreadable => self.failed(now),
+            }
+        }
+
+        /// An open that failed or a probe that could not read, at `now`: tried again only after a `Busy`, within the window from
+        /// the first such failure.
+        fn failed(&mut self, now: u64) -> Next {
+            if !self.busy {
+                return Next::Ignore;
+            }
+            let first = *self.first_failure.get_or_insert(now);
+            if now < first.saturating_add(PROBE_RETRY_MS).min(self.cap()) {
+                Next::OpenAgain
+            } else {
+                Next::Ignore
             }
         }
     }
@@ -349,8 +354,8 @@ pub mod discovery {
         }
 
         /// Every run of up to eight answers, at any non-decreasing times from any start: a volume is always used, a readable
-        /// non-volume never probed again, an unreadable device never retried unless it was Busy before, a failed or missing device
-        /// never opened again, and nothing is asked of the device manager at or past `DEVICE_BOUND_MS` after the first open
+        /// non-volume never probed again, an unreadable device or a failed open never retried unless it was Busy before, a missing
+        /// device never opened again, and nothing is asked of the device manager at or past `DEVICE_BOUND_MS` after the first open
         /// (`cargo kani -p mounts`, by hand: OD177, OD182).
         #[kani::proof]
         #[kani::unwind(9)]
@@ -386,7 +391,12 @@ pub mod discovery {
                     match o {
                         Opened::Ok => assert!(n == Next::Probe),
                         Opened::NoDevice => assert!(n == Next::End),
-                        Opened::Failed => assert!(n == Next::Ignore),
+                        Opened::Failed => {
+                            assert!(n == Next::OpenAgain || n == Next::Ignore);
+                            if !busy_seen {
+                                assert!(n == Next::Ignore);
+                            }
+                        }
                         Opened::Busy => {
                             assert!(n == Next::OpenAgain || n == Next::Ignore);
                             // the first wait for a Busy device is never cut short of BUSY_MS

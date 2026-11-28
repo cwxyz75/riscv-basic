@@ -245,12 +245,13 @@ def pci_args():
                               f"file.image.filename={read_only_disk()},readonly=on", ""),
                       ("pd3", f"file={slow_disk()},format=raw", f",throttling.bps-total={SLOW_DISK_BPS}")]
         for name, spec, top in disks:
-            # (`top`: what goes on the drive the device sees, the throttle; under record and replay that is the blkreplay filter)
+            # (`top`: the throttle. Under record and replay it goes on the drive below the blkreplay filter, whose completions
+            # blkreplay records: the throttle's timers run on the host's clock, which replay does not reproduce)
             top += disk_throttle(name)
             if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
                 ro = ",readonly=on" if "readonly=on" in spec else ""
-                drive += ["-drive", f"{spec},if=none,id={name}-direct",
-                          "-drive", f"driver=blkreplay,if=none,image={name}-direct,id={name}{ro}{top}"]
+                drive += ["-drive", f"{spec},if=none,id={name}-direct{top}",
+                          "-drive", f"driver=blkreplay,if=none,image={name}-direct,id={name}{ro}"]
             else:
                 drive += ["-drive", f"{spec},if=none,id={name}{top}"]
     return drive + [a for slot, model, _, extra, _ in pci_devices() for a in pci_device(slot, model, extra)]
@@ -1584,7 +1585,7 @@ def main() -> int:
                 and "s6: blkd exercised (interrupts)" not in text):
             found.append("the block-driver tests did not run with interrupts")
         # T286 (T44): where the boot has the fault disks, the driver's ReadOnly, IoError and Timeout were each seen (not skipped)
-        if (strict and fault_disks_on() and not RELEASE_SUITE
+        if (strict and fault_disks_on()
                 and "s6: blkd reported ReadOnly, IoError and Timeout" not in text):
             found.append("the fault-disk test did not run to its end (no 's6: blkd reported ReadOnly, IoError and Timeout')")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
@@ -1622,7 +1623,7 @@ def main() -> int:
             # the volume manager (FS-SPEC 5d, 5e): the junk disk was ignored and the table named the volume
             if os.environ.get("OS_DISK") != "0":
                 for want in (r"fs: volmgr served the volume by the table and after a restart",
-                             r"volmgr: t=\d+ device 0: not a doofs volume \(probe 1 took \d+ ms, \d+ ms in all\), ignored",
+                             r"volmgr: t=\d+ device 0: not a doofs volume \(probe \d+ took \d+ ms, \d+ ms in all[^)]*\), ignored",
                              r"fs: volmgr retried a device that was busy and published only mounted volumes"):
                     if not re.search(want, text):
                         found.append(f"the volume manager tests did not report {want!r}")
@@ -1661,6 +1662,13 @@ def main() -> int:
                 tts.sort(reverse=True)
                 print(f"suite guest time: {sum(t for t, _ in tts) / 1000:.0f} s over {len(tts)} tests; slowest: "
                       + ", ".join(f"{n} {t / 1000:.1f} s" for t, n in tts[:6]))
+            # T286 (T209): a volume server that took seconds to mount and say ready passes now (the tests wait out the volume
+            # manager's budgets), so a slow one is said here, with any host pause the detector saw, for the next one to be read
+            slow = [int(m[1]) for m in re.finditer(r"volmgr: t=\d+ volume \S+: ready in (\d+) ms", text) if int(m[1]) >= 5000]
+            if slow:
+                pauses = len(re.findall(r"##PAUSE", text))
+                print(f"note: a volume server took {max(slow)} ms to be ready ({len(slow)} slow of the volume manager's starts; "
+                      f"{pauses} host pauses seen)")
     return failed
 
 

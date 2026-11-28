@@ -1,5 +1,5 @@
-//! `volmgr`'s retry decision (T286, T209): Busy-then-probe-fails is retried within its bound; a non-volume is not; a failing
-//! device that was never Busy is not; nothing is asked past the device's bound. (Kani proves the same over every run of up to eight
+//! `volmgr`'s retry decision (T286, T209): Busy-then-probe-fails (or Busy-then-open-fails) is retried within its bound; a
+//! non-volume is not; a failing device that was never Busy is not; nothing is asked past the device's bound. (Kani proves the same over every run of up to eight
 //! answers: `cargo kani -p mounts`.)
 
 use mounts::discovery::{
@@ -27,6 +27,26 @@ fn the_end_of_the_list_and_a_refused_open() {
     assert_eq!(d.opened(Opened::NoDevice, 0), Next::End);
     let mut d = Device::new(0);
     assert_eq!(d.opened(Opened::Failed, 0), Next::Ignore);
+}
+
+#[test]
+fn a_failed_open_after_busy_is_retried_within_its_bound() {
+    // the old driver's domain still being taken down: the claim fails once after the Busy, then works
+    let mut d = Device::new(0);
+    assert_eq!(d.opened(Opened::Busy, 0), Next::OpenAgain);
+    assert_eq!(d.opened(Opened::Failed, 100), Next::OpenAgain);
+    assert_eq!(d.opened(Opened::Ok, 200), Next::Probe);
+    assert_eq!(d.probed(Probed::Volume, 250), Next::Use);
+    // failures and unreadable probes share one window from the first of them
+    let mut d = Device::new(0);
+    assert_eq!(d.opened(Opened::Busy, 0), Next::OpenAgain);
+    assert_eq!(d.opened(Opened::Failed, 100), Next::OpenAgain);
+    assert_eq!(d.opened(Opened::Ok, 200), Next::Probe);
+    assert_eq!(
+        d.probed(Probed::Unreadable, 100 + PROBE_RETRY_MS - 1),
+        Next::OpenAgain
+    );
+    assert_eq!(d.opened(Opened::Failed, 100 + PROBE_RETRY_MS), Next::Ignore);
 }
 
 #[test]

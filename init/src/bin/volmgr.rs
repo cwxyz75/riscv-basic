@@ -87,6 +87,9 @@ fn open_block_retry(dm: u64, txid: &mut u32, index: u16) -> Option<(devmgr::Stat
         if d.opened(opened(st, h), sys::clock_get()) != discovery::Next::OpenAgain {
             return Some((st, h));
         }
+        if let Some(h) = h {
+            sys::handle_close(h);
+        }
         let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
     }
 }
@@ -127,6 +130,9 @@ fn discover(dm: u64, txid: &mut u32, index: u16) -> Discovered {
         };
         match d.opened(opened(st, h), sys::clock_get()) {
             discovery::Next::OpenAgain => {
+                if let Some(h) = h {
+                    sys::handle_close(h);
+                }
                 let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
                 continue;
             }
@@ -295,14 +301,25 @@ fn start(
         sys::process_kill(p, -1);
         sys::handle_close(p);
         v.proc = None;
+        // (the listeners' other ends, never published)
+        for (_, theirs) in published {
+            sys::handle_close(theirs);
+        }
         return false;
     }
     // (after a restart the old listeners closed with the old server and the registry has marked the names stale, which the
     // caller waited for: a publish replaces a stale name; a publish that fails closes the listener, so the server is useless)
-    for (name, theirs) in published {
+    let mut published = published.into_iter();
+    while let Some((name, theirs)) = published.next() {
         if let Err(e) = reg.publish(name.as_bytes(), theirs) {
             say!("volmgr: t={now} publish {name}: status {e}");
             sys::process_kill(p, -1);
+            sys::handle_close(p);
+            v.proc = None;
+            // (the failed publish closed its listener; the rest were never handed over)
+            for (_, theirs) in published {
+                sys::handle_close(theirs);
+            }
             return false;
         }
     }

@@ -10926,6 +10926,8 @@ struct BlkDriver {
     ch: u64,
     conn: u64,
     job: u64,
+    /// The claimed function's requester id (its slot << 3): `release` waits until that one is unclaimed.
+    rid: u64,
 }
 
 fn blk_rig() -> Result<Option<BlkRig>, Detail> {
@@ -11009,13 +11011,18 @@ fn devmgr_connect(ch: u64, txid: u32) -> Result<u64, Detail> {
 /// Wait until `devmgr` (behind `ch`) lists the scratch disk's function as not claimed: the release is done (the manager is one
 /// thread, so a list that says so was answered after it).
 fn blk_unclaimed(ch: u64) -> Outcome {
+    blk_unclaimed_at(ch, PCI_BLK_DID)
+}
+
+/// The same for the function with requester id `rid`.
+fn blk_unclaimed_at(ch: u64, rid: u64) -> Outcome {
     let t0 = sys::clock_get();
     let mut txid = 500;
     loop {
         txid += 1;
         if pci_list(ch, txid)?
             .iter()
-            .any(|e| u64::from(e.rid) == PCI_BLK_DID && e.flags & proto::devmgr::PCI_CLAIMED == 0)
+            .any(|e| u64::from(e.rid) == rid && e.flags & proto::devmgr::PCI_CLAIMED == 0)
         {
             return Ok(());
         }
@@ -11137,11 +11144,12 @@ impl BlkRig {
                 ch,
                 conn,
                 job: dj,
+                rid: slot << 3,
             }),
             Err(e) => {
                 sys::handle_close(conn);
                 sys::handle_close(dj);
-                let _ = blk_unclaimed(self.mgr_ch);
+                let _ = blk_unclaimed_at(self.mgr_ch, slot << 3);
                 Err(e)
             }
         }
@@ -11151,9 +11159,10 @@ impl BlkRig {
     fn release(&self, d: BlkDriver) -> Outcome {
         let _ = sys::process_kill(d.p, 57);
         let ended = wait_ended(d.p, 2000);
+        let rid = d.rid;
         drop(d);
         ended?;
-        blk_unclaimed(self.mgr_ch)
+        blk_unclaimed_at(self.mgr_ch, rid)
     }
 }
 
@@ -11885,34 +11894,61 @@ fn blk_reports_read_only_io_errors_and_timeouts() -> Outcome {
     let r = (|| {
         let (st, _) = blk_call(d.ch, 1, blk::Op::Info)?;
         ensure_eq!(st, blk::Status::Ok, "a driver after the one that timed out");
-        let req = blk::Request {
-            txid: 2,
-            op: blk::Op::Read {
-                sector: 48,
-                count: 16,
-            },
+        // a read queued right after another waits seconds; if the throttle's bucket had drained meanwhile (a host pause between the
+        // sections) the first goes through at once, and fills the bucket for the next
+        for k in 0..3u32 {
+            let req = blk::Request {
+                txid: 2 + k,
+                op: blk::Op::Read {
+                    sector: 48 + 16 * u64::from(k),
+                    count: 16,
+                },
+            }
+            .encode();
+            ensure_eq!(
+                sysst(sys::channel_write(
+                    d.ch,
+                    req.as_ptr(),
+                    req.len(),
+                    core::ptr::null(),
+                    0
+                )),
+                Some(S::Ok),
+                "queue a read"
+            );
+            nap_ticks(300);
+            if sys::object_signals(d.ch).a1 as u32 & sig::READABLE == 0 {
+                return Ok(()); // the device holds it: the kill comes mid-request
+            }
+            let mut buf = vec![0u8; 16 * 1024];
+            let r = sys::channel_read(d.ch, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+            ensure_eq!(sysst(r), Some(S::Ok), "read the reply");
+            let (t, status, _) = blk::decode_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+            ensure_eq!(
+                (t, status),
+                (2 + k, blk::Status::Ok),
+                "a read the throttle let through"
+            );
         }
-        .encode();
-        ensure_eq!(
-            sysst(sys::channel_write(
-                d.ch,
-                req.as_ptr(),
-                req.len(),
-                core::ptr::null(),
-                0
-            )),
-            Some(S::Ok),
-            "queue a read"
-        );
-        nap_ticks(300);
-        ensure_eq!(
-            sys::object_signals(d.ch).a1 as u32 & sig::READABLE,
-            0,
-            "the device still holds the read (the throttle makes it wait seconds)"
+        ensure!(
+            false,
+            "the device never held a read (the throttle makes the second of two back-to-back reads wait seconds)"
         );
         Ok(())
     })();
-    rig.release(d)?;
+    // (the driver's job, kept past the release: what was charged to it, its channels, VMOs and pages, comes back to nothing)
+    let dj = ok(
+        sys::handle_duplicate(d.job, Rights::SAME.0),
+        "dup the driver's job",
+    )?
+    .a1 as u64;
+    let released = rig.release(d);
+    let settled = released.and_then(|_| {
+        job_use_settles(dj, 4, 0, 3000)?;
+        job_use_settles(dj, 2, 0, 3000)
+    });
+    sys::handle_close(dj);
+    settled?;
     r?;
     domains_at_baseline(doms)?;
     vectors_at_baseline(live, ids)?;
@@ -15452,11 +15488,12 @@ fn fsd_keeps_files_across_a_restart() -> Outcome {
         "the query finds both, ordered by key"
     );
     ensure!(!more, "nothing more");
-    ensure_eq!(root.sync(), Ok(()), "sync");
     // after the sync: more changes, then the server dies before it commits them (if it dies within the server's commit interval of
     // the first change: a slow disk or a host pause can make the test's own steps take longer, and then the timer has committed
-    // them, all together: T286)
+    // them, all together: T286). The interval is measured from before the sync: anything that starts the server's timer after the
+    // sync (a change, a connection's close drained late) does so no earlier than this.
     let unsynced_from = sys::clock_get();
+    ensure_eq!(root.sync(), Ok(()), "sync");
     ensure_eq!(
         a.attr_set(1, b"tag", b"late"),
         Ok(()),
@@ -15495,6 +15532,10 @@ fn fsd_keeps_files_across_a_restart() -> Outcome {
     let late_tag = hits
         .iter()
         .any(|h| h.key == b"late" && h.path == b"docs/b.txt");
+    let alpha_tag = hits
+        .iter()
+        .any(|h| h.key == b"alpha" && h.path == b"docs/b.txt");
+    let dir_tag = hits.iter().any(|h| h.key == b"dirtag" && h.path == b"docs");
     let late_file = if names(&top).contains(&b"late".to_vec()) {
         let mut l = root
             .open(b"late", 0, prt::READ)
@@ -15516,6 +15557,17 @@ fn fsd_keeps_files_across_a_restart() -> Outcome {
     ensure!(
         prefix.is_some(),
         "after the kill the volume holds the late attribute {late_tag} and the late file {late_file:?}: not a prefix of the changes"
+    );
+    // the synced attributes and their index: the directory's always, the file's until the late change replaced it
+    ensure!(
+        dir_tag && alpha_tag == (prefix == Some(0)) && hits.len() == 2,
+        "the index after the restart (prefix {prefix:?}): {:?}",
+        hits.iter()
+            .map(|h| (
+                alloc::string::String::from_utf8_lossy(&h.key).into_owned(),
+                alloc::string::String::from_utf8_lossy(&h.path).into_owned()
+            ))
+            .collect::<Vec<_>>()
     );
     ensure!(
         names(&top)
@@ -15852,7 +15904,8 @@ fn start_volmgr_rig_with(res: u64, bi: u64, stand_in: bool) -> Result<VolmgrRig,
 /// the budgets did not nest. It costs time only when the volume does not come.
 fn volume_publish_bound() -> Result<u64, Detail> {
     use mounts::discovery::{DEVICE_BOUND_MS, READY_MS};
-    Ok(u64::from(pci_disk_count()?.max(1)) * 2 * DEVICE_BOUND_MS + READY_MS)
+    // (every disk may hold a volume, and the volume manager starts its servers one after another)
+    Ok(u64::from(pci_disk_count()?.max(1)) * (2 * DEVICE_BOUND_MS + READY_MS))
 }
 
 /// Open the published volume `name` (retrying while the volume manager has not published it yet, up to `volume_publish_bound`);
@@ -15908,6 +15961,8 @@ struct DevmgrStandIn {
     ours: u64,
     real: u64,
     opens: [u32; 8],
+    /// How many opens of each device were passed to the real manager.
+    passed: [u32; 8],
 }
 
 impl DevmgrStandIn {
@@ -15915,7 +15970,7 @@ impl DevmgrStandIn {
     fn serve(
         &mut self,
         until: u64,
-        policy: &dyn Fn(u16, u32) -> StandIn,
+        policy: &mut dyn FnMut(u16, u32) -> StandIn,
         done: &mut dyn FnMut(&Self) -> bool,
     ) -> Result<bool, Detail> {
         use proto::devmgr as dm;
@@ -15958,6 +16013,7 @@ impl DevmgrStandIn {
                     sys::channel_write(self.ours, rep.as_ptr(), rep.len(), &given, 1);
                 }
                 StandIn::Pass => {
+                    self.passed[usize::from(index)] += 1;
                     ensure_eq!(
                         st(sys::channel_write(
                             self.real,
@@ -15988,7 +16044,13 @@ impl DevmgrStandIn {
                         hs.len(),
                     );
                     ensure_eq!(st(r), Some(S::Ok), "read its answer");
-                    sys::channel_write(self.ours, rb.as_ptr(), r.a1, hs.as_ptr(), r.a2);
+                    let w = sys::channel_write(self.ours, rb.as_ptr(), r.a1, hs.as_ptr(), r.a2);
+                    if st(w) != Some(S::Ok) {
+                        // (a failed write moves nothing)
+                        for &h in &hs[..r.a2] {
+                            sys::handle_close(h);
+                        }
+                    }
                 }
             }
         }
@@ -16004,15 +16066,18 @@ impl Drop for DevmgrStandIn {
 
 /// T286 (T209, T122): the volume manager's discovery and publishing, with the test answering for the device manager.
 ///
-/// - **A probe that fails just after the device was Busy is tried again** (T209's suspect: the old driver winding down). The first
-///   open of the volume's disk is answered `Busy`, the second with a driver that is already gone (the probe cannot read), the third
-///   by the real manager: the volume is published and serves its files. The junk disk is opened once (a readable non-volume is not
-///   probed again). The code before T286 called the unreadable disk "not a doofs volume" and never published it.
+/// - **A device that is Busy and then fails is tried again, and the wait for the volume covers the volume manager's budgets**
+///   (T209: the test waited 15 s against the server's own budgets, and a probe that failed just after a `Busy` made the volume
+///   manager ignore the device for good). Each disk's opens are answered `Busy` for 4 s, then with a driver that is already gone
+///   (the probe cannot read) for 4 s more, then by the real manager. The volume is published, after more than the old 15 s, within
+///   `volume_publish_bound` (the wait `open_volume` uses), and serves its files; each disk was probed by a real driver once (a
+///   readable non-volume is not probed again). The code before T286 called the unreadable disks "not a doofs volume" and never
+///   published.
 /// - **A volume whose server does not mount it is never published** (T122: a name published before the server mounted handed
 ///   clients a connection to a server that then exited, status -7). The disk's newest superblock names another geometry: the probe
 ///   (which skips it) finds the older one, `fsd`'s mount takes the newest and fails, and the server exits before it is ready. Once
-///   the volume manager has looked at every device and the server has had time to fail, the name is absent (`NOT_FOUND`): with the
-///   names published at the start, as before T122's fix, it would be there (stale, or a dead connection).
+///   the volume manager has looked at every device and its server has been seen to start, the name is absent (`NOT_FOUND`): with
+///   the names published at the server's start, as before T122's fix, it is there (stale).
 fn volmgr_retries_a_busy_device_and_publishes_only_mounted_volumes() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     if !pci_disks_present()? {
@@ -16021,158 +16086,15 @@ fn volmgr_retries_a_busy_device_and_publishes_only_mounted_volumes() -> Outcome 
     }
     let bi = boot_image_vmo()?;
     let r = (|| {
-        // setup: a volume on device 1, with a file on it
-        let blocks = {
-            let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
-            let mut guard = KillOnDrop(mj);
-            let blk = open_disk(mgr_ch, 1, 1)?;
-            let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
-            fsfmt::mkfs(&mut dev, FSD_UUID, "standin").map_err(|_| msg_at(line!()))?;
-            let blocks = fsfmt::Device::blocks(&dev);
-            sys::handle_close(blk);
-            sys::handle_close(mgr_ch);
-            wait_ended(mgr, 3000)?;
-            sys::handle_close(mgr);
-            job_use_settles(mj, 0, 0, 3000)?;
-            guard.0 = 0;
-            sys::handle_close(mj);
-            blocks
-        };
-        // ---- Busy, then a probe that cannot read, then the real driver
-        let (mut reg, mj, kept) = start_volmgr_rig_with(res, bi, true)?;
-        let mut guard = KillOnDrop(mj);
-        let (ours, real) = kept.ok_or_else(|| msg_at(line!()))?;
-        let mut si = DevmgrStandIn {
-            ours,
-            real,
-            opens: [0; 8],
-        };
-        let mut view = reg
-            .view(&[&b"vol-store"[..]], prt::ALL)
-            .map_err(|e| msg_e(e, line!()))?;
-        let mut vol = None;
-        let t0 = sys::clock_get();
-        let served = si.serve(
-            t0 + volume_publish_bound()?,
-            &|dev, n| match (dev, n) {
-                (1, 1) => StandIn::Busy,
-                (1, 2) => StandIn::Dead,
-                _ => StandIn::Pass,
-            },
-            &mut |_| {
-                vol = view.open(b"vol-store", pfl::DIRECTORY, RO_DIR).ok();
-                vol.is_some()
-            },
-        )?;
-        ensure!(
-            served,
-            "the volume was not published in {} ms (opens per device {:?}): a probe that failed after Busy was not tried again",
-            sys::clock_get() - t0,
-            si.opens
-        );
-        let mut vol = vol.ok_or_else(|| msg_at(line!()))?;
-        ensure_eq!(
-            vol.read_dir().map(|es| es.len()),
-            Ok(0),
-            "the volume serves (an empty root)"
-        );
-        vol.close();
-        ensure_eq!(
-            (si.opens[0], si.opens[1]),
-            (1, 3),
-            "the junk disk opened once, the volume's disk three times (Busy, unreadable, served)"
-        );
-        view.close();
-        reg.close();
-        drop(si);
-        ok(sys::job_kill(mj, -1), "kill the rig")?;
-        job_use_settles(mj, 0, 0, 5000)?;
-        guard.0 = 0;
-        sys::handle_close(mj);
-        // ---- a newest superblock of another geometry: the probe finds the volume, the server cannot mount it
-        {
-            let (mgr_ch, mgr, mj2) = start_devmgr_in_job(res)?;
-            let mut guard = KillOnDrop(mj2);
-            let blk = open_disk(mgr_ch, 1, 1)?;
-            let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
-            let mut sb = fsfmt::probe(&mut dev).ok_or_else(|| msg_at(line!()))?;
-            sb.generation += 100;
-            sb.blocks += 1;
-            fsfmt::Device::write(
-                &mut dev,
-                fsfmt::superblock::slot_addr(1, blocks),
-                &sb.encode(),
-            )
-            .map_err(|_| msg_at(line!()))?;
-            fsfmt::Device::flush(&mut dev).map_err(|_| msg_at(line!()))?;
-            ensure!(
-                fsfmt::probe(&mut dev).is_some() && fsfmt::mount(&mut dev).is_err(),
-                "the disk probes as a volume and does not mount"
-            );
-            sys::handle_close(blk);
-            sys::handle_close(mgr_ch);
-            wait_ended(mgr, 3000)?;
-            sys::handle_close(mgr);
-            job_use_settles(mj2, 0, 0, 3000)?;
-            guard.0 = 0;
-            sys::handle_close(mj2);
-        }
-        let (mut reg, mj3, kept) = start_volmgr_rig_with(res, bi, true)?;
-        let mut guard3 = KillOnDrop(mj3);
-        let (ours, real) = kept.ok_or_else(|| msg_at(line!()))?;
-        let mut si = DevmgrStandIn {
-            ours,
-            real,
-            opens: [0; 8],
-        };
-        // every device looked at (the manager answered the open past the last disk)
-        let past = usize::from(pci_disk_count()?);
-        let t0 = sys::clock_get();
-        let seen = si.serve(
-            t0 + volume_publish_bound()?,
-            &|_, _| StandIn::Pass,
-            &mut |s| s.opens.get(past).is_some_and(|&n| n > 0),
-        )?;
-        ensure!(
-            seen,
-            "the volume manager did not look at every device: {:?}",
-            si.opens
-        );
-        // the server's start and failed mount (milliseconds; two seconds of room), still answering for the manager
-        let _ = si.serve(sys::clock_get() + 2000, &|_, _| StandIn::Pass, &mut |_| {
-            false
-        })?;
-        let mut view = reg
-            .view(&[&b"vol-store"[..]], prt::ALL)
-            .map_err(|e| msg_e(e, line!()))?;
-        ensure_eq!(
-            view.open(b"vol-store", pfl::DIRECTORY, RO_DIR).map(|_| ()),
-            Err(pst::NOT_FOUND),
-            "a volume whose server did not mount it is not published"
-        );
-        view.close();
-        reg.close();
-        drop(si);
-        ok(sys::job_kill(mj3, -1), "kill the rig")?;
-        job_use_settles(mj3, 0, 0, 5000)?;
-        guard3.0 = 0;
-        sys::handle_close(mj3);
-        // leave device 1 a volume that mounts, for the tests after this one
-        {
-            let (mgr_ch, mgr, mj4) = start_devmgr_in_job(res)?;
-            let mut guard = KillOnDrop(mj4);
-            let blk = open_disk(mgr_ch, 1, 1)?;
-            let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
-            fsfmt::mkfs(&mut dev, FSD_UUID, "standin").map_err(|_| msg_at(line!()))?;
-            sys::handle_close(blk);
-            sys::handle_close(mgr_ch);
-            wait_ended(mgr, 3000)?;
-            sys::handle_close(mgr);
-            job_use_settles(mj4, 0, 0, 3000)?;
-            guard.0 = 0;
-            sys::handle_close(mj4);
-        }
-        Ok(())
+        let blocks = format_second_disk(res, "standin")?;
+        let r = (|| {
+            volmgr_waits_out_busy_and_failing_devices(res, bi)?;
+            poison_second_disk(res, blocks)?;
+            volmgr_does_not_publish_an_unmountable_volume(res, bi)
+        })();
+        // (whatever happened: leave device 1 a volume that mounts, for the tests after this one)
+        let restored = format_second_disk(res, "standin").map(|_| ());
+        r.and(restored)
     })();
     sys::handle_close(res);
     r?;
@@ -16180,6 +16102,216 @@ fn volmgr_retries_a_busy_device_and_publishes_only_mounted_volumes() -> Outcome 
         b"fs: volmgr retried a device that was busy and published only mounted volumes\n",
     );
     Ok(())
+}
+
+/// Format device 1 (the second disk) as a fresh volume labelled `label`, with a device manager of its own: its size in blocks.
+fn format_second_disk(res: u64, label: &str) -> Result<u64, Detail> {
+    let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
+    let mut guard = KillOnDrop(mj);
+    let blk = open_disk(mgr_ch, 1, 1)?;
+    let made = (|| {
+        let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
+        fsfmt::mkfs(&mut dev, FSD_UUID, label).map_err(|_| msg_at(line!()))?;
+        Ok(fsfmt::Device::blocks(&dev))
+    })();
+    sys::handle_close(blk);
+    sys::handle_close(mgr_ch);
+    wait_ended(mgr, 3000)?;
+    sys::handle_close(mgr);
+    job_use_settles(mj, 0, 0, 3000)?;
+    guard.0 = 0;
+    sys::handle_close(mj);
+    made
+}
+
+/// Write a newest superblock of another geometry on device 1: it probes as a volume (the probe skips the slot) and does not mount.
+fn poison_second_disk(res: u64, blocks: u64) -> Outcome {
+    let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
+    let mut guard = KillOnDrop(mj);
+    let blk = open_disk(mgr_ch, 1, 1)?;
+    let done = (|| {
+        let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
+        let mut sb = fsfmt::probe(&mut dev).ok_or_else(|| msg_at(line!()))?;
+        sb.generation += 100;
+        sb.blocks += 1;
+        fsfmt::Device::write(
+            &mut dev,
+            fsfmt::superblock::slot_addr(1, blocks),
+            &sb.encode(),
+        )
+        .map_err(|_| msg_at(line!()))?;
+        fsfmt::Device::flush(&mut dev).map_err(|_| msg_at(line!()))?;
+        ensure!(
+            fsfmt::probe(&mut dev).is_some() && fsfmt::mount(&mut dev).is_err(),
+            "the disk probes as a volume and does not mount"
+        );
+        Ok(())
+    })();
+    sys::handle_close(blk);
+    sys::handle_close(mgr_ch);
+    wait_ended(mgr, 3000)?;
+    sys::handle_close(mgr);
+    job_use_settles(mj, 0, 0, 3000)?;
+    guard.0 = 0;
+    sys::handle_close(mj);
+    done
+}
+
+/// End a volume manager rig: its connections, then the job (everything in it), then wait until nothing of it is left.
+fn end_volmgr_rig(reg: Fs, si: DevmgrStandIn, mj: u64, guard: &mut KillOnDrop) -> Outcome {
+    reg.close();
+    drop(si);
+    ok(sys::job_kill(mj, -1), "kill the rig")?;
+    job_use_settles(mj, 0, 0, 5000)?;
+    guard.0 = 0;
+    sys::handle_close(mj);
+    Ok(())
+}
+
+/// The first half of `volmgr_retries_a_busy_device_and_publishes_only_mounted_volumes`.
+fn volmgr_waits_out_busy_and_failing_devices(res: u64, bi: u64) -> Outcome {
+    /// How long each disk is answered `Busy`, and then with a dead driver (ms): inside `mounts::discovery`'s windows (5 s each),
+    /// and together, for two disks, past the old 15 s wait.
+    const BUSY_FOR: u64 = 4000;
+    const DEAD_FOR: u64 = 4000;
+    let (mut reg, mj, kept) = start_volmgr_rig_with(res, bi, true)?;
+    let mut guard = KillOnDrop(mj);
+    let (ours, real) = kept.ok_or_else(|| msg_at(line!()))?;
+    let mut si = DevmgrStandIn {
+        ours,
+        real,
+        opens: [0; 8],
+        passed: [0; 8],
+    };
+    let mut view = reg
+        .view(&[&b"vol-store"[..]], prt::ALL)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut vol = None;
+    let (mut first_open, mut first_dead) = ([None::<u64>; 2], [None::<u64>; 2]);
+    let t0 = sys::clock_get();
+    let bound = volume_publish_bound()?;
+    let served = si.serve(
+        t0 + bound,
+        &mut |dev, _| {
+            let Some(i) = [0u16, 1].iter().position(|&d| d == dev) else {
+                return StandIn::Pass;
+            };
+            let now = sys::clock_get();
+            if now < *first_open[i].get_or_insert(now) + BUSY_FOR {
+                StandIn::Busy
+            } else if now < *first_dead[i].get_or_insert(now) + DEAD_FOR {
+                StandIn::Dead
+            } else {
+                StandIn::Pass
+            }
+        },
+        &mut |_| {
+            vol = view.open(b"vol-store", pfl::DIRECTORY, RO_DIR).ok();
+            vol.is_some()
+        },
+    )?;
+    let took = sys::clock_get() - t0;
+    let r = (|| {
+        ensure!(
+            served,
+            "the volume was not published in {took} ms (the bound {bound} ms; opens per device {:?}, passed {:?}): a device that \
+             failed after Busy was not tried again, or the bound does not cover the volume manager's budgets",
+            si.opens,
+            si.passed
+        );
+        let mut vol = vol.take().ok_or_else(|| msg_at(line!()))?;
+        let listed = vol.read_dir().map(|es| es.len());
+        vol.close();
+        ensure_eq!(listed, Ok(0), "the volume serves (an empty root)");
+        ensure!(
+            took > 15_000,
+            "the volume came after {took} ms: the test's timing does not reach past the old 15 s wait"
+        );
+        ensure_eq!(
+            (si.passed[0], si.passed[1]),
+            (1, 1),
+            "each disk probed through a real driver once (opens {:?})",
+            si.opens
+        );
+        ensure!(
+            si.opens[0] > si.passed[0] && si.opens[1] > si.passed[1],
+            "both disks were Busy and failed first: opens {:?}",
+            si.opens
+        );
+        Ok(())
+    })();
+    view.close();
+    let ended = end_volmgr_rig(reg, si, mj, &mut guard);
+    r.and(ended)
+}
+
+/// The second half of `volmgr_retries_a_busy_device_and_publishes_only_mounted_volumes` (device 1 does not mount).
+fn volmgr_does_not_publish_an_unmountable_volume(res: u64, bi: u64) -> Outcome {
+    let (mut reg, mj, kept) = start_volmgr_rig_with(res, bi, true)?;
+    let mut guard = KillOnDrop(mj);
+    let (ours, real) = kept.ok_or_else(|| msg_at(line!()))?;
+    let mut si = DevmgrStandIn {
+        ours,
+        real,
+        opens: [0; 8],
+        passed: [0; 8],
+    };
+    let r = (|| {
+        // every device looked at (the manager answered the open past the last disk); the rig's processes counted before that
+        // answer, so that the volume server's start shows as one more
+        let past = usize::from(pci_disk_count()?);
+        let mut before = 0;
+        let t0 = sys::clock_get();
+        let seen = si.serve(
+            t0 + volume_publish_bound()?,
+            &mut |_, _| StandIn::Pass,
+            &mut |s| {
+                if s.opens.get(past).is_some_and(|&n| n > 0) {
+                    return true;
+                }
+                before = job_use(mj, 0).map(|(u, _)| u).unwrap_or(0);
+                false
+            },
+        )?;
+        ensure!(
+            seen,
+            "the volume manager did not look at every device: {:?}",
+            si.opens
+        );
+        // the volume server's start (a process more in the rig), its failed mount and exit: milliseconds
+        let until = sys::clock_get() + 5000;
+        let mut started = false;
+        while sys::clock_get() < until {
+            let (now, _) = job_use(mj, 0)?;
+            if now > before {
+                started = true;
+            } else if started {
+                break; // it came and went
+            }
+            rt::io::nap(1);
+        }
+        if !started {
+            // (a start too short to see between two looks: the 5 s above have passed in any case)
+            println!("fs: the unmountable volume's server came and went between two looks");
+        }
+        // (room for a publish made at the server's start, as before T122's fix, to land)
+        nap_ticks(500);
+        let mut view = reg
+            .view(&[&b"vol-store"[..]], prt::ALL)
+            .map_err(|e| msg_e(e, line!()))?;
+        let got = view
+            .open(b"vol-store", pfl::DIRECTORY, RO_DIR)
+            .map(|f| f.close());
+        view.close();
+        ensure_eq!(
+            got,
+            Err(pst::NOT_FOUND),
+            "a volume whose server did not mount it is not published"
+        );
+        Ok(())
+    })();
+    let ended = end_volmgr_rig(reg, si, mj, &mut guard);
+    r.and(ended)
 }
 
 /// Kills a job when it goes out of scope, so a test that fails part way does not leave services running on the disk for the
@@ -16208,6 +16340,7 @@ impl Drop for KillProcsOnDrop {
     fn drop(&mut self) {
         for &p in &self.0 {
             let _ = sys::process_kill(p, -1);
+            sys::handle_close(p);
         }
     }
 }
