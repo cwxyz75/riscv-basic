@@ -197,38 +197,138 @@ fn idle_runs_when_nothing_else_does() -> Outcome {
     )
 }
 
+static WBB_DONE: AtomicBool = AtomicBool::new(false);
+static WBB_RESCUED: AtomicBool = AtomicBool::new(false);
+static WBB_WOKEN: AtomicBool = AtomicBool::new(false);
+/// How long the rescuer of `wake_before_block_is_not_lost` waits before it wakes a test thread that blocked although a wake had
+/// arrived: a lost wake would otherwise hang the boot (nothing else wakes the test thread) instead of failing the test.
+const WBB_RESCUE_TICKS: u64 = 2_000;
+/// A pause of the host later than this inside the second half's window has the window taken again (its bound is 3 to 13 ticks).
+const WBB_PAUSE_US: u64 = 5_000;
+
 fn wake_before_block_is_not_lost() -> Outcome {
     let me = thread::current();
+    wbb_prepared_wake_is_kept(me)?;
+    wbb_a_real_block_is_woken(me)
+}
+
+/// The first half of `wake_before_block_is_not_lost` (a frame of its own: the whole test is over the 1 KiB budget).
+#[inline(never)]
+fn wbb_prepared_wake_is_kept(me: kcore::sched::Tid) -> Outcome {
     // a wake that finds nobody waiting is not remembered (SCHED-SMP-SPEC 3.7)
-    thread::wake(me as u64);
+    thread::wake(me);
     ensure(
         thread::park_state(me) == Some(kcore::park::ParkState::Idle),
         "a wake with nobody waiting left something behind",
     )?;
-    // a thread that has prepared to wait does get the wake: its block does not happen (and wakes do not queue)
-    let t0 = thread::ticks();
-    thread::prepare_block();
-    thread::wake(me as u64);
-    thread::wake(me as u64);
-    thread::block(); // consumes the notification
-    ensure(
-        thread::ticks() - t0 <= 1,
-        "block waited although a wake had already arrived",
-    )?;
-    // Nothing is left over: now block for real, woken by a thread that wakes us after 3 ticks.
-    let waker = thread::spawn(
-        "waker",
+    // A thread that has prepared to wait does get the wake: its block does not happen (and wakes do not queue). Judged by what the
+    // call did (`block` says whether it blocked), not by the clock: the old bound, at most one tick from before `prepare_block` to
+    // after `block`, was crossed by a pause of the host with nothing blocked (the release kernel at four harts on CI, run 46085592181;
+    // the host-stall injector crossed it 10 times in 40,000 rounds with `block` blocking in none, and never without the injector). A
+    // lost wake blocks for good, so a rescuer wakes the thread after `WBB_RESCUE_TICKS` and the test fails instead of hanging; its
+    // wake changes nothing when the block did not happen (a wake is never remembered).
+    WBB_DONE.store(false, SeqCst);
+    WBB_RESCUED.store(false, SeqCst);
+    let rescuer = thread::spawn(
+        "rescuer",
         NORMAL,
         |me| {
-            thread::sleep_ticks(3);
+            for _ in 0..WBB_RESCUE_TICKS {
+                if WBB_DONE.load(SeqCst) {
+                    return;
+                }
+                thread::sleep_ticks(1);
+            }
+            WBB_RESCUED.store(true, SeqCst);
             thread::wake(me as u64);
         },
         me as usize,
     );
-    let t1 = thread::ticks();
-    thread::block();
-    let waited = thread::ticks() - t1;
-    thread::join(waker);
+    thread::prepare_block();
+    thread::wake(me);
+    thread::wake(me);
+    let notified = thread::park_state(me);
+    let blocked = thread::block(); // consumes the notification
+    let left = thread::park_state(me);
+    WBB_DONE.store(true, SeqCst);
+    thread::join(rescuer);
+    wbb_judge(blocked, notified, left)
+}
+
+/// The first half's verdict (a frame of its own: its messages and the rest are over the budget together).
+#[inline(never)]
+fn wbb_judge(
+    blocked: bool,
+    notified: Option<kcore::park::ParkState>,
+    left: Option<kcore::park::ParkState>,
+) -> Outcome {
+    // (the messages are made only on a failure: each `format!` in `ensure`'s argument costs the frame whether it fails or not)
+    if blocked {
+        let who = if WBB_RESCUED.load(SeqCst) {
+            "the rescuer woke it"
+        } else {
+            "something else woke it"
+        };
+        return Err(format!(
+            "block waited although a wake had already arrived (the park word said {notified:?} before it; {who})"
+        ));
+    }
+    if notified != Some(kcore::park::ParkState::Notified)
+        || left != Some(kcore::park::ParkState::Idle)
+    {
+        return Err(format!(
+            "the park word said {notified:?} after the wakes and {left:?} after block (wanted Notified, then Idle)"
+        ));
+    }
+    Ok(())
+}
+
+/// The second half of `wake_before_block_is_not_lost`.
+#[inline(never)]
+fn wbb_a_real_block_is_woken(me: kcore::sched::Tid) -> Outcome {
+    // Nothing is left over: now block for real, woken by a thread that wakes us after 3 ticks, and again each tick until we say we
+    // are awake (a pause of the host before our `block` must not turn its one wake into a lost one: a wake is never remembered). A
+    // window that a pause of the host covered (T284: two harts' timer interrupts more than `WBB_PAUSE_US` late inside it) is taken
+    // again, at most three in a row.
+    crate::pause::watch(10_000 * 1_000_000);
+    let mut rs = kcore::pause::Resampler::new();
+    let waited = loop {
+        WBB_WOKEN.store(false, SeqCst);
+        let waker = thread::spawn(
+            "waker",
+            NORMAL,
+            |me| {
+                thread::sleep_ticks(3);
+                while !WBB_WOKEN.load(SeqCst) {
+                    thread::wake(me as u64);
+                    thread::sleep_ticks(1);
+                }
+            },
+            me as usize,
+        );
+        let n1 = thread::now_ns();
+        let t1 = thread::ticks();
+        thread::block();
+        let waited = thread::ticks() - t1;
+        let n2 = thread::now_ns();
+        WBB_WOKEN.store(true, SeqCst);
+        thread::join(waker);
+        let pause = match crate::pause::covering(n1, n2, WBB_PAUSE_US) {
+            kcore::pause::Cover::Pause { hart, late_us } => Some((hart, late_us)),
+            _ => None,
+        };
+        match rs.judge(pause, WBB_PAUSE_US) {
+            kcore::pause::Verdict::Keep => break waited,
+            kcore::pause::Verdict::Retake { hart, late_us } => {
+                crate::pause::report("wake_before_block_is_not_lost", hart, late_us)
+            }
+            kcore::pause::Verdict::GiveUp { hart, late_us } => {
+                crate::pause::report("wake_before_block_is_not_lost", hart, late_us);
+                break waited; // (judged as it is: a host that never runs the harts is a failure too)
+            }
+        }
+    };
+    crate::pause::watch(0);
     ensure(
         (3..=12 + LATE_TICKS).contains(&waited), // (a real clock and one-shot timers: the emulator's interrupt jitter shows)
         &format!("blocked for {waited} ticks, wanted about 3"),

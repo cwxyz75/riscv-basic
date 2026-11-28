@@ -438,7 +438,7 @@ ATOMICS = {
     "kernel/src/console.rs": (12, "the console's panic flag and line state, the lock-broken flag that stops other harts' output after a panic (KT14), and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
-    "kernel/src/sched_tests.rs": (59, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile; T284 the probe's re-sampling record)"),
+    "kernel/src/sched_tests.rs": (65, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile; T284 the probe's re-sampling record; the rescuer and waker flags of wake_before_block_is_not_lost)"),
     "kernel/src/smp_tests.rs": (22, "self-test flags and counters (PM1: the offline test's tick counter; T265: the process churn's rounds and first bad round)"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
