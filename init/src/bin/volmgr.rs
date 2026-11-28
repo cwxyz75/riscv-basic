@@ -178,10 +178,13 @@ fn discover(dm: u64, txid: &mut u32, index: u16) -> Discovered {
                 return Discovered::Volume(sb, ch);
             }
             (discovery::Next::OpenAgain, _) => {
-                say!(
-                    "volmgr: t={now} device {index}: unreadable (probe {probes} took {} ms{busy}): probing again",
-                    now - p0
-                );
+                // (said once: the outcome line gives the count)
+                if probes == 1 {
+                    say!(
+                        "volmgr: t={now} device {index}: unreadable (probe {probes} took {} ms{busy}): probing again",
+                        now - p0
+                    );
+                }
                 sys::handle_close(ch);
                 let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
             }
