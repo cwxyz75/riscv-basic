@@ -26,6 +26,7 @@ fn map_vmo_error(e: VmoError) -> Status {
 }
 
 /// `pager_create() -> (pager, channel)`: a pager and the user end of the channel the kernel writes its requests on (it keeps the other end).
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64, u64), Status> {
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let job = caller.job;
@@ -111,6 +112,7 @@ fn range(
 
 /// `pager_supply(pager, vmo, offset, length, source, source_offset)`: move the pages of `source` (an anonymous VMO of the caller's, WRITE) to
 /// the pager's VMO and wake the threads waiting for them. The frames are not copied; the charge follows them. Returns the threads to wake.
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn pager_supply<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,

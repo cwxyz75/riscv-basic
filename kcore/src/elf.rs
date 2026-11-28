@@ -155,7 +155,9 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the file is hostile data: the header length (64 bytes) and every program header's range were checked against the file length before these reads, with checked_add on the offsets
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: the file is hostile data: the header length (64 bytes) and every program header's range were checked against the file length before these reads, with checked_add on the offsets
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the boot loader's images and the system library, read at boot)
 pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     if bytes.len() < EHDR {
         return Err(ElfError::TooShort);
@@ -320,7 +322,9 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
 
 /// A static-PIE's dynamic section and relocation table (see the module comment): only the allowed tags, a table inside a loaded segment's file bytes, every
 /// entry an `R_RISCV_RELATIVE` (symbol 0) on an 8-byte word inside a writable segment.
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every range is checked against the file length with checked_add before the reads; the loop counts below the table's checked size
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: every range is checked against the file length with checked_add before the reads; the loop counts below the table's checked size
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (as `parse`)
 fn check_relocations(
     bytes: &[u8],
     segments: &[Segment],

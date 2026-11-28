@@ -61,7 +61,7 @@ pub enum Lookup {
 
 /// The region and page a fault is about, with the region's generation: enough to fetch the page without holding the address space and to
 /// notice afterwards that the region went away.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FaultPlan {
     start: u64,
     page: u64,
@@ -75,6 +75,36 @@ pub struct FaultPlan {
     write: bool,
     /// The page is mapped read-only and the region allows writes: this fault replaces the mapping by one of the VMO's own page.
     cow: bool,
+}
+
+// (by hand, not derived: the derived `fmt` builds arrays of every field's name and value, over KT13's 1 KiB frame in an unoptimised build)
+impl core::fmt::Debug for FaultPlan {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("FaultPlan");
+        debug_faultplan_0(self, &mut d);
+        debug_faultplan_1(self, &mut d);
+        d.finish()
+    }
+}
+
+/// Fields of `FaultPlan`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_faultplan_0(s: &FaultPlan, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("start", &s.start);
+    d.field("page", &s.page);
+    d.field("page_va", &s.page_va);
+    d.field("vmo", &s.vmo);
+    d.field("vmo_page", &s.vmo_page);
+    d.field("perms", &s.perms);
+}
+
+/// Fields of `FaultPlan`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_faultplan_1(s: &FaultPlan, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("pages", &s.pages);
+    d.field("gen", &s.gen);
+    d.field("write", &s.write);
+    d.field("cow", &s.cow);
 }
 
 impl FaultPlan {
@@ -483,24 +513,36 @@ impl Vmos {
 
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the index is below 2^32 (slots are bounded by the object quota)
     fn place(&mut self, vmo: Vmo) -> u64 {
-        if let Some(i) = self.free.pop() {
-            if let Some(slot) = self.slots.get_mut(i as usize) {
-                slot.vmo = Some(vmo);
-                self.live += 1;
-                return (u64::from(slot.gen) << 32) | (u64::from(i) + 1);
+        // (the VMO is moved into its slot, not wrapped in a temporary first: it is a quarter of a KiB, KT13)
+        let i = match self.free.pop() {
+            Some(i) if (i as usize) < self.slots.len() => i as usize,
+            other => {
+                // (`other` is never a free index past the table: a free index is a slot)
+                if let Some(i) = other {
+                    self.free.push(i);
+                }
+                self.new_slot()
             }
-            // (not reached: a free index is a slot)
-            self.free.push(i);
-        }
+        };
         self.live += 1;
-        let gen = self.first_gen;
+        let Some(slot) = self.slots.get_mut(i) else {
+            return 0; // (not reached: `i` is a slot)
+        };
+        let _ = slot.vmo.insert(vmo);
+        (u64::from(slot.gen) << 32) | (i as u64 + 1)
+    }
+
+    /// A new empty slot at the end of the table (its room was reserved: `reserve_one`), and its index.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the table is not empty after the push
+    #[inline(never)]
+    fn new_slot(&mut self) -> usize {
         self.slots.push(VmoSlot {
-            gen,
-            vmo: Some(vmo),
+            gen: self.first_gen,
+            vmo: None,
             dying: None,
             dying_next: 0,
         });
-        (u64::from(gen) << 32) | self.slots.len() as u64
+        self.slots.len() - 1
     }
 
     /// For tests (CNT1): slots made from now on start at generation `gen`, so the retirement of an exhausted slot is reached in a few reuses.
@@ -532,24 +574,26 @@ impl Vmos {
 
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
     fn take(&mut self, id: u64) -> Option<Vmo> {
-        let (v, i, retire) = self.take_slot(id)?;
+        let (i, retire) = self.end_slot(id)?;
+        let v = self.slots.get_mut(i).and_then(|s| s.vmo.take());
         self.free_slot(i, retire);
-        Some(v)
+        v
     }
 
-    /// Take the VMO out of its slot and make its id invalid; the slot is not free yet (`free_slot`). Says whether the slot's generation is exhausted.
+    /// Make the id of the VMO in `id`'s slot invalid (its generation moves on) and count it gone; the VMO is still in the slot, for the caller to
+    /// take, and the slot is not free yet (`free_slot`). The slot's index, and whether its generation is exhausted. (No VMO is moved here: a frame
+    /// holds a copy of a VMO at most once, KT13.)
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
-    fn take_slot(&mut self, id: u64) -> Option<(Vmo, usize, bool)> {
+    fn end_slot(&mut self, id: u64) -> Option<(usize, bool)> {
         let i = self.slot_index(id)?;
         let slot = &mut self.slots[i];
-        let v = slot.vmo.take()?;
         // (CNT1: a slot whose 32-bit generation is exhausted is retired, not wrapped: its ids stay invalid for ever)
         let retire = slot.gen == u32::MAX;
         if !retire {
             slot.gen += 1;
         }
         self.live -= 1;
-        Some((v, i, retire))
+        Some((i, retire))
     }
 
     fn free_slot(&mut self, i: usize, retire: bool) {
@@ -679,6 +723,7 @@ impl Vmos {
 
     /// ML1, checked: every region of every space in `spaces` has its entry in its VMO's list with the same window, every entry names a region of one of
     /// them, and every VMO holds one reference for each entry (the rest of `refs` are handles and children, which this does not know).
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit_maps<F: PageTableFormat>(
         &self,
         spaces: &[&AddressSpace<F>],
@@ -1148,32 +1193,63 @@ impl Vmos {
         src: u64,
         spage: u64,
     ) -> Result<u64, (u64, VmoError)> {
-        let d = self.vmo(dst).ok_or((0, VmoError::Gone))?;
+        let (djob, sjob) = self
+            .supply_ready(mm, dst, dpage, count, src, spage)
+            .map_err(|e| (0, e))?;
+        self.supply_move(jobs, (dst, djob), dpage, count, (src, sjob), spage)
+    }
+
+    /// `supply`'s checks, before anything moves: both VMOs, the ranges, and every source page there and held by nothing but its VMO. The jobs of
+    /// the destination and the source. (Each half of `supply` a frame of its own: KT13.)
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: spage + i < send, checked
+    fn supply_ready<M: PhysMem>(
+        &self,
+        mm: &Mm<M>,
+        dst: u64,
+        dpage: u64,
+        count: u64,
+        src: u64,
+        spage: u64,
+    ) -> Result<(JobId, JobId), VmoError> {
+        let d = self.vmo(dst).ok_or(VmoError::Gone)?;
         if d.pager.is_none() || d.kind != VmoKind::Plain {
-            return Err((0, VmoError::NotSuppliable));
+            return Err(VmoError::NotSuppliable);
         }
-        let s = self.vmo(src).ok_or((0, VmoError::Gone))?;
+        let s = self.vmo(src).ok_or(VmoError::Gone)?;
         if s.kind != VmoKind::Plain
             || s.pager.is_some()
             || s.parent.is_some()
             || !s.children.is_empty()
             || s.hidden
         {
-            return Err((0, VmoError::NotSuppliable));
+            return Err(VmoError::NotSuppliable);
         }
-        let dend = dpage.checked_add(count).ok_or((0, VmoError::OutOfRange))?;
-        let send = spage.checked_add(count).ok_or((0, VmoError::OutOfRange))?;
+        let dend = dpage.checked_add(count).ok_or(VmoError::OutOfRange)?;
+        let send = spage.checked_add(count).ok_or(VmoError::OutOfRange)?;
         if dend > d.pages || send > s.pages {
-            return Err((0, VmoError::OutOfRange));
+            return Err(VmoError::OutOfRange);
         }
-        let (djob, sjob) = (d.job, s.job);
         // every source page must be there and held by nothing but the VMO (nothing maps it any more)
         for i in 0..count {
             match s.committed.get(spage + i) {
                 Some(pfn) if mm.db.refs(pfn) == Some(1) => {}
-                _ => return Err((0, VmoError::NotSuppliable)),
+                _ => return Err(VmoError::NotSuppliable),
             }
         }
+        Ok((d.job, s.job))
+    }
+
+    /// `supply`'s moves, a page at a time: what it moved, or how far it got and why it stopped.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `supply`
+    fn supply_move(
+        &mut self,
+        jobs: &mut Jobs,
+        (dst, djob): (u64, JobId),
+        dpage: u64,
+        count: u64,
+        (src, sjob): (u64, JobId),
+        spage: u64,
+    ) -> Result<u64, (u64, VmoError)> {
         let mut moved = 0u64;
         for i in 0..count {
             let have = self
@@ -1354,6 +1430,21 @@ impl Vmos {
         job: JobId,
         mode: ChildMode,
     ) -> Result<u64, VmoError> {
+        let reuse = self.child_check(source, offset, pages, job, mode)?;
+        let stash = self.child_reserve(source, mode, reuse)?;
+        jobs.retain(job);
+        Ok(self.place_child(job, pages, stash))
+    }
+
+    /// `child_prepare`'s checks (each step of it a frame of its own: KT13): whether a SNAPSHOT reuses the source's hidden parent.
+    fn child_check(
+        &self,
+        source: u64,
+        offset: u64,
+        pages: u64,
+        job: JobId,
+        mode: ChildMode,
+    ) -> Result<bool, VmoError> {
         let src = self.vmo(source).ok_or(VmoError::Gone)?;
         if src.kind != VmoKind::Plain || src.hidden {
             return Err(VmoError::NotCopyable);
@@ -1389,6 +1480,17 @@ impl Vmos {
         if longest > MAX_FAMILY_DEPTH {
             return Err(VmoError::TooDeep);
         }
+        Ok(reuse)
+    }
+
+    /// `child_prepare`'s reservations: room in the lists the attach will push to, and the list a new hidden node will own (kept in the child until
+    /// then, and returned).
+    fn child_reserve(
+        &mut self,
+        source: u64,
+        mode: ChildMode,
+        reuse: bool,
+    ) -> Result<alloc::vec::Vec<u64>, VmoError> {
         let no_memory = |_| VmoError::NoMemory;
         // the lists the attach will push to, and the one a new hidden node will own (kept in the child until then)
         let mut stash: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
@@ -1410,8 +1512,13 @@ impl Vmos {
                 // (the old parent's list has the source in it, which the hidden node replaces: no growth)
             }
         }
-        jobs.retain(job);
-        Ok(self.place(Vmo {
+        Ok(stash)
+    }
+
+    /// The child `child_prepare` makes, placed: not yet part of the family.
+    #[inline(never)]
+    fn place_child(&mut self, job: JobId, pages: u64, stash: alloc::vec::Vec<u64>) -> u64 {
+        self.place(Vmo {
             kind: VmoKind::Plain,
             job,
             pages,
@@ -1427,7 +1534,7 @@ impl Vmos {
             restore: None,
             pager: None,
             inherit: 0,
-        }))
+        })
     }
 
     /// Step two: make `child` (from `child_prepare` with the same arguments) part of the family. Cannot fail. SNAPSHOT: the source's
@@ -1461,59 +1568,9 @@ impl Vmos {
                     }
                     l
                 } else {
-                    let taken = Self::vmo_in(&mut self.slots, source).map(|v| {
-                        (
-                            v.job,
-                            v.pages,
-                            v.parent,
-                            v.inherit,
-                            core::mem::replace(&mut v.committed, PageMap::new()),
-                        )
-                    });
-                    let Some((src_job, src_pages, old_parent, old_inherit, committed)) = taken
-                    else {
+                    let Some(hidden) = self.snapshot_hidden(jobs, child, source) else {
                         return;
                     };
-                    jobs.retain(src_job);
-                    let mut kids = Self::vmo_in(&mut self.slots, child)
-                        .map(|c| core::mem::take(&mut c.children))
-                        .unwrap_or_default();
-                    kids.push(source);
-                    kids.push(child);
-                    // the hidden node takes the source's pages and the source's place under its old parent (that link keeps its
-                    // reference); the source and the child each hold one reference on it
-                    let hidden = self.place(Vmo {
-                        kind: VmoKind::Plain,
-                        job: src_job,
-                        pages: src_pages,
-                        refs: 2,
-                        committed,
-                        resizable: false,
-                        parent: old_parent,
-                        children: kids,
-                        hidden: true,
-                        had_parent: old_parent.is_some(),
-                        maps: crate::fmap::FMap::new(),
-                        busy: None,
-                        restore: None,
-                        pager: None,
-                        inherit: old_inherit,
-                    });
-                    if let Some(l) = old_parent {
-                        if let Some(p) = Self::vmo_in(&mut self.slots, l.id) {
-                            for c in p.children.iter_mut().filter(|c| **c == source) {
-                                *c = hidden;
-                            }
-                        }
-                    }
-                    if let Some(v) = Self::vmo_in(&mut self.slots, source) {
-                        v.parent = Some(Link {
-                            id: hidden,
-                            offset: 0,
-                        });
-                        v.had_parent = true;
-                        v.inherit = src_pages;
-                    }
                     Link { id: hidden, offset }
                 }
             }
@@ -1525,10 +1582,70 @@ impl Vmos {
         }
     }
 
+    /// A SNAPSHOT that makes a new hidden node: it takes the source's pages and the source's place under its old parent (that link keeps its
+    /// reference), and the source and the child hang under it. The node's id (`None`: the source is gone). A frame of its own (KT13).
+    #[inline(never)]
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
+    fn snapshot_hidden(&mut self, jobs: &mut Jobs, child: u64, source: u64) -> Option<u64> {
+        let taken = Self::vmo_in(&mut self.slots, source).map(|v| {
+            (
+                v.job,
+                v.pages,
+                v.parent,
+                v.inherit,
+                core::mem::replace(&mut v.committed, PageMap::new()),
+            )
+        });
+        let (src_job, src_pages, old_parent, old_inherit, committed) = taken?;
+        jobs.retain(src_job);
+        let mut kids = Self::vmo_in(&mut self.slots, child)
+            .map(|c| core::mem::take(&mut c.children))
+            .unwrap_or_default();
+        kids.push(source);
+        kids.push(child);
+        // the hidden node takes the source's pages and the source's place under its old parent (that link keeps its
+        // reference); the source and the child each hold one reference on it
+        let hidden = self.place(Vmo {
+            kind: VmoKind::Plain,
+            job: src_job,
+            pages: src_pages,
+            refs: 2,
+            committed,
+            resizable: false,
+            parent: old_parent,
+            children: kids,
+            hidden: true,
+            had_parent: old_parent.is_some(),
+            maps: crate::fmap::FMap::new(),
+            busy: None,
+            restore: None,
+            pager: None,
+            inherit: old_inherit,
+        });
+        if let Some(l) = old_parent {
+            if let Some(p) = Self::vmo_in(&mut self.slots, l.id) {
+                for c in p.children.iter_mut().filter(|c| **c == source) {
+                    *c = hidden;
+                }
+            }
+        }
+        if let Some(v) = Self::vmo_in(&mut self.slots, source) {
+            v.parent = Some(Link {
+                id: hidden,
+                offset: 0,
+            });
+            v.had_parent = true;
+            v.inherit = src_pages;
+        }
+        Some(hidden)
+    }
+
     /// Pages of a hidden node's last child: when a hidden node has one child left, the node is merged into it: its pages move to the child
     /// (the child's own win; what the child cannot see is freed), the child takes the node's place under the node's parent, and the node
     /// goes. Nothing changes if the bookkeeping for a move cannot be had (the node stays and the next release tries again).
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page numbers are below the VMO limit and offsets were checked when the links were made
+    #[allow(clippy::arithmetic_side_effects)]
+    // INVARIANT: page numbers are below the VMO limit and offsets were checked when the links were made
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     fn try_merge<M: PhysMem>(&mut self, mm: &mut Mm<M>, jobs: &mut Jobs, p: u64) {
         let Some(pv) = self.vmo(p) else {
             return;
@@ -1587,6 +1704,20 @@ impl Vmos {
                 pvm.clear_page(jobs, pg);
             }
         }
+        self.merge_relink(mm, jobs, (p, pjob, pparent, pinherit), c, off_c, c_inherit);
+    }
+
+    /// The end of `try_merge`: the child takes the node's place under the node's parent, and the node goes (a frame of its own: KT13).
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
+    fn merge_relink<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        (p, pjob, pparent, pinherit): (u64, JobId, Option<Link>, u64),
+        c: u64,
+        off_c: u64,
+        c_inherit: u64,
+    ) {
         let new_parent = pparent.map(|l| Link {
             id: l.id,
             offset: l.offset.saturating_add(off_c),
@@ -1721,7 +1852,9 @@ impl Vmos {
     /// Drop one reference on a VMO; the last one frees it: its pages go back and its job is credited. The creator's reference is dropped when the
     /// object a handle names is destroyed (or by the kernel for its own VMOs), a mapping's when the region goes (L15: no scan for VMOs that
     /// nothing maps any more). Frames still mapped somewhere hold references of their own.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: refs >= 1 for a live VMO; dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
+    #[allow(clippy::arithmetic_side_effects)]
+    // INVARIANT: refs >= 1 for a live VMO; dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn release<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -1743,8 +1876,11 @@ impl Vmos {
                 }
                 return Ok(());
             }
-            let Some((vmo, slot_i, retire)) = self.take_slot(cur) else {
+            let Some((slot_i, retire)) = self.end_slot(cur) else {
                 return if first { Err(VmoGone) } else { Ok(()) };
+            };
+            let Some(vmo) = self.slots.get_mut(slot_i).and_then(|s| s.vmo.take()) else {
+                return if first { Err(VmoGone) } else { Ok(()) }; // (not reached: `end_slot` found the VMO there)
             };
             first = false;
             if self.live == 0 {
@@ -1812,7 +1948,7 @@ impl Vmos {
         }
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: slot_i came from `take_slot`; slot indices fit u32 (the free list holds u32)
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: slot_i came from `end_slot`; slot indices fit u32 (the free list holds u32)
     fn stash_dying(
         &mut self,
         slot_i: usize,
@@ -1925,7 +2061,9 @@ impl Vmos {
     }
 
     /// Read bytes out of a VMO (uncommitted pages read as zeros and stay uncommitted).
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: offset + len was checked with checked_add against the VMO's size (a VMO is at most the user half, so the product is small); `done < len` bounds every slice
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+    // INVARIANT: offset + len was checked with checked_add against the VMO's size (a VMO is at most the user half, so the product is small); `done < len` bounds every slice
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn read<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -1976,7 +2114,9 @@ impl Vmos {
         clippy::arithmetic_side_effects,
         clippy::expect_used,
         clippy::indexing_slicing
-    )] // INVARIANT: as `read`: the range was checked first; the committed lookup is of a page `page_for` committed in the loop above (nothing runs in between)
+    )]
+    // INVARIANT: as `read`: the range was checked first; the committed lookup is of a page `page_for` committed in the loop above (nothing runs in between)
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     fn access<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -2023,7 +2163,9 @@ impl Vmos {
     /// nothing: if the job's limit or the frames run out, everything this call committed is given back
     /// and `NoMemory` is returned, with the VMO and the ledger exactly as before. Pages already
     /// committed are left as they are. Device memory is never committed this way.
-    #[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: the id was looked up at the top and `committed` was checked in the same call; first + pages was checked against the VMO's size
+    #[allow(clippy::expect_used, clippy::indexing_slicing)]
+    // INVARIANT: the id was looked up at the top and `committed` was checked in the same call; first + pages was checked against the VMO's size
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn commit<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -2220,6 +2362,7 @@ impl Vmos {
     /// address space, has every hart drop its translations, and then `range_free`s them, all before it lets go of its locks. A page of a VMO that
     /// inherits, inside the window it inherits, becomes an explicit hole (it reads zeros whatever the parent shows now or later); any other page
     /// goes with its slot. A hole that needs a new leaf may find no memory: the step stops there (`err`), with what it did.
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn range_step(
         &mut self,
         jobs: &mut Jobs,
@@ -2407,7 +2550,9 @@ impl Vmos {
     /// later change by the parent is seen). A page only inherited is returned as it is for a read; for a write (`write`) it is copied into a
     /// new frame of this VMO, charged to its job (MM8). The VMO keeps its own reference on the frames it owns. A page that becomes visible
     /// to mappings of other VMOs of the family is logged (`invalidate_copies`).
-    #[allow(clippy::too_many_arguments)] // INVARIANT: one private function with every input of a page request: the store, the ledger, the reservation, the page, and the two flags
+    #[allow(clippy::too_many_arguments)]
+    // INVARIANT: one private function with every input of a page request: the store, the ledger, the reservation, the page, and the two flags
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     fn page_for<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -2767,6 +2912,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
 
     /// `map_region` with the permissions the mapping may later be raised to (`max_perms`, at least `perms`).
     #[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: as `map_region`
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn map_region_max(
         &mut self,
         vmos: &mut Vmos,
@@ -2931,7 +3077,9 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// Split the region that contains `va` in two at `va` (page aligned): both halves hold a reference on the VMO, keep the permissions and
     /// take fresh generations (a fault looked up before the split must look again). Nothing happens when `va` is at a region's start or
     /// in no region. `Err(TooMany)` when the table of regions is full.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: va lies strictly inside the region, so the halves' page counts are positive and their sum is the old count
+    #[allow(clippy::arithmetic_side_effects)]
+    // INVARIANT: va lies strictly inside the region, so the halves' page counts are positive and their sum is the old count
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn split_at(&mut self, vmos: &mut Vmos, va: u64) -> Result<(), RegionError> {
         let Some((&start, r)) = self.regions.range(..=va).next_back() else {
             return Ok(());
@@ -3305,6 +3453,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// Merge regions that touch, map the same VMO at contiguous offsets and agree on permissions, from the one before `lo` to the one at
     /// `hi` (the keys of the regions an operation changed). Each merge releases the VMO reference of the region that goes.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: region page counts bound the sums
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn merge_near<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -3493,6 +3642,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// caller flushes `first..=last` (page by page) before returning to the faulting instruction: a mapping that was absent may
     /// still be cached as absent unless the implementation has Svvptc, and a stale entry is harmless but a fault. A neighbour that
     /// cannot be mapped (no memory for a table) is simply left for its own fault. Device memory is not mapped around.
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn handle_fault_mapped<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -3544,7 +3694,9 @@ impl<F: PageTableFormat> AddressSpace<F> {
 
     /// First step of a fault: find the region and check the access. `Mapped` when the page is already mapped and allows it (a spurious
     /// fault); otherwise the plan for the page to fetch.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums
+    #[allow(clippy::arithmetic_side_effects)]
+    // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn fault_lookup<M: PhysMem>(
         &self,
         mm: &Mm<M>,
@@ -3620,6 +3772,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// region the plan came from is gone or was replaced since the lookup (an unmap in between): nothing is mapped, and the caller looks
     /// the fault up again.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the window arithmetic is on page-aligned addresses inside the region
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn fault_map<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,

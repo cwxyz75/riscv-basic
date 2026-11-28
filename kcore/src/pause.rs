@@ -50,13 +50,9 @@ pub struct HartRing {
     next: AtomicUsize,
 }
 
-impl Default for HartRing {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HartRing {
+    #[allow(clippy::large_stack_frames)] // KT13: a const fn that builds a static at compile time; no run-time frame
+    #[allow(clippy::new_without_default)] // (no `Default`: a ring is a kilobyte, built at compile time in a static, never on a stack: KT13)
     pub const fn new() -> HartRing {
         HartRing {
             slots: [const { AtomicU64::new(0) }; RING],

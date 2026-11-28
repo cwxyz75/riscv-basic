@@ -98,7 +98,6 @@ fn in_process<R>(
     .map_err(|e| (e, None, None))
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn object_wait(a: [u64; 6]) -> Reply {
     let w = in_process(|s, _, me| ksys::object_wait_check(s, me, a))?;
     let (h, mask, deadline) = (w.handle, w.mask, w.deadline);
@@ -316,7 +315,6 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
 
 /// A user thread has gone (big lock held): the PI futexes it owned that had waiters are poisoned (`OWNER_DIED`) and their waiters woken to report
 /// BAD_STATE; and it leaves the donation graph.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
     if PI_USED.load(Ordering::Relaxed) {
         // the PI futexes with waiters that it owns, one at a time (nothing is collected): what the word says now is read outside the bucket
@@ -470,79 +468,82 @@ pub(super) fn pager_after_call(frame: &mut crate::trap::TrapFrame) {
 
 /// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),
 /// then report one in turn.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn port_wait(a: [u64; 6]) -> Reply {
     let (h, deadline) = ksys::port_wait_check(a).map_err(|e| (e, None, None))?;
+    let got = port_wait_until(h, deadline)?;
+    ksys::port_wait_report(got, deadline, take_interrupt)
+}
+
+/// `port_wait`'s polls and sleeps: the binding that became ready, or none by the deadline.
+#[inline(never)]
+fn port_wait_until(h: Handle, deadline: u64) -> Result<Option<(u64, u32)>, ReplyErr> {
     let poll = || in_process(|s, k, me| ksys::port_poll(s, k.jobs, me, h));
     // Poll, and while nothing is ready and the deadline has not passed, sleep until the port
     // is READABLE and poll again (the readiness seen by the sleep check can be gone by the time
     // we poll, so one wait is not enough).
     let mut got = poll()?;
-    while got.is_none()
-        && deadline != 0
+    while got.is_none() && port_may_wait(deadline) {
+        port_block(h, deadline)?;
+        got = poll()?;
+    }
+    Ok(got)
+}
+
+/// Whether a port wait that found nothing ready sleeps: a deadline that has not passed, and no kill or interrupt pending.
+#[inline(never)]
+fn port_may_wait(deadline: u64) -> bool {
+    deadline != 0
         && thread::now_ns() < deadline
         && irq::without(killed_now).is_none()
         && !irq::without(interrupted_now)
-    {
-        admit_caller()?;
-        // (the poll above may have touched the port; tell the wait table before sleeping, so that no
-        // thread goes to sleep, and the lock is released, with signal changes still in the log)
-        commit_wake();
-        // Ready, killed, or the handle stopped naming a port (the poll then says so). The thread is
-        // registered on the port: the wait table re-evaluates a port's signal (which follows its
-        // bindings) when an object it binds, or the port, was touched (L21a).
-        let me = thread::current();
-        thread::wait_deadline_registered(
-            || {
-                killed_now().is_some()
-                    || interrupted_now()
-                    || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
-            },
-            || register_poll_wait(me, h),
-            deadline,
-        );
-        locked_state(|s| s.waits.forget(me));
-        touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
-        got = poll()?;
-    }
-    ksys::port_wait_report(got, deadline, take_interrupt)
+}
+
+/// One sleep of `port_wait` and `port_wait_many` on port `h`, until it is ready, the thread is killed or interrupted, or the deadline.
+#[inline(never)]
+fn port_block(h: Handle, deadline: u64) -> Result<(), ReplyErr> {
+    admit_caller()?;
+    // (the poll before may have touched the port; tell the wait table before sleeping, so that no
+    // thread goes to sleep, and the lock is released, with signal changes still in the log)
+    commit_wake();
+    // Ready, killed, or the handle stopped naming a port (the poll then says so). The thread is
+    // registered on the port: the wait table re-evaluates a port's signal (which follows its
+    // bindings) when an object it binds, or the port, was touched (L21a).
+    let me = thread::current();
+    thread::wait_deadline_registered(
+        || {
+            killed_now().is_some()
+                || interrupted_now()
+                || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
+        },
+        || register_poll_wait(me, h),
+        deadline,
+    );
+    locked_state(|s| s.waits.forget(me));
+    touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
+    Ok(())
 }
 
 /// `port_wait_many(port, buffer, capacity, deadline)` (AB4): `port_wait`'s wait, returning up to `capacity` ready bindings as records in
 /// `buffer` and their count in `a1`.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the poll closure and the wait's); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
     let (h, buf, cap, deadline) = ksys::port_wait_many_check(a).map_err(|e| (e, None, None))?;
-    let poll =
-        || in_process(|s, k, me| ksys::port_poll_many(s, k.mm, k.vmos, k.jobs, me, h, buf, cap));
-    let mut got = poll()?;
-    while got == 0
-        && deadline != 0
-        && thread::now_ns() < deadline
-        && irq::without(killed_now).is_none()
-        && !irq::without(interrupted_now)
-    {
-        admit_caller()?;
-        commit_wake();
-        let me = thread::current();
-        thread::wait_deadline_registered(
-            || {
-                killed_now().is_some()
-                    || interrupted_now()
-                    || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
-            },
-            || register_poll_wait(me, h),
-            deadline,
-        );
-        locked_state(|s| s.waits.forget(me));
-        touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
-        got = poll()?;
-    }
+    let got = port_wait_many_until(h, buf, cap, deadline)?;
     ksys::port_wait_many_report(got, deadline, take_interrupt)
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+/// `port_wait_many`'s polls and sleeps: how many records it wrote.
+#[inline(never)]
+fn port_wait_many_until(h: Handle, buf: u64, cap: usize, deadline: u64) -> Result<usize, ReplyErr> {
+    let poll =
+        || in_process(|s, k, me| ksys::port_poll_many(s, k.mm, k.vmos, k.jobs, me, h, buf, cap));
+    let mut got = poll()?;
+    while got == 0 && port_may_wait(deadline) {
+        port_block(h, deadline)?;
+        got = poll()?;
+    }
+    Ok(got)
+}
+
 pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     // (T215: a big request is copied in before the object lock, a big reply is copied out after it)
     let staged = super::trap::stage_call_in(a);
@@ -560,8 +561,6 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     r
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
     admit_caller()?; // (before anything is sent: the wait below registers without allocating)
                      // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
@@ -580,6 +579,13 @@ fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
     })?;
     notify_sync(); // (the request is queued and this thread blocks next: the server it wakes runs on this hart, L24)
                    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
+    call_reply(&call)
+}
+
+/// The wait for `channel_call`'s reply and its taking: a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, and the request
+/// stays queued.
+#[inline(never)]
+fn call_reply(call: &ksys::Call) -> Reply {
     let me = thread::current();
     let ready = || {
         with_state(|s| {
@@ -587,10 +593,9 @@ fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
                 return true;
             };
             let interrupted = s.interrupt_pending(thread::current());
-            ksys::channel_call_ready(s, pid, &call, interrupted)
+            ksys::channel_call_ready(s, pid, call, interrupted)
         })
     };
-    // the reply (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
     let mut wait = true;
     loop {
         if core::mem::take(&mut wait) {
@@ -613,7 +618,7 @@ fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
                     k.vmos,
                     k.jobs,
                     pid,
-                    &call,
+                    call,
                     &mut deferred,
                     true,
                     take_interrupt_in,

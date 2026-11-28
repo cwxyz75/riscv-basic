@@ -67,27 +67,35 @@ struct FpState {
     /// What each user thread's FP and vector state was charged to its job's kernel bytes (MM5): credited when the thread ends.
     fp_charge: BTreeMap<u64, (kcore::job::JobId, u64)>,
     vec_charge: BTreeMap<u64, (kcore::job::JobId, u64)>,
+    /// The token counters were set from the boot arguments (AB3's `ff=fptoken:`), at the first use.
+    ready: bool,
 }
 
-struct Cell(UnsafeCell<Option<FpState>>);
+struct Cell(UnsafeCell<FpState>);
 // SAFETY: every access holds the big kernel lock (asserted in `state`).
 unsafe impl Sync for Cell {}
-static STATE: Cell = Cell(UnsafeCell::new(None));
+/// The bookkeeping, built at compile time (a kilobyte of per-hart arrays: never built on a stack, KT13); `set_tokens` sets what the boot
+/// arguments say.
+static STATE: Cell = Cell(UnsafeCell::new(FpState {
+    tokens: Tokens::starting_at(0),
+    threads: BTreeMap::new(),
+    harts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
+    vtokens: Tokens::starting_at(0),
+    vthreads: BTreeMap::new(),
+    vharts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
+    fp_charge: BTreeMap::new(),
+    vec_charge: BTreeMap::new(),
+    ready: false,
+}));
 
-/// Build the FP bookkeeping once into `slot` (its per-hart array is MAX_HARTS entries: out of line, so `state` has a small frame).
+/// The token counters' first values, from the boot arguments (AB3: `ff=fptoken:` starts them near the 32-bit boundary), set once.
+#[cold]
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, once, at the first use of the FP state
-fn init_state(slot: &mut Option<FpState>) {
-    *slot = Some(FpState {
-        tokens: Tokens::starting_at(crate::dtb::ff_value("fptoken").unwrap_or(0)),
-        threads: BTreeMap::new(),
-        harts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
-        vtokens: Tokens::starting_at(crate::dtb::ff_value("fptoken").unwrap_or(0)),
-        vthreads: BTreeMap::new(),
-        vharts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
-        fp_charge: BTreeMap::new(),
-        vec_charge: BTreeMap::new(),
-    });
+fn set_tokens(s: &mut FpState) {
+    let n = crate::dtb::ff_value("fptoken").unwrap_or(0);
+    s.tokens = Tokens::starting_at(n);
+    s.vtokens = Tokens::starting_at(n);
+    s.ready = true;
 }
 
 fn state() -> &'static mut FpState {
@@ -97,16 +105,11 @@ fn state() -> &'static mut FpState {
     );
     // SAFETY: the object lock is held (every caller does; the `debug_assert!` above checks it in the debug and the release-checked builds, KT12, T285), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
     // that holds one passes it down (`drop_claim` takes `s`) instead of calling `state()` again, so no two live `&mut` alias on this hart (T239).
-    unsafe {
-        let cell = &mut *STATE.0.get();
-        if cell.is_none() {
-            init_state(cell);
-        }
-        match cell {
-            Some(s) => s,
-            None => unreachable!(),
-        }
+    let s = unsafe { &mut *STATE.0.get() };
+    if !s.ready {
+        set_tokens(s);
     }
+    s
 }
 
 /// This hart's FP registers.
@@ -734,7 +737,6 @@ fn drop_claim(s: &mut FpState, tid: u64, fp: bool) {
 /// Write the thread's FP state (the layout of `read_fp`; `fcsr` keeps its 8 defined bits). Allocates the state for a thread that has none,
 /// charged to its job. `frame` is the thread's saved user frame if it has run (its `sstatus.FS` is set so the return to user mode loads the
 /// state); a thread that has not run gets it at its first entry (`mark_present`). False when the job cannot be charged.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the register image is built on the stack and moved into its box); T172 shrinks them
 pub fn write_fp(tid: u64, job: Option<kcore::job::JobId>, w: &[u64; 33]) -> bool {
     let s = state();
     if !charge_state(
@@ -746,16 +748,16 @@ pub fn write_fp(tid: u64, job: Option<kcore::job::JobId>, w: &[u64; 33]) -> bool
         return false;
     }
     drop_claim(s, tid, true);
-    let mut f = [0u64; 32];
-    f.copy_from_slice(&w[..32]);
-    let regs = FpRegs {
-        f,
-        fcsr: (w[32] & 0xff) as u32,
-    };
     let FpState {
         tokens, threads, ..
     } = s;
-    threads.entry(tid).or_default().replace_regs(tokens, regs);
+    threads
+        .entry(tid)
+        .or_default()
+        .replace_regs_with(tokens, |r| {
+            r.f.copy_from_slice(&w[..32]);
+            r.fcsr = (w[32] & 0xff) as u32;
+        });
     true
 }
 

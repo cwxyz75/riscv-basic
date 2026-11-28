@@ -88,7 +88,7 @@ impl core::fmt::Debug for Home {
 }
 
 /// The per-thread record (SCHED-SMP-SPEC 4.3).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ThreadSched {
     /// Shared with the thread table; set by `HartRq::attach` and at creation.
     pub home: alloc::sync::Arc<Home>,
@@ -119,6 +119,58 @@ pub struct ThreadSched {
     /// The park word (SCHED-SMP-SPEC 3.7): whether a wake counts. (Plain here: this core runs under one lock; the
     /// atomic protocol is `kcore::park`.)
     pub park: crate::park::ParkState,
+}
+
+// (by hand, not derived: the derived `fmt` builds arrays of every field's name and value, over KT13's 1 KiB frame in an unoptimised build)
+impl core::fmt::Debug for ThreadSched {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("ThreadSched");
+        debug_threadsched_0(self, &mut d);
+        debug_threadsched_1(self, &mut d);
+        debug_threadsched_2(self, &mut d);
+        debug_threadsched_3(self, &mut d);
+        d.finish()
+    }
+}
+
+/// Fields of `ThreadSched`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_threadsched_0(s: &ThreadSched, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("home", &s.home);
+    d.field("tid", &s.tid);
+    d.field("base", &s.base);
+    d.field("eff", &s.eff);
+    d.field("demoted_window", &s.demoted_window);
+    d.field("undemoted", &s.undemoted);
+}
+
+/// Fields of `ThreadSched`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_threadsched_1(s: &ThreadSched, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("state", &s.state);
+    d.field("affinity", &s.affinity);
+    d.field("last_hart", &s.last_hart);
+    d.field("slice_left", &s.slice_left);
+    d.field("deadline", &s.deadline);
+    d.field("timer_hard", &s.timer_hard);
+}
+
+/// Fields of `ThreadSched`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_threadsched_2(s: &ThreadSched, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("timer_slack", &s.timer_slack);
+    d.field("runnable_since", &s.runnable_since);
+    d.field("started", &s.started);
+    d.field("cpu", &s.cpu);
+    d.field("group", &s.group);
+    d.field("job", &s.job);
+}
+
+/// Fields of `ThreadSched`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_threadsched_3(s: &ThreadSched, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("class_words", &s.class_words);
+    d.field("park", &s.park);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -746,6 +798,13 @@ impl<N: Class> HartRq<N> {
                 changed = true; // the running RT thread must give way to the normal band
             }
         }
+        changed |= self.enforce_on(tid);
+        changed
+    }
+
+    /// `enforce_tick` for the thread that ran: a running one whose RT budget is spent is demoted, a queued one moves to its new place.
+    fn enforce_on(&mut self, tid: Tid) -> bool {
+        let mut changed = false;
         match self.threads.get(&tid).map(|t| t.state) {
             Some(State::Running) => {
                 if let Some(mut t) = self.threads.remove(&tid) {
@@ -1272,6 +1331,18 @@ impl<N: Class> HartRq<N> {
         let ran = self.cur.filter(|&c| Some(c) != self.idle);
         self.now += dt;
         self.enforce_tick(None, dt); // (the window rolls before anything is queued)
+        self.expire_timers();
+        self.reschedule();
+        if let Some(c) = ran {
+            self.account_ran(c, dt);
+            self.enforce_tick(Some(c), dt);
+        }
+        self.reschedule();
+    }
+
+    /// `advance`'s timers: every one due by now ends its sleep (each step of `advance` a frame of its own: KT13).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `advance`
+    fn expire_timers(&mut self) {
         let due: Vec<(Time, Tid)> = self.timers.range(..(self.now + 1, 0)).copied().collect();
         for (d, tid) in due {
             self.timers.remove(&(d, tid));
@@ -1292,35 +1363,41 @@ impl<N: Class> HartRq<N> {
             }
         }
         // (v1 fires the timers and makes the designation right for them; the slice is accounted to the thread that ran)
-        self.reschedule();
-        if let Some(c) = ran {
-            let now = self.now;
-            let mut t = self.threads.remove(&c).expect("the thread that ran exists");
-            let rotate = match band(t.eff) {
-                Band::Rt => self.rt.account(&mut t, dt, now),
-                _ => self.normal.account(&mut t, dt, now),
-            };
-            self.charge_job(&t, dt);
-            self.threads.insert(c, t);
-            if rotate {
-                if self.cur == Some(c) {
-                    self.threads.get_mut(&c).expect("current exists").state = State::Runnable;
-                    self.cur = None;
-                    self.class_enqueue(c, Enq::SliceEnd);
-                    self.pick();
-                } else if self
-                    .threads
-                    .get(&c)
-                    .is_some_and(|t| t.state == State::Runnable)
-                {
-                    // preempted this very tick with its slice used up: it goes to the back of its level
-                    self.class_dequeue(c, Deq::AttrChange);
-                    self.class_enqueue(c, Enq::SliceEnd);
-                }
-            }
-            self.enforce_tick(Some(c), dt);
+    }
+
+    /// `advance`'s accounting of `c`, which ran for `dt`: its class's account, its job's, and a rotation at its slice's end.
+    #[allow(clippy::expect_used)] // INVARIANT: the thread that ran, and the current one, exist
+    fn account_ran(&mut self, c: Tid, dt: Time) {
+        let now = self.now;
+        let mut t = self.threads.remove(&c).expect("the thread that ran exists");
+        let rotate = match band(t.eff) {
+            Band::Rt => self.rt.account(&mut t, dt, now),
+            _ => self.normal.account(&mut t, dt, now),
+        };
+        self.charge_job(&t, dt);
+        self.threads.insert(c, t);
+        if rotate {
+            self.rotate_ran(c);
         }
-        self.reschedule();
+    }
+
+    /// The slice of `c` ended: the current thread goes to the back of its level, a queued one is requeued there.
+    #[allow(clippy::expect_used)] // INVARIANT: the current thread exists
+    fn rotate_ran(&mut self, c: Tid) {
+        if self.cur == Some(c) {
+            self.threads.get_mut(&c).expect("current exists").state = State::Runnable;
+            self.cur = None;
+            self.class_enqueue(c, Enq::SliceEnd);
+            self.pick();
+        } else if self
+            .threads
+            .get(&c)
+            .is_some_and(|t| t.state == State::Runnable)
+        {
+            // preempted this very tick with its slice used up: it goes to the back of its level
+            self.class_dequeue(c, Deq::AttrChange);
+            self.class_enqueue(c, Enq::SliceEnd);
+        }
     }
 
     // ---- what `kcore::sched_smp` (task 11) needs to run several of these as one machine: record migration, a quiet
@@ -1725,6 +1802,7 @@ impl<N: Class> HartRq<N> {
 
     /// The per-hart rules (the single-hart form of GP2): every thread is in exactly one place.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a count of running threads, at most the thread count
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit(&self) -> Result<(), String> {
         let mut running = 0;
         for (&tid, t) in &self.threads {

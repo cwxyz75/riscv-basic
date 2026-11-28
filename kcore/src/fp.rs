@@ -125,7 +125,7 @@ impl Tokens {
     }
 
     /// For test builds (`ff=fptoken:<n>`): the next token is `n + 1`, so the counter's far end is reached in a few steps.
-    pub fn starting_at(n: u64) -> Tokens {
+    pub const fn starting_at(n: u64) -> Tokens {
         Tokens { last: n }
     }
 
@@ -207,6 +207,14 @@ impl<R> UnitThread<R> {
 }
 
 impl UnitThread<FpRegs> {
+    /// `replace_regs` with the registers written in their box by `fill` (from zeros): no copy of the register file on the caller's stack (KT13).
+    pub fn replace_regs_with(&mut self, tokens: &mut Tokens, fill: impl FnOnce(&mut FpRegs)) {
+        let mut regs = Box::new(FpRegs::ZERO);
+        fill(&mut regs);
+        self.state = Some((regs, tokens.next()));
+        self.holder = None;
+    }
+
     /// The first FP use: start from a zeroed register file.
     pub fn enable(&mut self, tokens: &mut Tokens) -> bool {
         self.enable_with(tokens, FpRegs::ZERO)

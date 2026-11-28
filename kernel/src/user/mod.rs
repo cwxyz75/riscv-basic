@@ -193,51 +193,68 @@ pub(crate) fn locked_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
 }
 
 #[track_caller]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn state() -> &'static mut UserState {
     debug_assert!(
         !irq::enabled() && crate::bkl::held(),
         "user state touched without the big kernel lock"
     );
+    let slot = addr_of_mut!(USER);
     // SAFETY: the object lock is held (checked above in the debug and the release-checked builds: `debug_assert!` is on in both, KT12, T285), so no other hart has the state; every caller drops the reference before any context switch, and
     // `with_state` and `locked_state` never nest (a debug guard panics on a second open of either while one is live: T239, KT14), so no two live `&mut` alias.
+    // The two uses of the slot are one after the other: the first reference has ended when the second is made.
     unsafe {
-        let slot = &mut *addr_of_mut!(USER);
-        slot.get_or_insert_with(|| {
-            let mut s = UserState::with_irq_slots(crate::aia::slots());
-            // the backstops (PL8): derived from the RAM the machine has, the kernel-stack window's slots bounding the threads
-            let b = kcore::limits::Backstops::for_ram(
-                kmem::stats().memory_frames.saturating_mul(4096),
-                crate::kstack::MAX_SLOTS as usize,
-            );
-            s.backstops = b;
-            // (KT9, T177: the address-space cells `process_create` arms, one per process the backstop allows)
-            s.fill_as_pool(b.processes);
-            s.objs.set_caps(b.objects, b.ipc_bytes);
-            // (the kernel's own table holds one end per process and job: bounded by the object backstop, like the rest)
-            s.ktable = kcore::handle::HandleTable::new(b.objects);
-            // the ASID field the harts implement (L18): the allocator hands out ASIDs from it and turns the generation when they are used up
-            s.asids = kcore::asid::Asids::new(if cfg!(feature = "fault-asid-reuse-no-flush") {
-                1
-            } else {
-                crate::arch::asid_bits()
-            });
-            // (L19) the generation, for the return to user mode that holds no big lock
-            trap::publish_asid_generation(s.asids.generation_cell());
-            // AB3 (test builds): counters that start near a boundary, `ff=koid:..,objgen:..,handlegen:..`
-            if let Some(n) = crate::dtb::ff_value("koid") {
-                s.objs.fast_forward_koid(n);
-            }
-            if let Some(n) = crate::dtb::ff_value("objgen") {
-                s.objs.set_first_generation(n);
-            }
-            if let Some(n) = crate::dtb::ff_value("handlegen") {
-                s.first_handle_gen = n;
-            }
-            USER_READY.store(true, Ordering::Release);
-            s
-        })
+        if let Some(s) = (*slot).as_mut() {
+            return s;
+        }
+        fresh_state(&mut *slot)
     }
+}
+
+/// Make the user state now (boot, from `kmain`, before the first user thread: its first touch would make it, and it is made where nothing else
+/// is on the stack).
+pub fn init_state() {
+    locked_state(|_| {});
+}
+
+/// The user state as the machine makes it, made in its slot: the backstops derived from the RAM it has, the address-space pool, the ASID field, the counters
+/// `ff=` moves. Built once, by the first touch of the state, which is `init_state` in `kmain` (or a boot self-test before it).
+#[allow(clippy::large_stack_frames)]
+// KT13: boot or test only, on a stack nothing else is under (the state is built on the boot stack, once)
+#[cold]
+#[inline(never)]
+fn fresh_state(slot: &'static mut Option<UserState>) -> &'static mut UserState {
+    let mut s = UserState::with_irq_slots(crate::aia::slots());
+    // the backstops (PL8): derived from the RAM the machine has, the kernel-stack window's slots bounding the threads
+    let b = kcore::limits::Backstops::for_ram(
+        kmem::stats().memory_frames.saturating_mul(4096),
+        crate::kstack::MAX_SLOTS as usize,
+    );
+    s.backstops = b;
+    // (KT9, T177: the address-space cells `process_create` arms, one per process the backstop allows)
+    s.fill_as_pool(b.processes);
+    s.objs.set_caps(b.objects, b.ipc_bytes);
+    // (the kernel's own table holds one end per process and job: bounded by the object backstop, like the rest)
+    s.ktable = kcore::handle::HandleTable::new(b.objects);
+    // the ASID field the harts implement (L18): the allocator hands out ASIDs from it and turns the generation when they are used up
+    s.asids = kcore::asid::Asids::new(if cfg!(feature = "fault-asid-reuse-no-flush") {
+        1
+    } else {
+        crate::arch::asid_bits()
+    });
+    // (L19) the generation, for the return to user mode that holds no big lock
+    trap::publish_asid_generation(s.asids.generation_cell());
+    // AB3 (test builds): counters that start near a boundary, `ff=koid:..,objgen:..,handlegen:..`
+    if let Some(n) = crate::dtb::ff_value("koid") {
+        s.objs.fast_forward_koid(n);
+    }
+    if let Some(n) = crate::dtb::ff_value("objgen") {
+        s.objs.set_first_generation(n);
+    }
+    if let Some(n) = crate::dtb::ff_value("handlegen") {
+        s.first_handle_gen = n;
+    }
+    USER_READY.store(true, Ordering::Release);
+    slot.insert(s)
 }
 
 /// The backstops in force (a test hook: `debug_stat` 120 to 124).
@@ -327,7 +344,7 @@ fn kind_index(o: &ipc::KObj) -> usize {
 
 /// Print every process that exists (a leak test's failure report, T278): what it is waiting for to be torn down. The report is built
 /// under the lock and printed after it.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a failure-only report of the leak checks, run once on the boot thread's stack after init has ended
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (a leak test's report, on the boot thread after init has ended)
 pub fn report_processes() {
     use core::fmt::Write as _;
     let lines: alloc::vec::Vec<alloc::string::String> = locked_state(|s| {
@@ -457,12 +474,23 @@ pub use wake::*;
 /// Debug builds: what the user state says about the processes that are not finished (for `debug_stat` 132, which holds the state already:
 /// `with_state` is not opened again, T239).
 #[cfg(debug_assertions)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report
 pub(crate) fn dump_state(s: &UserState) {
+    dump_state_header(s);
+    for (pid, p) in s.procs.iter() {
+        if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
+            continue;
+        }
+        dump_process(*pid, p);
+    }
+}
+
+/// `dump_state`'s first line: the job exception channels, the suspended threads and the parked ones (each line a frame of its own: KT13).
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn dump_state_header(s: &UserState) {
     use core::fmt::Write;
-    let mut out = crate::console::Console;
     let _ = writeln!(
-        out,
+        crate::console::Console,
         "##SCHED user: job exception channels {:?}, suspends {:?}, parked {:?}",
         s.job_exc.keys().collect::<alloc::vec::Vec<_>>(),
         s.threads
@@ -476,14 +504,16 @@ pub(crate) fn dump_state(s: &UserState) {
             .map(|(tid, _)| *tid)
             .collect::<alloc::vec::Vec<_>>()
     );
-    for (pid, p) in s.procs.iter() {
-        if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
-            continue;
-        }
-        let _ = writeln!(
-            out,
-            "##SCHED proc {pid}: state {:?} stopped {} killed {:?} exc_channel {:?} threads {:?} job {:?}",
-            p.state, p.stopped, p.killed, p.exc_channel, p.live_tids, p.job
-        );
-    }
+}
+
+/// `dump_state`'s line for one process that is not finished.
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn dump_process(pid: u64, p: &Process) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        crate::console::Console,
+        "##SCHED proc {pid}: state {:?} stopped {} killed {:?} exc_channel {:?} threads {:?} job {:?}",
+        p.state, p.stopped, p.killed, p.exc_channel, p.live_tids, p.job
+    );
 }

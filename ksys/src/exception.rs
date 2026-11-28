@@ -64,6 +64,7 @@ pub fn deliver(
 }
 
 /// Offer it at one level. Nothing is left behind when the level does not take it.
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: ExcLevel) -> bool {
     let chan = match l {
         ExcLevel::Process => us.procs.get(&pid).and_then(|p| p.exc_channel),
@@ -280,6 +281,7 @@ pub enum Target {
 
 /// `process_exception_channel` / `job_exception_channel`: make the channel and give the caller its user end (a new handle, returned). A second
 /// call while the first channel's user end is open is BAD_STATE; one whose user end has closed replaces it.
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn exception_channel(
     us: &mut UserState,
     jobs: &mut Jobs,

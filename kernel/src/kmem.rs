@@ -377,8 +377,7 @@ fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64
 
 /// Build the kernel page table and switch to it. Needs the heap and the early
 /// boot table (which maps the direct map, so new tables can be written).
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: boot code: addresses come from the device tree and the linker script; a kernel that cannot build its own page table cannot run
 pub fn init() {
     let s = sections();
@@ -732,30 +731,36 @@ pub fn flush_pages(first: u64, last: u64, asid: u16) {
 /// afterwards (OD41); `kernel_half_unchanged` checks.
 static mut KERNEL_HALF: [u64; 256] = [0; 256];
 
+/// Top-level entry `256 + i` of the kernel table now (each entry read where it is: no copy of the half on the stack, KT13).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 256 slots of the root table plus 256, and the root is a frame of the direct map
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-fn kernel_half_now() -> [u64; 256] {
+fn kernel_half_entry(i: usize) -> u64 {
     let root = kernel_table().root();
     let f = frames();
-    let mut out = [0u64; 256];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = kcore::pagetable::PhysMem::read_u64(&f.mm.mem, (root << 12) + (256 + i as u64) * 8);
-    }
-    out
+    kcore::pagetable::PhysMem::read_u64(&f.mm.mem, (root << 12) + (256 + i as u64) * 8)
 }
 
 /// Remember the kernel half now (called once, after the S1 memory tests, before any process).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn snapshot_kernel_half() {
-    // SAFETY: the one call (`kmain`, after the memory tests) is before any reader: `kernel_half_unchanged` is called only on the paths that load or end a process, and
-    // the first process is loaded after it. Interrupts are on and the other harts are running by then, but none of them reads `KERNEL_HALF` yet (T242), and the first reader runs after the spawn of the process's first thread, whose thread-table lock orders this store before the read (KT14).
-    unsafe { *addr_of_mut!(KERNEL_HALF) = kernel_half_now() };
+    for i in 0..256 {
+        let e = kernel_half_entry(i);
+        // SAFETY: the one call (`kmain`, after the memory tests) is before any reader: `kernel_half_unchanged` is called only on the paths that load or end a process, and
+        // the first process is loaded after it. Interrupts are on and the other harts are running by then, but none of them reads `KERNEL_HALF` yet (T242), and the first reader runs after the spawn of the process's first thread, whose thread-table lock orders this store before the read (KT14). One entry at a time, through a pointer made without a reference to the array.
+        unsafe {
+            if let Some(slot) = (*addr_of_mut!(KERNEL_HALF)).get_mut(i) {
+                *slot = e;
+            }
+        }
+    }
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+/// Whether the kernel half is as `snapshot_kernel_half` saw it (on every process load: compared entry by entry, nothing copied, KT13).
+#[inline(never)]
 pub fn kernel_half_unchanged() -> bool {
-    // SAFETY: read of a static written once by `snapshot_kernel_half`.
-    kernel_half_now() == unsafe { *addr_of!(KERNEL_HALF) }
+    (0..256).all(|i| {
+        // SAFETY: read of a static written once by `snapshot_kernel_half`, before any process (one entry, by value).
+        let saved = unsafe { (*addr_of!(KERNEL_HALF)).get(i).copied() };
+        saved == Some(kernel_half_entry(i))
+    })
 }
 
 /// Free frames, plus the frames held by kernel stack slots (which keep theirs for ever once made, so

@@ -219,7 +219,7 @@ fn zeroed_frame() -> Option<u64> {
 
 /// The IOMMU's bring-up (IOMMU-SPEC 2.4). Panics with the fixed lines of 2.5 when there is no usable IOMMU. Boot only, on the boot
 /// hart, after `aia::init` (the sources are routed) and before any device window exists.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the directory, queue and plan values, the boot line's formatting) in boot code called once from `kmain` on the boot stack; the boot-time stack budget check bounds it
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub fn init() {
     // SAFETY: as `tree`.
     let found = unsafe { (*core::ptr::addr_of!(TREE)).as_ref() };
@@ -779,7 +779,7 @@ const SELFTEST_DID: u32 = 0x10_0000;
 /// then QEMU's own walker, through the debug translation interface, must agree with `iommucore::iopt` for mapped, read-only and
 /// unmapped addresses, read and write. Absent interface: a counted skip, said on the console (the boot script refuses it).
 #[cfg(not(feature = "release"))]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a test-only boot self-test (the tables, the probes and their formatted errors), run once from the kernel test list on the boot stack; the boot-time stack budget check bounds it
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub fn selftest() -> Result<(), alloc::string::String> {
     use alloc::format;
     use iommucore::ddt::DeviceContext;

@@ -52,19 +52,27 @@ fn page_contents() -> Page {
     }
 }
 
-/// Make the library's VMOs, once. Panics at boot-time on a library the loader cannot read: `build.rs` checked it.
+/// Make the library's VMOs, once (the first process start, which is the boot loader's start of `init`).
+pub(super) fn ensure(k: &mut kmem::Kmem) {
+    if slot().is_none() {
+        build_lib(k);
+    }
+}
+
+/// `ensure`'s work, at the first process start: the boot loader's (`kmain` starts `init`, or the boot tests start their programs, before any
+/// program can call `process_start`). Panics at boot-time on a library the loader cannot read: `build.rs` checked it.
 #[allow(
     clippy::expect_used,
     clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::large_stack_frames
+    clippy::indexing_slicing
 )]
 // INVARIANT: the object was built and checked by `build.rs` (a failure here means the kernel image is broken); `parse` checked every segment's offsets and sizes against the file and its
-// addresses against the user limit; the frame is the data page's 72-byte record and the loop's temporaries, once at the first process start
-pub(super) fn ensure(k: &mut kmem::Kmem) {
-    if slot().is_some() {
-        return;
-    }
+// addresses against the user limit
+#[allow(clippy::large_stack_frames)]
+// KT13: boot or test only, on a stack nothing else is under (the ELF parse, once, at the boot loader's first start)
+#[cold]
+#[inline(never)]
+fn build_lib(k: &mut kmem::Kmem) {
     let parsed = elf::parse(IMAGE).expect("libsys.so is a valid ELF object");
     let mut segs = Vec::new();
     let mut text_end = 0;

@@ -64,7 +64,7 @@ pub enum RState {
     Leaked,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct VecRoute {
     gen: u32,
     state: RState,
@@ -81,6 +81,37 @@ struct VecRoute {
     busy: bool,
     /// The first `object_wait` or `interrupt_ack` placed it (8.5).
     placed: bool,
+}
+
+// (by hand, not derived: the derived `fmt` builds arrays of every field's name and value, over KT13's 1 KiB frame in an unoptimised build)
+impl core::fmt::Debug for VecRoute {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("VecRoute");
+        debug_vecroute_0(self, &mut d);
+        debug_vecroute_1(self, &mut d);
+        d.finish()
+    }
+}
+
+/// Fields of `VecRoute`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_vecroute_0(s: &VecRoute, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("gen", &s.gen);
+    d.field("state", &s.state);
+    d.field("obj", &s.obj);
+    d.field("domain", &s.domain);
+    d.field("index", &s.index);
+    d.field("file", &s.file);
+}
+
+/// Fields of `VecRoute`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_vecroute_1(s: &VecRoute, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("job", &s.job);
+    d.field("named", &s.named);
+    d.field("target", &s.target);
+    d.field("busy", &s.busy);
+    d.field("placed", &s.placed);
 }
 
 const FREE: VecRoute = VecRoute {

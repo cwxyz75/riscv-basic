@@ -214,46 +214,71 @@ impl PiFutexes {
                 return Ok(Lock::WouldBlock);
             }
             // the room the queueing needs, before the word or anything is changed (the one reportable step: after it nothing here allocates)
-            let mut spare = self.reserve_waiter(key, owner)?;
+            let spare = self.reserve_waiter(key, owner)?;
             if v & WAITERS == 0 && w.cas(v, v | WAITERS).is_err() {
                 continue; // the word changed: look again
             }
             // (the word names another owner than the record does: user code stored to it outside the protocol; the old waiters are ended)
-            if self.recs.get(&key).is_some_and(|r| r.owner != owner) {
-                self.dissolve(d, key, sink);
-            }
-            // queued in arrival order: the unlock picks the best effective priority at that time, first come among equals
-            match self.recs.get_mut(&key) {
-                Some(rec) => rec.waiters.push_back(me),
-                None => {
-                    spare.push_back(me);
-                    self.recs.insert_reserved(
-                        key,
-                        Rec {
-                            owner,
-                            waiters: spare,
-                        },
-                    );
-                }
-            }
-            self.waiting
-                .insert_reserved(me, Waiting { key, outcome: None });
-            return match d.donate(me, owner) {
-                Ok(ch) => {
-                    sink(ch.as_slice());
-                    Ok(Lock::Blocked)
-                }
-                Err(DonateError::Cycle | DonateError::TooDeep | DonateError::NoThread) => {
-                    // (the classic deadlock, or a chain too long: refused, and nothing stays queued)
-                    self.leave_queue(me);
-                    Err(PiError::BadState)
-                }
-                Err(DonateError::AlreadyDonating) => {
-                    self.leave_queue(me);
-                    Err(PiError::BadState)
-                }
-            };
+            return self.block_on(d, key, me, owner, spare, sink);
         }
+    }
+
+    /// `lock`'s wait: `me` joins the queue of `key` (owned by `owner`; `spare` is the queue made for it if it is the first) and lends its
+    /// priority to the owner (a frame of its own: KT13).
+    fn block_on(
+        &mut self,
+        d: &mut Donations,
+        key: Key,
+        me: Tid,
+        owner: Tid,
+        spare: alloc::collections::VecDeque<Tid>,
+        sink: Sink<'_>,
+    ) -> Result<Lock, PiError> {
+        self.enqueue_waiter(d, key, me, owner, spare, sink);
+        let mut ch = crate::donate::Changes::default();
+        match d.donate_into(me, owner, &mut ch) {
+            Ok(()) => {
+                sink(ch.as_slice());
+                Ok(Lock::Blocked)
+            }
+            // (a cycle or a chain too long, a thread the graph does not know, or one already lending: the waiter leaves the queue)
+            Err(DonateError::Cycle | DonateError::TooDeep | DonateError::NoThread)
+            | Err(DonateError::AlreadyDonating) => {
+                self.leave_queue(me);
+                Err(PiError::BadState)
+            }
+        }
+    }
+
+    /// `block_on`'s queueing of `me` on `key`.
+    fn enqueue_waiter(
+        &mut self,
+        d: &mut Donations,
+        key: Key,
+        me: Tid,
+        owner: Tid,
+        mut spare: alloc::collections::VecDeque<Tid>,
+        sink: Sink<'_>,
+    ) {
+        if self.recs.get(&key).is_some_and(|r| r.owner != owner) {
+            self.dissolve(d, key, sink);
+        }
+        // queued in arrival order: the unlock picks the best effective priority at that time, first come among equals
+        match self.recs.get_mut(&key) {
+            Some(rec) => rec.waiters.push_back(me),
+            None => {
+                spare.push_back(me);
+                self.recs.insert_reserved(
+                    key,
+                    Rec {
+                        owner,
+                        waiters: spare,
+                    },
+                );
+            }
+        }
+        self.waiting
+            .insert_reserved(me, Waiting { key, outcome: None });
     }
 
     /// `futex_unlock_pi` by `me`: the lock goes to the head of the queue, or the word becomes 0. Allocates nothing; the changes go to `sink`.
@@ -301,24 +326,40 @@ impl PiFutexes {
             if w.cas(v, new).is_err() {
                 continue; // a waiter set `WAITERS` meanwhile: again
             }
-            rec.waiters.remove(at);
-            if let Some(wt) = self.waiting.get_mut(&first) {
-                wt.outcome = Some(Outcome::Granted);
-            }
-            sink(d.revoke(first).as_slice());
-            for &t in &rec.waiters {
-                // (retargeting to the new owner cannot close a cycle: `first` is not donating to anyone)
-                if let Ok(ch) = d.retarget(t, first) {
-                    sink(ch.as_slice());
-                }
-            }
-            // the record follows the lock (`me` is the record's owner here: a record of another owner was dissolved above)
-            if more {
-                rec.owner = first;
-            } else {
-                self.recs.remove(&key);
-            }
+            self.hand_off(d, key, at, first, more, sink);
             return Ok(Unlock::Handed { to: first });
+        }
+    }
+
+    /// `unlock`'s hand-off of `key` to `first` (at `at` in its queue; `more`: others still wait): it is granted, its donation goes, and every other
+    /// waiter's donation moves to it (a frame of its own: KT13).
+    fn hand_off(
+        &mut self,
+        d: &mut Donations,
+        key: Key,
+        at: usize,
+        first: Tid,
+        more: bool,
+        sink: Sink<'_>,
+    ) {
+        let Some(rec) = self.recs.get_mut(&key) else {
+            return;
+        };
+        rec.waiters.remove(at);
+        if let Some(wt) = self.waiting.get_mut(&first) {
+            wt.outcome = Some(Outcome::Granted);
+        }
+        let mut ch = crate::donate::Changes::default();
+        d.revoke_into(first, &mut ch);
+        sink(ch.as_slice());
+        for &t in &rec.waiters {
+            // (each waiter's lend moves from the old owner to the new one)
+            retarget_to(d, t, first, sink);
+        }
+        if more {
+            rec.owner = first;
+        } else {
+            self.recs.remove(&key);
         }
     }
 
@@ -414,10 +455,7 @@ impl PiFutexes {
             };
             let woken: Vec<Tid> = rec.waiters.into_iter().collect();
             for &t in &woken {
-                if let Some(w) = self.waiting.get_mut(&t) {
-                    w.outcome = Some(Outcome::Died);
-                }
-                changes.extend_from_slice(d.revoke(t).as_slice());
+                self.waiter_died(d, t, &mut changes);
             }
             out.push((key, woken));
         }
@@ -442,15 +480,23 @@ impl PiFutexes {
         for key in keys {
             if let Some(rec) = self.recs.remove(&key) {
                 for t in rec.waiters {
-                    if let Some(w) = self.waiting.get_mut(&t) {
-                        w.outcome = Some(Outcome::Died);
-                    }
-                    changes.extend_from_slice(d.revoke(t).as_slice());
+                    self.waiter_died(d, t, &mut changes);
                     gone.push(t);
                 }
             }
         }
         (gone, changes)
+    }
+
+    /// Waiter `t`'s futex went with its owner: it wakes with `Died`, and its donation goes (the changes are added to `changes`; a frame of its own
+    /// for its change list: KT13).
+    fn waiter_died(&mut self, d: &mut Donations, t: Tid, changes: &mut Vec<Change>) {
+        if let Some(w) = self.waiting.get_mut(&t) {
+            w.outcome = Some(Outcome::Died);
+        }
+        let mut ch = crate::donate::Changes::default();
+        d.revoke_into(t, &mut ch);
+        changes.extend_from_slice(ch.as_slice());
     }
 
     /// How many threads are queued (a leak counter for tests).
@@ -467,6 +513,7 @@ impl PiFutexes {
 
     /// The structure's own consistency (PF1 and the indexes), for the model tests: every queued thread is in `waiting` and in one record, no
     /// record is empty, every waiting entry without an outcome is in its record's queue, and the room `lock` keeps is there.
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit(&self, d: &Donations) -> Result<(), alloc::string::String> {
         use alloc::format;
         let mut seen: usize = 0;
@@ -513,5 +560,13 @@ impl PiFutexes {
             }
         }
         true
+    }
+}
+
+/// Move `t`'s donation to `to` and tell the sink what changed (a refused move changes nothing). A frame of its own for its change list (KT13).
+fn retarget_to(d: &mut Donations, t: Tid, to: Tid, sink: Sink<'_>) {
+    let mut ch = crate::donate::Changes::default();
+    if d.retarget_into(t, to, &mut ch).is_ok() {
+        sink(ch.as_slice());
     }
 }

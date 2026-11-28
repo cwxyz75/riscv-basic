@@ -5,6 +5,8 @@
 //! pieces to the machine.
 #![no_std]
 #![forbid(unsafe_code)]
+#![deny(clippy::large_stack_frames)]
+// KT13 (T289): no frame over 1 KiB (`clippy.toml`): this code runs on the kernel stack too
 // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause. The compiler finds the candidates; each remaining site carries an
 // `#[allow] // INVARIANT: ...` naming why it cannot fire (`scripts/kernel_allows.py` lists them). Unit tests are exempt.
 #![cfg_attr(

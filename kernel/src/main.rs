@@ -83,7 +83,7 @@ impl Tally {
 }
 
 #[no_mangle]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // First of all: this hart's record in `tp` (the trap entry and the console's lock need it, so a panic in what follows can still print).
     percpu::bind(0, hart_id);
@@ -131,6 +131,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     });
 
     heap::init();
+    dtb::init_chosen(); // (the command line and the seeds' places, found once: the tree is parsed by boot code only, KT13)
     trap::init();
     dtb::init_timebase(); // (the clock's rate: before anything reads the time)
     entropy::init(hart_id); // (HD1: the pool is seeded before any address is chosen)
@@ -189,7 +190,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     user::install_hooks(); // (the address-space locks run on this machine's interrupt state and order checker)
     user::reserve_scratch();
     bkl::enforce();
-    // The other harts join the scheduler (each adopts its boot context as its idle thread).
+    user::init_state(); // (built here, on the boot stack, not by the first thread to touch it: KT13)
+                        // The other harts join the scheduler (each adopts its boot context as its idle thread).
     {
         let deadline = timer::now()
             + timer::cycles_from_ns(2_000_000_000 + 100_000_000 * smp::started() as u64);

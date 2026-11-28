@@ -764,6 +764,7 @@ impl<C: SchedClass> Sched<C> {
     }
 
     /// Check the "exactly one place" rule, the per-hart rules and the timer bookkeeping.
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit(&self) -> Result<(), String> {
         let mut running = 0;
         for (&tid, t) in &self.threads {

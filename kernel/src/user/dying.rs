@@ -114,7 +114,7 @@ pub(crate) fn done(pid: u64) {
 
 /// One line per process on its way out, for a leak report: `in_table` says whether the process is still in the table (the caller holds
 /// the state to know). Times are in milliseconds (ticks) before now.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a failure-only report of the leak checks (the formatting's frame), run on the boot thread's stack after init has ended
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (a leak test's report, on the boot thread after init has ended)
 pub(crate) fn report(in_table: impl Fn(u64) -> bool) -> alloc::vec::Vec<alloc::string::String> {
     let now = crate::thread::ticks();
     let mut out = alloc::vec::Vec::new();

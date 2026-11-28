@@ -80,6 +80,7 @@ fn hart_of_intc(nodes: &[Node], ph: u32) -> Option<u32> {
 
 /// Find the supervisor-domain APLIC (the one without children, with `msi-parent`: message-signalled delivery needs an IMSIC) and what goes
 /// with it. `None` for a tree with no such controller (an APLIC in direct mode only, a PLIC machine, no interrupt controller).
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree's AIA, read once at boot)
 pub fn discover(nodes: &[Node]) -> Option<Aia> {
     let aplic = nodes
         .iter()

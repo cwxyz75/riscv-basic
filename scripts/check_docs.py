@@ -432,7 +432,7 @@ ATOMICS = {
     "kernel/src/heap.rs": (34, "heap statistics, the growth guard, the frame pool's readiness, size mirror, starvation flag and refused-free counter, and the fault-alloc test hook (armed thread, fail-at, count, fired, exempt thread, persistent mode: test builds only), and the reserve's switch (RESERVE_ON, KT9), and the pool's frame in hand and its finished moves (IN_TRANSIT, POOL_MOVES: the leak oracle's quiet reading, T227)"),
     "kernel/src/kmem.rs": (6, "the active-table bookkeeping counters, and the PI futex's lock word read and compare-and-swapped through the direct map (L23); the kernel page table's root, set once at boot (T224)"),
     "kernel/src/user/waits.rs": (2, "the flag that says a PI futex has had a waiter, so a thread's exit looks for owned PI futexes only then (L23)"),
-    "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
+    "kernel/src/dtb.rs": (17, "the device tree's address and length, set once at boot (PL4a), the boot-argument and device-tree flags, and where the /chosen properties the kernel reads after boot lie in the blob, found once at boot (T289)"),
     "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),
     "kernel/src/entropy.rs": (8, "whether the pool was keyed from a real seed, its first output for the boot tests (HD1), and the test-build flag `aslr=off` (HD2)"),
     "kernel/src/arch/riscv64/sbi.rs": (4, "whether the firmware has the debug console extension, probed once; the count of calls to the IPI extension (stays 0, PL6)"),
@@ -586,6 +586,14 @@ def check_kernel_allows():
     return ["KT3: " + p for p in kernel_allows.problems()]
 
 
+def check_stack_allows():
+    """KT13 (T289): the large-frame lint in every crate on a kernel stack, and its allows (boot or test only; the frames T289 left in kcore and ksys
+    pinned)."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import stack_allows
+    return ["KT13: " + p for p in stack_allows.problems()]
+
+
 def check_syscall_tests():
     """Every error SYSCALLS.md lists for a call has a row in docs/reference/syscall-tests.tsv naming a test that covers it (KT4)."""
     import io, contextlib
@@ -714,7 +722,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_kernel_allows() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_nofail() + check_syscall_tests() + check_unsafe_inventory() + check_kernel_allows() + check_stack_allows() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:
@@ -726,5 +734,8 @@ def main():
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import stack_allows
+        stack_allows.self_test()
         sys.exit(dispatch_self_test())
     sys.exit(main())

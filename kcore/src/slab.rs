@@ -166,15 +166,7 @@ impl Slab {
         let slab = self.partial[class];
         let size = CLASS_SIZES[class] as u64;
         // the first free slot
-        let mut slot = None;
-        for w in 0..BITMAP_WORDS {
-            let bits = mem.read(slab + W_BITMAP + 8 * w as u64);
-            if bits != u64::MAX {
-                slot = Some(w * 64 + (!bits).trailing_zeros() as usize);
-                break;
-            }
-        }
-        let slot = slot?;
+        let slot = Self::first_free(mem, slab)?;
         let word = slab + W_BITMAP + 8 * (slot / 64) as u64;
         mem.write(word, mem.read(word) | (1u64 << (slot % 64)));
         let free = mem.read(slab + W_FREE) - 1;
@@ -184,6 +176,18 @@ impl Slab {
         }
         self.in_use[class] += 1;
         Some(slab + slot as u64 * size)
+    }
+
+    /// The first free slot of `slab`, from its bitmap (a frame of its own: KT13).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: w < BITMAP_WORDS, so the bitmap offsets and the slot number are small
+    fn first_free<M: SlabMem>(mem: &M, slab: u64) -> Option<usize> {
+        for w in 0..BITMAP_WORDS {
+            let bits = mem.read(slab + W_BITMAP + 8 * w as u64);
+            if bits != u64::MAX {
+                return Some(w * 64 + (!bits).trailing_zeros() as usize);
+            }
+        }
+        None
     }
 
     /// Free the object at `addr`. The class is read from the slab's header. A slab that becomes empty goes back to `frames` unless it is the
@@ -302,6 +306,7 @@ impl Slab {
     }
 
     /// Check the allocator's books against the memory (for tests and diagnostics): every list is well formed, the counts agree.
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests and the boot self-tests)
     pub fn audit<M: SlabMem>(&self, mem: &M) -> Result<(), alloc::string::String> {
         use alloc::format;
         for class in 0..CLASSES {

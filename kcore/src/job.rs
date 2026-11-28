@@ -310,16 +310,23 @@ impl Jobs {
             usage: Usage::default(),
             uses: 1,
         };
-        let id = if let Some(i) = self.free.pop() {
+        let id = self.place_rec(rec);
+        self.live += 1;
+        self.rec_mut(parent).expect("checked").uses += 1;
+        Ok(id)
+    }
+
+    /// Put a new job's record in a free slot of the table, or a new one at its end (a frame of its own: KT13).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: a free index is a slot of the table; the table is not empty after a push
+    #[inline(never)]
+    fn place_rec(&mut self, rec: Rec) -> JobId {
+        if let Some(i) = self.free.pop() {
             self.recs[i as usize] = Some(rec);
             JobId(i)
         } else {
             self.recs.push(Some(rec));
             JobId(self.recs.len() as u32 - 1)
-        };
-        self.live += 1;
-        self.rec_mut(parent).expect("checked").uses += 1;
-        Ok(id)
+        }
     }
 
     /// One more holder of `id`.

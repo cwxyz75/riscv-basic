@@ -106,8 +106,6 @@ impl Drop for KStack {
 
 /// Make a slot with frames: map the four stack pages of the next unused slot. `None` if the window is
 /// full or no frames (or page-table frames) are left; nothing is changed then.
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 // INVARIANT: i < PAGES indexes the frames array of PAGES entries; the addresses are inside the kernel-stack window; the slot counter is far below u32::MAX
 fn make_slot(s: &mut Slots) -> Option<u32> {
@@ -116,33 +114,9 @@ fn make_slot(s: &mut Slots) -> Option<u32> {
     }
     let slot = s.next;
     let _kpt = crate::kmem::KPT.lock();
-    let k = crate::kmem::frames();
     let mut frames = [0u64; PAGES as usize];
-    for i in 0..frames.len() {
-        match k.mm.db.alloc() {
-            Some(f) => frames[i] = f,
-            None => {
-                for &f in &frames[..i] {
-                    let _ = k.mm.db.dec(f);
-                }
-                return None;
-            }
-        }
-    }
-    let mut pt = crate::kmem::kernel_table();
-    let top = slot_base(slot) + KSTACK_SLOT_BYTES;
-    for (i, &f) in frames.iter().enumerate() {
-        let va = top - (PAGES - i as u64) * PAGE_SIZE;
-        if pt.map(k.mm, va, f, Perms::RW).is_err() {
-            // undo this slot's mappings so far, and give every frame back
-            for j in 0..i {
-                let _ = pt.unmap(k.mm, top - (PAGES - j as u64) * PAGE_SIZE);
-            }
-            for &f in &frames {
-                let _ = k.mm.db.dec(f);
-            }
-            return None;
-        }
+    if !slot_frames(&mut frames) || !map_slot(slot, &frames) {
+        return None;
     }
     // (a mapping that was invalid is now valid: no remote flush is needed for that, and this hart is the
     // only one that can touch the slot until the stack is handed out)
@@ -150,6 +124,48 @@ fn make_slot(s: &mut Slots) -> Option<u32> {
     crate::arch::tlb_flush_all();
     s.next += 1;
     Some(slot)
+}
+
+/// The frames of a new slot (all or none: `false` with every frame given back). Each step of `make_slot` a frame of its own (KT13).
+#[allow(clippy::indexing_slicing)] // INVARIANT: i < frames.len()
+#[inline(never)]
+fn slot_frames(frames: &mut [u64; PAGES as usize]) -> bool {
+    let k = crate::kmem::frames();
+    for i in 0..frames.len() {
+        match k.mm.db.alloc() {
+            Some(f) => frames[i] = f,
+            None => {
+                for &f in &frames[..i] {
+                    let _ = k.mm.db.dec(f);
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Map `frames` as the stack pages of `slot` (the caller holds `KPT`); on a failure the slot's mappings so far are undone and every frame is
+/// given back.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the addresses are inside the kernel-stack window
+#[inline(never)]
+fn map_slot(slot: u32, frames: &[u64; PAGES as usize]) -> bool {
+    let k = crate::kmem::frames();
+    let mut pt = crate::kmem::kernel_table();
+    let top = slot_base(slot) + KSTACK_SLOT_BYTES;
+    for (i, &f) in frames.iter().enumerate() {
+        let va = top - (PAGES - i as u64) * PAGE_SIZE;
+        if pt.map(k.mm, va, f, Perms::RW).is_err() {
+            for j in 0..i {
+                let _ = pt.unmap(k.mm, top - (PAGES - j as u64) * PAGE_SIZE);
+            }
+            for &f in frames {
+                let _ = k.mm.db.dec(f);
+            }
+            return false;
+        }
+    }
+    true
 }
 
 /// How many kernel stacks are in use (one per thread): the allocator's reserve for the allocations that cannot be refused grows with it (KT9, `heap::reserve`).

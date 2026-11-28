@@ -228,7 +228,6 @@ type Link = Option<FBox<Mapping>>;
 
 /// One mapping (IOMMU-SPEC 4.3): its I/O range, its VMO window and access, its hold (the VMO id: the hold is a reference the record
 /// owns), its fence ticket, the table frames its removal detached, and its links.
-#[derive(Debug)]
 pub struct Mapping {
     page: u64,
     pages: u64,
@@ -244,6 +243,38 @@ pub struct Mapping {
     left: Link,
     right: Link,
     next: Link,
+}
+
+// (by hand, not derived: the derived `fmt` builds arrays of every field's name and value, over KT13's 1 KiB frame in an unoptimised build)
+impl core::fmt::Debug for Mapping {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("Mapping");
+        debug_mapping_0(self, &mut d);
+        debug_mapping_1(self, &mut d);
+        d.finish()
+    }
+}
+
+/// Fields of `Mapping`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_mapping_0(s: &Mapping, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("page", &s.page);
+    d.field("pages", &s.pages);
+    d.field("cleared", &s.cleared);
+    d.field("vmo", &s.vmo);
+    d.field("vmo_page", &s.vmo_page);
+    d.field("access", &s.access);
+}
+
+/// Fields of `Mapping`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_mapping_1(s: &Mapping, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("ticket", &s.ticket);
+    d.field("prio", &s.prio);
+    d.field("chain", &s.chain);
+    d.field("left", &s.left);
+    d.field("right", &s.right);
+    d.field("next", &s.next);
 }
 
 /// The kernel bytes one mapping record is charged (IOMMU-SPEC 5.3).
@@ -487,7 +518,9 @@ struct Domain {
     io_pages: u64,
     /// A fence of this domain was abandoned: its job keeps the use the domain held, for the charges that stay.
     leaks: bool,
-    ring: [FaultRecord; FAULT_RING],
+    /// `FAULT_RING` records, allocated with the domain (a boxed slice, not an inline array: the domain is built on the stack before it is boxed, and
+    /// with the ring inline it was a KiB, KT13).
+    ring: alloc::boxed::Box<[FaultRecord]>,
     ring_head: usize,
     ring_len: usize,
     dropped: u32,
@@ -495,7 +528,8 @@ struct Domain {
     /// The vector table (IOMMU7, IOMMU-SPEC 8.3): one slot per MSI page-table entry, sized at creation.
     vectors: Vec<VSlot>,
     /// The frames of the vectors' interrupt files: file `k` is at `files[k / 8] + (k % 8) * 512` (0: no frame yet).
-    files: [u64; FILE_FRAMES],
+    /// (`FILE_FRAMES` entries, a boxed slice allocated with the domain, like the fault ring: KT13)
+    files: alloc::boxed::Box<[u64]>,
     /// The store's list of leaked domains.
     next: Option<FBox<Domain>>,
 }
@@ -535,6 +569,8 @@ pub enum VectorState {
 /// The kernel bytes a domain is charged at creation (IOMMU-SPEC 5.3): its body with the fault ring, the root table, the MSI page table
 /// and the I/O address allocator's two bitmaps.
 pub const DOMAIN_BYTES: u64 = core::mem::size_of::<Domain>() as u64
+    + (FAULT_RING * core::mem::size_of::<FaultRecord>()) as u64
+    + (FILE_FRAMES * 8) as u64
     + ROOT_FRAMES * PAGE_SIZE
     + PAGE_SIZE
     + 2 * IO_WINDOW_PAGES.div_ceil(64) * 8
@@ -623,7 +659,7 @@ struct Slot {
 }
 
 /// What the store has counted (IOMMU-SPEC 7.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct IoStats {
     /// Faults handed to `fault`.
     pub faults: u64,
@@ -656,6 +692,48 @@ pub struct IoStats {
     pub vectors_leaked: u64,
     /// Stray bits taken from vectors' interrupt files at revoke and release (8.4: a data word other than the granted one).
     pub strays: u64,
+}
+
+// (by hand, not derived: the derived `fmt` builds arrays of every field's name and value, over KT13's 1 KiB frame in an unoptimised build)
+impl core::fmt::Debug for IoStats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("IoStats");
+        debug_iostats_0(self, &mut d);
+        debug_iostats_1(self, &mut d);
+        debug_iostats_2(self, &mut d);
+        d.finish()
+    }
+}
+
+/// Fields of `IoStats`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_iostats_0(s: &IoStats, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("faults", &s.faults);
+    d.field("faults_unprinted", &s.faults_unprinted);
+    d.field("last_fault", &s.last_fault);
+    d.field("commands", &s.commands);
+    d.field("fence_timeouts", &s.fence_timeouts);
+    d.field("queue_stuck", &s.queue_stuck);
+}
+
+/// Fields of `IoStats`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_iostats_1(s: &IoStats, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("dir_pages_waiting", &s.dir_pages_waiting);
+    d.field("holds_leaked", &s.holds_leaked);
+    d.field("pages_leaked", &s.pages_leaked);
+    d.field("tables_leaked", &s.tables_leaked);
+    d.field("domains", &s.domains);
+    d.field("slots", &s.slots);
+}
+
+/// Fields of `IoStats`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_iostats_2(s: &IoStats, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("io_pages", &s.io_pages);
+    d.field("vectors", &s.vectors);
+    d.field("vectors_leaked", &s.vectors_leaked);
+    d.field("strays", &s.strays);
 }
 
 /// The domain store (the state the `IOMMU` lock protects).
@@ -936,6 +1014,7 @@ impl Detached {
     /// job the domain's kernel bytes and its tables', and drop the domain's use of its job, unless a fence of the domain was abandoned
     /// (the leaked charges stay, and so does the use that keeps the job record: J2). Call after every record was taken. Allocates
     /// nothing.
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn finish<M: PhysMem64, F: IoFrames>(
         mut self,
         mem: &M,
@@ -1010,6 +1089,72 @@ fn inval_for(gscid: u16, rec: &Mapping) -> ([Command; INVAL_PAGES], usize) {
     inval_range(gscid, rec.page, rec.pages)
 }
 
+/// A domain's lists made with it: its vector slots, its fault ring and its interrupt files' frames.
+type DomainLists = (
+    Vec<VSlot>,
+    alloc::boxed::Box<[FaultRecord]>,
+    alloc::boxed::Box<[u64]>,
+);
+
+/// A new domain's vector slots (all free) and its fault ring (empty records), in room reserved exactly: `None` when there is no memory.
+fn domain_lists() -> Option<DomainLists> {
+    let mut vectors = Vec::new();
+    vectors.try_reserve_exact(IO_VECTOR_PAGES as usize).ok()?;
+    vectors.resize(
+        IO_VECTOR_PAGES as usize,
+        VSlot {
+            state: VState::Free,
+        },
+    );
+    let mut ring = Vec::new();
+    ring.try_reserve_exact(FAULT_RING).ok()?;
+    ring.resize(FAULT_RING, NO_FAULT);
+    let mut files = Vec::new();
+    files.try_reserve_exact(FILE_FRAMES).ok()?;
+    files.resize(FILE_FRAMES, 0u64);
+    Some((vectors, ring.into_boxed_slice(), files.into_boxed_slice()))
+}
+
+/// A new domain's parts: its I/O address allocator (the vector window taken), its tables (a root and an MSI page table) on fresh frames, its vector
+/// slots and its fault ring; with the two frames, which the caller gives back if a later step fails (`IoDomains::build_domain`; a frame of its own:
+/// KT13).
+#[allow(clippy::type_complexity)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
+fn domain_parts<M: PhysMem64, F: IoFrames>(
+    mem: &M,
+    frames: &mut F,
+) -> Result<(Iova, Iopt, MsiTable, DomainLists, u64, u64), IoError> {
+    let mut iova =
+        Iova::new(IO_BASE >> PAGE_SHIFT, IO_WINDOW_PAGES).map_err(|_| IoError::NoMemory)?;
+    if iova.alloc(IO_VECTOR_PAGES) != Some(IO_BASE >> PAGE_SHIFT) {
+        return Err(IoError::NoMemory); // (not reached: a fresh allocator's lowest fit is the window's start)
+    }
+    let window = MsiWindow::new(IO_BASE, 8).map_err(|_| IoError::NoMemory)?;
+    let Some(root) = frames.alloc_root() else {
+        return Err(IoError::NoMemory);
+    };
+    let Some(msi_pa) = frames.alloc() else {
+        frames.free_root(root);
+        return Err(IoError::NoMemory);
+    };
+    let undo_frames = |frames: &mut F| {
+        frames.free(msi_pa);
+        frames.free_root(root);
+    };
+    let (Ok(iopt), Ok(msi)) = (
+        Iopt::new(mem, root, PtMode::Sv39x4),
+        MsiTable::new(mem, msi_pa, window),
+    ) else {
+        undo_frames(frames);
+        return Err(IoError::NoMemory);
+    };
+    let Some(lists) = domain_lists() else {
+        undo_frames(frames);
+        return Err(IoError::NoMemory);
+    };
+    Ok((iova, iopt, msi, lists, root, msi_pa))
+}
+
 /// The commands that invalidate `pages` pages from `page` in soft context `gscid`: page by page for a short range, the whole soft
 /// context for a long one.
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)] // INVARIANT: i < pages <= INVAL_PAGES in the loop; page + i is inside the window
@@ -1030,6 +1175,7 @@ impl IoDomains {
     ///
     /// `seed` seeds the priorities of the mapping index (a treap): the kernel passes entropy, so the index's depth stays logarithmic in
     /// expectation whatever addresses a driver keeps.
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the IOMMU's tables, built once at boot)
     pub fn new(ddt: Ddt, cmdq: CmdQueue, quarantine: &Iopt, seed: u64) -> Option<IoDomains> {
         let quarantine = quarantine.context_root(u32::from(QUARANTINE_GSCID))?;
         let mut gscids = Vec::new();
@@ -1298,41 +1444,26 @@ impl IoDomains {
         }
         self.free_dir_dead(mem, regs, frames);
         self.reserve_slot()?;
-        let mut iova =
-            Iova::new(IO_BASE >> PAGE_SHIFT, IO_WINDOW_PAGES).map_err(|_| IoError::NoMemory)?;
-        if iova.alloc(IO_VECTOR_PAGES) != Some(IO_BASE >> PAGE_SHIFT) {
-            return Err(IoError::NoMemory); // (not reached: a fresh allocator's lowest fit is the window's start)
-        }
-        let window = MsiWindow::new(IO_BASE, 8).map_err(|_| IoError::NoMemory)?;
-        let Some(root) = frames.alloc_root() else {
-            return Err(IoError::NoMemory);
-        };
-        let Some(msi_pa) = frames.alloc() else {
-            frames.free_root(root);
-            return Err(IoError::NoMemory);
-        };
+        let (dom, ctx_root, root, msi_pa) = self.build_domain(mem, frames, device_id, job)?;
+        self.attach_domain(mem, regs, frames, device_id, dom, (ctx_root, root, msi_pa))
+    }
+
+    /// `create`'s new domain: its I/O address allocator, its tables (a root and an MSI page table), its lists and its GSCID, boxed. With the
+    /// context's root and the two frames to give back if the attach fails (each step of `create` a frame of its own: KT13).
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
+    fn build_domain<M: PhysMem64, F: IoFrames>(
+        &mut self,
+        mem: &M,
+        frames: &mut F,
+        device_id: u32,
+        job: JobId,
+    ) -> Result<(FBox<Domain>, TableRoot, u64, u64), IoError> {
+        let (iova, iopt, msi, (vectors, ring, files), root, msi_pa) = domain_parts(mem, frames)?;
         let undo_frames = |frames: &mut F| {
             frames.free(msi_pa);
             frames.free_root(root);
         };
-        let (Ok(iopt), Ok(msi)) = (
-            Iopt::new(mem, root, PtMode::Sv39x4),
-            MsiTable::new(mem, msi_pa, window),
-        ) else {
-            undo_frames(frames);
-            return Err(IoError::NoMemory);
-        };
-        let mut vectors = Vec::new();
-        if vectors.try_reserve_exact(IO_VECTOR_PAGES as usize).is_err() {
-            undo_frames(frames);
-            return Err(IoError::NoMemory);
-        }
-        vectors.resize(
-            IO_VECTOR_PAGES as usize,
-            VSlot {
-                state: VState::Free,
-            },
-        );
         let Some(gscid) = self.alloc_gscid() else {
             undo_frames(frames);
             return Err(IoError::NoMemory);
@@ -1361,13 +1492,13 @@ impl IoDomains {
             tables: 0,
             io_pages: 0,
             leaks: false,
-            ring: [NO_FAULT; FAULT_RING],
+            ring,
             ring_head: 0,
             ring_len: 0,
             dropped: 0,
             destroy_ticket: NO_TICKET,
             vectors,
-            files: [0; FILE_FRAMES],
+            files,
             next: None,
         }) {
             Ok(d) => d,
@@ -1376,6 +1507,24 @@ impl IoDomains {
                 undo_frames(frames);
                 return Err(IoError::NoMemory);
             }
+        };
+        Ok((dom, ctx_root, root, msi_pa))
+    }
+
+    /// `create`'s attach of `dom` to `device_id` in the directory, and the invalidations; on a failure everything `build_domain` made goes back.
+    fn attach_domain<M: PhysMem64, R: Regs, F: IoFrames>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        frames: &mut F,
+        device_id: u32,
+        dom: FBox<Domain>,
+        (ctx_root, root, msi_pa): (TableRoot, u64, u64),
+    ) -> Result<(DomainId, Ticket), IoError> {
+        let gscid = dom.gscid;
+        let undo_frames = |frames: &mut F| {
+            frames.free(msi_pa);
+            frames.free_root(root);
         };
         let was_quarantined = self.device_state(mem, device_id) == DeviceState::Quarantined;
         // (a directory page the write links and then unlinks again on a failure may already be in the IOMMU's directory cache: it is
@@ -1391,7 +1540,7 @@ impl IoDomains {
             mem,
             &mut df,
             device_id,
-            &DeviceContext::translate(ctx_root, Some(&msi)),
+            &DeviceContext::translate(ctx_root, Some(&dom.msi)),
         );
         if set.is_err() {
             drop(dom);
@@ -1464,6 +1613,7 @@ impl IoDomains {
     /// one call (the host tests' single critical section; the kernel takes `IOMMU` once per step). Table frames come from `frames`
     /// (prepaid by `charge_map`). Queues the invalidation of the range and a fence: the caller waits, and on a failed fence unmaps
     /// again (4.3).
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn map<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,
@@ -1535,7 +1685,9 @@ impl IoDomains {
     /// a table frame that cannot be allocated, with NO_MEMORY. A finished roll-back is an unmap (`MapFailed::RolledBack`: its
     /// fence is waited for and completed like one); a domain whose destruction has completed meanwhile took the leaves with its
     /// tables after its own fence, and the record comes back at once (`MapFailed::Dropped`). A destruction never waits for a map.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page + i stays inside the reserved range; written, undone <= pages; tables counts frames in the table
+    #[allow(clippy::arithmetic_side_effects)]
+    // INVARIANT: page + i stays inside the reserved range; written, undone <= pages; tables counts frames in the table
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn map_step<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,
@@ -1871,7 +2023,9 @@ impl IoDomains {
     /// soft context if a table frame was freed: OD169) and a fence (`Queued`). A domain whose destruction has begun takes the record
     /// as it is (`Taken`, OD170: the unmap is OK, the destruction's fence covers its leaves and its completion releases the record).
     /// Allocates nothing.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: cleared <= pages; page + cleared is inside the mapping's range; the table counts are frames moved from the table to the chain
+    #[allow(clippy::arithmetic_side_effects)]
+    // INVARIANT: cleared <= pages; page + cleared is inside the mapping's range; the table counts are frames moved from the table to the chain
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn unmap_step<M: PhysMem64, R: Regs>(
         &mut self,
         mem: &M,
@@ -1998,6 +2152,7 @@ impl IoDomains {
     /// 6.3 step 1: refuse new maps, write the device's context to the quarantine state, queue the directory invalidation, the
     /// invalidation of the domain's whole soft context (its translations and MSI entries) and a fence. `None` if the domain is already
     /// being destroyed or gone (destroying a destroyed domain does nothing). Allocates nothing.
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn destroy<M: PhysMem64, R: Regs>(
         &mut self,
         mem: &M,
@@ -2229,6 +2384,7 @@ impl IoDomains {
     /// `vector_fenced`. `InvalidArgs`: `index` is 256 or more. `BadState`: the domain is gone or being destroyed, or the index is not
     /// free. `NoMemory`: no frame for the file.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn vector_grant<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,

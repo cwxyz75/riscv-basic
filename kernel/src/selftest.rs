@@ -125,7 +125,7 @@ fn kernel_mappings_are_w_xor_x() -> Outcome {
     ensure_eq(bad, 0, "leaves that are W+X, huge or user-accessible")
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn kernel_sections_have_the_right_permissions() -> Outcome {
     let k = kmem::get_as();
     let s = kmem::sections();
@@ -163,7 +163,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
 
 /// Every direct-map leaf maps usable RAM (the frames the database manages and the metadata the database lives in; never the kernel image
 /// or the firmware's reserved ranges), or is one of the device pages or the tree's own frames.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn direct_map_does_not_alias_the_image() -> Outcome {
     let k = kmem::get_as();
     let st = kmem::stats();
@@ -241,7 +241,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
 /// frames, and the reserved part of RAM covers at least the kernel image (a tree that reserved nothing would hand out the image's frames)
 /// and is the image plus a little (firmware, the tree). The harness says how much RAM it gave QEMU (`ram=<size>` on the kernel line:
 /// `128M`, `4G`, or bytes); the tree must describe exactly that.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn ram_matches_the_machine() -> Outcome {
     let st = kmem::stats();
     let image = st.image_end - st.image_first;
@@ -311,7 +311,7 @@ fn the_console_is_where_the_boot_line_says() -> Outcome {
 /// (`load=0x...` on the kernel line; only the load-address boot test does) and the image's physical start, worked out by the early boot
 /// code from its own address, must be that: a kernel that quietly ran from the default address would pass every other test.
 /// HD1: the pool is seeded exactly when the tree has a seed (a stripped tree is booted with `-dtb`), and what it produces is not constant.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn the_entropy_pool_is_seeded_as_the_tree_says() -> Outcome {
     let blob = crate::dtb::dtb_blob().ok_or_else(|| String::from("no device tree"))?;
     let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
@@ -345,7 +345,7 @@ fn the_entropy_pool_is_seeded_as_the_tree_says() -> Outcome {
 /// HD3: the slide and the direct map's move that the early boot code (assembly, reading the tree itself) chose are what `kcore::kaslr` says the tree's seed gives, or
 /// nothing under `kaslr=off` or with no seed; the slide is a multiple of 2 MiB and the image still lies inside its slot; and the direct map starts where the
 /// move says.
-#[allow(clippy::large_stack_frames)] // (a boot self-test on the boot stack: the tree parse and the failure messages)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn kaslr_choice_follows_the_seed() -> Outcome {
     let blob = crate::dtb::dtb_blob().ok_or("no device tree")?;
     let seeds = kcore::fdt::chosen_seeds(blob).ok_or("the tree has no /chosen")?;
@@ -415,7 +415,7 @@ fn k_total_frames() -> u64 {
     crate::irq::without(|| kmem::get().mm.db.total() as u64)
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn heap_works() -> Outcome {
     let mut v: Vec<u64> = Vec::new();
     for i in 0..10_000 {
@@ -559,7 +559,7 @@ fn write_to_read_only_region_is_refused() -> Outcome {
     })
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn shared_vmo_is_one_memory() -> Outcome {
     balanced(|| {
         let a = LAZY_TEST_BASE;
@@ -621,7 +621,7 @@ type Test = (&'static str, fn() -> Outcome);
 
 /// The heap grows at a safe point when it runs low: fill the boot heap's free space, call `service`, and a block
 /// that no longer fits the boot heap is allocated in the grown one (in the window), then everything is freed.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn heap_grows_at_a_safe_point() -> Outcome {
     use alloc::vec::Vec;
     let grown_before = crate::heap::grown_bytes();
@@ -670,7 +670,7 @@ fn heap_grows_at_a_safe_point() -> Outcome {
 
 /// L16: this hart's frame cache hands out frames with one reference, refills in batches (the database's free count drops by whole
 /// batches, not per frame), takes frames back without the database, and the leak oracle counts what it holds as free.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn frame_cache_serves_and_accounts() -> Outcome {
     use alloc::vec::Vec;
     irq_service();
@@ -722,7 +722,7 @@ fn frame_cache_serves_and_accounts() -> Outcome {
 
 /// MM4: small objects come from the slabs (in the direct map, aligned to their class), keep what is written, and when they are all freed the
 /// frames and bytes the heap holds are back where they were: the churn test of T-SPEC section 8 for the slab path.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn slab_serves_small_objects_and_everything_comes_back() -> Outcome {
     use alloc::boxed::Box;
     use alloc::vec::Vec;

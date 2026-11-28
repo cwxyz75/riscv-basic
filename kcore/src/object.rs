@@ -927,6 +927,43 @@ impl<T: Object> Registry<T> {
             return SweepStep::Done(0);
         }
         // marking (also after a shade that reached a white object while freeing: its references must be followed before anything is freed)
+        let left = self.mark_some(budget);
+        if !self.mark_work.is_empty() || self.roots_pending {
+            return SweepStep::More;
+        }
+        if self.mark_incomplete {
+            // (T177: a reference could not be followed, so an unmarked object may be reachable: free nothing, and sweep again later)
+            self.mark_incomplete = false;
+            self.phase = Phase::Idle;
+            self.swept = 0;
+            return SweepStep::Done(0);
+        }
+        self.phase = Phase::Freeing;
+        // freeing
+        let abandoned = self.free_some(left);
+        self.release_step(RELEASE_UNITS);
+        if abandoned {
+            self.phase = Phase::Idle;
+            return SweepStep::Done(self.swept);
+        }
+        if self.cursor < self.slots.len() {
+            return SweepStep::More;
+        }
+        // Never past the cap (garbage cycles must not be able to fill it), and never so close
+        // to it that every creation sweeps while the objects are all genuinely reachable.
+        self.threshold = SWEEP_MIN.max(self.live * 2).min(self.cap.saturating_sub(4));
+        self.phase = Phase::Idle;
+        SweepStep::Done(self.swept)
+    }
+
+    /// The mark half of `sweep_step`: shade what the objects on the work list hold, up to `budget` of them. The budget left (each half a frame
+    /// of its own: KT13).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::expect_used
+    )] // INVARIANT: as `sweep_step`
+    fn mark_some(&mut self, budget: usize) -> usize {
         let mut left = budget;
         while left > 0 {
             let Some(id) = self.mark_work.pop() else {
@@ -952,18 +989,13 @@ impl<T: Object> Registry<T> {
             }
             self.scan = refs;
         }
-        if !self.mark_work.is_empty() || self.roots_pending {
-            return SweepStep::More;
-        }
-        if self.mark_incomplete {
-            // (T177: a reference could not be followed, so an unmarked object may be reachable: free nothing, and sweep again later)
-            self.mark_incomplete = false;
-            self.phase = Phase::Idle;
-            self.swept = 0;
-            return SweepStep::Done(0);
-        }
-        self.phase = Phase::Freeing;
-        // freeing
+        left
+    }
+
+    /// The freeing half of `sweep_step`: doom the unmarked objects from the cursor on, up to `left` slots, then tell their peers and drop what they
+    /// held. True when it ran out of memory for its lists and abandoned the sweep.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: as `sweep_step`
+    fn free_some(&mut self, left: usize) -> bool {
         let end = self.slots.len().min(self.cursor.saturating_add(left));
         let mut dropped_refs: Vec<ObjId> = Vec::new();
         let mut peers: Vec<ObjId> = Vec::new();
@@ -998,19 +1030,7 @@ impl<T: Object> Registry<T> {
                 self.release_bounded(id, 0);
             }
         }
-        self.release_step(RELEASE_UNITS);
-        if abandoned {
-            self.phase = Phase::Idle;
-            return SweepStep::Done(self.swept);
-        }
-        if self.cursor < self.slots.len() {
-            return SweepStep::More;
-        }
-        // Never past the cap (garbage cycles must not be able to fill it), and never so close
-        // to it that every creation sweeps while the objects are all genuinely reachable.
-        self.threshold = SWEEP_MIN.max(self.live * 2).min(self.cap.saturating_sub(4));
-        self.phase = Phase::Idle;
-        SweepStep::Done(self.swept)
+        abandoned
     }
 
     /// Destroy the object in slot `index` as the sweep does: give its job the credit, free the slot, and collect the references it held

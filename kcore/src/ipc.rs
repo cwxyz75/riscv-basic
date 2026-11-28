@@ -408,6 +408,19 @@ fn channel_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
     Ok(entry.obj)
 }
 
+/// One end of a new channel, with no peer yet, charged to `job` (the room was made: a frame of its own, KT13).
+fn new_channel_end(reg: &mut Kobjs, job: Option<JobId>) -> ObjId {
+    reg.create_charged(
+        KObj::Channel(Channel {
+            peer: None,
+            queue: VecDeque::new(),
+            peer_closed: false,
+            next_serial: 0,
+        }),
+        job,
+    )
+}
+
 /// A connected pair of channel endpoints, both with the default channel rights.
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: live is below MAX_OBJECTS, so + 2 cannot overflow
 pub fn channel_create_in(
@@ -419,15 +432,8 @@ pub fn channel_create_in(
         return Err(Status::NoMemory);
     }
     q.objects(reg, 2)?;
-    let end = || Channel {
-        peer: None,
-        queue: VecDeque::new(),
-        peer_closed: false,
-        next_serial: 0,
-    };
-    let (a_end, b_end) = (end(), end());
-    let a = reg.create_charged(KObj::Channel(a_end), q.job);
-    let b = reg.create_charged(KObj::Channel(b_end), q.job);
+    let a = new_channel_end(reg, q.job);
+    let b = new_channel_end(reg, q.job);
     for (me, other) in [(a, b), (b, a)] {
         if let Some(KObj::Channel(c)) = reg.get_mut(me) {
             c.peer = Some(other);
@@ -475,14 +481,31 @@ pub fn channel_write_from(
     jobs: &mut Jobs,
     caller: Option<(u64, u64)>,
 ) -> Result<(), Status> {
+    let peer = channel_write_checks(reg, table, ch, data, handles)?;
+    channel_enqueue(reg, table, peer, data, handles, jobs, caller)
+}
+
+/// `channel_write_from`'s checks, before anything changes: the sizes, the handles, the channel and its right, the transfers, and the peer's room.
+/// The peer (a frame of its own: KT13).
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unreachable
+)] // INVARIANT: as `channel_write_from`
+fn channel_write_checks(
+    reg: &Kobjs,
+    table: &HandleTable,
+    ch: Handle,
+    data: &[u8],
+    handles: &[Handle],
+) -> Result<ObjId, Status> {
     if data.len() > MAX_MSG_BYTES || handles.len() > MAX_MSG_HANDLES {
         return Err(Status::TooBig);
     }
     // BAD_HANDLE: the channel, then each listed handle.
     let ch_entry = table.get(ch)?;
-    for &h in handles {
-        table.get(h)?;
-    }
+    handles_resolve(table, handles)?;
     // WRONG_TYPE.
     match reg.get(ch_entry.obj) {
         Some(KObj::Channel(_)) => {}
@@ -493,16 +516,47 @@ pub fn channel_write_from(
     if !ch_entry.rights.contains(Rights::WRITE) {
         return Err(Status::AccessDenied);
     }
+    handles_transferable(table, handles)?;
+    write_peer(reg, table, ch_entry.obj, handles, data.len())
+}
+
+/// Every handle of a message names something (`channel_write_checks`; each step a frame of its own: KT13).
+fn handles_resolve(table: &HandleTable, handles: &[Handle]) -> Result<(), Status> {
+    for &h in handles {
+        table.get(h)?;
+    }
+    Ok(())
+}
+
+/// Every handle of a message may be transferred, and none appears twice.
+#[allow(clippy::indexing_slicing)] // INVARIANT: i < handles.len()
+fn handles_transferable(table: &HandleTable, handles: &[Handle]) -> Result<(), Status> {
     for &h in handles {
         table.check_transferable(h)?;
     }
-    // INVALID_ARGS: a handle listed twice.
+    // (a handle sent twice would be moved twice)
     for (i, h) in handles.iter().enumerate() {
         if handles[..i].contains(h) {
             return Err(Status::InvalidArgs);
         }
     }
-    let me = ch_entry.obj;
+    Ok(())
+}
+
+/// The peer of channel `me` that a message of `data_len` bytes with `handles` can go to: not itself or its peer among the handles, the peer
+/// still there and with room.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::unreachable
+)] // INVARIANT: `me` was resolved as a channel and the handles were validated; the sizes are bounded
+fn write_peer(
+    reg: &Kobjs,
+    table: &HandleTable,
+    me: ObjId,
+    handles: &[Handle],
+    data_len: usize,
+) -> Result<ObjId, Status> {
     let KObj::Channel(this) = reg.get(me).expect("resolved") else {
         unreachable!()
     };
@@ -518,15 +572,88 @@ pub fn channel_write_from(
     let peer = peer.ok_or(Status::PeerClosed)?;
     match reg.get(peer) {
         Some(KObj::Channel(p)) => {
-            if p.queue.len() >= MAX_QUEUED_MSGS || p.queued_bytes() + data.len() > MAX_QUEUED_BYTES
-            {
+            if p.queue.len() >= MAX_QUEUED_MSGS || p.queued_bytes() + data_len > MAX_QUEUED_BYTES {
                 return Err(Status::ShouldWait);
             }
         }
         _ => return Err(Status::PeerClosed),
     }
     // The system-wide budget for queued data (a user must not be able to exhaust kernel memory).
-    let cost = data.len() + MSG_OVERHEAD + handles.len() * core::mem::size_of::<Entry>();
+    Ok(peer)
+}
+
+/// `channel_write_from` once every check has passed: the charge, the room, the copy and the move of the handles, and the message on `peer`'s queue
+/// (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: as `channel_write_from`
+fn channel_enqueue(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    peer: ObjId,
+    data: &[u8],
+    handles: &[Handle],
+    jobs: &mut Jobs,
+    caller: Option<(u64, u64)>,
+) -> Result<(), Status> {
+    let cost = enqueue_charge(reg, jobs, peer, data.len(), handles.len())?;
+    let undo = |reg: &Kobjs, jobs: &mut Jobs, e: Status| {
+        credit_bytes(reg, jobs, peer, cost);
+        Err(e)
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    if bytes.try_reserve_exact(data.len()).is_err() {
+        return undo(reg, jobs, Status::NoMemory);
+    }
+    bytes.extend_from_slice(data);
+    let mut entries: Vec<Entry> = Vec::new();
+    if entries.try_reserve_exact(handles.len()).is_err() {
+        return undo(reg, jobs, Status::NoMemory);
+    }
+    // Commit: the handles leave the table and travel with the message.
+    entries.extend(
+        handles
+            .iter()
+            .map(|&h| table.remove_for_transfer(reg, h).expect("validated")),
+    );
+    for e in &entries {
+        reg.debug_assert_not_white(e.obj);
+    }
+    enqueue_message(reg, peer, bytes, entries, caller, cost);
+    Ok(())
+}
+
+/// The message on `peer`'s queue, with its serial, and its bytes on the meter (`channel_enqueue`; a frame of its own: KT13).
+fn enqueue_message(
+    reg: &mut Kobjs,
+    peer: ObjId,
+    bytes: Vec<u8>,
+    entries: Vec<Entry>,
+    caller: Option<(u64, u64)>,
+    cost: usize,
+) {
+    if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
+        let serial = p.next_serial;
+        p.next_serial = serial.wrapping_add(1);
+        p.queue.push_back(Message {
+            data: bytes,
+            handles: entries,
+            caller,
+            serial,
+        });
+        reg.meter_add(cost);
+    }
+}
+
+/// `channel_enqueue`'s charge of a message of `data_len` bytes and `nhandles` handles to `peer`'s job, and the room on its queue (undone on a
+/// refusal). The cost charged.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the sizes were bounded by MAX_MSG_BYTES and MAX_MSG_HANDLES
+fn enqueue_charge(
+    reg: &mut Kobjs,
+    jobs: &mut Jobs,
+    peer: ObjId,
+    data_len: usize,
+    nhandles: usize,
+) -> Result<usize, Status> {
+    let cost = data_len + MSG_OVERHEAD + nhandles * core::mem::size_of::<Entry>();
     if reg.meter() + cost > reg.ipc_cap() {
         return Err(Status::NoMemory);
     }
@@ -548,36 +675,7 @@ pub fn channel_write_from(
         _ => return undo(reg, jobs, Status::PeerClosed),
     }
     // Allocate before committing, so running out of memory changes nothing.
-    let mut bytes: Vec<u8> = Vec::new();
-    if bytes.try_reserve_exact(data.len()).is_err() {
-        return undo(reg, jobs, Status::NoMemory);
-    }
-    bytes.extend_from_slice(data);
-    let mut entries: Vec<Entry> = Vec::new();
-    if entries.try_reserve_exact(handles.len()).is_err() {
-        return undo(reg, jobs, Status::NoMemory);
-    }
-    // Commit: the handles leave the table and travel with the message.
-    entries.extend(
-        handles
-            .iter()
-            .map(|&h| table.remove_for_transfer(reg, h).expect("validated")),
-    );
-    for e in &entries {
-        reg.debug_assert_not_white(e.obj);
-    }
-    if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
-        let serial = p.next_serial;
-        p.next_serial = serial.wrapping_add(1);
-        p.queue.push_back(Message {
-            data: bytes,
-            handles: entries,
-            caller,
-            serial,
-        });
-        reg.meter_add(cost);
-    }
-    Ok(())
+    Ok(cost)
 }
 
 /// What a read will take, named so that the read can copy it out first and take it after (OD161: peek, copy, commit). For a channel it is
@@ -686,6 +784,86 @@ pub fn channel_commit(
     jobs: &mut Jobs,
     put: impl FnOnce(&[Handle], &mut Jobs) -> Result<(), Status>,
 ) -> Result<Received, CommitError> {
+    let (me, i, n) = commit_find(reg, table, ch, claim)?;
+    let handles = commit_move(reg, table, me, i, n)?;
+    if let Err(st) = put(&handles, jobs) {
+        commit_undo(reg, table, &handles);
+        return Err(st.into());
+    }
+    let data = commit_take(reg, jobs, me, i);
+    Ok(Received { data, handles })
+}
+
+/// The handles of the message at `i` of channel `me` (`n` of them) into the reader's table, in room reserved first: their numbers.
+fn commit_move(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    me: ObjId,
+    i: usize,
+    n: usize,
+) -> Result<Vec<Handle>, Status> {
+    let mut handles = commit_room(table, n)?;
+    let list = commit_entries(reg, me, i, n)?;
+    commit_handles(reg, table, &list, &mut handles);
+    Ok(handles)
+}
+
+/// The reader's copy of the handles goes again (the caller could not take the message).
+fn commit_undo(reg: &mut Kobjs, table: &mut HandleTable, handles: &[Handle]) {
+    for &h in handles {
+        let _ = table.take_back(reg, h);
+    }
+}
+
+/// The entries of a message into the reader's table (the room was reserved), their handles into `handles`.
+#[allow(clippy::expect_used)] // INVARIANT: the room was reserved by the caller
+fn commit_handles(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    list: &[Entry],
+    handles: &mut Vec<Handle>,
+) {
+    for e in list {
+        handles.push(
+            table
+                .insert(reg, e.obj, e.rights)
+                .expect("room was checked"),
+        );
+    }
+}
+
+/// Room for `n` handles in the reader's table, and the list of their numbers (empty, with room for `n`).
+fn commit_room(table: &mut HandleTable, n: usize) -> Result<Vec<Handle>, Status> {
+    if table.room() < n {
+        return Err(Status::NoMemory);
+    }
+    table.reserve(n)?;
+    let mut handles = Vec::new();
+    handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
+    Ok(handles)
+}
+
+/// A copy of the handle entries of the message at `i` of channel `me` (`n` of them), made in room reserved first.
+fn commit_entries(reg: &Kobjs, me: ObjId, i: usize, n: usize) -> Result<Vec<Entry>, Status> {
+    let mut list: Vec<Entry> = Vec::new();
+    list.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
+    if let Some(KObj::Channel(c)) = reg.get(me) {
+        if let Some(m) = c.queue.get(i) {
+            list.extend_from_slice(&m.handles);
+        }
+    }
+    Ok(list)
+}
+
+/// `channel_commit`'s look-up of the claimed message: the channel, the message's place in its queue, and how many handles it carries (each step a
+/// frame of its own: KT13).
+#[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: `channel_of` resolved a channel
+fn commit_find(
+    reg: &Kobjs,
+    table: &HandleTable,
+    ch: Handle,
+    claim: &ReadClaim,
+) -> Result<(ObjId, usize, usize), CommitError> {
     let me = channel_of(reg, table, ch, Rights::READ)?;
     if me != claim.obj {
         return Err(CommitError::Moved);
@@ -696,35 +874,12 @@ pub fn channel_commit(
     let Some(i) = c.queue.iter().position(|m| m.serial == claim.mark) else {
         return Err(CommitError::Moved);
     };
-    let n = c.queue.get(i).map_or(0, |m| m.handles.len());
-    if table.room() < n {
-        return Err(Status::NoMemory.into());
-    }
-    table.reserve(n)?;
-    let mut handles = Vec::new();
-    handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
-    let mut list: Vec<Entry> = Vec::new();
-    list.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
-    if let Some(KObj::Channel(c)) = reg.get(me) {
-        if let Some(m) = c.queue.get(i) {
-            list.extend_from_slice(&m.handles);
-        }
-    }
-    // The handles go into the table (each takes over the message's reference), their numbers are written out, and the message is removed
-    // only after both: if anything fails before that, the references are the message's again.
-    for e in &list {
-        handles.push(
-            table
-                .insert(reg, e.obj, e.rights)
-                .expect("room was checked"),
-        );
-    }
-    if let Err(st) = put(&handles, jobs) {
-        for &h in &handles {
-            let _ = table.take_back(reg, h);
-        }
-        return Err(st.into());
-    }
+    Ok((me, i, c.queue.get(i).map_or(0, |m| m.handles.len())))
+}
+
+/// `channel_commit`'s removal of the message at `i` (its handles were moved): its bytes come off the meter and the queue's job; its data.
+#[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the message was found at `i` under the same lock
+fn commit_take(reg: &mut Kobjs, jobs: &mut Jobs, me: ObjId, i: usize) -> Vec<u8> {
     let KObj::Channel(c) = reg.get_mut(me).expect("resolved") else {
         unreachable!()
     };
@@ -735,11 +890,7 @@ pub fn channel_commit(
     }
     reg.meter_sub(msg.cost());
     credit_bytes(reg, jobs, me, msg.cost());
-    // (the entries' references now belong to the table: the message's list is dropped without releasing them)
-    Ok(Received {
-        data: msg.data,
-        handles,
-    })
+    msg.data
 }
 
 /// Claim and commit in one step, for a caller that holds every lock across both (the kernel's own reads, the tests).
@@ -1003,6 +1154,20 @@ fn socket_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resul
     Ok(entry.obj)
 }
 
+/// One end of a new socket, with no peer yet, charged to `job` (the room was made: a frame of its own, KT13).
+fn new_socket_end(reg: &mut Kobjs, job: Option<JobId>) -> ObjId {
+    reg.create_charged(
+        KObj::Socket(SocketEnd {
+            peer: None,
+            buf: VecDeque::new(),
+            peer_closed: false,
+            shut: false,
+            taken: 0,
+        }),
+        job,
+    )
+}
+
 /// A connected pair of socket endpoints with the default socket rights.
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: live is below MAX_OBJECTS, so + 2 cannot overflow
 pub fn socket_create_in(
@@ -1014,15 +1179,8 @@ pub fn socket_create_in(
         return Err(Status::NoMemory);
     }
     q.objects(reg, 2)?;
-    let end = || SocketEnd {
-        peer: None,
-        buf: VecDeque::new(),
-        peer_closed: false,
-        shut: false,
-        taken: 0,
-    };
-    let a = reg.create_charged(KObj::Socket(end()), q.job);
-    let b = reg.create_charged(KObj::Socket(end()), q.job);
+    let a = new_socket_end(reg, q.job);
+    let b = new_socket_end(reg, q.job);
     for (me, other) in [(a, b), (b, a)] {
         if let Some(KObj::Socket(s)) = reg.get_mut(me) {
             s.peer = Some(other);
@@ -1067,18 +1225,11 @@ pub fn socket_write_in(
         return Err(Status::TooBig);
     }
     let meter = reg.meter();
-    if matches!(reg.get(me), Some(KObj::Socket(s)) if s.shut) {
-        return Err(Status::BadState);
-    }
-    let peer = match reg.get(me) {
-        Some(KObj::Socket(s)) if !s.peer_closed => s.peer,
-        _ => None,
-    }
-    .ok_or(Status::PeerClosed)?;
-    let Some(KObj::Socket(p)) = reg.get_mut(peer) else {
-        return Err(Status::PeerClosed);
+    let peer = socket_write_peer(reg, me)?;
+    let end_room = match reg.get(peer) {
+        Some(KObj::Socket(p)) => SOCKET_BUFFER - p.buf.len(),
+        _ => return Err(Status::PeerClosed),
     };
-    let end_room = SOCKET_BUFFER - p.buf.len();
     if data.is_empty() {
         return Ok(0);
     }
@@ -1087,6 +1238,26 @@ pub fn socket_write_in(
     }
     // Both limits apply: this end's buffer and the system-wide budget (NO_MEMORY, not
     // SHOULD_WAIT: other sockets' readers will not make room for this one).
+    let n = socket_room(reg, jobs, peer, meter)?
+        .min(end_room)
+        .min(data.len());
+    socket_append(reg, jobs, peer, data.get(..n).unwrap_or(&[]))
+}
+
+/// The peer a write on socket `me` goes to: BAD_STATE for a socket shut for writing, PEER_CLOSED without one.
+fn socket_write_peer(reg: &Kobjs, me: ObjId) -> Result<ObjId, Status> {
+    if matches!(reg.get(me), Some(KObj::Socket(s)) if s.shut) {
+        return Err(Status::BadState);
+    }
+    match reg.get(me) {
+        Some(KObj::Socket(s)) if !s.peer_closed => s.peer,
+        _ => None,
+    }
+    .ok_or(Status::PeerClosed)
+}
+
+/// What the IPC backstop and the job of `peer` still allow a socket write (`meter` read before), or NO_MEMORY for nothing.
+fn socket_room(reg: &Kobjs, jobs: &Jobs, peer: ObjId, meter: usize) -> Result<usize, Status> {
     let global_room = reg.ipc_cap().saturating_sub(meter);
     if global_room == 0 {
         return Err(Status::NoMemory);
@@ -1097,15 +1268,26 @@ pub fn socket_write_in(
     if job_room == 0 {
         return Err(Status::NoMemory);
     }
-    let n = end_room.min(global_room).min(job_room).min(data.len());
+    Ok(global_room.min(job_room))
+}
+
+/// `socket_write_in`'s append of `data` (what fits) to `peer`'s buffer, charged to its job. How much went (a frame of its own: KT13).
+fn socket_append(
+    reg: &mut Kobjs,
+    jobs: &mut Jobs,
+    peer: ObjId,
+    data: &[u8],
+) -> Result<usize, Status> {
     let Some(KObj::Socket(p)) = reg.get_mut(peer) else {
         return Err(Status::PeerClosed);
     };
-    p.buf.try_reserve(n).map_err(|_| Status::NoMemory)?;
-    p.buf.extend(&data[..n]);
-    reg.meter_add(n);
-    charge_bytes_unchecked(reg, jobs, peer, n);
-    Ok(n)
+    p.buf
+        .try_reserve(data.len())
+        .map_err(|_| Status::NoMemory)?;
+    p.buf.extend(data);
+    reg.meter_add(data.len());
+    charge_bytes_unchecked(reg, jobs, peer, data.len());
+    Ok(data.len())
 }
 
 /// How many bytes `socket_read` would return for `max` (so the caller can check the
@@ -1341,6 +1523,29 @@ pub fn port_bind_flags_in(
     jobs: &mut Jobs,
 ) -> Result<(), Status> {
     settle(reg, jobs);
+    let (port_obj, obj) = bind_checks(reg, table, port, object, mask, flags)?;
+    bind_add(
+        reg,
+        jobs,
+        port_obj,
+        obj,
+        (table.id(), object.0),
+        mask,
+        key,
+        flags,
+    )
+}
+
+/// `port_bind_flags_in`'s checks: the port with MANAGE, the object with WAIT (not a port), the mask and the flags. The port and the object (each half
+/// of the call a frame of its own: KT13).
+fn bind_checks(
+    reg: &Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    object: Handle,
+    mask: u64,
+    flags: u64,
+) -> Result<(ObjId, ObjId), Status> {
     let pe = table.get(port)?;
     let oe = table.get(object)?;
     let port_obj = port_of(reg, table, port, Rights::MANAGE)?;
@@ -1362,6 +1567,21 @@ pub fn port_bind_flags_in(
     if flags & !abi::port_flags::ONESHOT != 0 {
         return Err(Status::InvalidArgs);
     }
+    Ok((port_obj, oe.obj))
+}
+
+/// `port_bind_flags_in`'s binding of `obj` (named through `via`) to `port_obj`, once checked: the room, the charge and the binding.
+#[allow(clippy::too_many_arguments)] // (the binding's fields, as the call gave them)
+fn bind_add(
+    reg: &mut Kobjs,
+    jobs: &mut Jobs,
+    port_obj: ObjId,
+    obj: ObjId,
+    via: (u64, u64),
+    mask: u64,
+    key: u64,
+    flags: u64,
+) -> Result<(), Status> {
     let mask = mask as u32;
     prune_port(reg, jobs, port_obj);
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
@@ -1378,16 +1598,16 @@ pub fn port_bind_flags_in(
         return Err(Status::BadHandle);
     };
     p.bindings.push(Binding {
-        via: (table.id(), object.0),
-        obj: oe.obj,
+        via,
+        obj,
         mask,
         key,
         oneshot: flags & abi::port_flags::ONESHOT != 0,
         armed: true,
     });
     reg.meter_add(BINDING_COST);
-    reg.watch_adjust(oe.obj, 1);
-    reg.bound_add(oe.obj, port_obj);
+    reg.watch_adjust(obj, 1);
+    reg.bound_add(obj, port_obj);
     Ok(())
 }
 
@@ -1399,7 +1619,13 @@ pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjI
         return;
     }
     // (a set, so that a process that dies with thousands of bound handles costs one lookup per binding, not one comparison per pair)
-    let gone: alloc::collections::BTreeSet<(ObjId, u64, u64)> = gone.iter().copied().collect();
+    // (inserted one at a time: `collect` into a set sorts first, and the standard stable sort keeps a 4 KiB buffer on the stack, KT13)
+    let mut set: alloc::collections::BTreeSet<(ObjId, u64, u64)> =
+        alloc::collections::BTreeSet::new();
+    for &g in gone {
+        set.insert(g);
+    }
+    let gone = set;
     let ports: Vec<ObjId> = reg
         .live_ids()
         .into_iter()
@@ -1417,39 +1643,50 @@ pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjI
         if !any {
             continue;
         }
-        let mut ended: Vec<ObjId> = Vec::new();
-        let mut bindings = match reg.get_mut(port) {
-            Some(KObj::Port(p)) => core::mem::take(&mut p.bindings),
-            _ => continue,
-        };
-        let mut before_next = 0;
-        let next = match reg.get(port) {
-            Some(KObj::Port(p)) => p.next,
-            _ => 0,
-        };
-        let mut i = 0;
-        bindings.retain(|b| {
-            let end = gone.contains(&(b.obj, b.via.0, b.via.1));
-            if end {
-                ended.push(b.obj);
-                if i < next {
-                    before_next += 1;
-                }
-            }
-            i += 1;
-            !end
-        });
-        if let Some(KObj::Port(p)) = reg.get_mut(port) {
-            p.bindings = bindings;
-            p.next -= before_next.min(p.next);
-        }
-        for o in &ended {
-            reg.watch_adjust(*o, -1);
-            reg.bound_remove(*o, port);
-        }
-        reg.meter_sub(ended.len() * BINDING_COST);
-        credit_bytes(reg, jobs, port, ended.len() * BINDING_COST);
+        end_port_bindings(reg, jobs, port, &gone);
     }
+}
+
+/// `end_bindings_made_through` for one port that has bindings in `gone`: they go, with their watches, their charges and the port's cursor.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: counts of a port's bindings, bounded by its binding limit
+fn end_port_bindings(
+    reg: &mut Kobjs,
+    jobs: &mut Jobs,
+    port: ObjId,
+    gone: &alloc::collections::BTreeSet<(ObjId, u64, u64)>,
+) {
+    let mut ended: Vec<ObjId> = Vec::new();
+    let mut bindings = match reg.get_mut(port) {
+        Some(KObj::Port(p)) => core::mem::take(&mut p.bindings),
+        _ => return,
+    };
+    let mut before_next = 0;
+    let next = match reg.get(port) {
+        Some(KObj::Port(p)) => p.next,
+        _ => 0,
+    };
+    let mut i = 0;
+    bindings.retain(|b| {
+        let end = gone.contains(&(b.obj, b.via.0, b.via.1));
+        if end {
+            ended.push(b.obj);
+            if i < next {
+                before_next += 1;
+            }
+        }
+        i += 1;
+        !end
+    });
+    if let Some(KObj::Port(p)) = reg.get_mut(port) {
+        p.bindings = bindings;
+        p.next -= before_next.min(p.next);
+    }
+    for o in &ended {
+        reg.watch_adjust(*o, -1);
+        reg.bound_remove(*o, port);
+    }
+    reg.meter_sub(ended.len() * BINDING_COST);
+    credit_bytes(reg, jobs, port, ended.len() * BINDING_COST);
 }
 
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: next is at least 1 when a binding is removed behind it
@@ -1530,6 +1767,27 @@ pub fn port_poll_many_in(
     let port_obj = port_of(reg, table, port, Rights::WAIT)?;
     prune_port(reg, jobs, port_obj);
     // (both lists are reserved before anything is taken: NO_MEMORY here leaves the port as it was, T248)
+    let (picked, mut observed) = poll_many_pick(reg, port_obj, max)?;
+    observed.extend(
+        picked
+            .iter()
+            .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask))),
+    );
+    poll_many_mark(reg, port_obj, &picked)?;
+    Ok(observed)
+}
+
+/// `port_poll_many_in`'s choice: up to `max` ready bindings from the cursor on, and the room for what they show (a frame of its own: KT13).
+#[allow(
+    clippy::type_complexity,
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing
+)] // INVARIANT: indices modulo the bindings' count
+fn poll_many_pick(
+    reg: &Kobjs,
+    port_obj: ObjId,
+    max: usize,
+) -> Result<(Vec<(usize, u64, u32, ObjId)>, Vec<(u64, u32)>), Status> {
     let mut picked: Vec<(usize, u64, u32, ObjId)> = Vec::new();
     let mut observed: Vec<(u64, u32)> = Vec::new();
     match reg.get(port_obj) {
@@ -1552,21 +1810,26 @@ pub fn port_poll_many_in(
         }
         _ => return Err(Status::BadHandle),
     }
-    observed.extend(
-        picked
-            .iter()
-            .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask))),
-    );
+    Ok((picked, observed))
+}
+
+/// `port_poll_many_in`'s marks: the cursor moves past each binding reported, and a one-shot one is disarmed (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the indices were taken from the bindings under the same lock
+fn poll_many_mark(
+    reg: &mut Kobjs,
+    port_obj: ObjId,
+    picked: &[(usize, u64, u32, ObjId)],
+) -> Result<(), Status> {
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
         return Err(Status::BadHandle);
     };
-    for &(i, ..) in &picked {
+    for &(i, ..) in picked {
         p.next = i + 1;
         if p.bindings[i].oneshot {
             p.bindings[i].armed = false;
         }
     }
-    Ok(observed)
+    Ok(())
 }
 
 /// Arm binding `key` again (a one-shot binding that was delivered; harmless on one that is armed): it
