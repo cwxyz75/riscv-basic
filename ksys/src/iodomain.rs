@@ -668,7 +668,12 @@ fn map_one<E: IoEnv>(e: &mut E, vmo: u64, cur: iod::MapCursor) -> MapStep {
 
 /// The frames `map_one`'s step writes, read under `VMO` into `buf`: how many.
 #[inline(never)]
-fn next_frames<E: IoEnv>(e: &mut E, vmo: u64, cur: &iod::MapCursor, buf: &mut [Pfn; RANGE_STEP as usize]) -> usize {
+fn next_frames<E: IoEnv>(
+    e: &mut E,
+    vmo: u64,
+    cur: &iod::MapCursor,
+    buf: &mut [Pfn; RANGE_STEP as usize],
+) -> usize {
     let Some((at, k)) = cur.next_frames() else {
         return 0;
     };

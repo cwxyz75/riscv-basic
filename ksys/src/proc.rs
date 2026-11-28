@@ -2,7 +2,7 @@
 //! `process_info`, `thread_info`, `job_root` and `resource_root` over the process table, with the machine's part (TLB shootdowns) behind
 //! a small trait.
 
-use crate::{fail, Reply};
+use crate::Reply;
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::syscall as nr;
@@ -69,6 +69,7 @@ pub type ProcTable = kcore::fmap::FMap<u64, kcore::fbox::FBox<Process>>;
 
 /// Put a process in the table (the boot loader and the host tests, which have nobody to tell). Panics when there is no memory.
 #[allow(clippy::expect_used)] // INVARIANT: boot and test setup only: allocation failure there is a failure to start
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the boot loader's and the host tests' records)
 pub fn put_process(procs: &mut ProcTable, pid: u64, p: Process) {
     let b = kcore::fbox::FBox::try_new(p)
         .ok()
@@ -226,19 +227,18 @@ fn range_status(e: kcore::aspace::VmoError) -> Status {
     }
 }
 
-/// `vmo_decommit` / `vmo_set_size`, first part (T207 PR 3a): resolve and check the arguments, refuse what is refused, and mark the VMO busy.
-/// `Ok(None)`: nothing to take away (a growth, or an empty range); otherwise the steps follow (`vmo_range_step` until it says done, then
-/// `Vmos::range_end`, whatever the steps answered).
-pub fn vmo_range_begin<M: PhysMem, X: Machine>(
-    c: &mut PCtx<'_, M, X>,
+/// The pages `vmo_range_begin` takes away from VMO `id` (the first, how many) and, for `vmo_set_size`, the new size, checked. A frame of its own
+/// (KT13).
+#[inline(never)]
+fn range_window(
+    vmos: &Vmos,
+    id: u64,
     n: usize,
-    a: [u64; 6],
-) -> Result<Option<RangeCall>, Status> {
-    let caller = c.procs.get(&c.me).ok_or(Status::BadState)?;
-    let id = ipc::vmo_of(c.objs, &caller.handles, Handle(a[0]), Rights::WRITE)?;
-    let size = c.vmos.pages(id).ok_or(Status::BadHandle)?;
-    let (first, count, new_size) = if n == nr::VMO_DECOMMIT {
-        if c.vmos.kind(id) != Some(kcore::aspace::VmoKind::Plain) {
+    a: &[u64; 6],
+) -> Result<(u64, u64, Option<u64>), Status> {
+    let size = vmos.pages(id).ok_or(Status::BadHandle)?;
+    if n == nr::VMO_DECOMMIT {
+        if vmos.kind(id) != Some(kcore::aspace::VmoKind::Plain) {
             return Err(Status::NotSupported);
         }
         let (offset, len) = (a[1], a[2]);
@@ -250,10 +250,10 @@ pub fn vmo_range_begin<M: PhysMem, X: Machine>(
         if first.checked_add(count).is_none_or(|end| end > size) {
             return Err(Status::InvalidArgs);
         }
-        (first, count, None)
+        Ok((first, count, None))
     } else {
         // (a VMO that is not resizable, which every device and DMA VMO is, is refused before the size is looked at)
-        if !c.vmos.is_resizable(id) {
+        if !vmos.is_resizable(id) {
             return Err(Status::AccessDenied);
         }
         let bytes = a[1];
@@ -262,8 +262,21 @@ pub fn vmo_range_begin<M: PhysMem, X: Machine>(
         }
         let new = bytes / 4096;
         // growing takes nothing away; shrinking takes the tail
-        (new.min(size), size.saturating_sub(new), Some(new))
-    };
+        Ok((new.min(size), size.saturating_sub(new), Some(new)))
+    }
+}
+
+/// `vmo_decommit` / `vmo_set_size`, first part (T207 PR 3a): resolve and check the arguments, refuse what is refused, and mark the VMO busy.
+/// `Ok(None)`: nothing to take away (a growth, or an empty range); otherwise the steps follow (`vmo_range_step` until it says done, then
+/// `Vmos::range_end`, whatever the steps answered).
+pub fn vmo_range_begin<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    n: usize,
+    a: [u64; 6],
+) -> Result<Option<RangeCall>, Status> {
+    let caller = c.procs.get(&c.me).ok_or(Status::BadState)?;
+    let id = ipc::vmo_of(c.objs, &caller.handles, Handle(a[0]), Rights::WRITE)?;
+    let (first, count, new_size) = range_window(c.vmos, id, n, &a)?;
     // (a VMO with children cannot change size: refused before anything is unmapped)
     if new_size.is_some() && c.vmos.has_children(id) {
         return Err(Status::BadState);
@@ -308,25 +321,25 @@ pub struct RangeBatch {
 }
 
 impl RangeBatch {
-    /// An empty batch, for `vmo_range_take` to fill (the caller keeps it in one place: its frames are half a KiB, KT13).
-    pub const fn new() -> RangeBatch {
-        RangeBatch {
-            frames: [0; kcore::aspace::RANGE_STEP],
-            lo: 0,
-            next: 0,
-            n: 0,
-            done: false,
-            err: None,
-            bound: 0,
-            cursor: 0,
-            cleared: 0,
-        }
-    }
-}
+    /// An empty batch, for `vmo_range_take` to fill (the caller keeps it in one place: its frames are half a KiB, KT13). A constant, not a
+    /// function: nothing builds one in a frame at run time.
+    pub const EMPTY: RangeBatch = RangeBatch {
+        frames: [0; kcore::aspace::RANGE_STEP],
+        lo: 0,
+        next: 0,
+        n: 0,
+        done: false,
+        err: None,
+        bound: 0,
+        cursor: 0,
+        cleared: 0,
+    };
 
-impl Default for RangeBatch {
-    fn default() -> Self {
-        RangeBatch::new()
+    /// Make the batch empty again, in place (as `EMPTY`).
+    fn clear(&mut self) {
+        self.frames.fill(0);
+        (self.lo, self.next, self.n, self.done, self.err) = (0, 0, 0, false, None);
+        (self.bound, self.cursor, self.cleared) = (0, 0, 0);
     }
 }
 
@@ -337,7 +350,7 @@ pub fn vmo_range_take<M: PhysMem, X: Machine>(
     b: &mut RangeBatch,
 ) -> Result<(), Status> {
     let PCtx { vmos, jobs, .. } = c;
-    *b = RangeBatch::new();
+    b.clear();
     let st = vmos
         .range_step(jobs, call.id, &mut b.frames)
         .map_err(range_status)?;
@@ -432,7 +445,7 @@ pub fn vmo_range_step<M: PhysMem, X: Machine>(
     n: usize,
     call: RangeCall,
 ) -> Result<bool, Status> {
-    let mut batch = RangeBatch::new();
+    let mut batch = RangeBatch::EMPTY;
     vmo_range_take(c, call, &mut batch)?;
     while let Some(owner) = vmo_range_next_owner(c, call, &batch) {
         vmo_range_unmap_owner(c, n, call, &mut batch, owner);
@@ -470,22 +483,23 @@ pub struct UnmapCall {
 /// Mappings one unmap step clears at most, and the page-table entries it may look at (T207 PR 3b).
 pub const UNMAP_STEP_PTES: u64 = 64;
 
-/// `process_unmap`, first part: resolve and check the arguments, split the regions at the edges and mark the ones inside dying. Every failure is
-/// here, before the first page goes.
-pub fn process_unmap_begin<M: PhysMem, X: Machine>(
-    c: &mut PCtx<'_, M, X>,
-    a: [u64; 6],
-) -> Result<UnmapCall, Status> {
-    let PCtx {
-        objs,
-        procs,
-        me,
-        vmos,
-        jobs,
-        ..
-    } = c;
-    let caller = procs.get(me).ok_or(Status::BadState)?;
-    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
+/// The process a call on `a0` (a process handle with MANAGE) acts on: its id. A frame of its own (KT13).
+#[inline(never)]
+fn managed_target(
+    objs: &kcore::ipc::Kobjs,
+    procs: &ProcTable,
+    me: u64,
+    a0: u64,
+) -> Result<u64, Status> {
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a0), Rights::MANAGE)?;
+    Ok(tpid)
+}
+
+/// The target of an unmap or a protect, before its regions change: its space takes its job's region limit (PL8), and a process that is ending is
+/// BAD_STATE. A frame of its own (KT13).
+#[inline(never)]
+fn ready_target(procs: &mut ProcTable, jobs: &Jobs, tpid: u64) -> Result<(), Status> {
     let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
     target
         .aspace
@@ -494,6 +508,19 @@ pub fn process_unmap_begin<M: PhysMem, X: Machine>(
     if target.exit_code.is_some() || target.killed.is_some() {
         return Err(Status::BadState);
     }
+    Ok(())
+}
+
+/// `process_unmap`, first part: resolve and check the arguments, split the regions at the edges and mark the ones inside dying. Every failure is
+/// here, before the first page goes.
+pub fn process_unmap_begin<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+    a: [u64; 6],
+) -> Result<UnmapCall, Status> {
+    let tpid = managed_target(c.objs, c.procs, c.me, a[0])?;
+    ready_target(c.procs, c.jobs, tpid)?;
+    let PCtx { procs, vmos, .. } = c;
+    let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
     // length 0: the region that starts at `vaddr`, whole (the original call). Otherwise (MM7) every page of `[vaddr, vaddr + length)`:
     // holes are fine, regions are split at the edges.
     if a[2] == 0 {
@@ -615,32 +642,23 @@ pub fn process_protect_begin<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
     a: [u64; 6],
 ) -> Result<ProtectCall, Status> {
-    let PCtx {
-        objs,
-        procs,
-        me,
-        mm,
-        vmos,
-        jobs,
-        ..
-    } = c;
     let (vaddr, length, flags) = (a[1], a[2], a[3]);
-    let caller = procs.get(me).ok_or(Status::BadState)?;
-    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
+    let tpid = managed_target(c.objs, c.procs, c.me, a[0])?;
     if flags & !(PF_R | PF_W | PF_X) != 0
         || flags & PF_W != 0 && flags & PF_X != 0
         || !in_user_range(vaddr, length)
     {
         return Err(Status::InvalidArgs);
     }
+    ready_target(c.procs, c.jobs, tpid)?;
+    let PCtx {
+        procs,
+        mm,
+        vmos,
+        jobs,
+        ..
+    } = c;
     let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
-    target
-        .aspace
-        .held_mut()
-        .set_region_limit(jobs.region_limit(target.job));
-    if target.exit_code.is_some() || target.killed.is_some() {
-        return Err(Status::BadState);
-    }
     let perms = Perms {
         read: true,
         write: flags & PF_W != 0,
@@ -736,10 +754,6 @@ fn process_protect_all<M: PhysMem, X: Machine>(
     }
     process_protect_end(c, n, call);
     Ok((None, None))
-}
-
-fn bad(s: Status) -> Reply {
-    fail(s)
 }
 
 fn e(s: Status) -> (Status, Option<u64>, Option<u64>) {
@@ -862,9 +876,7 @@ fn snapshot_protect<M: PhysMem, X: Machine>(
     }
 }
 
-/// `None`: `n` is not one of these calls.
-#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
-// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+/// `None`: `n` is not one of these calls. Each call is a frame of its own (KT13): this one only routes.
 pub fn proc_call<M: PhysMem, X: Machine>(
     n: usize,
     a: [u64; 6],
@@ -880,556 +892,750 @@ pub fn proc_call<M: PhysMem, X: Machine>(
         // (the steps the kernel runs with a switch point between them, run here one after another)
         return Some(vmo_range_all(c, n, a));
     }
+    proc_call_in(n, &a, c)
+}
+
+/// `proc_call`'s calls that run in one section (a frame of its own: KT13).
+#[inline(never)]
+fn proc_call_in<M: PhysMem, X: Machine>(
+    n: usize,
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Option<Reply> {
+    let r = match n {
+        nr::PROCESS_MAP => process_map(a, c),
+        nr::VMO_CREATE_CHILD => vmo_create_child(a, c),
+        nr::PROCESS_CLONE_REGION => process_clone_region(a, c),
+        nr::PROCESS_MAP_INFO => process_map_info(a, c),
+        // `process_info(process, which)`: 0 the exit code of an ended process (BAD_STATE while it runs), 1 the CPU nanoseconds its threads have
+        // run, ended and live (needs INSPECT, works while it runs; AB6)
+        nr::PROCESS_INFO if a[1] == 1 => process_cpu(a, c),
+        nr::PROCESS_INFO if a[1] != 0 => Err(Status::InvalidArgs),
+        nr::PROCESS_INFO => process_info(a, c),
+        // `thread_info(thread, which)`: 0 the exit code of an ended thread, 1 its CPU nanoseconds (works while it runs; AB6)
+        // (handle 0 names the calling thread, as in `thread_set_sched`: it needs no right)
+        nr::THREAD_INFO if a[1] == 1 && a[0] == 0 => {
+            Ok((Some(c.machine.current_thread_cpu_ns()), None))
+        }
+        nr::THREAD_INFO if a[1] == 1 => thread_cpu(a, c),
+        nr::THREAD_INFO if a[1] != 0 => Err(Status::InvalidArgs),
+        nr::THREAD_INFO => thread_info(a, c),
+        nr::RESOURCE_ROOT => resource_root(c),
+        nr::DEBUG_ROOT => debug_root(c),
+        nr::JOB_ROOT => job_root(c),
+        nr::PROCESS_SELF => process_self(c),
+        _ => return None,
+    };
+
+    cow_sync(c.procs, c.mm, c.vmos, &mut *c.machine);
+    Some(r.map_err(e))
+}
+
+/// `proc_call`'s `nr::PROCESS_MAP` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn process_map<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
     let PCtx {
         objs,
         procs,
-        me,
         mm,
         vmos,
         jobs,
         machine,
+        me,
+        ..
     } = c;
     let me = *me;
-    let r: Reply = match n {
-        nr::PROCESS_MAP => (|| {
-            let (ph, vh) = (Handle(a[0]), Handle(a[1]));
-            let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (tpid, vid, max_perms) =
-                resolve_map_args(objs, caller, ph, vh, flags).map_err(e)?;
-            let caller_job = caller.job;
-            let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
-            target
-                .aspace
-                .held_mut()
-                .set_region_limit(jobs.region_limit(target.job));
-            if target.exit_code.is_some() || target.killed.is_some() {
-                return bad(Status::BadState);
-            }
-            let aligned = |x: u64| x.is_multiple_of(4096);
-            // ANYWHERE (MM7): the flag asks the kernel to choose a free place (`vaddr` must be 0), at random among those that fit in the
-            // mapping arena. Every other argument is checked first (with the arena's start standing in for the address), so a refused
-            // call costs no entropy.
-            // (HD5: the reserved bits are named and refused, before any other argument is looked at beyond the handles)
-            if flags & (abi::map_flags::SHADOW_STACK | abi::map_flags::RESERVED_9) != 0 {
-                return bad(Status::NotSupported);
-            }
-            let anywhere = flags & abi::map_flags::ANYWHERE != 0;
-            let flags = flags & !abi::map_flags::ANYWHERE;
-            if anywhere && vaddr != 0 {
-                return bad(Status::InvalidArgs);
-            }
-            let probe = if anywhere { abi::user::BASE } else { vaddr };
-            let in_user = probe >= abi::user::BASE
-                && probe
-                    .checked_add(length)
-                    .is_some_and(|end| end <= abi::user::TOP);
-            let vmo_pages = vmos.pages(vid).ok_or(e(Status::BadHandle))?;
-            let inside_vmo = offset
-                .checked_add(length)
-                .is_some_and(|end| end <= vmo_pages * 4096);
-            if !aligned(probe)
-                || !aligned(offset)
-                || !aligned(length)
-                || length == 0
-                || flags & !(PF_R | PF_W | PF_X) != 0
-                || (flags & PF_W != 0 && flags & PF_X != 0)
-                || !in_user
-                || !inside_vmo
-            {
-                return bad(Status::InvalidArgs);
-            }
-            let vaddr = if anywhere {
-                match place_anywhere(
-                    &mut |n| machine.random_below(n),
-                    target.aspace.held_ref(),
-                    length,
-                ) {
-                    Some(at) => at,
-                    None => return bad(Status::NoMemory),
-                }
-            } else {
-                vaddr
-            };
-            // A VMO charged to a job that is neither the caller's nor the address space owner's must already be committed over the
-            // range (slice V, INVARIANTS V1): its pages are paid for, so a touch can neither fail nor charge a stranger, and a
-            // process cannot be killed by a VMO it was handed. A parent mapping its own VMO, or one charged to the child's job,
-            // into a child stays lazy.
-            let vmo_job = vmos.job_of(vid);
-            if vmo_job != Some(caller_job)
-                && vmo_job != Some(target.job)
-                && !vmos.is_committed(vid, offset / 4096, length / 4096)
-            {
-                return bad(Status::BadState);
-            }
-            // (a stranger's mapping of pages being taken away would outlive the promise above: wait for the call to end)
-            if vmo_job != Some(target.job) && vmos.is_busy(vid) {
-                return bad(Status::ShouldWait);
-            }
-            let perms = Perms {
-                read: true,
-                write: flags & PF_W != 0,
-                exec: flags & PF_X != 0,
-                user: true,
-            };
-            // Page tables for this region, worst case: one leaf table per 512 pages it spans (plus one for each end not aligned to
-            // them) and two interior ones.
-            let tables = length / 4096 / 512 + 4;
-            // (KT9: the room for the charge's records before anything is charged or mapped)
-            target.reserve_charge().map_err(e)?;
-            jobs.charge(target.job, Resource::Pages, tables)
-                .map_err(|x| e(crate::job_status(x)))?;
-            if let Err(x) = target.aspace.held_mut().map_region_max(
-                vmos,
-                vaddr,
-                length / 4096,
-                vid,
-                offset / 4096,
-                perms,
-                max_perms,
-            ) {
-                jobs.credit(target.job, Resource::Pages, tables);
+    let (ph, vh) = (Handle(a[0]), Handle(a[1]));
+    let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (tpid, vid, max_perms) = resolve_map_args(objs, caller, ph, vh, flags)?;
+    let caller_job = caller.job;
+    let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
+    target
+        .aspace
+        .held_mut()
+        .set_region_limit(jobs.region_limit(target.job));
+    if target.exit_code.is_some() || target.killed.is_some() {
+        return Err(Status::BadState);
+    }
+    let aligned = |x: u64| x.is_multiple_of(4096);
+    // ANYWHERE (MM7): the flag asks the kernel to choose a free place (`vaddr` must be 0), at random among those that fit in the
+    // mapping arena. Every other argument is checked first (with the arena's start standing in for the address), so a refused
+    // call costs no entropy.
+    // (HD5: the reserved bits are named and refused, before any other argument is looked at beyond the handles)
+    if flags & (abi::map_flags::SHADOW_STACK | abi::map_flags::RESERVED_9) != 0 {
+        return Err(Status::NotSupported);
+    }
+    let anywhere = flags & abi::map_flags::ANYWHERE != 0;
+    let flags = flags & !abi::map_flags::ANYWHERE;
+    if anywhere && vaddr != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    let probe = if anywhere { abi::user::BASE } else { vaddr };
+    let in_user = probe >= abi::user::BASE
+        && probe
+            .checked_add(length)
+            .is_some_and(|end| end <= abi::user::TOP);
+    let vmo_pages = vmos.pages(vid).ok_or(Status::BadHandle)?;
+    let inside_vmo = offset
+        .checked_add(length)
+        .is_some_and(|end| end <= vmo_pages * 4096);
+    if !aligned(probe)
+        || !aligned(offset)
+        || !aligned(length)
+        || length == 0
+        || flags & !(PF_R | PF_W | PF_X) != 0
+        || (flags & PF_W != 0 && flags & PF_X != 0)
+        || !in_user
+        || !inside_vmo
+    {
+        return Err(Status::InvalidArgs);
+    }
+    let vaddr = if anywhere {
+        match place_anywhere(
+            &mut |n| machine.random_below(n),
+            target.aspace.held_ref(),
+            length,
+        ) {
+            Some(at) => at,
+            None => return Err(Status::NoMemory),
+        }
+    } else {
+        vaddr
+    };
+    // A VMO charged to a job that is neither the caller's nor the address space owner's must already be committed over the
+    // range (slice V, INVARIANTS V1): its pages are paid for, so a touch can neither fail nor charge a stranger, and a
+    // process cannot be killed by a VMO it was handed. A parent mapping its own VMO, or one charged to the child's job,
+    // into a child stays lazy.
+    let vmo_job = vmos.job_of(vid);
+    if vmo_job != Some(caller_job)
+        && vmo_job != Some(target.job)
+        && !vmos.is_committed(vid, offset / 4096, length / 4096)
+    {
+        return Err(Status::BadState);
+    }
+    // (a stranger's mapping of pages being taken away would outlive the promise above: wait for the call to end)
+    if vmo_job != Some(target.job) && vmos.is_busy(vid) {
+        return Err(Status::ShouldWait);
+    }
+    let perms = Perms {
+        read: true,
+        write: flags & PF_W != 0,
+        exec: flags & PF_X != 0,
+        user: true,
+    };
+    // Page tables for this region, worst case: one leaf table per 512 pages it spans (plus one for each end not aligned to
+    // them) and two interior ones.
+    let tables = length / 4096 / 512 + 4;
+    // (KT9: the room for the charge's records before anything is charged or mapped)
+    target.reserve_charge()?;
+    jobs.charge(target.job, Resource::Pages, tables)
+        .map_err(crate::job_status)?;
+    if let Err(x) = target.aspace.held_mut().map_region_max(
+        vmos,
+        vaddr,
+        length / 4096,
+        vid,
+        offset / 4096,
+        perms,
+        max_perms,
+    ) {
+        jobs.credit(target.job, Resource::Pages, tables);
+        return Err(match x {
+            kcore::aspace::RegionError::TooMany => Status::NoMemory,
+            _ => Status::InvalidArgs,
+        });
+    }
+    // (a key that is already there is a mapping that was split and whose start has been mapped again: its charge stays, and this one adds)
+    let end = vaddr + length;
+    target.add_charge(vaddr, tables, end);
+    // a mapping that touches one of the same VMO with the same permissions becomes part of it (fewer regions)
+    target
+        .aspace
+        .held_mut()
+        .merge_near(mm, vmos, jobs, vaddr, vaddr + length);
+    Ok((anywhere.then_some(vaddr), None))
+}
+
+/// `proc_call`'s `nr::VMO_CREATE_CHILD` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn vmo_create_child<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        mm,
+        vmos,
+        jobs,
+        machine,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    use kcore::aspace::{ChildMode, VmoError};
+    let (offset, bytes, job_handle, flags) = (a[1], a[2], a[3], a[4]);
+    let mode = match flags {
+        abi::child_flags::SNAPSHOT => ChildMode::Snapshot,
+        abi::child_flags::PRIVATE => ChildMode::Private,
+        _ => return Err(Status::InvalidArgs),
+    };
+    if !offset.is_multiple_of(4096) || !bytes.is_multiple_of(4096) || bytes == 0 {
+        return Err(Status::InvalidArgs);
+    }
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::READ)?;
+    let caller_job = caller.job;
+    let job = if job_handle == 0 {
+        caller_job
+    } else {
+        ipc::job_of(objs, &caller.handles, Handle(job_handle), Rights::MANAGE)?
+    };
+    if mode == ChildMode::Snapshot {
+        // the pages never change payer (COW2)
+        let vmo_job = vmos.job_of(id).ok_or(Status::BadHandle)?;
+        if vmo_job != job {
+            return Err(Status::AccessDenied);
+        }
+        // V1: a process of another job maps the source on the promise that a write never fails on the VMO's job; a SNAPSHOT
+        // would make its next write a copy charged to that job
+        if vmos.maps_other_job(id, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job)) {
+            return Err(Status::BadState);
+        }
+    }
+    // everything that can fail comes before the source changes: the handle's room, the quota, the bookkeeping
+    vmos.reserve_n(2)?;
+    let child = match vmos.child_prepare(jobs, id, offset / 4096, bytes / 4096, job, mode) {
+        Ok(c) => c,
+        Err(VmoError::Gone) => return Err(Status::BadHandle),
+        Err(VmoError::JobMismatch) => return Err(Status::AccessDenied),
+        Err(VmoError::TooDeep) => return Err(Status::BadState),
+        Err(VmoError::NotCopyable) => return Err(Status::NotSupported),
+        Err(VmoError::NoMemory) => return Err(Status::NoMemory),
+        Err(VmoError::Busy) => return Err(Status::ShouldWait),
+        Err(_) => return Err(Status::InvalidArgs),
+    };
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    let handle = match ipc::vmo_object_create_in(
+        objs,
+        &mut caller.handles,
+        child,
+        &mut ipc::Quota {
+            jobs,
+            job: Some(caller_job),
+        },
+    ) {
+        Ok(h) => h,
+        Err(x) => {
+            let _ = vmos.release(mm, jobs, child);
+            return Err(x);
+        }
+    };
+    vmos.child_attach(jobs, child, id, offset / 4096, bytes / 4096, mode);
+    if mode == ChildMode::Snapshot {
+        snapshot_protect(procs, mm, &mut **machine, id);
+    }
+    Ok((Some(handle.0), None))
+}
+
+/// `proc_call`'s `nr::PROCESS_CLONE_REGION` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn process_clone_region<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        mm,
+        vmos,
+        jobs,
+        machine,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    use kcore::aspace::{ChildMode, VmoError};
+    let (vaddr, mode) = (a[2], a[3]);
+    if (mode != abi::clone_mode::SHARE && mode != abi::clone_mode::SNAPSHOT)
+        || !vaddr.is_multiple_of(4096)
+    {
+        return Err(Status::InvalidArgs);
+    }
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (_, spid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[1]), Rights::MANAGE)?;
+    let caller_job = caller.job;
+    let source = procs.get(&spid).ok_or(Status::BadState)?;
+    let target = procs.get(&tpid).ok_or(Status::BadState)?;
+    if source.exit_code.is_some()
+        || source.killed.is_some()
+        || target.exit_code.is_some()
+        || target.killed.is_some()
+    {
+        return Err(Status::BadState);
+    }
+    let region = source
+        .aspace
+        .held_ref()
+        .region_at_or_after(vaddr)
+        .filter(|r| r.start == vaddr)
+        .ok_or(Status::InvalidArgs)?;
+    let length = region.pages * 4096;
+    let end = vaddr.checked_add(length).ok_or(Status::InvalidArgs)?;
+    if target.aspace.held_ref().has_region_in(vaddr, end) {
+        return Err(Status::InvalidArgs);
+    }
+    // (the mapping below cannot fail for want of a region slot)
+    if target.aspace.held_ref().region_count() as u64
+        >= jobs
+            .region_limit(target.job)
+            .min(abi::limits::MAX_REGIONS as u64)
+    {
+        return Err(Status::NoMemory);
+    }
+    let target_job = target.job;
+    let vid = region.vmo;
+    let vmo_job = vmos.job_of(vid).ok_or(Status::BadHandle)?;
+    let snapshot = mode == abi::clone_mode::SNAPSHOT;
+    if snapshot {
+        // a fork child runs in its parent's job: the copy is charged to the source's job, which must be the target's
+        if vmo_job != target_job {
+            return Err(Status::AccessDenied);
+        }
+        // (V1, as `vmo_create_child`)
+        if vmos.maps_other_job(vid, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job)) {
+            return Err(Status::BadState);
+        }
+    } else if vmo_job != caller_job
+        && vmo_job != target_job
+        && !vmos.is_committed(vid, region.vmo_page, region.pages)
+    {
+        // (V1, as `process_map`: a stranger's VMO must already be paid for)
+        return Err(Status::BadState);
+    }
+    if vmo_job != target_job && vmos.is_busy(vid) {
+        return Err(Status::ShouldWait);
+    }
+    let tables = region.pages / 512 + 4;
+    jobs.charge(target_job, Resource::Pages, tables)
+        .map_err(crate::job_status)?;
+    let undo = |jobs: &mut Jobs| jobs.credit(target_job, Resource::Pages, tables);
+    let (map_vmo, map_page, child) = if snapshot {
+        if let Err(x) = vmos.reserve_n(2) {
+            undo(jobs);
+            return Err(x);
+        }
+        match vmos.child_prepare(
+            jobs,
+            vid,
+            region.vmo_page,
+            region.pages,
+            vmo_job,
+            ChildMode::Snapshot,
+        ) {
+            Ok(c) => (c, 0, Some(c)),
+            Err(x) => {
+                undo(jobs);
                 return Err(match x {
-                    kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
-                    _ => e(Status::InvalidArgs),
+                    VmoError::TooDeep => Status::BadState,
+                    VmoError::JobMismatch => Status::AccessDenied,
+                    VmoError::Gone => Status::BadHandle,
+                    VmoError::NotCopyable => Status::NotSupported,
+                    VmoError::Busy => Status::ShouldWait,
+                    VmoError::NoMemory => Status::NoMemory,
+                    _ => Status::InvalidArgs,
                 });
             }
-            // (a key that is already there is a mapping that was split and whose start has been mapped again: its charge stays, and this one adds)
-            let end = vaddr + length;
-            target.add_charge(vaddr, tables, end);
-            // a mapping that touches one of the same VMO with the same permissions becomes part of it (fewer regions)
-            target
-                .aspace
-                .held_mut()
-                .merge_near(mm, vmos, jobs, vaddr, vaddr + length);
-            Ok((anywhere.then_some(vaddr), None))
-        })(),
-        nr::VMO_CREATE_CHILD => (|| {
-            use kcore::aspace::{ChildMode, VmoError};
-            let (offset, bytes, job_handle, flags) = (a[1], a[2], a[3], a[4]);
-            let mode = match flags {
-                abi::child_flags::SNAPSHOT => ChildMode::Snapshot,
-                abi::child_flags::PRIVATE => ChildMode::Private,
-                _ => return bad(Status::InvalidArgs),
-            };
-            if !offset.is_multiple_of(4096) || !bytes.is_multiple_of(4096) || bytes == 0 {
-                return bad(Status::InvalidArgs);
-            }
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::READ).map_err(e)?;
-            let caller_job = caller.job;
-            let job = if job_handle == 0 {
-                caller_job
-            } else {
-                ipc::job_of(objs, &caller.handles, Handle(job_handle), Rights::MANAGE).map_err(e)?
-            };
-            if mode == ChildMode::Snapshot {
-                // the pages never change payer (COW2)
-                let vmo_job = vmos.job_of(id).ok_or(e(Status::BadHandle))?;
-                if vmo_job != job {
-                    return bad(Status::AccessDenied);
-                }
-                // V1: a process of another job maps the source on the promise that a write never fails on the VMO's job; a SNAPSHOT
-                // would make its next write a copy charged to that job
-                if vmos.maps_other_job(id, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job))
-                {
-                    return bad(Status::BadState);
-                }
-            }
-            // everything that can fail comes before the source changes: the handle's room, the quota, the bookkeeping
-            vmos.reserve_n(2).map_err(e)?;
-            let child = match vmos.child_prepare(jobs, id, offset / 4096, bytes / 4096, job, mode) {
-                Ok(c) => c,
-                Err(VmoError::Gone) => return bad(Status::BadHandle),
-                Err(VmoError::JobMismatch) => return bad(Status::AccessDenied),
-                Err(VmoError::TooDeep) => return bad(Status::BadState),
-                Err(VmoError::NotCopyable) => return bad(Status::NotSupported),
-                Err(VmoError::NoMemory) => return bad(Status::NoMemory),
-                Err(VmoError::Busy) => return bad(Status::ShouldWait),
-                Err(_) => return bad(Status::InvalidArgs),
-            };
-            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
-            let handle = match ipc::vmo_object_create_in(
-                objs,
-                &mut caller.handles,
-                child,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(caller_job),
-                },
-            ) {
-                Ok(h) => h,
-                Err(x) => {
-                    let _ = vmos.release(mm, jobs, child);
-                    return Err(e(x));
-                }
-            };
-            vmos.child_attach(jobs, child, id, offset / 4096, bytes / 4096, mode);
-            if mode == ChildMode::Snapshot {
-                snapshot_protect(procs, mm, &mut **machine, id);
-            }
-            Ok((Some(handle.0), None))
-        })(),
-        nr::PROCESS_CLONE_REGION => (|| {
-            use kcore::aspace::{ChildMode, VmoError};
-            let (vaddr, mode) = (a[2], a[3]);
-            if (mode != abi::clone_mode::SHARE && mode != abi::clone_mode::SNAPSHOT)
-                || !vaddr.is_multiple_of(4096)
-            {
-                return bad(Status::InvalidArgs);
-            }
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (_, spid, _, _) =
-                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
-            let (_, tpid, _, _) =
-                ipc::process_of(objs, &caller.handles, Handle(a[1]), Rights::MANAGE).map_err(e)?;
-            let caller_job = caller.job;
-            let source = procs.get(&spid).ok_or(e(Status::BadState))?;
-            let target = procs.get(&tpid).ok_or(e(Status::BadState))?;
-            if source.exit_code.is_some()
-                || source.killed.is_some()
-                || target.exit_code.is_some()
-                || target.killed.is_some()
-            {
-                return bad(Status::BadState);
-            }
-            let region = source
+        }
+    } else {
+        (vid, region.vmo_page, None)
+    };
+    let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
+    target
+        .aspace
+        .held_mut()
+        .set_region_limit(jobs.region_limit(target.job));
+    // (KT9: the room for the charge's records before the mapping; with none the call undoes what it did and says NO_MEMORY)
+    if let Err(x) = target.reserve_charge() {
+        if let Some(c) = child {
+            let _ = vmos.release(mm, jobs, c);
+        }
+        undo(jobs);
+        return Err(x);
+    }
+    if let Err(x) = target.aspace.held_mut().map_region_max(
+        vmos,
+        vaddr,
+        region.pages,
+        map_vmo,
+        map_page,
+        region.perms,
+        region.max_perms,
+    ) {
+        if let Some(c) = child {
+            let _ = vmos.release(mm, jobs, c);
+        }
+        undo(jobs);
+        return Err(match x {
+            kcore::aspace::RegionError::TooMany => Status::NoMemory,
+            _ => Status::InvalidArgs,
+        });
+    }
+    target.add_charge(vaddr, tables, end);
+    target
+        .aspace
+        .held_mut()
+        .merge_near(mm, vmos, jobs, vaddr, end);
+    if let Some(c) = child {
+        // the child is part of the family only now (nothing could fail since `child_prepare`); the region holds its own reference
+        vmos.child_attach(
+            jobs,
+            c,
+            vid,
+            region.vmo_page,
+            region.pages,
+            ChildMode::Snapshot,
+        );
+        let _ = vmos.release(mm, jobs, c);
+        snapshot_protect(procs, mm, &mut **machine, vid);
+    }
+    Ok((None, None))
+}
+
+/// `proc_call`'s `nr::PROCESS_MAP_INFO` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn process_map_info<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        mm,
+        vmos,
+        jobs,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let (vaddr, buf) = (a[1], a[2]);
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (_, tpid, _, _) = ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)?;
+    let target = procs.get(&tpid).ok_or(Status::BadState)?;
+    let bits = |p: Perms| u64::from(p.read) | u64::from(p.write) << 1 | u64::from(p.exec) << 2;
+    // the region at or after `vaddr`; none: a zeroed record and 0
+    let (record, next) = match target.aspace.held_ref().region_at_or_after(vaddr) {
+        Some(r) => {
+            let len = r.pages * 4096;
+            let next = target
                 .aspace
                 .held_ref()
-                .region_at_or_after(vaddr)
-                .filter(|r| r.start == vaddr)
-                .ok_or(e(Status::InvalidArgs))?;
-            let length = region.pages * 4096;
-            let end = vaddr.checked_add(length).ok_or(e(Status::InvalidArgs))?;
-            if target.aspace.held_ref().has_region_in(vaddr, end) {
-                return bad(Status::InvalidArgs);
-            }
-            // (the mapping below cannot fail for want of a region slot)
-            if target.aspace.held_ref().region_count() as u64
-                >= jobs
-                    .region_limit(target.job)
-                    .min(abi::limits::MAX_REGIONS as u64)
-            {
-                return bad(Status::NoMemory);
-            }
-            let target_job = target.job;
-            let vid = region.vmo;
-            let vmo_job = vmos.job_of(vid).ok_or(e(Status::BadHandle))?;
-            let snapshot = mode == abi::clone_mode::SNAPSHOT;
-            if snapshot {
-                // a fork child runs in its parent's job: the copy is charged to the source's job, which must be the target's
-                if vmo_job != target_job {
-                    return bad(Status::AccessDenied);
-                }
-                // (V1, as `vmo_create_child`)
-                if vmos.maps_other_job(vid, 0, u64::MAX, vmo_job, &|o| procs.get(&o).map(|p| p.job))
-                {
-                    return bad(Status::BadState);
-                }
-            } else if vmo_job != caller_job
-                && vmo_job != target_job
-                && !vmos.is_committed(vid, region.vmo_page, region.pages)
-            {
-                // (V1, as `process_map`: a stranger's VMO must already be paid for)
-                return bad(Status::BadState);
-            }
-            if vmo_job != target_job && vmos.is_busy(vid) {
-                return bad(Status::ShouldWait);
-            }
-            let tables = region.pages / 512 + 4;
-            jobs.charge(target_job, Resource::Pages, tables)
-                .map_err(|x| e(crate::job_status(x)))?;
-            let undo = |jobs: &mut Jobs| jobs.credit(target_job, Resource::Pages, tables);
-            let (map_vmo, map_page, child) = if snapshot {
-                if let Err(x) = vmos.reserve_n(2) {
-                    undo(jobs);
-                    return bad(x);
-                }
-                match vmos.child_prepare(
-                    jobs,
-                    vid,
-                    region.vmo_page,
-                    region.pages,
-                    vmo_job,
-                    ChildMode::Snapshot,
-                ) {
-                    Ok(c) => (c, 0, Some(c)),
-                    Err(x) => {
-                        undo(jobs);
-                        return bad(match x {
-                            VmoError::TooDeep => Status::BadState,
-                            VmoError::JobMismatch => Status::AccessDenied,
-                            VmoError::Gone => Status::BadHandle,
-                            VmoError::NotCopyable => Status::NotSupported,
-                            VmoError::Busy => Status::ShouldWait,
-                            VmoError::NoMemory => Status::NoMemory,
-                            _ => Status::InvalidArgs,
-                        });
-                    }
-                }
-            } else {
-                (vid, region.vmo_page, None)
-            };
-            let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
-            target
-                .aspace
-                .held_mut()
-                .set_region_limit(jobs.region_limit(target.job));
-            // (KT9: the room for the charge's records before the mapping; with none the call undoes what it did and says NO_MEMORY)
-            if let Err(x) = target.reserve_charge() {
-                if let Some(c) = child {
-                    let _ = vmos.release(mm, jobs, c);
-                }
-                undo(jobs);
-                return Err(e(x));
-            }
-            if let Err(x) = target.aspace.held_mut().map_region_max(
-                vmos,
-                vaddr,
-                region.pages,
-                map_vmo,
-                map_page,
-                region.perms,
-                region.max_perms,
-            ) {
-                if let Some(c) = child {
-                    let _ = vmos.release(mm, jobs, c);
-                }
-                undo(jobs);
-                return Err(match x {
-                    kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
-                    _ => e(Status::InvalidArgs),
-                });
-            }
-            target.add_charge(vaddr, tables, end);
-            target
-                .aspace
-                .held_mut()
-                .merge_near(mm, vmos, jobs, vaddr, end);
-            if let Some(c) = child {
-                // the child is part of the family only now (nothing could fail since `child_prepare`); the region holds its own reference
-                vmos.child_attach(
-                    jobs,
-                    c,
-                    vid,
-                    region.vmo_page,
-                    region.pages,
-                    ChildMode::Snapshot,
-                );
-                let _ = vmos.release(mm, jobs, c);
-                snapshot_protect(procs, mm, &mut **machine, vid);
-            }
-            Ok((None, None))
-        })(),
-        nr::PROCESS_MAP_INFO => (|| {
-            let (vaddr, buf) = (a[1], a[2]);
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (_, tpid, _, _) =
-                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT).map_err(e)?;
-            let target = procs.get(&tpid).ok_or(e(Status::BadState))?;
-            let bits =
-                |p: Perms| u64::from(p.read) | u64::from(p.write) << 1 | u64::from(p.exec) << 2;
-            // the region at or after `vaddr`; none: a zeroed record and 0
-            let (record, next) = match target.aspace.held_ref().region_at_or_after(vaddr) {
-                Some(r) => {
-                    let len = r.pages * 4096;
-                    let next = target
-                        .aspace
-                        .held_ref()
-                        .region_at_or_after(r.start + len)
-                        .map_or(0, |n| n.start);
-                    (
-                        [
-                            r.start,
-                            len,
-                            bits(r.perms),
-                            bits(r.max_perms),
-                            r.vmo,
-                            r.vmo_page * 4096,
-                        ],
-                        next,
-                    )
-                }
-                None => ([0; 6], 0),
-            };
-            // (no allocation: `concat` would make a vector, which cannot fail here (T177))
-            let mut bytes = [0u8; 48];
-            for (out, w) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(record.iter()) {
-                *out = w.to_le_bytes();
-            }
-            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
-            kcore::usercopy::copy_to_user(caller.aspace.held_mut(), mm, vmos, jobs, buf, &bytes)
-                .map_err(|_| e(Status::InvalidArgs))?;
-            Ok((Some(next), None))
-        })(),
-        // `process_info(process, which)`: 0 the exit code of an ended process (BAD_STATE while it runs), 1 the CPU nanoseconds its threads have
-        // run, ended and live (needs INSPECT, works while it runs; AB6)
-        nr::PROCESS_INFO if a[1] == 1 => (|| {
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (pid, terminated, ended) =
-                ipc::process_cpu_info(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)
-                    .map_err(e)?;
-            let live = if terminated {
-                0
-            } else {
-                procs.get(&pid).map_or(0, |p| {
-                    p.live_tids
-                        .iter()
-                        .fold(0u64, |s, &t| s.saturating_add(machine.thread_cpu_ns(t)))
-                })
-            };
-            Ok((Some(ended.saturating_add(live)), None))
-        })(),
-        nr::PROCESS_INFO if a[1] != 0 => fail(Status::InvalidArgs),
-        nr::PROCESS_INFO => (|| {
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (_, _, terminated, code) =
-                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT).map_err(e)?;
-            if !terminated {
-                return bad(Status::BadState);
-            }
-            Ok((Some(code as i64 as u64), None))
-        })(),
-        // `thread_info(thread, which)`: 0 the exit code of an ended thread, 1 its CPU nanoseconds (works while it runs; AB6)
-        // (handle 0 names the calling thread, as in `thread_set_sched`: it needs no right)
-        nr::THREAD_INFO if a[1] == 1 && a[0] == 0 => {
-            Ok((Some(machine.current_thread_cpu_ns()), None))
+                .region_at_or_after(r.start + len)
+                .map_or(0, |n| n.start);
+            (
+                [
+                    r.start,
+                    len,
+                    bits(r.perms),
+                    bits(r.max_perms),
+                    r.vmo,
+                    r.vmo_page * 4096,
+                ],
+                next,
+            )
         }
-        nr::THREAD_INFO if a[1] == 1 => (|| {
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (obj, pid, terminated, final_ns) =
-                ipc::thread_cpu_info(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)
-                    .map_err(e)?;
-            if terminated {
-                return Ok((Some(final_ns), None));
-            }
-            let tid = match objs.get(obj) {
-                Some(ipc::KObj::Thread(t)) => t.tid,
-                _ => None,
-            }
-            .filter(|t| procs.get(&pid).is_some_and(|p| p.live_tids.contains(t)));
-            Ok((Some(tid.map_or(0, |t| machine.thread_cpu_ns(t))), None))
-        })(),
-        nr::THREAD_INFO if a[1] != 0 => fail(Status::InvalidArgs),
-        nr::THREAD_INFO => (|| {
-            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (terminated, code) =
-                ipc::thread_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT).map_err(e)?;
-            if !terminated {
-                return bad(Status::BadState);
-            }
-            Ok((Some(code as i64 as u64), None))
-        })(),
-        nr::RESOURCE_ROOT => (|| {
-            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
-            if !caller.privileged {
-                return bad(Status::AccessDenied);
-            }
-            let job = caller.job;
-            match ipc::resource_object_create_in(
-                objs,
-                &mut caller.handles,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            ) {
-                Ok(h) => Ok((Some(h.0), None)),
-                Err(x) => Err(e(x)),
-            }
-        })(),
-        nr::DEBUG_ROOT => (|| {
-            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
-            if !caller.privileged {
-                return bad(Status::AccessDenied);
-            }
-            let job = caller.job;
-            match ipc::debug_object_create_in(
-                objs,
-                &mut caller.handles,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            ) {
-                Ok(h) => Ok((Some(h.0), None)),
-                Err(x) => Err(e(x)),
-            }
-        })(),
-        nr::JOB_ROOT => (|| {
-            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
-            if !caller.privileged {
-                return bad(Status::AccessDenied);
-            }
-            let job = caller.job;
-            jobs.retain(JobId::ROOT);
-            match ipc::job_object_create(
-                objs,
-                &mut caller.handles,
-                JobId::ROOT,
-                Rights::JOB,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            ) {
-                Ok(h) => Ok((Some(h.0), None)),
-                Err(x) => {
-                    jobs.release(JobId::ROOT);
-                    Err(e(x))
-                }
-            }
-        })(),
-        nr::PROCESS_SELF => (|| {
-            let p = procs.get_mut(&me).ok_or(e(Status::BadState))?;
-            let rights =
-                Rights(Rights::MANAGE.0 | Rights::INSPECT.0 | Rights::WAIT.0 | Rights::DUPLICATE.0);
-            if p.handles.room() < 1 || p.handles.reserve(1).is_err() {
-                return bad(Status::NoMemory);
-            }
-            // A process its parent created has a kill-on-close object (the parent's handle to it); the child's own view must not be
-            // another reference to *that* object, or the parent closing its handle would never destroy it and the child would not
-            // be killed (review 2026-11-14). Such a child gets a separate view object; the view is only ever held by the child.
-            let own = p.obj.filter(|&o| objs.is_alive(o));
-            let kill_on_close = matches!(own.and_then(|o| objs.get(o)), Some(ipc::KObj::Process(po)) if po.kill_on_close);
-            match own.filter(|_| !kill_on_close) {
-                Some(obj) => {
-                    // another view of the same process object
-                    objs.retain(obj);
-                    let h = p
-                        .handles
-                        .insert(objs, obj, rights)
-                        .expect("room was checked");
-                    Ok((Some(h.0), None))
-                }
-                None => {
-                    let job = p.job;
-                    let (h, obj) = ipc::process_object_create_in(
-                        objs,
-                        &mut p.handles,
-                        me,
-                        false,
-                        &mut ipc::Quota {
-                            jobs,
-                            job: Some(job),
-                        },
-                    )
-                    .map_err(e)?;
-                    // narrow the default rights: a self handle cannot be sent away (a table whose last free slot is on its last
-                    // generation refuses the replace: give the new object back)
-                    let Ok(h) = p.handles.replace(objs, h, rights) else {
-                        let _ = p.handles.close(objs, h);
-                        return bad(Status::NoMemory);
-                    };
-                    if own.is_none() {
-                        p.obj = Some(obj);
-                    }
-                    Ok((Some(h.0), None))
-                }
-            }
-        })(),
-        _ => return None,
+        None => ([0; 6], 0),
     };
-    cow_sync(procs, mm, vmos, &mut **machine);
-    Some(r)
+    // (no allocation: `concat` would make a vector, which cannot fail here (T177))
+    let mut bytes = [0u8; 48];
+    for (out, w) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(record.iter()) {
+        *out = w.to_le_bytes();
+    }
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    kcore::usercopy::copy_to_user(caller.aspace.held_mut(), mm, vmos, jobs, buf, &bytes)
+        .map_err(|_| Status::InvalidArgs)?;
+    Ok((Some(next), None))
+}
+
+/// `proc_call`'s `nr::PROCESS_INFO if a[1] == 1` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn process_cpu<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        machine,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (pid, terminated, ended) =
+        ipc::process_cpu_info(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)?;
+    let live = if terminated {
+        0
+    } else {
+        procs.get(&pid).map_or(0, |p| {
+            p.live_tids
+                .iter()
+                .fold(0u64, |s, &t| s.saturating_add(machine.thread_cpu_ns(t)))
+        })
+    };
+    Ok((Some(ended.saturating_add(live)), None))
+}
+
+/// `proc_call`'s `nr::PROCESS_INFO` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn process_info<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs, procs, me, ..
+    } = c;
+    let me = *me;
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (_, _, terminated, code) =
+        ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)?;
+    if !terminated {
+        return Err(Status::BadState);
+    }
+    Ok((Some(code as i64 as u64), None))
+}
+
+/// `proc_call`'s `nr::THREAD_INFO if a[1] == 1` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn thread_cpu<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        machine,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (obj, pid, terminated, final_ns) =
+        ipc::thread_cpu_info(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)?;
+    if terminated {
+        return Ok((Some(final_ns), None));
+    }
+    let tid = match objs.get(obj) {
+        Some(ipc::KObj::Thread(t)) => t.tid,
+        _ => None,
+    }
+    .filter(|t| procs.get(&pid).is_some_and(|p| p.live_tids.contains(t)));
+    Ok((Some(tid.map_or(0, |t| machine.thread_cpu_ns(t))), None))
+}
+
+/// `proc_call`'s `nr::THREAD_INFO` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn thread_info<M: PhysMem, X: Machine>(
+    a: &[u64; 6],
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs, procs, me, ..
+    } = c;
+    let me = *me;
+    let caller = procs.get(&me).ok_or(Status::BadState)?;
+    let (terminated, code) = ipc::thread_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)?;
+    if !terminated {
+        return Err(Status::BadState);
+    }
+    Ok((Some(code as i64 as u64), None))
+}
+
+/// `proc_call`'s `nr::RESOURCE_ROOT` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn resource_root<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        jobs,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    if !caller.privileged {
+        return Err(Status::AccessDenied);
+    }
+    let job = caller.job;
+    match ipc::resource_object_create_in(
+        objs,
+        &mut caller.handles,
+        &mut ipc::Quota {
+            jobs,
+            job: Some(job),
+        },
+    ) {
+        Ok(h) => Ok((Some(h.0), None)),
+        Err(x) => Err(x),
+    }
+}
+
+/// `proc_call`'s `nr::DEBUG_ROOT` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn debug_root<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        jobs,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    if !caller.privileged {
+        return Err(Status::AccessDenied);
+    }
+    let job = caller.job;
+    match ipc::debug_object_create_in(
+        objs,
+        &mut caller.handles,
+        &mut ipc::Quota {
+            jobs,
+            job: Some(job),
+        },
+    ) {
+        Ok(h) => Ok((Some(h.0), None)),
+        Err(x) => Err(x),
+    }
+}
+
+/// `proc_call`'s `nr::JOB_ROOT` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn job_root<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        jobs,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    if !caller.privileged {
+        return Err(Status::AccessDenied);
+    }
+    let job = caller.job;
+    jobs.retain(JobId::ROOT);
+    match ipc::job_object_create(
+        objs,
+        &mut caller.handles,
+        JobId::ROOT,
+        Rights::JOB,
+        &mut ipc::Quota {
+            jobs,
+            job: Some(job),
+        },
+    ) {
+        Ok(h) => Ok((Some(h.0), None)),
+        Err(x) => {
+            jobs.release(JobId::ROOT);
+            Err(x)
+        }
+    }
+}
+
+/// `proc_call`'s `nr::PROCESS_SELF` (a frame of its own: KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
+#[inline(never)]
+fn process_self<M: PhysMem, X: Machine>(
+    c: &mut PCtx<'_, M, X>,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    let PCtx {
+        objs,
+        procs,
+        jobs,
+        me,
+        ..
+    } = c;
+    let me = *me;
+    let p = procs.get_mut(&me).ok_or(Status::BadState)?;
+    let rights =
+        Rights(Rights::MANAGE.0 | Rights::INSPECT.0 | Rights::WAIT.0 | Rights::DUPLICATE.0);
+    if p.handles.room() < 1 || p.handles.reserve(1).is_err() {
+        return Err(Status::NoMemory);
+    }
+    // A process its parent created has a kill-on-close object (the parent's handle to it); the child's own view must not be
+    // another reference to *that* object, or the parent closing its handle would never destroy it and the child would not
+    // be killed (review 2026-11-14). Such a child gets a separate view object; the view is only ever held by the child.
+    let own = p.obj.filter(|&o| objs.is_alive(o));
+    let kill_on_close =
+        matches!(own.and_then(|o| objs.get(o)), Some(ipc::KObj::Process(po)) if po.kill_on_close);
+    match own.filter(|_| !kill_on_close) {
+        Some(obj) => {
+            // another view of the same process object
+            objs.retain(obj);
+            let h = p
+                .handles
+                .insert(objs, obj, rights)
+                .expect("room was checked");
+            Ok((Some(h.0), None))
+        }
+        None => {
+            let job = p.job;
+            let (h, obj) = ipc::process_object_create_in(
+                objs,
+                &mut p.handles,
+                me,
+                false,
+                &mut ipc::Quota {
+                    jobs,
+                    job: Some(job),
+                },
+            )?;
+            // narrow the default rights: a self handle cannot be sent away (a table whose last free slot is on its last
+            // generation refuses the replace: give the new object back)
+            let Ok(h) = p.handles.replace(objs, h, rights) else {
+                let _ = p.handles.close(objs, h);
+                return Err(Status::NoMemory);
+            };
+            if own.is_none() {
+                p.obj = Some(obj);
+            }
+            Ok((Some(h.0), None))
+        }
+    }
 }

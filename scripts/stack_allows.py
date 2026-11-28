@@ -50,6 +50,8 @@ BOOT = {
     ("ksys/src/state.rs", "with_irq_slots"),
     ("ksys/src/state.rs", "new"),
     ("ksys/src/state.rs", "default"),
+    # a process record put in the table by the boot loader (`kernel::user::loader::start_locked`) and by the host tests
+    ("ksys/src/proc.rs", "put_process"),
     # kcore: the device tree, the ELF images and the IOMMU tables are read by boot code only; the audits are the tests' invariant checks
     ("kcore/src/aiatree.rs", "discover"),
     ("kcore/src/iommutree.rs", "pci_memory_windows"),
