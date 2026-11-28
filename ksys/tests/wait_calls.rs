@@ -699,10 +699,66 @@ fn a_big_call_takes_its_request_staged_and_leaves_its_reply_to_copy_out() {
     );
     assert_eq!(r, Ok((Some(2048), Some(0))));
     let d = deferred.expect("a big reply is left for the caller");
-    assert_eq!((d.bytes_at, d.data), (MEM + 0x1000, reply));
+    assert_eq!((d.bytes_at, &d.data), (MEM + 0x1000, &reply));
     assert_eq!(
         w.peek(MEM + 0x1000, 4),
         vec![0; 4],
         "nothing was copied in the call"
     );
+    // (OD161) nothing was taken either: the reply is queued until the caller has copied it out and committed
+    let still = |w: &W| {
+        let p = w.us.procs.get(&1).unwrap();
+        ipc::channel_peek(
+            &w.us.objs,
+            &p.handles,
+            abi::Handle(client),
+            Some(7),
+            4096,
+            4,
+        )
+    };
+    assert_eq!(still(&w), Ok((2048, 0)));
+    {
+        let ksys::UserState { objs, procs, .. } = &mut w.us;
+        let p = procs.get_mut(&1).unwrap();
+        ksys::deferred_copy(
+            p.aspace.held_mut(),
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            &d,
+            0,
+            d.data.len(),
+        )
+        .unwrap();
+        assert_eq!(still_queued(objs, &p.handles, client), Ok((2048, 0)));
+        let p = &mut **p;
+        let done = ksys::deferred_commit(
+            objs,
+            &mut p.handles,
+            p.aspace.held_mut(),
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            &d,
+        );
+        assert!(matches!(
+            done,
+            ksys::Committed::Done(Ok((Some(2048), Some(0))))
+        ));
+    }
+    assert_eq!(w.peek(MEM + 0x1000, 2048), reply);
+    assert_eq!(
+        still(&w),
+        Err(ipc::ReadError::Status(Status::ShouldWait)),
+        "the commit took it"
+    );
+}
+
+fn still_queued(
+    objs: &ipc::Kobjs,
+    handles: &kcore::handle::HandleTable,
+    client: u64,
+) -> Result<(usize, usize), ipc::ReadError> {
+    ipc::channel_peek(objs, handles, abi::Handle(client), Some(7), 4096, 4)
 }

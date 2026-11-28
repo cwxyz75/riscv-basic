@@ -95,7 +95,7 @@ fn state() -> &'static mut FpState {
         crate::bkl::held(),
         "FP state touched without the big kernel lock"
     );
-    // SAFETY: the object lock is held (every caller does; it is checked in debug builds only), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
+    // SAFETY: the object lock is held (every caller does; the `debug_assert!` above checks it in the debug and the release-checked builds, KT12, T285), so no other hart has the tables; no caller keeps the reference across a context switch, and a function
     // that holds one passes it down (`drop_claim` takes `s`) instead of calling `state()` again, so no two live `&mut` alias on this hart (T239).
     unsafe {
         let cell = &mut *STATE.0.get();

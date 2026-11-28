@@ -171,6 +171,36 @@ fn scenarios() -> Vec<Scenario> {
             },
         },
         Scenario {
+            // (OD161, T285) a big read as the kernel makes it: claimed, copied out to a lazily backed destination, committed; a failure at any
+            // step is NO_MEMORY with the message still queued (the same read, made again with memory, succeeds)
+            name: "channel_read_big_deferred",
+            run: |w, go| {
+                let (x, y) = w.pair(nr::CHANNEL_CREATE);
+                let e = w.ok(nr::EVENT_CREATE, [0; 6]).0.unwrap();
+                let m: Vec<u8> = (0..6000u32).map(|i| i as u8).collect();
+                w.poke(BASE, &m);
+                w.poke(BASE + 0xF000, &e.to_le_bytes());
+                w.ok(nr::CHANNEL_WRITE, [x, BASE, 6000, BASE + 0xF000, 1, 0]);
+                w.defer_reads = true;
+                vec![go(
+                    w,
+                    nr::CHANNEL_READ,
+                    [y, BASE + 0x3800, 65536, BASE + 0xE000, 4, 0],
+                )]
+            },
+        },
+        Scenario {
+            name: "socket_read_big_deferred",
+            run: |w, go| {
+                let (x, y) = w.pair(nr::SOCKET_CREATE);
+                let m: Vec<u8> = (0..6000u32).map(|i| i as u8).collect();
+                w.poke(BASE, &m);
+                w.ok(nr::SOCKET_WRITE, [x, BASE, 6000, 0, 0, 0]);
+                w.defer_reads = true;
+                vec![go(w, nr::SOCKET_READ, [y, BASE + 0x3800, 6000, 0, 0, 0])]
+            },
+        },
+        Scenario {
             name: "socket_write_and_read",
             run: |w, go| {
                 let (x, y) = w.pair(nr::SOCKET_CREATE);

@@ -271,6 +271,26 @@ backed page through the fault path if it is not yet mapped, (3) requires the pag
 user-accessible and to allow the access (read for a source, write for a destination),
 and copies through the direct map. Anything else is `INVALID_ARGS`; a zero length never
 touches memory, whatever the pointer. A call that fails on a pointer changes nothing.
+
+What a copy reports when the walk cannot make a page available (OD161; `kcore::usercopy::fault_status`, checked against this table by
+`kcore/tests/usercopy_status.rs`). A bad address reports the status the caller would have met touching the memory itself; NO_MEMORY is only
+real exhaustion; SHOULD_WAIT only a page a pager owes (see `pager_create_vmo`):
+
+| What the walk found | Status |
+|---|---|
+| `NoRegion`: no region at the address | INVALID_ARGS |
+| `Denied`: the region does not allow the access | INVALID_ARGS |
+| `VmoGone`: the region's VMO was destroyed and the page never mapped | INVALID_ARGS |
+| `MapFailed`: the page table refused the mapping for a reason other than memory | INVALID_ARGS |
+| `NoMemory`: no frame for a commit or a copy-on-write copy, or for a page-table frame | NO_MEMORY |
+| `NeedPager`: a page of a pager's VMO that nobody has supplied | SHOULD_WAIT |
+
+**Reads take nothing until the copy has succeeded** (OD161: peek, copy, commit). `channel_read`, `channel_read_txid`, `socket_read` and the
+reply of `channel_call` find what they would deliver, check the destinations against it, copy it out, and only then remove it from the
+queue (a message's handles are put in the caller's table and their numbers written as part of that last step, and taken out of the table
+again if the write fails). A copy that fails for any reason (a bad pointer, a sibling thread that unmapped or decommitted the buffer during
+the call, no memory, a page a pager owes) reports its status and leaves the message, or the bytes, queued, in place, for the next read. The
+destination's contents after a failed read are unspecified (the copy may have written part of it).
 `debug_write` is limited to 4096 bytes per call (TOO_BIG beyond). It is a debugging aid for
 the trusted boot-time suite: nothing ties a `##TEST` line to the program that wrote it.
 
@@ -436,8 +456,9 @@ not taken back, and its handles have gone): PEER_CLOSED (the peer closed before 
 TIMED_OUT (the deadline passed first; the reply may still arrive and can be read with
 `channel_read_txid`), BUFFER_TOO_SMALL (the reply is too big for the capacity; it stays queued
 and the sizes come back in `nbytes`, `nhandles`), INVALID_ARGS (the reply buffer or reply handles
-buffer is not writable; the reply stays queued), NO_MEMORY (the reply carries handles and the
-table has no room; it stays queued).
+buffer is not writable, or stops being writable during the copy; the reply stays queued), NO_MEMORY (the reply carries handles and the
+table has no room, or there is no memory to commit a page of the reply buffers; it stays queued). The reply is removed only after it has
+been copied (OD161).
 The kernel does not donate priority to the server yet (OS-ARCHITECTURE 5.3): the call is
 where that attaches.
 Tests: `channel_call_*` in `init`.
@@ -1014,7 +1035,10 @@ A write that is not refused writes at least one byte.
 Remove up to `max` bytes from the own buffer into `buffer`. Rights: READ. `max` at most
 `SOCKET_BUFFER`. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG; then, if
 `max` > 0 and the buffer is empty: PEER_CLOSED (the peer is gone: end of stream) or
-SHOULD_WAIT; INVALID_ARGS (the destination is not writable user memory; nothing is removed).
+SHOULD_WAIT; INVALID_ARGS (the destination is not writable user memory; nothing is removed); NO_MEMORY (no memory to
+commit a page of the destination; nothing is removed); SHOULD_WAIT (a page of the destination in a pager's VMO, see `pager_create_vmo`).
+The bytes are removed only after they have been copied (OD161, "Copying from and to user memory"): a failed copy, at any point, leaves
+every byte queued, and a stream is never reordered.
 `max` 0 is OK with `read` 0.
 
 ### socket_shutdown(socket) -> status
@@ -1161,8 +1185,8 @@ Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; SHOULD_WAIT (queue empty and the 
 open); PEER_CLOSED (queue empty and the peer is gone: messages queued before the peer
 closed are still delivered first); BUFFER_TOO_SMALL (the front message does not fit
 `max_bytes` or `max_handles`; **the message stays queued** and the actual sizes are
-returned); NO_MEMORY (the caller's table lacks room for the message's handles; the
-message stays queued).
+returned); NO_MEMORY (the caller's table lacks room for the message's handles, or the kernel has no memory for its copy of a
+message of 1 KiB or more, or to commit a page of the destination; the message stays queued).
 Invariants: H4. Tests: `channel_basics`, `channel_errors`, `channel_model`.
 
 The user's destination pointers are checked against the **message actually delivered**, not
@@ -1170,11 +1194,16 @@ against the declared capacity: a 5-byte message needs 5 writable bytes however l
 `max_bytes` is (a capacity over the limits counts as the limit). They are checked *after*
 the status above is known (so BUFFER_TOO_SMALL and SHOULD_WAIT win over a bad pointer) and
 *before* the message is dequeued, so a bad pointer is INVALID_ARGS and never loses a message.
+The message is dequeued only after its bytes and handle numbers have been copied (OD161): a copy that fails later (a sibling thread that
+unmaps or decommits the destination during the call: INVALID_ARGS; no memory to commit it again: NO_MEMORY) leaves the message queued, first,
+with its handles.
 
 A message of 1 KiB or more is copied in (`channel_write`, `socket_write`) before the object lock is taken and out (`channel_read`, `socket_read`) after it is let go (T215). The
-errors and their order are those of a small message; one case differs: a thread of the same process that unmaps or decommits the destination
-between the check and the copy makes the copy fail, and the message, already taken, is lost with the error. A program that does that to its own
-buffer during the call has no use for the message.
+errors and their order are those of a small message. The read claims the message under the object lock, copies it out with the lock let go,
+and takes the lock again to commit: it removes exactly the message (or the bytes) it copied. If another reader of the same endpoint took it
+in between, the read starts again inside the kernel and delivers the next message (or the status an empty queue gives), so every message and
+every byte is delivered once, in order. A process killed during the copy takes nothing; the message stays for another holder of the
+endpoint. Tests: `ksys/tests/read_commit.rs`, the `*_big_deferred` scenarios of `ksys/tests/allocfail.rs`.
 
 ### channel_read_txid(channel, txid, max_bytes, max_handles) -> status, bytes, handles
 
@@ -1270,8 +1299,8 @@ kernel lock; the others run with interrupts on, take the locks named for short s
 them. A call is atomic with respect to other threads only where its entry says so."
 
 **Copying** (will be added): "A copy of more than 16 KiB is done in sections. If another thread of the same process unmaps the
-destination buffer of a read while the read is copying, the read fails with INVALID_ARGS and the message or bytes it
-had taken are lost: that race is the program's."
+destination buffer of a read while the read is copying, the read fails with INVALID_ARGS and the message or bytes stay queued (OD161: a read
+takes nothing until its copy has succeeded)."
 
 ### thread_spawn(process, args) -> status, handle, tid
 

@@ -305,66 +305,84 @@ pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
     Some(ksys::Staged { data, handles })
 }
 
-/// The copy-out of a big `channel_read` or `socket_read`, after the object lock was let go (T215): the destinations were checked against the message
-/// under it, before the message was taken. A sibling thread that unmaps or decommits the buffer in between makes this copy fail, and the message,
-/// already taken, is lost with the error: the program that does that has no use for the message (SYSCALLS.md).
+/// The rest of a big `channel_read`, `socket_read` or `channel_call` reply, after the object lock was let go (T215, OD161: peek, copy,
+/// commit). The call claimed the message (or the bytes) and checked the destinations against it, and nothing has been taken: the copy runs
+/// here under the caller's address-space lock and the memory locks only, a piece at a time, and then the object lock is taken again to take
+/// exactly what was copied. A copy that fails (a sibling that unmapped or decommitted the buffer in between, no memory for a commit or a
+/// copy-on-write, a page a pager owes) takes nothing and reports its status: the message stays queued. `None`: another read took what was
+/// claimed between the claim and the commit, and the caller makes the read again from the start.
 #[inline(never)]
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: at < d.data.len() in the loop, n <= len - at, so at + n <= len
-pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
-    let Some(d) = deferred else {
-        return result;
-    };
+pub(super) fn finish_read(d: &ksys::Deferred) -> Option<Reply> {
+    if let Err(e) = copy_deferred(d) {
+        return Some(Err((e, None, None)));
+    }
+    match locked_state(|s| commit_deferred(s, d)) {
+        ksys::Committed::Done(r) => Some(r),
+        ksys::Committed::Moved => None,
+    }
+}
+
+/// The copy of `finish_read`, in `COPY_CHUNK` pieces with an interrupts window between them (T206). The pager-need slot is put back as it was,
+/// except after a copy that stopped for a page a pager owes: then the need stays for `pager_after_call` (or `channel_call`) to wait on.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: at < d.data.len() in the loop, n <= len - at, so at + n <= len
+fn copy_deferred(d: &ksys::Deferred) -> Result<(), Status> {
     let Some(cell) = current_space() else {
-        return Err((Status::BadState, None, None));
+        return Err(Status::BadState);
     };
-    let mut done: Result<(), Status> = Ok(());
     let mut at = 0usize;
-    while at < d.data.len() && done.is_ok() {
+    while at < d.data.len() {
         let n = COPY_CHUNK.min(d.data.len() - at);
         {
             let _as = cell.lock();
             let k = kmem::mem();
             let saved = k.vmos.swap_need(None);
-            done = kcore::usercopy::copy_to_user(
-                cell.held_mut(),
-                k.mm,
-                k.vmos,
-                k.jobs,
-                d.bytes_at.saturating_add(at as u64),
-                &d.data[at..at + n],
-            );
-            let _ = k.vmos.swap_need(saved);
+            let done = ksys::deferred_copy(cell.held_mut(), k.mm, k.vmos, k.jobs, d, at, n);
+            if done != Err(Status::ShouldWait) {
+                let _ = k.vmos.swap_need(saved);
+            }
+            done?;
         }
         at += n;
         if at < d.data.len() {
             crate::irq::window();
         }
     }
-    if done.is_ok() && !d.handles.is_empty() {
-        let _as = cell.lock();
-        let k = kmem::mem();
-        let saved = k.vmos.swap_need(None);
-        for (i, h) in d.handles.iter().enumerate() {
-            if done.is_err() {
-                break;
-            }
-            done = kcore::usercopy::copy_to_user(
-                cell.held_mut(),
-                k.mm,
-                k.vmos,
-                k.jobs,
-                d.handles_at.saturating_add((i as u64).saturating_mul(8)),
-                &h.0.to_le_bytes(),
-            );
-        }
-        let _ = k.vmos.swap_need(saved);
+    Ok(())
+}
+
+/// The commit of `finish_read`, under the object lock with the caller's address space and the memory locks (the order of `dispatch`). A
+/// process that was killed while its thread copied takes nothing: the message stays for another reader of the endpoint (the thread never
+/// returns to see it).
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, as `dispatch`
+fn commit_deferred(s: &mut UserState, d: &ksys::Deferred) -> ksys::Committed {
+    let Ok(pid) = caller_pid(s) else {
+        return ksys::Committed::Done(fail(Status::BadState));
+    };
+    let UserState { objs, procs, .. } = s;
+    let Some(p) = procs.get_mut(&pid) else {
+        return ksys::Committed::Done(fail(Status::BadState));
+    };
+    if p.killed.is_some() {
+        return ksys::Committed::Done(fail(Status::BadState));
     }
-    match done {
-        Ok(()) => result,
-        Err(e) => Err((e, None, None)),
-    }
+    let as_cell = p.aspace.clone();
+    let _as = klock::aslock::AsCell::hold(&as_cell);
+    let k = kmem::get();
+    ksys::deferred_commit(
+        objs,
+        &mut p.handles,
+        as_cell.held_mut(),
+        k.mm,
+        k.vmos,
+        k.jobs,
+        d,
+    )
 }
 
 /// `vmo_read` and `vmo_write` (T215): the handle under the object lock, the copy under the caller's address-space lock and the memory locks only, so the
@@ -1223,14 +1241,22 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         _ => {
             // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
             sweep_before_create(n);
-            let staged = stage_in(n, a);
-            let mut deferred = None;
-            let result = irq::without(|| dispatch(n, a, staged, &mut deferred));
-            if deferred.is_some() {
-                // (KT7, T266: under `chaos`, a delay and a yield here switch the reader out with its message taken; nothing without the feature)
+            let mut staged = stage_in(n, a);
+            let result = loop {
+                let mut deferred = None;
+                let result = irq::without(|| dispatch(n, a, staged.take(), &mut deferred));
+                let Some(d) = deferred else {
+                    break result;
+                };
+                // (KT7, T266: under `chaos`, a delay and a yield here switch the reader out between its claim and its copy; nothing without the
+                // feature)
                 crate::chaos::point(crate::chaos::Point::CopyOut);
-            }
-            let result = finish_out(result, deferred);
+                // (OD161) the copy, then the commit; `None`: another read took what this one claimed, so it reads again (the next message, or
+                // the status an empty queue gives)
+                if let Some(r) = finish_read(&d) {
+                    break r;
+                }
+            };
             if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
                 // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
                 lend_to_reader();

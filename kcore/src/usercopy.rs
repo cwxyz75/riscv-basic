@@ -31,13 +31,7 @@ fn resolve<M: PhysMem>(
     if t.is_none() || cow {
         aspace
             .handle_fault(mm, vmos, jobs, page, access)
-            .map_err(|e| match e {
-                // (MM9) the page is not supplied yet: the kernel asks the pager, waits, and the call answers "try again"
-                FaultError::NeedPager(_) => Status::ShouldWait,
-                // (a commit or copy that found no memory is not the caller's bad address: T233)
-                FaultError::NoMemory => Status::NoMemory,
-                _ => Status::InvalidArgs,
-            })?;
+            .map_err(|e| fault_status(&e))?;
         t = aspace.table().translate(mm, page);
     }
     let t = t.ok_or(Status::InvalidArgs)?;
@@ -53,6 +47,27 @@ fn resolve<M: PhysMem>(
         return Err(Status::InvalidArgs);
     }
     Ok((t.pfn << 12) | (va & (PAGE_SIZE - 1)))
+}
+
+/// The status a user copy reports for a fault the walk could not resolve (OD161; SYSCALLS.md, "Copying from and to user memory", whose
+/// table `kcore/tests/usercopy_status.rs` checks this against). A bad address is the status the caller would have met touching the memory
+/// itself (its own access would fault): INVALID_ARGS. NO_MEMORY is only real exhaustion, SHOULD_WAIT only a page a pager owes. Every arm is
+/// named: a new kind of fault must be given its status here, deliberately.
+pub fn fault_status(e: &FaultError) -> Status {
+    match e {
+        // no region at the address: the caller's own access would fault
+        FaultError::NoRegion => Status::InvalidArgs,
+        // the region does not allow the access (a write to a read-only mapping, say): the caller's own access would fault
+        FaultError::Denied => Status::InvalidArgs,
+        // the region's VMO was destroyed and the page never mapped: the caller's own access would fault (a fault with no page to give)
+        FaultError::VmoGone => Status::InvalidArgs,
+        // the page table refused the mapping for a reason other than memory: the address cannot be mapped, as for the caller's own access
+        FaultError::MapFailed(_) => Status::InvalidArgs,
+        // (T233) a commit or copy that found no memory is real exhaustion, not the caller's bad address
+        FaultError::NoMemory => Status::NoMemory,
+        // (MM9) the page is not supplied yet: the kernel asks the pager, waits, and the call answers "try again"
+        FaultError::NeedPager(_) => Status::ShouldWait,
+    }
 }
 
 fn check_range(va: u64, len: usize) -> Result<(), Status> {

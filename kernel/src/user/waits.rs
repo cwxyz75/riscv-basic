@@ -546,8 +546,7 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
 pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     // (T215: a big request is copied in before the object lock, a big reply is copied out after it)
     let staged = super::trap::stage_call_in(a);
-    let mut deferred = None;
-    let r = channel_call_inner(a, staged, &mut deferred);
+    let r = channel_call_inner(a, staged);
     // the call is over, whichever way: the priority it lent to the server that read its request goes back, and the record of its wait goes (L22)
     let me = thread::current();
     thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
@@ -558,19 +557,12 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
         }
         thread::pi_revoke(me);
     });
-    if deferred.is_some() {
-        crate::chaos::point(crate::chaos::Point::CopyOut); // (as in `trap.rs`: the reply is taken, the copy-out not yet made)
-    }
-    super::trap::finish_out(r, deferred)
+    r
 }
 
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-fn channel_call_inner(
-    a: [u64; 6],
-    staged: Option<ksys::Staged>,
-    deferred: &mut Option<ksys::Deferred>,
-) -> Reply {
+fn channel_call_inner(a: [u64; 6], staged: Option<ksys::Staged>) -> Reply {
     admit_caller()?; // (before anything is sent: the wait below registers without allocating)
                      // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
     let call = in_process(|s, k, me| {
@@ -607,7 +599,8 @@ fn channel_call_inner(
     locked_state(|s| s.waits.forget(me));
     // the reply (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
     loop {
-        let r = locked_state(|s| {
+        let mut deferred = None;
+        let mut r = locked_state(|s| {
             let _as = AsLocks::caller(s);
             let k = kmem::get();
             match caller_pid(s) {
@@ -618,13 +611,22 @@ fn channel_call_inner(
                     k.jobs,
                     pid,
                     &call,
-                    deferred,
+                    &mut deferred,
                     true,
                     take_interrupt_in,
                 ),
                 Err(e) => Err((e, None, None)),
             }
         });
+        if let Some(d) = deferred {
+            // (OD161, as in `trap.rs`: the reply is claimed, not taken; the copy and the commit follow, and another read that took the reply in
+            // between makes this one look for it again)
+            crate::chaos::point(crate::chaos::Point::CopyOut);
+            match super::trap::finish_read(&d) {
+                Some(done) => r = done,
+                None => continue,
+            }
+        }
         // (MM9) a reply buffer in a page of a pager's VMO that is not there: the reply stays queued; wait for the page here and take the reply
         // again, since a retry by the caller would send the request a second time
         if matches!(&r, Err((Status::ShouldWait, _, _))) {

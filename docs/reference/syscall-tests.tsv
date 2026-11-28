@@ -258,6 +258,7 @@ process_unmap	WRONG_TYPE	device_caps_need_the_resource
 socket_read	ACCESS_DENIED	socket_half_close
 socket_read	BAD_HANDLE	big_messages_are_copied_outside_the_object_lock
 socket_read	INVALID_ARGS	socket_syscalls
+socket_read	NO_MEMORY	UNTESTED
 socket_read	PEER_CLOSED	socket_end_of_stream
 socket_read	SHOULD_WAIT	socket_half_close
 socket_read	TOO_BIG	socket_syscalls

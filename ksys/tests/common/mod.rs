@@ -73,6 +73,8 @@ pub struct World {
     pub vec_dead: Vec<kcore::ipc::VectorRef>,
     /// Frames a harness took for itself (the IOMMU's directory, queues and quarantine table): `frame_accounting` counts them.
     pub extra_frames: usize,
+    /// `call` makes a big read as the kernel does (OD161): claimed with `defer_out`, copied out, then committed (`finish`).
+    pub defer_reads: bool,
 }
 
 pub fn world_with(handles: usize) -> World {
@@ -110,6 +112,7 @@ pub fn world_with_frames(handles: usize, frames: usize) -> World {
         io_dead: Vec::new(),
         vec_dead: Vec::new(),
         extra_frames: 0,
+        defer_reads: false,
     }
 }
 
@@ -122,7 +125,60 @@ pub fn world() -> World {
 
 impl World {
     pub fn call(&mut self, n: usize, a: [u64; 6]) -> Option<Reply> {
-        self.call_split(n, a, None, false).0
+        if !self.defer_reads {
+            return self.call_split(n, a, None, false).0;
+        }
+        // (the kernel's loop, `trap.rs`: a claim another read took in between is made again)
+        loop {
+            let (r, d) = self.call_split(n, a, None, true);
+            let Some(d) = d else {
+                return r;
+            };
+            if let Some(r) = self.finish(&d) {
+                return Some(r);
+            }
+        }
+    }
+    /// The rest of a deferred read, as the kernel's `finish_read` does it: the copy out (in pieces of 16 KiB), then the commit. `None`: the
+    /// claim was taken by another read in between.
+    pub fn finish(&mut self, d: &ksys::Deferred) -> Option<Reply> {
+        if let Err(e) = self.copy_out(d) {
+            return Some(Err((e, None, None)));
+        }
+        self.commit(d)
+    }
+    /// The copy of a deferred read, alone (a test puts something between it and the commit).
+    pub fn copy_out(&mut self, d: &ksys::Deferred) -> Result<(), Status> {
+        let mut at = 0;
+        while at < d.data.len() {
+            let n = (16 * 1024).min(d.data.len() - at);
+            ksys::deferred_copy(
+                &mut self.aspace,
+                &mut self.mm,
+                &mut self.vmos,
+                &mut self.jobs,
+                d,
+                at,
+                n,
+            )?;
+            at += n;
+        }
+        Ok(())
+    }
+    /// The commit of a deferred read, alone. `None`: moved.
+    pub fn commit(&mut self, d: &ksys::Deferred) -> Option<Reply> {
+        match ksys::deferred_commit(
+            &mut self.objs,
+            &mut self.handles,
+            &mut self.aspace,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            d,
+        ) {
+            ksys::Committed::Done(r) => Some(r),
+            ksys::Committed::Moved => None,
+        }
     }
     /// The call as the kernel runs a big message call: its bytes copied in beforehand (`staged`), its copy-out left to the caller (`defer_out`).
     pub fn call_split(

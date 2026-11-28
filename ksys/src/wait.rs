@@ -507,10 +507,9 @@ pub fn channel_call_ready(us: &UserState, me: u64, c: &Call, interrupted: bool) 
     )
 }
 
-/// `channel_call`, the reply half: take the reply with the call's transaction id and copy it out (the destinations are checked before the message
-/// is taken, so a bad pointer loses nothing), or report TIMED_OUT, BUFFER_TOO_SMALL... An interrupt that ended the wait reports INTERRUPTED (the
-/// request stays queued).
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nh <= MAX_MSG_HANDLES and the index of a handle in the message is below it, so nh * 4 and handle_index * 4 are small; rd_handles + offset stays in the user range that `verify_writable` checked
+/// `channel_call`, the reply half: copy out the reply with the call's transaction id and then take it (peek, copy, commit, OD161: the destinations
+/// are checked first and a failed copy takes nothing, so the reply stays queued), or report TIMED_OUT, BUFFER_TOO_SMALL... An interrupt that ended
+/// the wait reports INTERRUPTED (the request stays queued).
 pub fn channel_call_reply<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -523,9 +522,10 @@ pub fn channel_call_reply<M: PhysMem>(
     channel_call_reply_deferred(us, mm, vmos, jobs, me, c, &mut None, false, take_interrupt)
 }
 
-/// `channel_call_reply` that, when `defer_out` is set and the reply is `OUTSIDE_COPY_MIN` bytes or more, leaves the message in `deferred` for the caller to copy out
-/// after it let the object lock go (T215): the destinations were checked and the message taken, only the copy is left.
-#[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: as `channel_call_reply`
+/// `channel_call_reply` that, when `defer_out` is set and the reply is `OUTSIDE_COPY_MIN` bytes or more, leaves the reply claimed in `deferred`
+/// for the caller to copy out after it let the object lock go and then commit (T215, OD161): the destinations were checked and the bytes
+/// copied, nothing is taken yet.
+#[allow(clippy::too_many_arguments)]
 pub fn channel_call_reply_deferred<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -546,53 +546,36 @@ pub fn channel_call_reply_deferred<M: PhysMem>(
     } = us;
     objs.clear_dequeued_calls(); // (the reply is read here, not by a server: a note an earlier read left must not be attributed to a later one, L22)
     let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+    let crate::Process {
+        handles: ph,
+        aspace: pa,
+        ..
+    } = &mut **p;
     let out: Reply = match ipc::channel_peek(
         objs,
-        &p.handles,
+        ph,
         c.ch,
         Some(c.txid),
         c.rd_max_bytes,
         c.rd_max_handles,
     ) {
-        Ok((nb, nh)) => (|| {
-            verify_writable(p.aspace.held_mut(), mm, vmos, jobs, c.rd_bytes, nb)
-                .map_err(|e| (e, None, None))?;
-            verify_writable(p.aspace.held_mut(), mm, vmos, jobs, c.rd_handles, nh * 8)
-                .map_err(|e| (e, None, None))?;
-            let got = ipc::channel_read_txid_in(
-                objs,
-                &mut p.handles,
-                c.ch,
-                c.txid,
-                c.rd_max_bytes,
-                c.rd_max_handles,
-                jobs,
-            )
-            .map_err(|_| (Status::BadState, None, None))?;
-            if defer_out && got.data.len() >= crate::OUTSIDE_COPY_MIN {
-                let (nb, nh) = (got.data.len() as u64, got.handles.len() as u64);
-                *deferred = Some(crate::Deferred {
-                    bytes_at: c.rd_bytes,
-                    data: got.data,
-                    handles_at: c.rd_handles,
-                    handles: got.handles,
-                });
-                return Ok((Some(nb), Some(nh)));
-            }
-            copy_to_user_verified(p.aspace.held_mut(), mm, c.rd_bytes, &got.data)
-                .map_err(|e| (e, None, None))?;
-            // (the handle numbers go out one at a time from the stack: nothing here allocates after the message has been taken: KT9)
-            for (i, h) in got.handles.iter().enumerate() {
-                copy_to_user_verified(
-                    p.aspace.held_mut(),
-                    mm,
-                    c.rd_handles + (i as u64) * 8,
-                    &h.0.to_le_bytes(),
-                )
-                .map_err(|e| (e, None, None))?;
-            }
-            Ok((Some(got.data.len() as u64), Some(got.handles.len() as u64)))
-        })(),
+        // (peek, copy, commit, OD161: a copy that fails leaves the reply queued, and the call reports the copy's status)
+        Ok(_) => crate::read_message(
+            objs,
+            ph,
+            pa.held_mut(),
+            mm,
+            vmos,
+            jobs,
+            c.ch,
+            Some(c.txid),
+            c.rd_bytes,
+            c.rd_max_bytes,
+            c.rd_handles,
+            c.rd_max_handles,
+            defer_out,
+            deferred,
+        ),
         Err(ReadError::TooSmall { bytes, handles }) => Err((
             Status::BufferTooSmall,
             Some(bytes as u64),
