@@ -137,13 +137,7 @@ pub fn new_start(
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a stack the kernel maps in
 /// the process's stack arena (freed when the thread ends) unless the caller brings its own. `handle` is 0 for a detached thread. The caller
-/// spawns the kernel thread `token` names at `prio` and returns the handle and the tid.
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::expect_used,
-    clippy::indexing_slicing
-)]
-// INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (64 bytes) at indices below 8
+/// spawns the kernel thread `token` names at `prio` and returns the handle and the tid. Each step is a frame of its own (KT13).
 #[inline(never)]
 pub fn thread_spawn<M: PhysMem>(
     us: &mut UserState,
@@ -154,24 +148,176 @@ pub fn thread_spawn<M: PhysMem>(
     creator_prio: u8,
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
-    use abi::spawn as sp;
-    let ph = Handle(a[0]);
-    // the record first (a bad pointer is the first error), then the handle
-    let raw = {
-        let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
-        copy_from_user(c.aspace.held_mut(), mm, vmos, jobs, a[1], sp::ARGS_BYTES)?
+    let args = spawn_args(us, mm, vmos, jobs, me, creator_prio, &a)?;
+    spawn_rest(us, (mm, vmos, jobs), me, &args)
+}
+
+/// `thread_spawn` after its checks. A frame of its own (KT13).
+#[inline(never)]
+fn spawn_rest<M: PhysMem>(
+    us: &mut UserState,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    me: u64,
+    args: &SpawnArgs,
+) -> Result<Spawn, Status> {
+    // (KT9: every allocation the registration needs is made here, before anything is charged or changed: the thread's record, its start, its
+    // place in the process, and its register image)
+    let image = new_image()?;
+    us.reserve_thread(args.tpid)?;
+    charge_thread(jobs, args.tjob).map_err(crate::job_status)?;
+    let made = spawn_object(us, jobs, me, args)?;
+    // the stack: a VMO of its own (nobody holds a handle), mapped read-write; its table pages are charged like any mapping's
+    let stack = match args.place {
+        Some(region) => Some(spawn_stack(us, (mm, vmos, jobs), me, args, region, made)?),
+        None => None,
     };
-    let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
-    let (entry, arg, tp, stack_bytes, guard_bytes) = (w(0), w(1), w(2), w(3), w(4));
-    let prio_req = (w(5) & 0xffff_ffff) as u32;
-    let flags = (w(5) >> 32) as u32;
-    let (caller_sp, reserved) = (w(6), w(7));
-    let caller = us.procs.get(&me).ok_or(Status::BadState)?;
-    let (_, tpid, _, _) = ipc::process_of(&us.objs, &caller.handles, ph, Rights::MANAGE)?;
+    Ok(spawn_register(us, args, made, stack, image))
+}
+
+/// A `thread_spawn` call, checked (`spawn_args`).
+struct SpawnArgs {
+    tpid: u64,
+    tjob: JobId,
+    entry: u64,
+    arg: u64,
+    tp: u64,
+    flags: u32,
+    caller_sp: u64,
+    stack_len: u64,
+    /// Where the kernel's stack goes (above its guard); `None`: the caller brings its own.
+    place: Option<u64>,
+    prio: u8,
+}
+
+/// A new thread's register image, in its box (zeroed: `initial_general` fills it). NO_MEMORY without memory. A frame of its own (KT13).
+#[inline(never)]
+pub(crate) fn new_image() -> Result<kcore::fbox::FBox<[u64; 32]>, Status> {
+    let room = kcore::fbox::FBox::room().ok_or(Status::NoMemory)?;
+    Ok(room.fill_with(|| [0u64; 32]))
+}
+
+/// Fill a new thread's register image (`initial_general`, with the system library's base in `a2`: AB7), in its box.
+#[inline(never)]
+pub(crate) fn fill_image(
+    image: &mut [u64; 32],
+    (entry, sp, arg, tp, a1): (u64, u64, u64, u64, u64),
+    lib_base: u64,
+) {
+    *image = initial_general(entry, sp, arg, tp, a1);
+    if let Some(w) = image.get_mut(11) {
+        *w = lib_base; // (`a2`: AB7)
+    }
+}
+
+/// The 64-byte spawn record at `ptr` (in the caller's memory), as its eight words (into `w`). A bad pointer is the call's first error.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+// INVARIANT: the record is copied in whole (64 bytes) and read at word indices below 8, so the slices are inside it and `try_into` of eight bytes cannot fail
+#[inline(never)]
+fn spawn_record<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    me: u64,
+    ptr: u64,
+    w: &mut [u64; 8],
+) -> Result<(), Status> {
+    let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
+    let raw = copy_from_user(
+        c.aspace.held_mut(),
+        mm,
+        vmos,
+        jobs,
+        ptr,
+        abi::spawn::ARGS_BYTES,
+    )?;
+    for (i, x) in w.iter_mut().enumerate() {
+        *x = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+    }
+    Ok(())
+}
+
+/// `thread_spawn`'s checks: the record first (a bad pointer is the first error), then the handle, the priority, the target's state, the entry,
+/// the sizes and the flags, the thread backstop, and the place of the stack. Nothing changes. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX
+#[inline(never)]
+fn spawn_args<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    me: u64,
+    creator_prio: u8,
+    a: &[u64; 6],
+) -> Result<SpawnArgs, Status> {
+    let mut w = [0u64; 8];
+    spawn_record(us, mm, vmos, jobs, me, a[1], &mut w)?;
+    let prio_req = (w[5] & 0xffff_ffff) as u32;
+    let flags = (w[5] >> 32) as u32;
+    let tpid = spawn_target(us, me, a[0])?;
+    let (tjob, stack_len, place) = spawn_checks(us, jobs, tpid, &w)?;
+    let prio = if prio_req == 0 {
+        clamp_prio(jobs, tjob, creator_prio)
+    } else {
+        prio_req as u8
+    };
+    Ok(SpawnArgs {
+        tpid,
+        tjob,
+        entry: w[0],
+        arg: w[1],
+        tp: w[2],
+        flags,
+        caller_sp: w[6],
+        stack_len,
+        place,
+        prio,
+    })
+}
+
+/// `spawn_args`'s checks against the target process `tpid` (`spawn_valid`), the thread backstop, and the stack's plan (`stack_plan`): the
+/// target's job, the stack's length and its place.
+#[inline(never)]
+fn spawn_checks(
+    us: &UserState,
+    jobs: &Jobs,
+    tpid: u64,
+    w: &[u64; 8],
+) -> Result<(JobId, u64, Option<u64>), Status> {
     let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
-    let tjob = target.job;
-    // a priority above the job's maximum is refused (ACCESS_DENIED), not clamped: the program asked for it
-    let max = jobs.sched(tjob).map_or(10, |j| j.max_prio);
+    spawn_valid(target, jobs, w)?;
+    if total_threads(us) >= us.backstops.user_threads {
+        return Err(Status::NoMemory);
+    }
+    let own_stack = (w[5] >> 32) as u32 & abi::spawn::CALLER_STACK != 0;
+    let (stack_len, place) = stack_plan(target, own_stack, (w[3], w[4]))?;
+    Ok((target.job, stack_len, place))
+}
+
+/// The process `thread_spawn`'s handle `h` names (MANAGE).
+#[inline(never)]
+fn spawn_target(us: &UserState, me: u64, h: u64) -> Result<u64, Status> {
+    let caller = us.procs.get(&me).ok_or(Status::BadState)?;
+    let (_, tpid, _, _) = ipc::process_of(&us.objs, &caller.handles, Handle(h), Rights::MANAGE)?;
+    Ok(tpid)
+}
+
+/// `spawn_args`'s checks of the record against the target (in the order of SYSCALLS.md): the priority (above the job's maximum it is refused,
+/// ACCESS_DENIED, not clamped: the program asked for it), the target's state, then the entry, the sizes, the stack pointer and the flags.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: none: comparisons only
+#[inline(never)]
+fn spawn_valid(target: &crate::Process, jobs: &Jobs, w: &[u64; 8]) -> Result<(), Status> {
+    use abi::spawn as sp;
+    let (entry, stack_bytes, guard_bytes) = (w[0], w[3], w[4]);
+    let prio_req = (w[5] & 0xffff_ffff) as u32;
+    let flags = (w[5] >> 32) as u32;
+    let (caller_sp, reserved) = (w[6], w[7]);
+    let max = jobs.sched(target.job).map_or(10, |j| j.max_prio);
     if (1..=63).contains(&prio_req) && prio_req as u8 > max {
         return Err(Status::AccessDenied);
     }
@@ -206,10 +352,18 @@ pub fn thread_spawn<M: PhysMem>(
     {
         return Err(Status::InvalidArgs);
     }
-    if total_threads(us) >= us.backstops.user_threads {
-        return Err(Status::NoMemory);
-    }
-    // where the stack goes: a gap in the arena for the guard and the stack, at or after the hint, wrapping once
+    Ok(())
+}
+
+/// The length of a new thread's stack and where the kernel puts it (`None`: the caller brings its own): a gap in the arena for the guard and
+/// the stack, at or after the hint, wrapping once.
+#[inline(never)]
+fn stack_plan(
+    target: &crate::Process,
+    own_stack: bool,
+    (stack_bytes, guard_bytes): (u64, u64),
+) -> Result<(u64, Option<u64>), Status> {
+    use abi::spawn as sp;
     let stack_len = if stack_bytes == 0 {
         sp::DEFAULT_STACK
     } else {
@@ -220,146 +374,228 @@ pub fn thread_spawn<M: PhysMem>(
     } else {
         guard_bytes.next_multiple_of(4096)
     };
-    let place = if own_stack {
-        None
-    } else {
-        let (lo, hi) = (abi::user::STACK_ARENA_BASE, abi::user::STACK_ARENA_END);
-        // the stack's guard below it, and one more guard above it: the next stack up has a guard of its own below *its* start, so two stacks are
-        // never flush (a neighbour's overflow always faults)
-        let total = guard_len + stack_len + guard_len;
-        let at = target
-            .aspace
-            .held_ref()
-            .find_gap(lo, hi, total, target.stack_hint)
-            .or_else(|| target.aspace.held_ref().find_gap(lo, hi, total, lo));
-        match at {
-            Some(at) => Some(at + guard_len),
-            None => return Err(Status::NoMemory),
-        }
-    };
-    let prio = if prio_req == 0 {
-        clamp_prio(jobs, tjob, creator_prio)
-    } else {
-        prio_req as u8
-    };
-    let detached = flags & sp::DETACHED != 0;
-    // (KT9: every allocation the registration needs is made here, before anything is charged or changed: the thread's record, its start, its
-    // place in the process, and its register image)
-    let mut image = kcore::fbox::FBox::try_new([0u64; 32]).map_err(|_| Status::NoMemory)?;
-    us.reserve_thread(tpid)?;
-    charge_thread(jobs, tjob).map_err(crate::job_status)?;
-    let UserState { objs, procs, .. } = us;
-    // the thread's object and handle (not for a detached thread)
-    let made = if detached {
-        None
-    } else {
-        let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
-        let job = caller.job;
-        match ipc::thread_object_create_in(
-            objs,
-            &mut caller.handles,
-            tpid,
-            &mut Quota {
-                jobs,
-                job: Some(job),
-            },
-        ) {
-            Ok(x) => Some(x),
-            Err(e) => {
-                credit_thread(jobs, tjob);
-                return Err(e);
-            }
-        }
-    };
-    // the stack: a VMO of its own (nobody holds a handle), mapped read-write; its table pages are charged like any mapping's
-    let mut stack = None;
-    let mut top = caller_sp;
-    if let Some(region) = place {
-        let tables = stack_len / 4096 / 512 + 4;
-        let undo = |made: Option<(Handle, ObjId)>,
-                    procs: &mut crate::ProcTable,
-                    objs: &mut kcore::ipc::Kobjs,
-                    jobs: &mut Jobs| {
-            if let Some((h, _)) = made {
-                if let Some(c) = procs.get_mut(&me) {
-                    let _ = c.handles.close(objs, h);
-                }
-            }
-            credit_thread(jobs, tjob);
-        };
-        if let Err(e) = jobs.charge(tjob, Resource::Pages, tables) {
-            undo(made, procs, objs, jobs);
-            return Err(crate::job_status(e));
-        }
-        if let Err(e) = vmos.reserve_one() {
-            undo(made, procs, objs, jobs);
-            jobs.credit(tjob, Resource::Pages, tables);
-            return Err(e);
-        }
-        // (KT9: the room for the stack's page-table charge record, before the VMO exists)
-        if procs
-            .get_mut(&tpid)
-            .expect("target exists")
-            .table_charge
-            .reserve(1)
-            .is_err()
-        {
-            undo(made, procs, objs, jobs);
-            jobs.credit(tjob, Resource::Pages, tables);
-            return Err(Status::NoMemory);
-        }
-        let vmo = vmos.create_in(jobs, stack_len / 4096, tjob);
-        let perms = Perms {
-            read: true,
-            write: true,
-            exec: false,
-            user: true,
-        };
-        let t = procs.get_mut(&tpid).expect("target exists");
-        t.aspace
-            .held_mut()
-            .set_region_limit(jobs.region_limit(t.job));
-        if let Err(e) =
-            t.aspace
-                .held_mut()
-                .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
-        {
-            let _ = vmos.release(mm, jobs, vmo);
-            jobs.credit(tjob, Resource::Pages, tables);
-            undo(made, procs, objs, jobs);
-            return Err(match e {
-                kcore::aspace::RegionError::TooMany => Status::NoMemory,
-                _ => Status::InvalidArgs,
-            });
-        }
-        t.table_charge.insert_reserved(region, tables);
-        t.stack_hint = region + stack_len;
-        stack = Some(crate::SpawnStack { region, vmo });
-        top = region + stack_len;
+    if own_stack {
+        return Ok((stack_len, None));
     }
-    procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
-    // (AB7: every thread of a process starts with the system library's base in `a2`, so that code that starts at the program's entry finds it)
-    let lib_base = procs.get(&tpid).map_or(0, |p| p.libsys.base);
-    let token = new_start(us, tpid, entry, top, arg, made.map(|(_, o)| o));
+    Ok((stack_len, Some(stack_place(target, stack_len, guard_len)?)))
+}
+
+/// Where a new stack of `stack_len` bytes goes in `target`'s stack arena (above its guard of `guard_len`): a gap for the guard, the stack and
+/// one more guard above it (the next stack up has a guard of its own below *its* start, so two stacks are never flush: a neighbour's overflow
+/// always faults), at or after the hint, wrapping once. NO_MEMORY: no gap.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the lengths are at most MAX_STACK each
+#[inline(never)]
+fn stack_place(target: &crate::Process, stack_len: u64, guard_len: u64) -> Result<u64, Status> {
+    let (lo, hi) = (abi::user::STACK_ARENA_BASE, abi::user::STACK_ARENA_END);
+    let total = guard_len + stack_len + guard_len;
+    let at = target
+        .aspace
+        .held_ref()
+        .find_gap(lo, hi, total, target.stack_hint)
+        .or_else(|| target.aspace.held_ref().find_gap(lo, hi, total, lo));
+    match at {
+        Some(at) => Ok(at + guard_len),
+        None => Err(Status::NoMemory),
+    }
+}
+
+/// `thread_spawn`'s thread object and the caller's handle to it (not for a detached thread: `None`). On `Err` the thread's charge is credited.
+/// A frame of its own (KT13).
+#[inline(never)]
+fn spawn_object(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    me: u64,
+    args: &SpawnArgs,
+) -> Result<Option<(Handle, ObjId)>, Status> {
+    if args.flags & abi::spawn::DETACHED != 0 {
+        return Ok(None);
+    }
+    let UserState { objs, procs, .. } = us;
+    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+    let job = caller.job;
+    match ipc::thread_object_create_in(
+        objs,
+        &mut caller.handles,
+        args.tpid,
+        &mut Quota {
+            jobs,
+            job: Some(job),
+        },
+    ) {
+        Ok(x) => Ok(Some(x)),
+        Err(e) => {
+            credit_thread(jobs, args.tjob);
+            Err(e)
+        }
+    }
+}
+
+/// `thread_spawn`'s stack at `region`: a VMO of its own (nobody holds a handle), mapped read-write; its table pages are charged like any
+/// mapping's. On `Err` everything the call did is undone (the handle `made`, the thread's charge). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: the stack's length is at most MAX_STACK; the target process was looked up under the same lock
+#[inline(never)]
+fn spawn_stack<M: PhysMem>(
+    us: &mut UserState,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    me: u64,
+    args: &SpawnArgs,
+    region: u64,
+    made: Option<(Handle, ObjId)>,
+) -> Result<crate::SpawnStack, Status> {
+    let (tpid, tjob, stack_len) = (args.tpid, args.tjob, args.stack_len);
+    let UserState { objs, procs, .. } = us;
+    let tables = stack_len / 4096 / 512 + 4;
+    if let Err((e, charged)) = stack_room(procs, vmos, jobs, (tpid, tjob), tables) {
+        undo_spawn(made, procs, objs, jobs, (me, tjob));
+        if charged {
+            jobs.credit(tjob, Resource::Pages, tables);
+        }
+        return Err(e);
+    }
+    let t = procs.get_mut(&tpid).expect("target exists");
+    match stack_map(t, (mm, vmos, jobs), (region, stack_len, tables)) {
+        Ok(vmo) => Ok(crate::SpawnStack { region, vmo }),
+        Err(e) => {
+            jobs.credit(tjob, Resource::Pages, tables);
+            undo_spawn(made, procs, objs, jobs, (me, tjob));
+            Err(e)
+        }
+    }
+}
+
+/// `spawn_stack`'s room, before the VMO exists: the page-table charge (`tables` pages), a VMO slot, and the charge's record (KT9). On `Err`,
+/// whether the charge was made (the caller credits it).
+#[allow(clippy::expect_used)] // INVARIANT: the target process was looked up under the same lock
+#[inline(never)]
+fn stack_room(
+    procs: &mut crate::ProcTable,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    (tpid, tjob): (u64, JobId),
+    tables: u64,
+) -> Result<(), (Status, bool)> {
+    jobs.charge(tjob, Resource::Pages, tables)
+        .map_err(|e| (crate::job_status(e), false))?;
+    vmos.reserve_one().map_err(|e| (e, true))?;
+    procs
+        .get_mut(&tpid)
+        .expect("target exists")
+        .table_charge
+        .reserve(1)
+        .map_err(|_| (Status::NoMemory, true))
+}
+
+/// Undo `thread_spawn`'s handle to the thread's object (if it made one) and the thread's charge.
+#[inline(never)]
+fn undo_spawn(
+    made: Option<(Handle, ObjId)>,
+    procs: &mut crate::ProcTable,
+    objs: &mut kcore::ipc::Kobjs,
+    jobs: &mut Jobs,
+    (me, tjob): (u64, JobId),
+) {
+    if let Some((h, _)) = made {
+        if let Some(c) = procs.get_mut(&me) {
+            let _ = c.handles.close(objs, h);
+        }
+    }
+    credit_thread(jobs, tjob);
+}
+
+/// `spawn_stack`'s VMO (room for it was reserved), mapped read-write at `region` in `t`, with the page-table charge's record (its room was
+/// reserved too). On `Err` the VMO goes again. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the stack's length is at most MAX_STACK
+#[inline(never)]
+fn stack_map<M: PhysMem>(
+    t: &mut crate::Process,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    (region, stack_len, tables): (u64, u64, u64),
+) -> Result<u64, Status> {
+    let vmo = vmos.create_in(jobs, stack_len / 4096, t.job);
+    let perms = Perms {
+        read: true,
+        write: true,
+        exec: false,
+        user: true,
+    };
+    t.aspace
+        .held_mut()
+        .set_region_limit(jobs.region_limit(t.job));
+    if let Err(e) = t
+        .aspace
+        .held_mut()
+        .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
+    {
+        let _ = vmos.release(mm, jobs, vmo);
+        return Err(match e {
+            kcore::aspace::RegionError::TooMany => Status::NoMemory,
+            _ => Status::InvalidArgs,
+        });
+    }
+    t.table_charge.insert_reserved(region, tables);
+    t.stack_hint = region + stack_len;
+    Ok(vmo)
+}
+
+/// A spawned thread's start, registered by `new_start`, completed: its thread pointer, its stack, round robin, SUSPENDED, and the system
+/// library's base in `a2` (AB7).
+#[allow(clippy::expect_used)] // INVARIANT: the start was registered by the caller just before
+#[inline(never)]
+fn fill_start(
+    us: &mut UserState,
+    token: usize,
+    args: &SpawnArgs,
+    stack: Option<crate::SpawnStack>,
+    lib_base: u64,
+) {
+    use abi::spawn as sp;
     let st = us.starts.get_mut(&token).expect("just registered");
-    st.tp = tp;
+    st.tp = args.tp;
     st.stack = stack;
-    st.rr = flags & sp::ROUND_ROBIN != 0;
+    st.rr = args.flags & sp::ROUND_ROBIN != 0;
     st.spawned = true;
     st.a2 = lib_base;
+    st.suspended = args.flags & sp::SUSPENDED != 0;
+}
+
+/// The end of `thread_spawn` (nothing can fail): the thread counted in its process, its start registered (with the system library's base in
+/// `a2`: AB7, every thread of a process starts with it so that code that starts at the program's entry finds it), a SUSPENDED thread's object
+/// marked, and its register image filled.
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
+// INVARIANT: the target process was looked up under the same lock; the start was registered just above
+#[inline(never)]
+fn spawn_register(
+    us: &mut UserState,
+    args: &SpawnArgs,
+    made: Option<(Handle, ObjId)>,
+    stack: Option<crate::SpawnStack>,
+    mut image: kcore::fbox::FBox<[u64; 32]>,
+) -> Spawn {
+    let top = stack.map_or(args.caller_sp, |s| s.region + args.stack_len);
+    use abi::spawn as sp;
+    let (tpid, flags) = (args.tpid, args.flags);
+    us.procs
+        .get_mut(&tpid)
+        .expect("target exists")
+        .threads_alive += 1;
+    let lib_base = us.procs.get(&tpid).map_or(0, |p| p.libsys.base);
+    let token = new_start(us, tpid, args.entry, top, args.arg, made.map(|(_, o)| o));
     let suspended = flags & sp::SUSPENDED != 0;
-    st.suspended = suspended;
+    fill_start(us, token, args, stack, lib_base);
     if let (true, Some((_, o))) = (suspended, made) {
         ipc::thread_set_suspended(&mut us.objs, o, true);
     }
-    *image = initial_general(entry, top, arg, tp, 0);
-    if let Some(w) = image.get_mut(11) {
-        *w = lib_base; // (`a2`: AB7)
-    }
-    Ok(Spawn {
+    fill_image(
+        &mut image,
+        (args.entry, top, args.arg, args.tp, 0),
+        lib_base,
+    );
+    Spawn {
         token,
         handle: made.map_or(0, |(h, _)| h.0),
-        prio,
+        prio: args.prio,
         suspended,
         pid: tpid,
         obj: made.map(|(_, o)| o),
@@ -367,7 +603,7 @@ pub fn thread_spawn<M: PhysMem>(
         rr: flags & sp::ROUND_ROBIN != 0,
         spawned: true,
         image: Some(image),
-    })
+    }
 }
 
 /// `process_start(process, entry, sp, channel, arg)` (SYSCALLS.md): move the bootstrap channel end into a Created process as its handle 1 and register
