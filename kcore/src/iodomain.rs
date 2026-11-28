@@ -843,6 +843,19 @@ impl MapCursor {
             (self.rec.pages - self.written).min(RANGE_STEP),
         ))
     }
+
+    /// The frames of `pfns` (all of the map's, by VMO page) that the next step writes (`next_frames`); empty when it writes none.
+    fn chunk_of<'a>(&self, pfns: &'a [Pfn]) -> &'a [Pfn] {
+        match self.next_frames() {
+            Some((first, n)) => {
+                let at =
+                    usize::try_from(first.saturating_sub(self.rec.vmo_page)).unwrap_or(usize::MAX);
+                pfns.get(at..at.saturating_add(usize::try_from(n).unwrap_or(usize::MAX)))
+                    .unwrap_or(&[])
+            }
+            None => &[],
+        }
+    }
     pub fn domain(&self) -> DomainId {
         self.domain
     }
@@ -1014,7 +1027,6 @@ impl Detached {
     /// job the domain's kernel bytes and its tables', and drop the domain's use of its job, unless a fence of the domain was abandoned
     /// (the leaked charges stay, and so does the use that keeps the job record: J2). Call after every record was taken. Allocates
     /// nothing.
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn finish<M: PhysMem64, F: IoFrames>(
         mut self,
         mem: &M,
@@ -1034,27 +1046,7 @@ impl Detached {
             frames.free_root(iopt.root());
         }
         frames.free(self.dom.msi.root());
-        // the vectors' files (the fence covered every entry, and the kernel ended the vectors' routes before the release: IO10): the
-        // stray bits counted, the frames freed; a frame that holds a leaked vector's file stays leaked (IO8)
-        let mut strays = 0u64;
-        for k in 0..IO_VECTOR_PAGES as u16 {
-            let st = self.dom.vectors.get(usize::from(k)).map(|v| v.state);
-            if matches!(st, Some(VState::Free | VState::Leaked) | None) {
-                continue;
-            }
-            if let Some(w) = file_of(&self.dom, k)
-                .and_then(|f| Mrif::new(f).ok())
-                .and_then(|f| f.stray(mem, VECTOR_DATA).ok())
-            {
-                strays = strays.saturating_add(w.iter().map(|x| u64::from(x.count_ones())).sum());
-            }
-            if let Some(v) = self.dom.vectors.get_mut(usize::from(k)) {
-                v.state = VState::Free;
-            }
-        }
-        for k in (0..IO_VECTOR_PAGES as u16).step_by(FILES_PER_FRAME as usize) {
-            free_file_frame(&mut self.dom, k, frames);
-        }
+        let strays = finish_vectors(&mut self.dom, mem, frames);
         let job = self.dom.job;
         jobs.credit(
             job,
@@ -1066,6 +1058,211 @@ impl Detached {
         }
         strays
     }
+}
+
+/// The vectors' files of a domain that goes (`Detached::finish`; the fence covered every entry, and the kernel ended the vectors' routes before
+/// the release: IO10): the stray bits counted (returned), the frames freed; a frame that holds a leaked vector's file stays leaked (IO8). A frame
+/// of its own (KT13).
+#[inline(never)]
+fn finish_vectors<M: PhysMem64, F: IoFrames>(dom: &mut Domain, mem: &M, frames: &mut F) -> u64 {
+    let mut strays = 0u64;
+    for k in 0..IO_VECTOR_PAGES as u16 {
+        let st = dom.vectors.get(usize::from(k)).map(|v| v.state);
+        if matches!(st, Some(VState::Free | VState::Leaked) | None) {
+            continue;
+        }
+        strays = strays.saturating_add(stray_bits(dom, mem, k));
+        if let Some(v) = dom.vectors.get_mut(usize::from(k)) {
+            v.state = VState::Free;
+        }
+    }
+    for k in (0..IO_VECTOR_PAGES as u16).step_by(FILES_PER_FRAME as usize) {
+        free_file_frame(dom, k, frames);
+    }
+    strays
+}
+
+/// The stray bits in vector `k`'s interrupt file (`finish_vectors`): 0 when it has no file. A frame of its own (KT13).
+#[inline(never)]
+fn stray_bits<M: PhysMem64>(dom: &Domain, mem: &M, k: u16) -> u64 {
+    file_of(dom, k)
+        .and_then(|f| Mrif::new(f).ok())
+        .and_then(|f| f.stray(mem, VECTOR_DATA).ok())
+        .map_or(0, |w| w.iter().map(|x| u64::from(x.count_ones())).sum())
+}
+
+/// A map step's writes (`IoDomains::map_step`, the map not failing): the leaves of the next `RANGE_STEP` pages, whose frames are `pfns`. `Ok`:
+/// more to do (or the map is now failing, and rolls back from the next step). `Err`: the last leaf is written and the record is published in the
+/// domain: (its first page, its pages, the domain's GSCID, the table frames the map allocated). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: page + i stays inside the reserved range; written <= pages; tables counts frames in the table
+#[inline(never)]
+fn map_leaves<M: PhysMem64, F: TableFrames>(
+    dom: &mut Domain,
+    mem: &M,
+    frames: &mut F,
+    mut cur: MapCursor,
+    pfns: &[Pfn],
+) -> Result<MapCursor, (u64, u64, u16, u64)> {
+    let Some(iopt) = dom.iopt.as_mut() else {
+        return Ok(cur); // (not reached: `map_step` checked it)
+    };
+    let n = cur.rec.pages;
+    let page = cur.rec.page;
+    let access = cur.rec.access;
+    let want = (n - cur.written).min(RANGE_STEP);
+    if pfns.len() as u64 != want {
+        debug_assert!(false, "a map step is given the frames next_frames names");
+        cur.back = Some(IoError::InvalidArgs);
+        return Ok(cur);
+    }
+    let before = cur.rec.chain.n;
+    let allocs = write_leaves(iopt, mem, frames, &mut cur, pfns, (page, access));
+    cur.allocs += allocs;
+    dom.tables = dom.tables + allocs - (cur.rec.chain.n - before);
+    if cur.back.is_some() || cur.written < n {
+        return Ok(cur); // (a roll-back starts at the next hold)
+    }
+    // published: from here an unmap or the destruction can name it
+    dom.mappings += 1;
+    dom.io_pages += n;
+    let tables = cur.allocs;
+    insert(&mut dom.live, cur.rec);
+    Err((page, n, dom.gscid, tables))
+}
+
+/// The leaves of `map_leaves`: one per frame of `pfns`, from the cursor's next page, with `access`, until one cannot be (no memory for a table:
+/// the map is failing). The table frames allocated. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `map_leaves`
+#[inline(never)]
+fn write_leaves<M: PhysMem64, F: TableFrames>(
+    iopt: &mut Iopt,
+    mem: &M,
+    frames: &mut F,
+    cur: &mut MapCursor,
+    pfns: &[Pfn],
+    (page, access): (u64, Access),
+) -> u64 {
+    let mut df = Deferring {
+        mem,
+        frames,
+        chain: &mut cur.rec.chain,
+        allocs: 0,
+    };
+    for pfn in pfns {
+        let at = (page + cur.written) << PAGE_SHIFT;
+        if iopt
+            .map(mem, &mut df, at, pfn << PAGE_SHIFT, access)
+            .is_err()
+        {
+            cur.back = Some(IoError::NoMemory);
+            break;
+        }
+        cur.written += 1;
+    }
+    df.allocs
+}
+
+/// A map step's roll-back (`IoDomains::map_step`, the map failing): clear what was written, a step at a time (the record's `cleared` counts the
+/// leaves undone). `Ok`: more to clear. `Err`: every leaf is cleared and the range is pending (with the domain's GSCID). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: page + i stays inside the reserved range; cleared <= written <= pages; tables counts frames in the table
+#[inline(never)]
+fn unmap_leaves<M: PhysMem64>(
+    dom: &mut Domain,
+    mem: &M,
+    mut cur: MapCursor,
+) -> Result<MapCursor, (MapCursor, u16)> {
+    let Some(iopt) = dom.iopt.as_mut() else {
+        return Ok(cur); // (not reached: `map_step` checked it)
+    };
+    let (page, n) = (cur.rec.page, cur.rec.pages);
+    let mut cleared = cur.rec.cleared;
+    let undo = (cur.written - cleared).min(RANGE_STEP);
+    let before = cur.rec.chain.n;
+    let mut na = NoAlloc {
+        mem,
+        chain: &mut cur.rec.chain,
+    };
+    for _ in 0..undo {
+        iopt.unmap(mem, &mut na, (page + cleared) << PAGE_SHIFT);
+        cleared += 1;
+    }
+    cur.rec.cleared = cleared;
+    dom.tables -= cur.rec.chain.n - before;
+    if cur.rec.cleared < cur.written {
+        return Ok(cur);
+    }
+    // every leaf is cleared: the range pending
+    if dom.iova.release(page, n).is_err() {
+        debug_assert!(false, "a range a map reserved is live");
+    }
+    dom.io_pages += n;
+    Err((cur, dom.gscid))
+}
+
+/// `IoDomains::destroy`'s clear of the enable bit of every vector of `dom` that is granted (10.6 step 2).
+#[inline(never)]
+fn disable_vectors<M: PhysMem64>(dom: &Domain, mem: &M) {
+    for (k, v) in dom.vectors.iter().enumerate() {
+        if matches!(
+            v.state,
+            VState::Granting(_) | VState::Live | VState::Moving(_)
+        ) {
+            if let Some(f) = u16::try_from(k)
+                .ok()
+                .and_then(|k| file_of(dom, k))
+                .and_then(|f| Mrif::new(f).ok())
+            {
+                let _ = f.disable(mem, VECTOR_DATA);
+            }
+        }
+    }
+}
+
+/// One hold of an unmap of the pending record at `page` (`IoDomains::unmap_step`): clear its next `RANGE_STEP` leaves. `None`: no such record
+/// (not reached); `Some(None)`: more to clear; `Some(Some(..))`: every leaf is clear, and the invalidation it needs (page-wise, or of the whole soft
+/// context if a table frame was freed: OD169). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: cleared <= pages; page + cleared is inside the mapping's range; the table counts are frames moved from the table to the chain
+#[inline(never)]
+fn unmap_rec_step<M: PhysMem64>(
+    dom: &mut Domain,
+    mem: &M,
+    page: u64,
+) -> Option<Option<([Command; INVAL_PAGES], usize)>> {
+    let Domain {
+        pending,
+        iopt,
+        tables,
+        pending_tables,
+        gscid,
+        ..
+    } = dom;
+    let rec = find_list_mut(pending, |m| {
+        m.page == page && m.ticket == NO_TICKET && m.cleared < m.pages
+    })?;
+    let mut cleared = rec.cleared;
+    let k = (rec.pages - cleared).min(RANGE_STEP);
+    let before = rec.chain.n;
+    if let Some(iopt) = iopt.as_mut() {
+        let mut na = NoAlloc {
+            mem,
+            chain: &mut rec.chain,
+        };
+        for _ in 0..k {
+            iopt.unmap(mem, &mut na, (page + cleared) << PAGE_SHIFT);
+            cleared += 1;
+        }
+    }
+    rec.cleared = cleared;
+    let chained = rec.chain.n - before;
+    *tables -= chained;
+    *pending_tables += chained;
+    if cleared < rec.pages {
+        return Some(None);
+    }
+    Some(Some(inval_for(*gscid, rec)))
 }
 
 /// A domain's granted vectors (granting, live, moving or revoking) and, of them, the ones being revoked.
@@ -1096,6 +1293,9 @@ type DomainLists = (
     alloc::boxed::Box<[u64]>,
 );
 
+/// A new domain's parts (`domain_parts`): its I/O address allocator, its page table, its MSI page table, its lists, and the frames of the two tables.
+type DomainParts = (Iova, Iopt, MsiTable, DomainLists, u64, u64);
+
 /// A new domain's vector slots (all free) and its fault ring (empty records), in room reserved exactly: `None` when there is no memory.
 fn domain_lists() -> Option<DomainLists> {
     let mut vectors = Vec::new();
@@ -1118,41 +1318,56 @@ fn domain_lists() -> Option<DomainLists> {
 /// A new domain's parts: its I/O address allocator (the vector window taken), its tables (a root and an MSI page table) on fresh frames, its vector
 /// slots and its fault ring; with the two frames, which the caller gives back if a later step fails (`IoDomains::build_domain`; a frame of its own:
 /// KT13).
-#[allow(clippy::type_complexity)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 fn domain_parts<M: PhysMem64, F: IoFrames>(
     mem: &M,
     frames: &mut F,
-) -> Result<(Iova, Iopt, MsiTable, DomainLists, u64, u64), IoError> {
-    let mut iova =
-        Iova::new(IO_BASE >> PAGE_SHIFT, IO_WINDOW_PAGES).map_err(|_| IoError::NoMemory)?;
-    if iova.alloc(IO_VECTOR_PAGES) != Some(IO_BASE >> PAGE_SHIFT) {
-        return Err(IoError::NoMemory); // (not reached: a fresh allocator's lowest fit is the window's start)
-    }
-    let window = MsiWindow::new(IO_BASE, 8).map_err(|_| IoError::NoMemory)?;
-    let Some(root) = frames.alloc_root() else {
+) -> Result<DomainParts, IoError> {
+    let Some(iova) = domain_iova() else {
         return Err(IoError::NoMemory);
     };
-    let Some(msi_pa) = frames.alloc() else {
-        frames.free_root(root);
+    let Some((iopt, msi, root, msi_pa)) = domain_tables(mem, frames) else {
         return Err(IoError::NoMemory);
     };
-    let undo_frames = |frames: &mut F| {
+    let Some(lists) = domain_lists() else {
         frames.free(msi_pa);
         frames.free_root(root);
+        return Err(IoError::NoMemory);
+    };
+    Ok((iova, iopt, msi, lists, root, msi_pa))
+}
+
+/// A new domain's I/O address allocator, with the vector window taken (`domain_parts`). `None`: no memory. A frame of its own (KT13).
+#[inline(never)]
+fn domain_iova() -> Option<Iova> {
+    let mut iova = Iova::new(IO_BASE >> PAGE_SHIFT, IO_WINDOW_PAGES).ok()?;
+    if iova.alloc(IO_VECTOR_PAGES) != Some(IO_BASE >> PAGE_SHIFT) {
+        return None; // (not reached: a fresh allocator's lowest fit is the window's start)
+    }
+    Some(iova)
+}
+
+/// A new domain's two tables (`domain_parts`): a root and an MSI page table on fresh frames, with the frames. `None`: no memory (nothing is
+/// kept). A frame of its own (KT13).
+#[inline(never)]
+fn domain_tables<M: PhysMem64, F: IoFrames>(
+    mem: &M,
+    frames: &mut F,
+) -> Option<(Iopt, MsiTable, u64, u64)> {
+    let window = MsiWindow::new(IO_BASE, 8).ok()?;
+    let root = frames.alloc_root()?;
+    let Some(msi_pa) = frames.alloc() else {
+        frames.free_root(root);
+        return None;
     };
     let (Ok(iopt), Ok(msi)) = (
         Iopt::new(mem, root, PtMode::Sv39x4),
         MsiTable::new(mem, msi_pa, window),
     ) else {
-        undo_frames(frames);
-        return Err(IoError::NoMemory);
+        frames.free(msi_pa);
+        frames.free_root(root);
+        return None;
     };
-    let Some(lists) = domain_lists() else {
-        undo_frames(frames);
-        return Err(IoError::NoMemory);
-    };
-    Ok((iova, iopt, msi, lists, root, msi_pa))
+    Some((iopt, msi, root, msi_pa))
 }
 
 /// The commands that invalidate `pages` pages from `page` in soft context `gscid`: page by page for a short range, the whole soft
@@ -1451,7 +1666,6 @@ impl IoDomains {
     /// `create`'s new domain: its I/O address allocator, its tables (a root and an MSI page table), its lists and its GSCID, boxed. With the
     /// context's root and the two frames to give back if the attach fails (each step of `create` a frame of its own: KT13).
     #[allow(clippy::type_complexity)]
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     fn build_domain<M: PhysMem64, F: IoFrames>(
         &mut self,
         mem: &M,
@@ -1459,7 +1673,21 @@ impl IoDomains {
         device_id: u32,
         job: JobId,
     ) -> Result<(FBox<Domain>, TableRoot, u64, u64), IoError> {
-        let (iova, iopt, msi, (vectors, ring, files), root, msi_pa) = domain_parts(mem, frames)?;
+        let parts = domain_parts(mem, frames)?;
+        self.box_domain(frames, parts, device_id, job)
+    }
+
+    /// The second half of `build_domain`: the GSCID, the context's root, and the domain in its box (built in the box's own frame, not copied
+    /// through this one: KT13). On a failure the two frames of `parts` go back, then the rest of `parts` is dropped.
+    #[inline(never)]
+    fn box_domain<F: IoFrames>(
+        &mut self,
+        frames: &mut F,
+        parts: DomainParts,
+        device_id: u32,
+        job: JobId,
+    ) -> Result<(FBox<Domain>, TableRoot, u64, u64), IoError> {
+        let (root, msi_pa) = (parts.4, parts.5);
         let undo_frames = |frames: &mut F| {
             frames.free(msi_pa);
             frames.free_root(root);
@@ -1468,38 +1696,42 @@ impl IoDomains {
             undo_frames(frames);
             return Err(IoError::NoMemory);
         };
-        let Some(ctx_root) = iopt.context_root(u32::from(gscid)) else {
+        let Some(ctx_root) = parts.1.context_root(u32::from(gscid)) else {
             self.free_gscid(gscid);
             undo_frames(frames);
             return Err(IoError::NoMemory);
         };
-        let dom = match FBox::try_new(Domain {
-            device: device_id,
-            job,
-            state: State::Attached,
-            gscid,
-            iopt: Some(iopt),
-            msi,
-            iova,
-            live: None,
-            mappings: 0,
-            pending: None,
-            pending_n: 0,
-            pending_tables: 0,
-            leaked: None,
-            leaked_pages: 0,
-            tag: [0; 2],
-            tables: 0,
-            io_pages: 0,
-            leaks: false,
-            ring,
-            ring_head: 0,
-            ring_len: 0,
-            dropped: 0,
-            destroy_ticket: NO_TICKET,
-            vectors,
-            files,
-            next: None,
+        // (on a failure the closure, and the parts it holds, come back and are dropped last, as the unboxed domain was)
+        let dom = match FBox::try_new_with(move || {
+            let (iova, iopt, msi, (vectors, ring, files), _, _) = parts;
+            Domain {
+                device: device_id,
+                job,
+                state: State::Attached,
+                gscid,
+                iopt: Some(iopt),
+                msi,
+                iova,
+                live: None,
+                mappings: 0,
+                pending: None,
+                pending_n: 0,
+                pending_tables: 0,
+                leaked: None,
+                leaked_pages: 0,
+                tag: [0; 2],
+                tables: 0,
+                io_pages: 0,
+                leaks: false,
+                ring,
+                ring_head: 0,
+                ring_len: 0,
+                dropped: 0,
+                destroy_ticket: NO_TICKET,
+                vectors,
+                files,
+                next: None,
+            }
         }) {
             Ok(d) => d,
             Err(_) => {
@@ -1613,7 +1845,6 @@ impl IoDomains {
     /// one call (the host tests' single critical section; the kernel takes `IOMMU` once per step). Table frames come from `frames`
     /// (prepaid by `charge_map`). Queues the invalidation of the range and a fence: the caller waits, and on a failed fence unmaps
     /// again (4.3).
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn map<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,
@@ -1628,15 +1859,7 @@ impl IoDomains {
         }
         let mut cur = self.map_begin(d, rec)?;
         loop {
-            let chunk = match cur.next_frames() {
-                Some((first, n)) => {
-                    let at = usize::try_from(first.saturating_sub(cur.rec.vmo_page))
-                        .unwrap_or(usize::MAX);
-                    pfns.get(at..at.saturating_add(usize::try_from(n).unwrap_or(usize::MAX)))
-                        .unwrap_or(&[])
-                }
-                None => &[],
-            };
+            let chunk = cur.chunk_of(pfns);
             match self.map_step(mem, regs, frames, cur, chunk) {
                 MapStep::More(c) => cur = c,
                 MapStep::Done(m) => return Ok(m),
@@ -1685,9 +1908,6 @@ impl IoDomains {
     /// a table frame that cannot be allocated, with NO_MEMORY. A finished roll-back is an unmap (`MapFailed::RolledBack`: its
     /// fence is waited for and completed like one); a domain whose destruction has completed meanwhile took the leaves with its
     /// tables after its own fence, and the record comes back at once (`MapFailed::Dropped`). A destruction never waits for a map.
-    #[allow(clippy::arithmetic_side_effects)]
-    // INVARIANT: page + i stays inside the reserved range; written, undone <= pages; tables counts frames in the table
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn map_step<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,
@@ -1696,112 +1916,121 @@ impl IoDomains {
         mut cur: MapCursor,
         pfns: &[Pfn],
     ) -> MapStep {
+        // (each part a frame of its own: KT13)
         let Some(dom) = self.dom_mut(cur.domain) else {
-            let tables = cur.allocs;
-            if self.abandons != cur.abandons {
-                // a destruction was abandoned since the map began, perhaps this domain's: its tables may still be walked, so the
-                // record keeps its hold for good (counted as leaked, IO8). Only an IOMMU that has stopped completing fences gets here.
-                let rec = cur.rec;
-                let s = &mut self.stats;
-                s.holds_leaked = s.holds_leaked.saturating_add(1);
-                s.pages_leaked = s.pages_leaked.saturating_add(rec.pages);
-                s.tables_leaked = s.tables_leaked.saturating_add(rec.chain.n);
-                self.leak_list(rec);
-                return MapStep::Failed(MapFailed::Leaked { tables });
-            }
-            // the destruction completed: its fence covered every leaf this map wrote, and its tables went with it
-            return MapStep::Failed(MapFailed::Dropped {
-                released: Released {
-                    rec: cur.rec,
-                    job: cur.job,
-                },
-                tables,
-            });
+            return self.map_gone(cur);
         };
         if dom.state != State::Attached && cur.back.is_none() {
             cur.back = Some(IoError::BadState);
             cur.rec.cleared = 0;
         }
-        let Some(iopt) = dom.iopt.as_mut() else {
+        if dom.iopt.is_none() {
             // (not reached: a domain in the store keeps its table until its destruction completes)
             cur.back.get_or_insert(IoError::BadState);
             return MapStep::More(cur);
-        };
-        let n = cur.rec.pages;
-        let page = cur.rec.page;
-        let access = cur.rec.access;
+        }
         if cur.back.is_none() {
-            let want = (n - cur.written).min(RANGE_STEP);
-            if pfns.len() as u64 != want {
-                debug_assert!(false, "a map step is given the frames next_frames names");
-                cur.back = Some(IoError::InvalidArgs);
-                return MapStep::More(cur);
-            }
-            let before = cur.rec.chain.n;
-            let mut df = Deferring {
-                mem,
-                frames,
-                chain: &mut cur.rec.chain,
-                allocs: 0,
-            };
-            for pfn in pfns {
-                let at = (page + cur.written) << PAGE_SHIFT;
-                if iopt
-                    .map(mem, &mut df, at, pfn << PAGE_SHIFT, access)
-                    .is_err()
-                {
-                    cur.back = Some(IoError::NoMemory);
-                    break;
-                }
-                cur.written += 1;
-            }
-            let allocs = df.allocs;
-            cur.allocs += allocs;
-            dom.tables = dom.tables + allocs - (cur.rec.chain.n - before);
-            if cur.back.is_none() {
-                if cur.written < n {
-                    return MapStep::More(cur);
-                }
-                // published: from here an unmap or the destruction can name it
-                dom.mappings += 1;
-                dom.io_pages += n;
-                let gscid = dom.gscid;
-                let tables = cur.allocs;
-                insert(&mut dom.live, cur.rec);
-                self.stats.io_pages += n;
-                let (cmds, k) = inval_range(gscid, page, n);
-                let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
-                return MapStep::Done(Mapped {
-                    iova: page << PAGE_SHIFT,
-                    ticket,
-                    tables,
-                });
-            }
-            return MapStep::More(cur); // (the roll-back starts at the next hold)
+            self.map_write(mem, regs, frames, cur, pfns)
+        } else {
+            self.map_back(mem, regs, cur)
         }
-        // rolling back: clear what was written, a step at a time (`cleared` counts the leaves undone)
-        let mut cleared = cur.rec.cleared;
-        let undo = (cur.written - cleared).min(RANGE_STEP);
-        let before = cur.rec.chain.n;
-        let mut na = NoAlloc {
-            mem,
-            chain: &mut cur.rec.chain,
+    }
+
+    /// A map step's writes (`map_leaves`), and the publication after the last.
+    #[inline(never)]
+    fn map_write<M: PhysMem64, R: Regs, F: TableFrames>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        frames: &mut F,
+        cur: MapCursor,
+        pfns: &[Pfn],
+    ) -> MapStep {
+        let Some(dom) = self.dom_mut(cur.domain) else {
+            return self.map_gone(cur); // (not reached: `map_step` found it)
         };
-        for _ in 0..undo {
-            iopt.unmap(mem, &mut na, (page + cleared) << PAGE_SHIFT);
-            cleared += 1;
+        match map_leaves(dom, mem, frames, cur, pfns) {
+            Ok(c) => MapStep::More(c),
+            Err((page, n, gscid, tables)) => self.map_published(mem, regs, page, n, gscid, tables),
         }
-        cur.rec.cleared = cleared;
-        dom.tables -= cur.rec.chain.n - before;
-        if cur.rec.cleared < cur.written {
-            return MapStep::More(cur);
+    }
+
+    /// A map step's roll-back (`unmap_leaves`), and the pending unmap after its last.
+    #[inline(never)]
+    fn map_back<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        cur: MapCursor,
+    ) -> MapStep {
+        let Some(dom) = self.dom_mut(cur.domain) else {
+            return self.map_gone(cur); // (not reached: `map_step` found it)
+        };
+        match unmap_leaves(dom, mem, cur) {
+            Ok(c) => MapStep::More(c),
+            Err((cur, gscid)) => self.map_rolled_back(mem, regs, cur, gscid),
         }
-        // every leaf is cleared: the roll-back is an unmap (4.3, 6.1): the range pending, the record waiting for a fence
-        if dom.iova.release(page, n).is_err() {
-            debug_assert!(false, "a range a map reserved is live");
+    }
+
+    /// A map step that found its domain gone (`map_step`).
+    #[inline(never)]
+    fn map_gone(&mut self, cur: MapCursor) -> MapStep {
+        let tables = cur.allocs;
+        if self.abandons != cur.abandons {
+            // a destruction was abandoned since the map began, perhaps this domain's: its tables may still be walked, so the
+            // record keeps its hold for good (counted as leaked, IO8). Only an IOMMU that has stopped completing fences gets here.
+            let rec = cur.rec;
+            let s = &mut self.stats;
+            s.holds_leaked = s.holds_leaked.saturating_add(1);
+            s.pages_leaked = s.pages_leaked.saturating_add(rec.pages);
+            s.tables_leaked = s.tables_leaked.saturating_add(rec.chain.n);
+            self.leak_list(rec);
+            return MapStep::Failed(MapFailed::Leaked { tables });
         }
-        dom.io_pages += n;
-        let gscid = dom.gscid;
+        // the destruction completed: its fence covered every leaf this map wrote, and its tables went with it
+        MapStep::Failed(MapFailed::Dropped {
+            released: Released {
+                rec: cur.rec,
+                job: cur.job,
+            },
+            tables,
+        })
+    }
+
+    /// The last write of a map (`map_leaves` published its record): the store's count, and the invalidation of the range and its fence queued.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: io_pages counts the pages of the domains' mappings
+    #[inline(never)]
+    fn map_published<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        page: u64,
+        n: u64,
+        gscid: u16,
+        tables: u64,
+    ) -> MapStep {
+        self.stats.io_pages += n;
+        let (cmds, k) = inval_range(gscid, page, n);
+        let ticket = self.submit(mem, regs, cmds.get(..k).unwrap_or(&cmds));
+        MapStep::Done(Mapped {
+            iova: page << PAGE_SHIFT,
+            ticket,
+            tables,
+        })
+    }
+
+    /// The end of a map's roll-back (`unmap_leaves` cleared every leaf it wrote, and its range is pending): the roll-back is an unmap (4.3, 6.1):
+    /// the record waits in the pending list for the fence queued here.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: io_pages counts the pages of the domains' mappings
+    #[inline(never)]
+    fn map_rolled_back<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        cur: MapCursor,
+        gscid: u16,
+    ) -> MapStep {
+        let (page, n) = (cur.rec.page, cur.rec.pages);
         let error = cur.back.unwrap_or(IoError::NoMemory);
         let tables = cur.allocs;
         let mut rec = cur.rec;
@@ -2023,9 +2252,6 @@ impl IoDomains {
     /// soft context if a table frame was freed: OD169) and a fence (`Queued`). A domain whose destruction has begun takes the record
     /// as it is (`Taken`, OD170: the unmap is OK, the destruction's fence covers its leaves and its completion releases the record).
     /// Allocates nothing.
-    #[allow(clippy::arithmetic_side_effects)]
-    // INVARIANT: cleared <= pages; page + cleared is inside the mapping's range; the table counts are frames moved from the table to the chain
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn unmap_step<M: PhysMem64, R: Regs>(
         &mut self,
         mem: &M,
@@ -2038,42 +2264,27 @@ impl IoDomains {
         else {
             return UnmapStep::Taken;
         };
-        let Domain {
-            pending,
-            iopt,
-            tables,
-            pending_tables,
-            gscid,
-            ..
-        } = dom;
-        let Some(rec) = find_list_mut(pending, |m| {
-            m.page == u.page && m.ticket == NO_TICKET && m.cleared < m.pages
-        }) else {
-            return UnmapStep::Taken; // (not reached: only the destruction takes a pending record before its fence)
-        };
-        let mut cleared = rec.cleared;
-        let k = (rec.pages - cleared).min(RANGE_STEP);
-        let before = rec.chain.n;
-        if let Some(iopt) = iopt.as_mut() {
-            let mut na = NoAlloc {
-                mem,
-                chain: &mut rec.chain,
-            };
-            for _ in 0..k {
-                iopt.unmap(mem, &mut na, (u.page + cleared) << PAGE_SHIFT);
-                cleared += 1;
-            }
+        match unmap_rec_step(dom, mem, u.page) {
+            // (not reached: only the destruction takes a pending record before its fence)
+            None => UnmapStep::Taken,
+            Some(None) => UnmapStep::More(u),
+            Some(Some((cmds, n))) => self.unmap_queue(mem, regs, u, &cmds, n),
         }
-        rec.cleared = cleared;
-        let chained = rec.chain.n - before;
-        *tables -= chained;
-        *pending_tables += chained;
-        if cleared < rec.pages {
-            return UnmapStep::More(u);
-        }
-        let (cmds, n) = inval_for(*gscid, rec);
+    }
+
+    /// The end of an unmap (`unmap_step`, every leaf clear): queue the invalidation `cmds[..n]` and a fence, whose ticket the record takes. A
+    /// frame of its own (KT13).
+    #[inline(never)]
+    fn unmap_queue<M: PhysMem64, R: Regs>(
+        &mut self,
+        mem: &M,
+        regs: &mut R,
+        u: Unmapping,
+        cmds: &[Command; INVAL_PAGES],
+        n: usize,
+    ) -> UnmapStep {
         #[cfg(not(feature = "fault-iommu-skip-inval"))]
-        let ticket = self.submit(mem, regs, cmds.get(..n).unwrap_or(&cmds));
+        let ticket = self.submit(mem, regs, cmds.get(..n).unwrap_or(cmds));
         // (the negative control: the leaves are clear but nothing is invalidated and no fence is waited for)
         #[cfg(feature = "fault-iommu-skip-inval")]
         let ticket = {
@@ -2152,17 +2363,35 @@ impl IoDomains {
     /// 6.3 step 1: refuse new maps, write the device's context to the quarantine state, queue the directory invalidation, the
     /// invalidation of the domain's whole soft context (its translations and MSI entries) and a fence. `None` if the domain is already
     /// being destroyed or gone (destroying a destroyed domain does nothing). Allocates nothing.
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn destroy<M: PhysMem64, R: Regs>(
         &mut self,
         mem: &M,
         regs: &mut R,
         d: DomainId,
     ) -> Option<Destroying> {
-        let quarantine = self.quarantine;
         let dom = self.dom_mut(d).filter(|x| x.state == State::Attached)?;
         dom.state = State::Detaching;
         let (device, gscid) = (dom.device, dom.gscid);
+        self.quarantine_device(mem, device);
+        // 10.6 step 2: every vector's enable bit is cleared (nothing more is noticed); the whole-context invalidation drops its entries
+        if let Some(dom) = self.dom(d) {
+            disable_vectors(dom, mem);
+        }
+        let cmds = [
+            Command::iodir_inval_ddt(Some(device)),
+            Command::iotinval_gvma(gscid, None),
+        ];
+        let ticket = self.submit(mem, regs, &cmds);
+        if let Some(dom) = self.dom_mut(d) {
+            dom.destroy_ticket = ticket.0;
+        }
+        Some(Destroying { domain: d, ticket })
+    }
+
+    /// `destroy`'s write of the device's context to the quarantine state (a frame of its own: KT13).
+    #[inline(never)]
+    fn quarantine_device<M: PhysMem64>(&mut self, mem: &M, device: u32) {
+        let quarantine = self.quarantine;
         let mut chain = Chain::default();
         let mut na = NoAlloc {
             mem,
@@ -2177,32 +2406,6 @@ impl IoDomains {
             self.ddt.clear(mem, &mut na, device);
         }
         debug_assert_eq!(chain.n, 0, "a quarantine write freed no directory page");
-        // 10.6 step 2: every vector's enable bit is cleared (nothing more is noticed); the whole-context invalidation drops its entries
-        if let Some(dom) = self.dom(d) {
-            for (k, v) in dom.vectors.iter().enumerate() {
-                if matches!(
-                    v.state,
-                    VState::Granting(_) | VState::Live | VState::Moving(_)
-                ) {
-                    if let Some(f) = u16::try_from(k)
-                        .ok()
-                        .and_then(|k| file_of(dom, k))
-                        .and_then(|f| Mrif::new(f).ok())
-                    {
-                        let _ = f.disable(mem, VECTOR_DATA);
-                    }
-                }
-            }
-        }
-        let cmds = [
-            Command::iodir_inval_ddt(Some(device)),
-            Command::iotinval_gvma(gscid, None),
-        ];
-        let ticket = self.submit(mem, regs, &cmds);
-        if let Some(dom) = self.dom_mut(d) {
-            dom.destroy_ticket = ticket.0;
-        }
-        Some(Destroying { domain: d, ticket })
     }
 
     /// 6.3 steps 2 to 4, once the fence has completed (IOMMU7 retires the domain's interrupt identities before this): the domain leaves
@@ -2384,7 +2587,6 @@ impl IoDomains {
     /// `vector_fenced`. `InvalidArgs`: `index` is 256 or more. `BadState`: the domain is gone or being destroyed, or the index is not
     /// free. `NoMemory`: no frame for the file.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub fn vector_grant<M: PhysMem64, R: Regs, F: TableFrames>(
         &mut self,
         mem: &M,
@@ -2402,6 +2604,29 @@ impl IoDomains {
             .dom_mut(d)
             .filter(|x| x.state == State::Attached)
             .ok_or(IoError::BadState)?;
+        let file = Self::grant_entry(dom, mem, frames, index, (notice_page, notice_id))?;
+        let gscid = dom.gscid;
+        let ticket = self.submit(mem, regs, &Self::vector_cmds(gscid, index));
+        if let Some(v) = self
+            .dom_mut(d)
+            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
+        {
+            v.state = VState::Granting(ticket.0);
+        }
+        self.stats.vectors = self.stats.vectors.saturating_add(1);
+        Ok((ticket, file))
+    }
+
+    /// `vector_grant`'s change to the domain: the file (and its frame, the first time), reset, and the MSI entry. The file's address. A frame of
+    /// its own (KT13).
+    #[inline(never)]
+    fn grant_entry<M: PhysMem64, F: TableFrames>(
+        dom: &mut Domain,
+        mem: &M,
+        frames: &mut F,
+        index: u16,
+        (notice_page, notice_id): (u64, u16),
+    ) -> Result<u64, IoError> {
         if dom.vectors.get(usize::from(index)).map(|v| v.state) != Some(VState::Free) {
             return Err(IoError::BadState);
         }
@@ -2422,16 +2647,7 @@ impl IoDomains {
         if dom.msi.set(mem, u64::from(index), pte).is_err() {
             return Err(IoError::InvalidArgs);
         }
-        let gscid = dom.gscid;
-        let ticket = self.submit(mem, regs, &Self::vector_cmds(gscid, index));
-        if let Some(v) = self
-            .dom_mut(d)
-            .and_then(|dom| dom.vectors.get_mut(usize::from(index)))
-        {
-            v.state = VState::Granting(ticket.0);
-        }
-        self.stats.vectors = self.stats.vectors.saturating_add(1);
-        Ok((ticket, file))
+        Ok(file)
     }
 
     /// 8.5, a move, under `IOMMU`: rewrite live vector `index`'s notice target (page and identity) with one store (A16), queue the

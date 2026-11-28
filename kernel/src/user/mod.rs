@@ -170,7 +170,7 @@ pub(crate) fn with_caller_opt<R>(
         let UserState { objs, procs, .. } = s;
         let caller = pid.and_then(|pid| procs.get_mut(&pid)).map(|p| {
             let job = p.job;
-            (&mut p.handles, job)
+            (&mut *p.handles, job)
         });
         f(objs, caller)
     })

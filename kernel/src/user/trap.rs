@@ -1889,17 +1889,18 @@ fn tally_verdicts(lines: &[String]) {
 fn debug_write_check(
     a: [u64; 6],
 ) -> Result<(alloc::sync::Arc<klock::aslock::AsCell>, u64, usize), ReplyErr> {
-    locked_state(|s| -> Result<_, ReplyErr> {
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::WRITE)
-            .map_err(|e| (e, None, None))?;
+    // (a status-only error inside: the frame stays small, KT13)
+    locked_state(|s| -> Result<_, Status> {
+        let me = caller_pid(s)?;
+        let p = s.procs.get(&me).ok_or(Status::BadState)?;
+        ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::WRITE)?;
         let len = a[2] as usize;
         if len > MAX_DEBUG_WRITE {
-            return Err((Status::TooBig, None, None));
+            return Err(Status::TooBig);
         }
         Ok((p.aspace.clone(), a[1], len))
     })
+    .map_err(|e| (e, None, None))
 }
 
 /// Show the lines of a `debug_write` (no big lock: the console's own lock keeps each line whole).

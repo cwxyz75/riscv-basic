@@ -182,252 +182,284 @@ pub(crate) fn handle_list(args: &[u8]) -> Result<Vec<Handle>, Status> {
 }
 
 /// The calls on handles, events, channels, sockets and ports. `None`: `n` is not one of them (the caller handles it). The width of
-/// 32-bit arguments is checked by the caller with [`wide_argument_error`].
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
-// INVARIANT: a is [u64; 6] and every `h(i)` is called with a constant below 6; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 is small)
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
+/// 32-bit arguments is checked by the caller with [`wide_argument_error`]. Each call is a frame of its own (KT13): this one only routes.
 pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
-    let Ctx {
-        objs,
-        handles,
-        job,
-        aspace,
-        mm,
-        vmos,
-        jobs,
-        faults,
-        staged,
-        defer_out,
-        deferred,
-        ..
-    } = c;
-    let (job, skip_forced_touch) = (*job, faults.skip_forced_touch);
-    if !matches!(
-        n,
-        nr::HANDLE_CLOSE
-            | nr::HANDLE_DUPLICATE
-            | nr::HANDLE_REPLACE
-            | nr::CHANNEL_CREATE
-            | nr::SOCKET_CREATE
-            | nr::SOCKET_WRITE
-            | nr::SOCKET_READ
-            | nr::SOCKET_SHUTDOWN
-            | nr::PORT_CREATE
-            | nr::PORT_BIND
-            | nr::PORT_REARM
-            | nr::PORT_UNBIND
-            | nr::EVENT_CREATE
-            | nr::EVENT_SIGNAL
-            | nr::OBJECT_INFO
-            | nr::OBJECT_SIGNALS
-            | nr::CHANNEL_WRITE
-            | nr::CHANNEL_READ
-            | nr::CHANNEL_READ_TXID
-    ) {
-        return None;
+    let a = &a;
+    Some(match n {
+        nr::HANDLE_CLOSE => ipc_handle_close(a, c),
+        nr::HANDLE_DUPLICATE => ipc_handle_duplicate(a, c),
+        nr::HANDLE_REPLACE => ipc_handle_replace(a, c),
+        nr::CHANNEL_CREATE | nr::SOCKET_CREATE | nr::PORT_CREATE | nr::EVENT_CREATE => {
+            ipc_create(n, c)
+        }
+        nr::SOCKET_WRITE => ipc_socket_write(a, c),
+        nr::SOCKET_READ => ipc_socket_read(a, c),
+        nr::SOCKET_SHUTDOWN
+        | nr::PORT_BIND
+        | nr::PORT_REARM
+        | nr::PORT_UNBIND
+        | nr::EVENT_SIGNAL
+        | nr::OBJECT_INFO
+        | nr::OBJECT_SIGNALS => ipc_simple(n, a, c),
+        nr::CHANNEL_WRITE => ipc_channel_write(a, c),
+        nr::CHANNEL_READ | nr::CHANNEL_READ_TXID => ipc_channel_read(n, a, c),
+        _ => return None,
+    })
+}
+
+/// `a[i]` as a handle (`i` is a constant below 6).
+fn h(a: &[u64; 6], i: usize) -> Handle {
+    Handle(a.get(i).copied().unwrap_or(0))
+}
+
+#[inline(never)]
+fn ipc_handle_close<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    c.handles
+        .close_bounded(c.objs, h(a, 0))
+        .map(|_| (None, None))
+        .map_err(|e| (e, None, None))
+}
+
+#[inline(never)]
+fn ipc_handle_duplicate<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    let nh = c
+        .handles
+        .duplicate(c.objs, h(a, 0), Rights(a[1] as u32))
+        .map_err(|e| (e, None, None))?;
+    Ok((Some(nh.0), None))
+}
+
+#[inline(never)]
+fn ipc_handle_replace<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    let nh = c
+        .handles
+        .replace(c.objs, h(a, 0), Rights(a[1] as u32))
+        .map_err(|e| (e, None, None))?;
+    // (the negative-control kernel forgets the forced touch: a waiter on the replaced handle
+    // must then sleep on, and the test that guards the wake must fail)
+    if c.faults.skip_forced_touch {
+        c.objs.take_dirty();
     }
-    let h = |i: usize| Handle(a[i]);
-    let r: Reply = (|| match n {
-        nr::HANDLE_CLOSE => handles
-            .close_bounded(objs, h(0))
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::HANDLE_DUPLICATE => {
-            let nh = handles
-                .duplicate(objs, h(0), Rights(a[1] as u32))
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(nh.0), None))
+    Ok((Some(nh.0), None))
+}
+
+/// The calls that make objects: a channel or a socket (two handles), a port or an event (one), charged to the caller's job.
+#[inline(never)]
+fn ipc_create<M: PhysMem>(n: usize, c: &mut Ctx<'_, M>) -> Reply {
+    let mut quota = ipc::Quota {
+        jobs: c.jobs,
+        job: Some(c.job),
+    };
+    let r = match n {
+        nr::CHANNEL_CREATE => ipc::channel_create_in(c.objs, c.handles, &mut quota)
+            .map(|(x, y)| (Some(x.0), Some(y.0))),
+        nr::SOCKET_CREATE => ipc::socket_create_in(c.objs, c.handles, &mut quota)
+            .map(|(x, y)| (Some(x.0), Some(y.0))),
+        nr::PORT_CREATE => {
+            ipc::port_create_in(c.objs, c.handles, &mut quota).map(|p| (Some(p.0), None))
         }
-        nr::HANDLE_REPLACE => {
-            let nh = handles
-                .replace(objs, h(0), Rights(a[1] as u32))
-                .map_err(|e| (e, None, None))?;
-            // (the negative-control kernel forgets the forced touch: a waiter on the replaced handle
-            // must then sleep on, and the test that guards the wake must fail)
-            if skip_forced_touch {
-                objs.take_dirty();
-            }
-            Ok((Some(nh.0), None))
+        nr::EVENT_CREATE => {
+            ipc::event_create_in(c.objs, c.handles, &mut quota).map(|e| (Some(e.0), None))
         }
-        nr::CHANNEL_CREATE => {
-            let (x, y) = ipc::channel_create_in(
-                objs,
-                handles,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            )
-            .map_err(|e| (e, None, None))?;
-            Ok((Some(x.0), Some(y.0)))
-        }
-        nr::SOCKET_CREATE => {
-            let (x, y) = ipc::socket_create_in(
-                objs,
-                handles,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            )
-            .map_err(|e| (e, None, None))?;
-            Ok((Some(x.0), Some(y.0)))
-        }
-        nr::SOCKET_WRITE => {
-            let len = a[2] as usize;
-            ipc::socket_write_check(objs, handles, h(0), len).map_err(|e| (e, None, None))?;
-            let data = match staged.take() {
-                Some(st) => st.data,
-                None => copy_from_user(aspace, mm, vmos, jobs, a[1], len)
-                    .map_err(|e| (e, None, None))?,
-            };
-            ipc::socket_write_in(objs, handles, h(0), &data, jobs)
-                .map(|n| (Some(n as u64), None))
-                .map_err(|e| (e, None, None))
-        }
-        nr::SOCKET_READ => {
-            let max = a[2] as usize;
-            // Peek, copy, commit (OD161): what a read would deliver is checked against the destination and copied out before anything is
-            // removed, so a bad pointer or a failed copy never loses data.
-            let (claim, n) =
-                ipc::socket_claim(objs, handles, h(0), max).map_err(|e| (e, None, None))?;
-            verify_writable(aspace, mm, vmos, jobs, a[1], n).map_err(|e| (e, None, None))?;
-            if *defer_out && n >= OUTSIDE_COPY_MIN {
-                let mut data: Vec<u8> = Vec::new();
-                data.try_reserve_exact(n)
-                    .map_err(|_| (Status::NoMemory, None, None))?;
-                if let Some((x, y)) = ipc::claimed_stream(objs, &claim, n) {
-                    data.extend_from_slice(x);
-                    data.extend_from_slice(y);
-                }
-                *deferred = Some(Deferred {
-                    bytes_at: a[1],
-                    data,
-                    handles_at: 0,
-                    nhandles: 0,
-                    read: DeferredRead::Socket { h: h(0), claim, n },
-                });
-                return Ok((Some(n as u64), None));
-            }
-            if let Some((x, y)) = ipc::claimed_stream(objs, &claim, n) {
-                copy_to_user(aspace, mm, vmos, jobs, a[1], x).map_err(|e| (e, None, None))?;
-                copy_to_user(aspace, mm, vmos, jobs, a[1] + x.len() as u64, y)
-                    .map_err(|e| (e, None, None))?;
-            }
-            match commit_socket(objs, handles, jobs, h(0), &claim, n) {
-                Committed::Done(r) => r,
-                // (not reached: the object lock was held from the claim to here)
-                Committed::Moved => fail(Status::BadState),
-            }
-        }
-        nr::SOCKET_SHUTDOWN => ipc::socket_shutdown(objs, handles, h(0))
+        // (not reached: `ipc_call` routes only these here)
+        _ => Err(Status::BadSyscall),
+    };
+    status_reply(r)
+}
+
+/// A reply whose failure carries only its status (the frames of the calls stay small with a 4-byte error inside: KT13).
+fn status_reply(r: Result<(Option<u64>, Option<u64>), Status>) -> Reply {
+    r.map_err(|e| (e, None, None))
+}
+
+#[inline(never)]
+fn ipc_socket_write<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    status_reply(socket_write(a, c).map(|n| (Some(n as u64), None)))
+}
+
+fn socket_write<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Result<usize, Status> {
+    let len = a[2] as usize;
+    ipc::socket_write_check(c.objs, c.handles, h(a, 0), len)?;
+    let data = match c.staged.take() {
+        Some(st) => st.data,
+        None => copy_from_user(c.aspace, c.mm, c.vmos, c.jobs, a[1], len)?,
+    };
+    ipc::socket_write_in(c.objs, c.handles, h(a, 0), &data, c.jobs)
+}
+
+#[inline(never)]
+fn ipc_socket_read<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    let (claim, n) = match socket_read_copy(a, c) {
+        Ok((claim, n, false)) => (claim, n),
+        Ok((claim, n, true)) => return defer_socket_read(c.objs, &mut c.deferred, a, claim, n),
+        Err(e) => return fail(e),
+    };
+    match commit_socket(c.objs, c.handles, c.jobs, h(a, 0), &claim, n) {
+        Committed::Done(r) => r,
+        // (not reached: the object lock was held from the claim to here)
+        Committed::Moved => fail(Status::BadState),
+    }
+}
+
+/// The peek and the copy of a socket read (OD161: what a read would deliver is checked against the destination and copied out before anything
+/// is removed, so a bad pointer or a failed copy never loses data): the claim and its length, for the commit, and whether the read is a big one
+/// with `defer_out`, not copied here but left for the caller (`defer_socket_read`).
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: a claim is at most the stream's length, which is bounded, so a[1] + x.len() is inside the range the verify checked
+#[inline(never)]
+fn socket_read_copy<M: PhysMem>(
+    a: &[u64; 6],
+    c: &mut Ctx<'_, M>,
+) -> Result<(ipc::ReadClaim, usize, bool), Status> {
+    let max = a[2] as usize;
+    let (claim, n) = ipc::socket_claim(c.objs, c.handles, h(a, 0), max)?;
+    verify_writable(c.aspace, c.mm, c.vmos, c.jobs, a[1], n)?;
+    if c.defer_out && n >= OUTSIDE_COPY_MIN {
+        return Ok((claim, n, true));
+    }
+    if let Some((x, y)) = ipc::claimed_stream(c.objs, &claim, n) {
+        copy_to_user(c.aspace, c.mm, c.vmos, c.jobs, a[1], x)?;
+        copy_to_user(c.aspace, c.mm, c.vmos, c.jobs, a[1] + x.len() as u64, y)?;
+    }
+    Ok((claim, n, false))
+}
+
+/// A big socket read left for the caller to copy out with the object lock let go (T215): the claimed bytes copied into `deferred`.
+#[inline(never)]
+fn defer_socket_read(
+    objs: &Kobjs,
+    deferred: &mut Option<Deferred>,
+    a: &[u64; 6],
+    claim: ipc::ReadClaim,
+    n: usize,
+) -> Reply {
+    let mut data: Vec<u8> = Vec::new();
+    data.try_reserve_exact(n)
+        .map_err(|_| (Status::NoMemory, None, None))?;
+    if let Some((x, y)) = ipc::claimed_stream(objs, &claim, n) {
+        data.extend_from_slice(x);
+        data.extend_from_slice(y);
+    }
+    *deferred = Some(Deferred {
+        bytes_at: a[1],
+        data,
+        handles_at: 0,
+        nhandles: 0,
+        read: DeferredRead::Socket {
+            h: h(a, 0),
+            claim,
+            n,
+        },
+    });
+    Ok((Some(n as u64), None))
+}
+
+/// The calls of one step on a handle: a socket's shutdown, a port's bind, re-arm and unbind, an event's signal, and an object's info and signals.
+#[inline(never)]
+fn ipc_simple<M: PhysMem>(n: usize, a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    let (objs, handles, jobs) = (&mut *c.objs, &mut *c.handles, &mut *c.jobs);
+    match n {
+        nr::SOCKET_SHUTDOWN => ipc::socket_shutdown(objs, handles, h(a, 0))
             .map(|()| (None, None))
             .map_err(|e| (e, None, None)),
-        nr::PORT_CREATE => {
-            let port = ipc::port_create_in(
-                objs,
-                handles,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            )
-            .map_err(|e| (e, None, None))?;
-            Ok((Some(port.0), None))
+        nr::PORT_BIND => {
+            ipc::port_bind_flags_in(objs, handles, h(a, 0), h(a, 1), a[2], a[3], a[4], jobs)
+                .map(|_| (None, None))
+                .map_err(|e| (e, None, None))
         }
-        nr::PORT_BIND => ipc::port_bind_flags_in(objs, handles, h(0), h(1), a[2], a[3], a[4], jobs)
+        nr::PORT_REARM => ipc::port_rearm_in(objs, handles, h(a, 0), a[1], jobs)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
-        nr::PORT_REARM => ipc::port_rearm_in(objs, handles, h(0), a[1], jobs)
+        nr::PORT_UNBIND => ipc::port_unbind_in(objs, handles, h(a, 0), a[1], jobs)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
-        nr::PORT_UNBIND => ipc::port_unbind_in(objs, handles, h(0), a[1], jobs)
+        nr::EVENT_SIGNAL => ipc::event_signal(objs, handles, h(a, 0), a[1] as u32, a[2] as u32)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
-        nr::EVENT_CREATE => {
-            let e = ipc::event_create_in(
-                objs,
-                handles,
-                &mut ipc::Quota {
-                    jobs,
-                    job: Some(job),
-                },
-            )
-            .map_err(|e| (e, None, None))?;
-            Ok((Some(e.0), None))
-        }
-        nr::EVENT_SIGNAL => ipc::event_signal(objs, handles, h(0), a[1] as u32, a[2] as u32)
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::OBJECT_INFO => ipc::object_info(objs, handles, h(0))
+        nr::OBJECT_INFO => ipc::object_info(objs, handles, h(a, 0))
             .map(|(k, peer)| (Some(k), Some(peer)))
             .map_err(|e| (e, None, None)),
-        nr::OBJECT_SIGNALS => ipc::signals_of(objs, handles, h(0))
+        nr::OBJECT_SIGNALS => ipc::signals_of(objs, handles, h(a, 0))
             .map(|s| (Some(u64::from(s)), None))
             .map_err(|e| (e, None, None)),
-        nr::CHANNEL_WRITE => {
-            let (nbytes, nhandles) = (a[2] as usize, a[4] as usize);
-            // Sizes first: they bound everything that follows (SYSCALLS.md).
-            if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
-                return fail(Status::TooBig);
-            }
-            // The channel handle next (BAD_HANDLE is the first error after the sizes, SYSCALLS.md): before anything is copied, so a probe with a bad
-            // handle and a bad buffer reads BAD_HANDLE (T171). The type and the rights are checked with the rest, after the copies.
-            if let Err(e) = handles.get(h(0)) {
-                return fail(e);
-            }
-            let (data, raw) = match staged.take() {
-                Some(st) => (st.data, st.handles),
-                None => (
-                    copy_from_user(aspace, mm, vmos, jobs, a[1], nbytes)
-                        .map_err(|e| (e, None, None))?,
-                    copy_from_user(aspace, mm, vmos, jobs, a[3], nhandles * 8)
-                        .map_err(|e| (e, None, None))?,
-                ),
-            };
-            ipc::channel_write_in(
-                objs,
-                handles,
-                h(0),
-                &data,
-                &handle_list(&raw).map_err(|e| (e, None, None))?,
-                jobs,
-            )
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None))
-        }
-        nr::CHANNEL_READ | nr::CHANNEL_READ_TXID => {
-            let (txid, bytes_at, max_bytes, handles_at, max_handles) = if n == nr::CHANNEL_READ {
-                (None, a[1], a[2] as usize, a[3], a[4] as usize)
-            } else {
-                (Some(a[1] as u32), a[2], a[3] as usize, a[4], a[5] as usize)
-            };
-            // A message never exceeds the limits, so larger declared buffers act as the limit.
-            let (mb, mh) = (
-                max_bytes.min(MAX_MSG_BYTES),
-                max_handles.min(MAX_MSG_HANDLES),
-            );
-            read_message(
-                objs,
-                handles,
-                aspace,
-                mm,
-                vmos,
-                jobs,
-                h(0),
-                txid,
-                bytes_at,
-                mb,
-                handles_at,
-                mh,
-                *defer_out,
-                deferred,
-            )
-        }
-        // (not reached: the guard above returned `None` for every call that is not one of these)
+        // (not reached: `ipc_call` routes only these here)
         _ => fail(Status::BadSyscall),
-    })();
-    Some(r)
+    }
+}
+
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES (checked first), so nhandles * 8 is small
+#[inline(never)]
+fn ipc_channel_write<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    status_reply(channel_write(a, c).map(|()| (None, None)))
+}
+
+/// The bytes and the raw handle numbers of a message to write: the ones the caller staged (T215), else copied in now. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES (checked by `channel_write`), so nhandles * 8 is small
+#[inline(never)]
+fn message_in<M: PhysMem>(
+    a: &[u64; 6],
+    c: &mut Ctx<'_, M>,
+    nbytes: usize,
+    nhandles: usize,
+) -> Result<(Vec<u8>, Vec<u8>), Status> {
+    Ok(match c.staged.take() {
+        Some(st) => (st.data, st.handles),
+        None => (
+            copy_from_user(c.aspace, c.mm, c.vmos, c.jobs, a[1], nbytes)?,
+            copy_from_user(c.aspace, c.mm, c.vmos, c.jobs, a[3], nhandles * 8)?,
+        ),
+    })
+}
+
+fn channel_write<M: PhysMem>(a: &[u64; 6], c: &mut Ctx<'_, M>) -> Result<(), Status> {
+    let (nbytes, nhandles) = (a[2] as usize, a[4] as usize);
+    // Sizes first: they bound everything that follows (SYSCALLS.md).
+    if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
+        return Err(Status::TooBig);
+    }
+    // The channel handle next (BAD_HANDLE is the first error after the sizes, SYSCALLS.md): before anything is copied, so a probe with a bad
+    // handle and a bad buffer reads BAD_HANDLE (T171). The type and the rights are checked with the rest, after the copies.
+    c.handles.get(h(a, 0))?;
+    let (data, raw) = message_in(a, c, nbytes, nhandles)?;
+    ipc::channel_write_in(
+        c.objs,
+        c.handles,
+        h(a, 0),
+        &data,
+        &handle_list(&raw)?,
+        c.jobs,
+    )
+    .map(|_| ())
+}
+
+#[inline(never)]
+fn ipc_channel_read<M: PhysMem>(n: usize, a: &[u64; 6], c: &mut Ctx<'_, M>) -> Reply {
+    let (txid, bytes_at, max_bytes, handles_at, max_handles) = if n == nr::CHANNEL_READ {
+        (None, a[1], a[2] as usize, a[3], a[4] as usize)
+    } else {
+        (Some(a[1] as u32), a[2], a[3] as usize, a[4], a[5] as usize)
+    };
+    // A message never exceeds the limits, so larger declared buffers act as the limit.
+    let (mb, mh) = (
+        max_bytes.min(MAX_MSG_BYTES),
+        max_handles.min(MAX_MSG_HANDLES),
+    );
+    read_message(
+        c.objs,
+        c.handles,
+        c.aspace,
+        c.mm,
+        c.vmos,
+        c.jobs,
+        h(a, 0),
+        txid,
+        bytes_at,
+        mb,
+        handles_at,
+        mh,
+        c.defer_out,
+        &mut c.deferred,
+    )
 }
 
 /// What a commit came to (OD161): the call's reply, or `Moved` when what the read claimed was taken by another read after the claim, and
@@ -443,7 +475,6 @@ pub enum Committed {
 /// `defer_out` is copied into `deferred` (allocating now, before anything is taken) for the caller to copy out with the object lock let go
 /// and then commit (`deferred_commit`). A copy that fails takes nothing: the message stays queued. `channel_call`'s reply uses it too.
 #[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES, so nhandles * 8 is small
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub(crate) fn read_message<M: PhysMem>(
     objs: &mut Kobjs,
     handles: &mut HandleTable,
@@ -472,25 +503,19 @@ pub(crate) fn read_message<M: PhysMem>(
             }
             Err(ReadError::Status(st)) => return fail(st),
         };
-    verify_writable(aspace, mm, vmos, jobs, bytes_at, nbytes).map_err(|e| (e, None, None))?;
-    verify_writable(aspace, mm, vmos, jobs, handles_at, nhandles * 8)
-        .map_err(|e| (e, None, None))?;
-    if defer_out && nbytes >= OUTSIDE_COPY_MIN {
-        let mut data: Vec<u8> = Vec::new();
-        data.try_reserve_exact(nbytes)
-            .map_err(|_| (Status::NoMemory, None, None))?;
-        data.extend_from_slice(ipc::claimed_bytes(objs, &claim).unwrap_or(&[]));
-        *deferred = Some(Deferred {
-            bytes_at,
-            data,
-            handles_at,
-            nhandles,
-            read: DeferredRead::Channel { ch, claim },
-        });
-        return Ok((Some(nbytes as u64), Some(nhandles as u64)));
+    let copy = read_copy(
+        objs,
+        (aspace, mm, vmos, jobs),
+        (bytes_at, handles_at),
+        (ch, claim, nbytes, nhandles),
+        defer_out,
+        deferred,
+    );
+    match copy {
+        Err(e) => return fail(e),
+        Ok(true) => return Ok((Some(nbytes as u64), Some(nhandles as u64))),
+        Ok(false) => {}
     }
-    let bytes = ipc::claimed_bytes(objs, &claim).unwrap_or(&[]);
-    copy_to_user(aspace, mm, vmos, jobs, bytes_at, bytes).map_err(|e| (e, None, None))?;
     match commit_channel(
         objs, handles, aspace, mm, vmos, jobs, ch, &claim, handles_at,
     ) {
@@ -500,10 +525,58 @@ pub(crate) fn read_message<M: PhysMem>(
     }
 }
 
+/// The checks and the copy of `read_message`, after the claim: both destinations are checked against the message, then its bytes are copied out
+/// (or, a big one with `defer_out`, into `deferred`, allocated now: `true`). A failure takes nothing. A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES, so nhandles * 8 is small
+#[inline(never)]
+fn read_copy<M: PhysMem>(
+    objs: &Kobjs,
+    (aspace, mm, vmos, jobs): (&mut AddressSpace, &mut Mm<M>, &mut Vmos, &mut Jobs),
+    (bytes_at, handles_at): (u64, u64),
+    (ch, claim, nbytes, nhandles): (Handle, ipc::ReadClaim, usize, usize),
+    defer_out: bool,
+    deferred: &mut Option<Deferred>,
+) -> Result<bool, Status> {
+    verify_writable(aspace, mm, vmos, jobs, bytes_at, nbytes)?;
+    verify_writable(aspace, mm, vmos, jobs, handles_at, nhandles * 8)?;
+    if defer_out && nbytes >= OUTSIDE_COPY_MIN {
+        return defer_channel_read(
+            objs,
+            (bytes_at, handles_at),
+            (ch, claim, nbytes, nhandles),
+            deferred,
+        );
+    }
+    let bytes = ipc::claimed_bytes(objs, &claim).unwrap_or(&[]);
+    copy_to_user(aspace, mm, vmos, jobs, bytes_at, bytes)?;
+    Ok(false)
+}
+
+/// A big channel read left for the caller to copy out with the object lock let go (T215): the claimed bytes copied into `deferred`. `true`.
+#[inline(never)]
+fn defer_channel_read(
+    objs: &Kobjs,
+    (bytes_at, handles_at): (u64, u64),
+    (ch, claim, nbytes, nhandles): (Handle, ipc::ReadClaim, usize, usize),
+    deferred: &mut Option<Deferred>,
+) -> Result<bool, Status> {
+    let mut data: Vec<u8> = Vec::new();
+    data.try_reserve_exact(nbytes)
+        .map_err(|_| Status::NoMemory)?;
+    data.extend_from_slice(ipc::claimed_bytes(objs, &claim).unwrap_or(&[]));
+    *deferred = Some(Deferred {
+        bytes_at,
+        data,
+        handles_at,
+        nhandles,
+        read: DeferredRead::Channel { ch, claim },
+    });
+    Ok(true)
+}
+
 /// Write a received message's handle numbers to `at`, as 8-byte little-endian words, in one copy (from the stack: nothing allocates but the
 /// copy's own page list, and a failure there is reported before the message is taken).
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < n <= MAX_MSG_HANDLES, so every slice is inside `words`
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: n <= MAX_MSG_HANDLES, so the slice is inside `words`
 fn put_handle_words<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
@@ -513,11 +586,19 @@ fn put_handle_words<M: PhysMem>(
     hs: &[Handle],
 ) -> Result<(), Status> {
     let mut words = [0u8; MAX_MSG_HANDLES * 8];
+    let n = handle_words(&mut words, hs);
+    copy_to_user(aspace, mm, vmos, jobs, at, &words[..n * 8])
+}
+
+/// The words of `put_handle_words` (a frame of its own: KT13): how many handles were written.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < n <= MAX_MSG_HANDLES, so every slice is inside `words`
+#[inline(never)]
+fn handle_words(words: &mut [u8; MAX_MSG_HANDLES * 8], hs: &[Handle]) -> usize {
     let n = hs.len().min(MAX_MSG_HANDLES);
     for (i, h) in hs.iter().take(n).enumerate() {
         words[i * 8..i * 8 + 8].copy_from_slice(&h.0.to_le_bytes());
     }
-    copy_to_user(aspace, mm, vmos, jobs, at, &words[..n * 8])
+    n
 }
 
 #[allow(clippy::too_many_arguments)]

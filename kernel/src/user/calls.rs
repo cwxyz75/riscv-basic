@@ -189,7 +189,7 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
         Ok(Err(e)) | Err(e) => return bad(e),
     };
     // (the batch is filled in place by each step: one copy of its frames, in this frame, KT13)
-    let mut batch = ksys::RangeBatch::new();
+    let mut batch = ksys::RangeBatch::EMPTY;
     let r: Result<(), Status> = (|| loop {
         // A
         section(true, None, |ctx| {

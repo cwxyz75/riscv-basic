@@ -139,13 +139,19 @@ pub fn port_poll_many<M: PhysMem>(
     let mut bytes: Vec<u8> = Vec::new();
     bytes.try_reserve_exact(len).map_err(|_| Status::NoMemory)?;
     let got = ipc::port_poll_many_in(objs, &p.handles, h, jobs, cap)?;
-    for &(key, observed) in &got {
+    packet_records(&mut bytes, &got);
+    copy_to_user_verified(p.aspace.held_mut(), mm, buf, &bytes)?;
+    Ok(got.len())
+}
+
+/// `port_poll_many`'s records, into `bytes` (room for them was reserved): `key: u64`, `observed: u32`, four zero bytes each.
+#[inline(never)]
+fn packet_records(bytes: &mut Vec<u8>, got: &[(u64, u32)]) {
+    for &(key, observed) in got {
         bytes.extend_from_slice(&key.to_le_bytes());
         bytes.extend_from_slice(&observed.to_le_bytes());
         bytes.extend_from_slice(&[0; 4]);
     }
-    copy_to_user_verified(p.aspace.held_mut(), mm, buf, &bytes)?;
-    Ok(got.len())
 }
 
 /// How `port_wait_many` reports: the count, else INTERRUPTED if the interrupt flag was taken, else TIMED_OUT.
@@ -382,7 +388,6 @@ pub fn channel_call_send<M: PhysMem>(
 /// `channel_call_send` with the request's bytes and handle words already copied in by the caller before it took the object lock (T215): `staged` is used in place
 /// of the two copies (the record is read here as always, so every check and its order are unchanged).
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: as `channel_call_send`
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn channel_call_send_staged<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -391,7 +396,7 @@ pub fn channel_call_send_staged<M: PhysMem>(
     me: u64,
     caller: u64,
     a: [u64; 6],
-    mut staged: Option<crate::Staged>,
+    staged: Option<crate::Staged>,
     take_interrupt: impl FnOnce(&mut crate::state::Threads, &mut usize) -> bool,
 ) -> Result<Call, Status> {
     let ch = Handle(a[0]);
@@ -404,86 +409,231 @@ pub fn channel_call_send_staged<M: PhysMem>(
         ..
     } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
-    let rec = copy_from_user(
-        p.aspace.held_mut(),
-        mm,
-        vmos,
-        jobs,
-        a[1],
-        abi::CHANNEL_CALL_ARGS_BYTES,
-    )?;
-    let (req_bytes, req_handles) = (le64(&rec, 0), le64(&rec, 8));
-    let (nbytes, nhandles) = (le32(&rec, 16) as usize, le32(&rec, 20) as usize);
-    let (rd_bytes, rd_handles) = (le64(&rec, 24), le64(&rec, 32));
-    let (rd_max_bytes, rd_max_handles) = (
-        (le32(&rec, 40) as usize).min(MAX_MSG_BYTES),
-        (le32(&rec, 44) as usize).min(MAX_MSG_HANDLES),
-    );
-    let deadline = le64(&rec, 48);
-    if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
-        return Err(Status::TooBig);
-    }
-    if nbytes < 4 {
-        return Err(Status::InvalidArgs);
-    }
+    let r = call_record(p, mm, vmos, jobs, a[1])?;
     // An interrupt already pending ends the call before anything is sent (a retry then sends one request, not two).
-    if deadline != 0 && take_interrupt(threads, n_interrupts) {
+    if r.deadline != 0 && take_interrupt(threads, n_interrupts) {
         return Err(Status::Interrupted);
     }
-    // Send the request.
-    let entry = p.handles.get(ch)?;
-    if !(entry.rights.contains(Rights::READ) && entry.rights.contains(Rights::WRITE)) {
-        // (a non-channel handle still reports WRONG_TYPE first)
-        if !matches!(objs.get(entry.obj), Some(ipc::KObj::Channel(_))) {
-            return Err(Status::WrongType);
-        }
-        return Err(Status::AccessDenied);
-    }
-    let (data, raw) = match staged.take() {
-        Some(st) if st.data.len() == nbytes && st.handles.len() == nhandles * 8 => {
-            (st.data, st.handles)
-        }
-        _ => (
-            copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, req_bytes, nbytes)?,
-            Vec::new(),
-        ),
-    };
-    let call = *next_call;
-    *next_call = next_call.wrapping_add(1);
-    let raw = if raw.is_empty() && nhandles != 0 {
-        copy_from_user(
-            p.aspace.held_mut(),
-            mm,
-            vmos,
-            jobs,
-            req_handles,
-            nhandles * 8,
-        )?
-    } else {
-        raw
-    };
-    ipc::channel_write_from(
+    call_send(
+        (objs, threads, next_call),
+        p,
+        (mm, vmos, jobs),
+        (ch, caller),
+        &r,
+        staged,
+    )
+}
+
+/// Send `channel_call`'s request (after the record and the interrupt check): the rights, the bytes and handle words, the call's id, and the
+/// write; then the caller is marked in a call. A frame of its own (KT13).
+#[inline(never)]
+fn call_send<M: PhysMem>(
+    (objs, threads, next_call): (&mut ipc::Kobjs, &mut crate::state::Threads, &mut u64),
+    p: &mut crate::Process,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    (ch, caller): (Handle, u64),
+    r: &CallRecord,
+    staged: Option<crate::Staged>,
+) -> Result<Call, Status> {
+    call_rights(objs, &p.handles, ch)?;
+    let (call, txid) = call_write(
         objs,
-        &mut p.handles,
-        ch,
-        &data,
-        &crate::handle_list(&raw)?,
-        jobs,
-        Some((caller, call)),
+        p,
+        (mm, vmos, jobs),
+        (ch, caller),
+        r,
+        staged,
+        next_call,
     )?;
     // (from here until the call ends, a server that reads the request lends it the caller's priority: L22)
     if let Some(t) = threads.get_mut(&caller) {
         t.call = Some(call);
     }
-    Ok(Call {
+    Ok(call_of(ch, txid, r))
+}
+
+/// The request of `call_send`, made (`call_message`) and written on `ch` (`send_call`): the call's id and its transaction id (the request's
+/// first four bytes). A frame of its own (KT13).
+#[inline(never)]
+fn call_write<M: PhysMem>(
+    objs: &mut ipc::Kobjs,
+    p: &mut crate::Process,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    (ch, caller): (Handle, u64),
+    r: &CallRecord,
+    staged: Option<crate::Staged>,
+    next_call: &mut u64,
+) -> Result<(u64, u32), Status> {
+    let (data, raw, call) = call_message(p, (mm, vmos, jobs), r, staged, next_call)?;
+    send_call(objs, p, jobs, ch, (&data, &raw), (caller, call))?;
+    Ok((call, le32(&data, 0)))
+}
+
+/// The call a sent request waits on: its channel, its transaction id and where its reply goes.
+#[inline(never)]
+fn call_of(ch: Handle, txid: u32, r: &CallRecord) -> Call {
+    Call {
         ch,
-        txid: le32(&data, 0),
-        rd_bytes,
-        rd_handles,
-        rd_max_bytes,
-        rd_max_handles,
-        deadline,
+        txid,
+        rd_bytes: r.rd_bytes,
+        rd_handles: r.rd_handles,
+        rd_max_bytes: r.rd_max_bytes,
+        rd_max_handles: r.rd_max_handles,
+        deadline: r.deadline,
+    }
+}
+
+/// A `channel_call` record, read (`call_record`).
+struct CallRecord {
+    req_bytes: u64,
+    req_handles: u64,
+    nbytes: usize,
+    nhandles: usize,
+    rd_bytes: u64,
+    rd_handles: u64,
+    rd_max_bytes: usize,
+    rd_max_handles: usize,
+    deadline: u64,
+}
+
+/// The `channel_call` record at `ptr` (a bad pointer is the first error), with its sizes checked. A frame of its own (KT13).
+#[inline(never)]
+fn call_record<M: PhysMem>(
+    p: &mut crate::Process,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    ptr: u64,
+) -> Result<CallRecord, Status> {
+    let rec = copy_from_user(
+        p.aspace.held_mut(),
+        mm,
+        vmos,
+        jobs,
+        ptr,
+        abi::CHANNEL_CALL_ARGS_BYTES,
+    )?;
+    let r = CallRecord {
+        req_bytes: le64(&rec, 0),
+        req_handles: le64(&rec, 8),
+        nbytes: le32(&rec, 16) as usize,
+        nhandles: le32(&rec, 20) as usize,
+        rd_bytes: le64(&rec, 24),
+        rd_handles: le64(&rec, 32),
+        rd_max_bytes: (le32(&rec, 40) as usize).min(MAX_MSG_BYTES),
+        rd_max_handles: (le32(&rec, 44) as usize).min(MAX_MSG_HANDLES),
+        deadline: le64(&rec, 48),
+    };
+    if r.nbytes > MAX_MSG_BYTES || r.nhandles > MAX_MSG_HANDLES {
+        return Err(Status::TooBig);
+    }
+    if r.nbytes < 4 {
+        return Err(Status::InvalidArgs);
+    }
+    Ok(r)
+}
+
+/// The call's channel handle carries READ and WRITE (a non-channel handle still reports WRONG_TYPE first).
+#[inline(never)]
+fn call_rights(
+    objs: &ipc::Kobjs,
+    handles: &kcore::handle::HandleTable,
+    ch: Handle,
+) -> Result<(), Status> {
+    let entry = handles.get(ch)?;
+    if !(entry.rights.contains(Rights::READ) && entry.rights.contains(Rights::WRITE)) {
+        if !matches!(objs.get(entry.obj), Some(ipc::KObj::Channel(_))) {
+            return Err(Status::WrongType);
+        }
+        return Err(Status::AccessDenied);
+    }
+    Ok(())
+}
+
+/// The request's bytes and handle words (`call_bytes`, `call_handle_words`), and the call's id, taken between them. A frame of its own (KT13).
+#[inline(never)]
+fn call_message<M: PhysMem>(
+    p: &mut crate::Process,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    r: &CallRecord,
+    staged: Option<crate::Staged>,
+    next_call: &mut u64,
+) -> Result<(Vec<u8>, Vec<u8>, u64), Status> {
+    let (data, raw) = call_bytes(p, mm, vmos, jobs, r, staged)?;
+    let call = *next_call;
+    *next_call = next_call.wrapping_add(1);
+    let raw = call_handle_words(p, mm, vmos, jobs, r, raw)?;
+    Ok((data, raw, call))
+}
+
+/// The request's bytes, and its handle words when the caller staged them (T215: used when they are what the record says), else copied in now
+/// (the handle words then empty: `call_handle_words` copies them). A frame of its own (KT13).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked by `call_record`
+#[inline(never)]
+fn call_bytes<M: PhysMem>(
+    p: &mut crate::Process,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    r: &CallRecord,
+    staged: Option<crate::Staged>,
+) -> Result<(Vec<u8>, Vec<u8>), Status> {
+    Ok(match staged {
+        Some(st) if st.data.len() == r.nbytes && st.handles.len() == r.nhandles * 8 => {
+            (st.data, st.handles)
+        }
+        _ => (
+            copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, r.req_bytes, r.nbytes)?,
+            Vec::new(),
+        ),
     })
+}
+
+/// The request's handle words: `raw` when it has them, else copied in now.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked by `call_record`
+#[inline(never)]
+fn call_handle_words<M: PhysMem>(
+    p: &mut crate::Process,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    r: &CallRecord,
+    raw: Vec<u8>,
+) -> Result<Vec<u8>, Status> {
+    if raw.is_empty() && r.nhandles != 0 {
+        copy_from_user(
+            p.aspace.held_mut(),
+            mm,
+            vmos,
+            jobs,
+            r.req_handles,
+            r.nhandles * 8,
+        )
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Write the call's request on `ch`, as call `call` of thread `caller`.
+#[inline(never)]
+fn send_call(
+    objs: &mut ipc::Kobjs,
+    p: &mut crate::Process,
+    jobs: &mut Jobs,
+    ch: Handle,
+    (data, raw): (&[u8], &[u8]),
+    (caller, call): (kcore::sched::Tid, u64),
+) -> Result<(), Status> {
+    ipc::channel_write_from(
+        objs,
+        &mut p.handles,
+        ch,
+        data,
+        &crate::handle_list(raw)?,
+        jobs,
+        Some((caller, call)),
+    )?;
+    Ok(())
 }
 
 /// The test that ends a call's sleep: the thread was killed or interrupted, or a reply with its transaction id (or the peer closing) is there.
@@ -527,7 +677,6 @@ pub fn channel_call_reply<M: PhysMem>(
 /// for the caller to copy out after it let the object lock go and then commit (T215, OD161): the destinations were checked and the bytes
 /// copied, nothing is taken yet.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn channel_call_reply_deferred<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -547,13 +696,35 @@ pub fn channel_call_reply_deferred<M: PhysMem>(
         ..
     } = us;
     objs.clear_dequeued_calls(); // (the reply is read here, not by a server: a note an earlier read left must not be attributed to a later one, L22)
-    let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+    let Some(p) = procs.get_mut(&me) else {
+        return fail(Status::BadState);
+    };
+    let out = call_reply_read(objs, p, (mm, vmos, jobs), c, deferred, defer_out);
+    match out {
+        Err((Status::TimedOut, ..)) if c.deadline != 0 && take_interrupt(threads, n_interrupts) => {
+            fail(Status::Interrupted)
+        }
+        other => other,
+    }
+}
+
+/// `channel_call_reply_deferred`'s peek and read of the reply (peek, copy, commit, OD161: a copy that fails leaves the reply queued, and the call
+/// reports the copy's status; nothing there yet is TIMED_OUT). A frame of its own (KT13).
+#[inline(never)]
+fn call_reply_read<M: PhysMem>(
+    objs: &mut ipc::Kobjs,
+    p: &mut crate::Process,
+    (mm, vmos, jobs): (&mut Mm<M>, &mut Vmos, &mut Jobs),
+    c: &Call,
+    deferred: &mut Option<crate::Deferred>,
+    defer_out: bool,
+) -> Reply {
     let crate::Process {
         handles: ph,
         aspace: pa,
         ..
-    } = &mut **p;
-    let out: Reply = match ipc::channel_peek(
+    } = p;
+    match ipc::channel_peek(
         objs,
         ph,
         c.ch,
@@ -585,11 +756,5 @@ pub fn channel_call_reply_deferred<M: PhysMem>(
         )),
         Err(ReadError::Status(Status::ShouldWait)) => Err((Status::TimedOut, None, None)),
         Err(ReadError::Status(st)) => Err((st, None, None)),
-    };
-    match out {
-        Err((Status::TimedOut, ..)) if c.deadline != 0 && take_interrupt(threads, n_interrupts) => {
-            fail(Status::Interrupted)
-        }
-        other => other,
     }
 }

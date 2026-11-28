@@ -115,7 +115,10 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     let process = Process {
         live_tids: Default::default(),
         aspace: alloc::sync::Arc::new(klock::aslock::AsCell::new(pid, aspace)),
-        handles: HandleTable::new(MAX_HANDLES),
+        // (boot: running out of memory here is a failure to start)
+        handles: kcore::fbox::FBox::try_new(HandleTable::new(MAX_HANDLES))
+            .ok()
+            .expect("memory for the first process's handle table"),
         tag,
         vmos: vmo_ids,
         entry: base + parsed.entry,

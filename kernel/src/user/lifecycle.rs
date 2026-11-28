@@ -339,7 +339,10 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
     // 3. what the process was charged
     crate::chaos::point(crate::chaos::Point::Teardown);
     teardown_credits(&process);
-    let cell = process.into_inner().aspace;
+    // (the cell is taken by a reference of its own, and the record is dropped in its box: `into_inner` would copy the whole record onto this
+    // stack, KT13; once the box is gone the pool's cell has this one holder again)
+    let cell = alloc::sync::Arc::clone(&process.aspace);
+    drop(process);
     any_state(|s| s.return_as_cell(cell));
 }
 

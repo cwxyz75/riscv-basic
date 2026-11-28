@@ -26,14 +26,20 @@ fn map_vmo_error(e: VmoError) -> Status {
 }
 
 /// `pager_create() -> (pager, channel)`: a pager and the user end of the channel the kernel writes its requests on (it keeps the other end).
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64, u64), Status> {
+    let job = pager_room(us, me)?;
+    pager_make(us, jobs, me, job)
+}
+
+/// `pager_create`'s room, before anything changes: the caller's job, room for both handles (so that the inserts cannot fail and strand an end),
+/// and room for the pager and its channel's end. A frame of its own (KT13).
+#[inline(never)]
+fn pager_room(us: &mut UserState, me: u64) -> Result<kcore::job::JobId, Status> {
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let job = caller.job;
     if caller.handles.room() < 2 {
         return Err(Status::NoMemory);
     }
-    // (room for both handles first, so that the inserts below cannot fail and strand an end)
     us.procs
         .get_mut(&me)
         .ok_or(Status::BadState)?
@@ -42,6 +48,17 @@ pub fn pager_create(us: &mut UserState, jobs: &mut Jobs, me: u64) -> Result<(u64
         .map_err(|_| Status::NoMemory)?;
     us.pager_ends.reserve(1).map_err(|_| Status::NoMemory)?;
     us.pagers.reserve_pager().map_err(|_| Status::NoMemory)?;
+    Ok(job)
+}
+
+/// `pager_create`'s objects: the channel (the caller gets the user end), and the pager's object and handle. A frame of its own (KT13).
+#[inline(never)]
+fn pager_make(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    me: u64,
+    job: kcore::job::JobId,
+) -> Result<(u64, u64), Status> {
     let id = us.next_pager;
     let UserState {
         objs,
@@ -112,7 +129,6 @@ fn range(
 
 /// `pager_supply(pager, vmo, offset, length, source, source_offset)`: move the pages of `source` (an anonymous VMO of the caller's, WRITE) to
 /// the pager's VMO and wake the threads waiting for them. The frames are not copied; the charge follows them. Returns the threads to wake.
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn pager_supply<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -122,7 +138,32 @@ pub fn pager_supply<M: PhysMem>(
     me: u64,
     a: [u64; 6],
 ) -> Result<(), Status> {
-    let (pager, vmo, first, count) = range(us, vmos, me, &a)?;
+    let (pager, vmo, first, count, src, sfirst) = supply_args(us, vmos, me, &a)?;
+    // the source's pages leave every address space that maps them, and every hart drops its translation, before the frames change owner
+    unmap_everywhere(us, mm, machine, (src, sfirst, count));
+    let (moved, err) = match vmos.supply(mm, jobs, vmo, first, count, src, sfirst) {
+        Ok(n) => (n, None),
+        Err((n, e)) => (n, Some(e)),
+    };
+    // (the pages that did move are supplied, and their waiters end, whatever the call answers; the kernel wakes them with `drain_woken`)
+    us.pagers.supply(pager, vmo, first, moved);
+    match err {
+        Some(e) => Err(map_vmo_error(e)),
+        None => Ok(()),
+    }
+}
+
+/// `pager_supply`'s arguments, checked (refused for what is wrong with the VMOs before any mapping is touched): the pager, the VMO and its pages,
+/// and the source and its first page. A frame of its own (KT13).
+#[allow(clippy::type_complexity)]
+#[inline(never)]
+fn supply_args(
+    us: &UserState,
+    vmos: &Vmos,
+    me: u64,
+    a: &[u64; 6],
+) -> Result<(u64, u64, u64, u64, u64, u64), Status> {
+    let (pager, vmo, first, count) = range(us, vmos, me, a)?;
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let src = ipc::vmo_of(&us.objs, &caller.handles, Handle(a[4]), Rights::WRITE)?;
     let soffset = a[5];
@@ -141,28 +182,27 @@ pub fn pager_supply<M: PhysMem>(
     }) {
         return Err(Status::BadState);
     }
-    // (refused for what is wrong with the VMOs before any mapping is touched)
     vmos.supply_check(vmo, first, count, src, sfirst)
         .map_err(map_vmo_error)?;
-    // the source's pages leave every address space that maps them, and every hart drops its translation, before the frames change owner
+    Ok((pager, vmo, first, count, src, sfirst))
+}
+
+/// Pages `first .. first + count` of VMO `vmo` leave every address space that maps them, and every hart drops its translations.
+#[inline(never)]
+fn unmap_everywhere<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    machine: &mut impl Machine,
+    (vmo, first, count): (u64, u64, u64),
+) {
     let mut cleared = 0u64;
     for p in us.procs.values_mut() {
         cleared =
-            cleared.saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, src, sfirst, count));
+            cleared.saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, vmo, first, count));
     }
     if cleared > 0 {
         machine.shootdown();
         machine.flush_tlb();
-    }
-    let (moved, err) = match vmos.supply(mm, jobs, vmo, first, count, src, sfirst) {
-        Ok(n) => (n, None),
-        Err((n, e)) => (n, Some(e)),
-    };
-    // (the pages that did move are supplied, and their waiters end, whatever the call answers; the kernel wakes them with `drain_woken`)
-    us.pagers.supply(pager, vmo, first, moved);
-    match err {
-        Some(e) => Err(map_vmo_error(e)),
-        None => Ok(()),
     }
 }
 

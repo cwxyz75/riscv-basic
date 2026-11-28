@@ -7,10 +7,9 @@ else is under it, and says so:
   // KT13: a const fn that builds a static at compile time       (no run-time frame at all)
 
 and a boot-or-test allow only in a test file (`*_tests.rs`, `selftest.rs`) or in a function `BOOT` lists, so that a frame on a path every
-thread can take cannot be relabelled to pass. An allow with no note is refused. `KT13: audited` (the debt marker of T172) is refused in the
-kernel crate: T289 shrank every such frame there. In `kcore` and `ksys`, whose frames the lint first measured in T289, the frames T289 did not
-shrink carry `KT13: audited, ... left by T289`: their number is pinned at `AUDITED_LEFT`, so a new one fails and one shrunk lowers the pin
-(work/T289.md lists them). The check also refuses a crate without its `clippy.toml` threshold or its crate-level `deny`.
+thread can take cannot be relabelled to pass. An allow with no note is refused. `KT13: audited` (the debt marker of T172) is refused in every
+crate: T289 shrank every such frame (the kernel's first, then the 48 of `kcore` and `ksys` it had left), so there is no pin of what is left,
+and a new one fails the check. The check also refuses a crate without its `clippy.toml` threshold or its crate-level `deny`.
 
 Usage: stack_allows.py [--list] [--self-test]"""
 import os
@@ -23,9 +22,6 @@ THRESHOLD = 1024
 BOOT_NOTE = "KT13: boot or test only, on a stack nothing else is under"
 CONST_NOTE = "KT13: a const fn that builds a static at compile time"
 TEST_FILE = re.compile(r"(_tests|selftest)\.rs$")
-LEFT_NOTE = "KT13: audited, clippy's estimate over 1 KiB, left by T289"
-# The `kcore` and `ksys` frames over the estimate that T289 left (work/T289.md): may only fall.
-AUDITED_LEFT = 48
 # Boot-only and test-only functions outside the test files: (file, function). A new entry is a claim a reviewer checks: the function runs once
 # at boot on the boot stack (or only in a test build, or only on a test's failure), never on a path a user thread or an interrupt takes.
 BOOT = {
@@ -50,6 +46,8 @@ BOOT = {
     ("ksys/src/state.rs", "with_irq_slots"),
     ("ksys/src/state.rs", "new"),
     ("ksys/src/state.rs", "default"),
+    # a process record put in the table by the boot loader (`kernel::user::loader::start_locked`) and by the host tests
+    ("ksys/src/proc.rs", "put_process"),
     # kcore: the device tree, the ELF images and the IOMMU tables are read by boot code only; the audits are the tests' invariant checks
     ("kcore/src/aiatree.rs", "discover"),
     ("kcore/src/iommutree.rs", "pci_memory_windows"),
@@ -115,9 +113,8 @@ def allows_in(rel, text):
 
 def file_problems(rel, text):
     bad = []
-    kernel = rel.startswith("kernel/")
     for n, line in enumerate(text.split("\n"), 1):
-        if "KT13: audited" in line and (kernel or LEFT_NOTE not in line):
+        if "KT13: audited" in line:
             bad.append(f"{rel}:{n}: `KT13: audited` (the debt marker of T172) is gone: shrink the frame (T289)")
     lines = text.split("\n")
     for i, first in enumerate(lines):
@@ -139,7 +136,11 @@ def file_problems(rel, text):
             if re.match(r"(pub(\([^)]*\))?\s+)?(unsafe\s+)?(impl|mod|trait)\b", nxt):
                 bad.append(f"{rel}:{i + 1}: an allow of clippy::large_stack_frames on an `impl`, `mod` or `trait` (KT13): put it on the function")
     for n, func, note in allows_in(rel, text):
-        if note.startswith(CONST_NOTE) or (not kernel and note.startswith(LEFT_NOTE)):
+        if note.startswith(CONST_NOTE):
+            # (only on a `const fn`: a run-time function cannot be relabelled to pass)
+            sig = next((l for l in lines[n - 1 : n + 11] if FN.match(l)), "")
+            if not re.search(r"\bconst\s+(unsafe\s+)?fn\b", sig):
+                bad.append(f"{rel}:{n}: `{func}` is marked a const fn but is not one (KT13)")
             continue
         if note.startswith(BOOT_NOTE):
             if not TEST_FILE.search(rel) and (rel, func) not in BOOT:
@@ -170,24 +171,12 @@ def sources(root=ROOT):
                     yield os.path.relpath(path, root), open(path, encoding="utf-8").read()
 
 
-def left_count(root=ROOT):
-    """The `kcore` and `ksys` allows T289 left."""
-    return sum(
-        1 for rel, text in sources(root) for _, _, note in allows_in(rel, text) if not rel.startswith("kernel/") and note.startswith(LEFT_NOTE)
-    )
-
-
 def problems(root=ROOT):
     bad = []
     for crate in CRATES:
         bad += crate_problems(crate, root)
     for rel, text in sources(root):
         bad += file_problems(rel, text)
-    n = left_count(root)
-    if n > AUDITED_LEFT:
-        bad.append(f"kcore/ksys: {n} large frames left over clippy's estimate, more than the {AUDITED_LEFT} T289 left: shrink the new one (KT13)")
-    elif n < AUDITED_LEFT:
-        bad.append(f"kcore/ksys: {n} large frames left, fewer than the pin: lower `AUDITED_LEFT` in scripts/stack_allows.py to {n} (and the list in work/T289.md)")
     return bad
 
 
@@ -205,7 +194,13 @@ def self_test():
     planted["a cfg_attr allow"] = ("kernel/src/user/trap.rs", "#[cfg_attr(not(test), allow(clippy::large_stack_frames))]\nfn syscall() {}\n")
     planted["the nursery group"] = ("kcore/src/aspace.rs", "#[allow(clippy::nursery)]\nfn page_for() {}\n")
     planted["an allow on an impl"] = ("kernel/src/kmem.rs", f"#[allow(clippy::large_stack_frames)] // {BOOT_NOTE}\nimpl X {{\n    pub fn init() {{}}\n    fn other() {{}}\n}}\n")
-    planted["the left marker in the kernel"] = ("kernel/src/user/trap.rs", f"#[allow(clippy::large_stack_frames)] // {LEFT_NOTE}\nfn syscall() {{}}\n")
+    # (the marker T289 used for the frames it left in `kcore` and `ksys`, now gone: refused in every crate, not counted against a pin)
+    left = "KT13: audited, clippy's estimate over 1 KiB, left by T289"
+    planted["the left marker in the kernel"] = ("kernel/src/user/trap.rs", f"#[allow(clippy::large_stack_frames)] // {left}\nfn syscall() {{}}\n")
+    planted["the left marker in kcore"] = ("kcore/src/aspace.rs", f"    #[allow(clippy::large_stack_frames)] // {left} (see work/T289.md)\n    fn page_for() {{}}\n")
+    planted["an audited allow in ksys"] = ("ksys/src/proc.rs", "#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB\npub fn proc_call() {}\n")
+    planted["a run-time fn labelled const"] = ("ksys/src/thread.rs", f"#[allow(clippy::large_stack_frames)] // {CONST_NOTE}\npub fn thread_spawn() {{}}\n")
+    planted["a ksys production frame relabelled"] = ("ksys/src/thread.rs", f"#[allow(clippy::large_stack_frames)] // {BOOT_NOTE}\npub fn thread_spawn() {{}}\n")
     for what, (rel, text) in planted.items():
         assert file_problems(rel, text), f"stack_allows self-test: {what} was not refused"
     accepted = {
@@ -213,7 +208,7 @@ def self_test():
         "a listed boot function": ("kernel/src/main.rs", f"#[allow(clippy::large_stack_frames)]\n// {BOOT_NOTE}\n#[no_mangle]\npub extern \"C\" fn kmain() {{}}\n"),
         "a const fn": ("kernel/src/percpu.rs", f"    #[allow(clippy::large_stack_frames)] // {CONST_NOTE}; no run-time frame\n    const fn new() -> PerHart {{}}\n"),
         "no allow": ("kcore/src/aspace.rs", ok),
-        "a frame T289 left in kcore": ("kcore/src/aspace.rs", f"    #[allow(clippy::large_stack_frames)] // {LEFT_NOTE} (see work/T289.md)\n    fn page_for() {{}}\n"),
+        "a listed ksys boot function": ("ksys/src/proc.rs", f"#[allow(clippy::large_stack_frames)] // {BOOT_NOTE} (the boot loader)\npub fn put_process() {{}}\n"),
     }
     for what, (rel, text) in accepted.items():
         assert not file_problems(rel, text), f"stack_allows self-test: {what} was refused: {file_problems(rel, text)}"
