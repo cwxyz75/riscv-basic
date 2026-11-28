@@ -61,7 +61,12 @@ pub fn process_create<M: PhysMem>(
 /// The job the new process is charged to (`process_create`): the one named by the handle in `a0` (MANAGE), or the caller's own when `a0` is 0;
 /// charged a process and the root page table's page, and retained. Nothing is charged on `Err`. A frame of its own (KT13).
 #[inline(never)]
-fn charge_create(us: &UserState, jobs: &mut Jobs, me: u64, a0: u64) -> Result<kcore::job::JobId, Status> {
+fn charge_create(
+    us: &UserState,
+    jobs: &mut Jobs,
+    me: u64,
+    a0: u64,
+) -> Result<kcore::job::JobId, Status> {
     let creator = us.procs.get(&me).ok_or(Status::BadState)?;
     let job = if a0 == 0 {
         creator.job

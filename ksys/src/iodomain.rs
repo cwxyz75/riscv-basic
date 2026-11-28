@@ -482,68 +482,7 @@ fn create_in<E: IoEnv>(e: &mut E, a: [u64; 6], job: JobId) -> Reply {
 pub fn iodomain_map<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let (offset, pages, access) = (a[2], a[3], a[4]);
     let writes = access & io::WRITE != 0;
-    let resolved = e.obj(
-        |o| -> Result<(DomainId, JobId, u64, iod::MapCharge), Status> {
-            let d = ipc::iodomain_of(o.objs, o.handles, Handle(a[0]), Rights::IO_MAP);
-            // the VMO: a DMA VMO (WRONG_TYPE otherwise) whose handle carries DMA, READ, and WRITE for a writable mapping (IO4)
-            let v = (|| -> Result<u64, Status> {
-                let entry = o.handles.get(Handle(a[1]))?;
-                let id = match o.objs.get(entry.obj) {
-                    Some(KObj::Vmo(id)) => *id,
-                    Some(_) => return Err(Status::WrongType),
-                    None => return Err(Status::BadHandle),
-                };
-                if o.vmos.kind(id) != Some(VmoKind::Dma) {
-                    return Err(Status::WrongType);
-                }
-                let mut need = Rights(Rights::DMA.0 | Rights::READ.0);
-                if writes {
-                    need = need.union(Rights::WRITE);
-                }
-                if !entry.rights.contains(need) {
-                    return Err(Status::AccessDenied);
-                }
-                Ok(id)
-            })();
-            if let Some(s) = first_error(&[d.err(), v.err()]) {
-                return Err(s);
-            }
-            let (d, vmo) = (
-                d.map_err(|_| Status::BadHandle)?,
-                v.map_err(|_| Status::BadHandle)?,
-            );
-            if pages == 0
-                || offset % 4096 != 0
-                || access & !(io::READ | io::WRITE) != 0
-                || access & io::READ == 0
-            {
-                return Err(Status::InvalidArgs);
-            }
-            let first = offset / 4096;
-            if first
-                .checked_add(pages)
-                .is_none_or(|end| o.vmos.pages(vmo).is_none_or(|n| end > n))
-            {
-                return Err(Status::InvalidArgs);
-            }
-            if d.destroyed {
-                return Err(Status::BadState);
-            }
-            let charge = iod::charge_map(o.jobs, d.job, pages).map_err(|_| Status::NoMemory)?;
-            if let Err(x) = o.vmos.hold_for_io(vmo, first, pages) {
-                charge.refund(o.jobs);
-                return Err(match x {
-                    IoHoldError::Gone => Status::BadHandle,
-                    IoHoldError::NotDma => Status::WrongType,
-                    IoHoldError::OutOfRange => Status::InvalidArgs,
-                    IoHoldError::NoMemory => Status::NoMemory,
-                });
-            }
-            // (the call's own use of the job: the handle may be closed by another thread while the map runs)
-            o.jobs.retain(d.job);
-            Ok((DomainId::from_raw(d.domain), d.job, vmo, charge))
-        },
-    );
+    let resolved = e.obj(|o| map_resolve(o, &a, writes));
     let (d, job, vmo, charge) = match resolved.unwrap_or(Err(Status::BadState)) {
         Ok(x) => x,
         Err(s) => return err(s),
@@ -552,6 +491,108 @@ pub fn iodomain_map<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let r = map_in(e, d, vmo, first, pages, access, charge);
     release_job(e, job);
     r
+}
+
+/// `iodomain_map`'s first section (`OBJ`, the memory locks inside): the domain and the VMO resolved and checked (errors in the order of 4.3), the
+/// charge for the map's tables and pages had, the VMO's pages held for I/O, and the call's own use of the domain's job. A frame of its own (KT13).
+#[inline(never)]
+fn map_resolve<M: PhysMem>(
+    o: IoObj<'_, M>,
+    a: &[u64; 6],
+    writes: bool,
+) -> Result<(DomainId, JobId, u64, iod::MapCharge), Status> {
+    let (offset, pages, access) = (a[2], a[3], a[4]);
+    let (d, vmo) = map_targets(o.objs, o.handles, o.vmos, a, writes)?;
+    if pages == 0
+        || offset % 4096 != 0
+        || access & !(io::READ | io::WRITE) != 0
+        || access & io::READ == 0
+    {
+        return Err(Status::InvalidArgs);
+    }
+    let first = offset / 4096;
+    if first
+        .checked_add(pages)
+        .is_none_or(|end| o.vmos.pages(vmo).is_none_or(|n| end > n))
+    {
+        return Err(Status::InvalidArgs);
+    }
+    if d.destroyed {
+        return Err(Status::BadState);
+    }
+    let charge = map_hold(o.jobs, o.vmos, d.job, (vmo, first, pages))?;
+    Ok((DomainId::from_raw(d.domain), d.job, vmo, charge))
+}
+
+/// `map_resolve`'s charge (the map's tables and pages, to the domain's job) and hold on the VMO's pages; then the call's own use of the job (the
+/// handle may be closed by another thread while the map runs). Nothing is kept on `Err`.
+#[inline(never)]
+fn map_hold(
+    jobs: &mut Jobs,
+    vmos: &mut Vmos,
+    job: JobId,
+    (vmo, first, pages): (u64, u64, u64),
+) -> Result<iod::MapCharge, Status> {
+    let charge = iod::charge_map(jobs, job, pages).map_err(|_| Status::NoMemory)?;
+    if let Err(x) = vmos.hold_for_io(vmo, first, pages) {
+        charge.refund(jobs);
+        return Err(match x {
+            IoHoldError::Gone => Status::BadHandle,
+            IoHoldError::NotDma => Status::WrongType,
+            IoHoldError::OutOfRange => Status::InvalidArgs,
+            IoHoldError::NoMemory => Status::NoMemory,
+        });
+    }
+    jobs.retain(job);
+    Ok(charge)
+}
+
+/// The domain and the VMO `iodomain_map` names (their errors in the order of 4.3).
+#[inline(never)]
+fn map_targets(
+    objs: &Kobjs,
+    handles: &HandleTable,
+    vmos: &Vmos,
+    a: &[u64; 6],
+    writes: bool,
+) -> Result<(ipc::IoDomainRef, u64), Status> {
+    let d = ipc::iodomain_of(objs, handles, Handle(a[0]), Rights::IO_MAP);
+    let v = dma_vmo(objs, handles, vmos, a[1], writes);
+    if let Some(s) = first_error(&[d.err(), v.err()]) {
+        return Err(s);
+    }
+    Ok((
+        d.map_err(|_| Status::BadHandle)?,
+        v.map_err(|_| Status::BadHandle)?,
+    ))
+}
+
+/// The VMO `iodomain_map` names: a DMA VMO (WRONG_TYPE otherwise) whose handle carries DMA, READ, and WRITE for a writable mapping (IO4).
+#[inline(never)]
+fn dma_vmo(
+    objs: &Kobjs,
+    handles: &HandleTable,
+    vmos: &Vmos,
+    h: u64,
+    writes: bool,
+) -> Result<u64, Status> {
+    let entry = handles.get(Handle(h))?;
+    let id = match objs.get(entry.obj) {
+        Some(KObj::Vmo(id)) => *id,
+        Some(_) => return Err(Status::WrongType),
+        None => return Err(Status::BadHandle),
+    };
+    if vmos.kind(id) != Some(VmoKind::Dma) {
+        return Err(Status::WrongType);
+    }
+    let mut need = Rights(Rights::DMA.0 | Rights::READ.0);
+    if writes {
+        need = need.union(Rights::WRITE);
+    }
+    if !entry.rights.contains(need) {
+        return Err(Status::AccessDenied);
+    }
+    Ok(id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -571,50 +612,83 @@ fn map_in<E: IoEnv>(
     };
     // the hold is taken: the frames are marked before any leaf names them (debug builds), and the record is made with no lock held
     mark(e, vmo, first, pages, true);
-    let undo_hold = |e: &mut E, charge: iod::MapCharge| {
-        mark(e, vmo, first, pages, false);
-        e.mem(|mm, vmos, jobs, _| {
-            charge.refund(jobs);
-            let released = vmos.release(mm, jobs, vmo);
-            debug_assert!(released.is_ok(), "the map's hold");
-        });
-    };
     let Some(rec) = Record::new(vmo, first, pages, acc) else {
-        undo_hold(e, charge);
+        undo_hold(e, (vmo, first, pages), charge);
         return err(Status::NoMemory);
     };
-    let mut cur = match e.iommu(|s, _, _, _| s.map_begin(d, rec)) {
+    let cur = match e.iommu(|s, _, _, _| s.map_begin(d, rec)) {
         Ok(c) => c,
         Err(f) => {
             let s = match f {
                 MapFailed::Refused(x, _) => io_status(x),
                 _ => Status::BadState, // (not reached: nothing is written before the first step)
             };
-            undo_hold(e, charge);
+            undo_hold(e, (vmo, first, pages), charge);
             return err(s);
         }
     };
-    let step = loop {
-        let mut buf = [0 as Pfn; RANGE_STEP as usize];
-        let mut n = 0usize;
-        if let Some((at, k)) = cur.next_frames() {
-            n = usize::try_from(k).unwrap_or(0).min(buf.len());
-            let out = buf.get_mut(..n).unwrap_or(&mut []);
-            if !e.mem(|_, vmos, _, _| vmos.io_frames(vmo, at, out)) {
-                n = 0; // (not reached: the hold keeps the VMO and its frames)
-            }
-        }
-        let frames = buf.get(..n).unwrap_or(&[]);
-        match e
-            .iommu(|s, mem, regs, db| s.map_step(mem, regs, &mut DbFrames { db, mem }, cur, frames))
-        {
+    let step = map_run(e, vmo, cur);
+    map_end(e, (d, vmo, first, pages), step, charge)
+}
+
+/// `map_in`'s steps, to the last (`More` is never returned).
+#[inline(never)]
+fn map_run<E: IoEnv>(e: &mut E, vmo: u64, mut cur: iod::MapCursor) -> MapStep {
+    loop {
+        match map_one(e, vmo, cur) {
             MapStep::More(c) => {
                 cur = c;
                 e.relax(); // (between steps, with no lock held: OD168)
             }
-            other => break other,
+            other => return other,
         }
+    }
+}
+
+/// The undo of `map_in`'s hold, before anything is written: the frames unmarked, the charge refunded, and the hold released.
+#[inline(never)]
+fn undo_hold<E: IoEnv>(e: &mut E, (vmo, first, pages): (u64, u64, u64), charge: iod::MapCharge) {
+    mark(e, vmo, first, pages, false);
+    e.mem(|mm, vmos, jobs, _| {
+        charge.refund(jobs);
+        let released = vmos.release(mm, jobs, vmo);
+        debug_assert!(released.is_ok(), "the map's hold");
+    });
+}
+
+/// One step of `map_in`: the frames the next step writes read under `VMO` (into a buffer of `RANGE_STEP`), then the step under `IOMMU`. A frame
+/// of its own (KT13).
+#[inline(never)]
+fn map_one<E: IoEnv>(e: &mut E, vmo: u64, cur: iod::MapCursor) -> MapStep {
+    let mut buf = [0 as Pfn; RANGE_STEP as usize];
+    let n = next_frames(e, vmo, &cur, &mut buf);
+    let frames = buf.get(..n).unwrap_or(&[]);
+    e.iommu(|s, mem, regs, db| s.map_step(mem, regs, &mut DbFrames { db, mem }, cur, frames))
+}
+
+/// The frames `map_one`'s step writes, read under `VMO` into `buf`: how many.
+#[inline(never)]
+fn next_frames<E: IoEnv>(e: &mut E, vmo: u64, cur: &iod::MapCursor, buf: &mut [Pfn; RANGE_STEP as usize]) -> usize {
+    let Some((at, k)) = cur.next_frames() else {
+        return 0;
     };
+    let n = usize::try_from(k).unwrap_or(0).min(buf.len());
+    let out = buf.get_mut(..n).unwrap_or(&mut []);
+    if !e.mem(|_, vmos, _, _| vmos.io_frames(vmo, at, out)) {
+        return 0; // (not reached: the hold keeps the VMO and its frames)
+    }
+    n
+}
+
+/// How `map_in`'s last step ended: the charge settled with the tables the map used, and the reply. A published map waits for its fence (one that
+/// fails is unmapped again: NO_MEMORY, 4.3, 6.4); a rolled-back one settles its pending unmap. A frame of its own (KT13).
+#[inline(never)]
+fn map_end<E: IoEnv>(
+    e: &mut E,
+    (d, vmo, first, pages): (DomainId, u64, u64, u64),
+    step: MapStep,
+    charge: iod::MapCharge,
+) -> Reply {
     match step {
         MapStep::Done(m) => {
             e.mem(|_, _, jobs, _| charge.settle(jobs, m.tables));
@@ -647,7 +721,7 @@ fn map_in<E: IoEnv>(
         }
         MapStep::Failed(MapFailed::Refused(x, _)) => {
             // (not reached: a refusal comes from `map_begin`)
-            undo_hold(e, charge);
+            undo_hold(e, (vmo, first, pages), charge);
             err(io_status(x))
         }
         MapStep::More(_) => err(Status::BadState), // (not reached: the loop runs until the map ends)
@@ -775,67 +849,17 @@ pub fn iodomain_fault_read<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
 /// `vmo_create_dma_in(resource, pages, job) -> vmo` (4.7; amendment part 1 point 5: the frames are taken and zeroed `RANGE_STEP` at a
 /// time under `FRAME` only, while no handle names the VMO).
 pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
-    let pages = a[1];
-    let begun = e.obj(|o| -> Result<(JobId, kcore::aspace::DmaBuild), Status> {
-        let r = ipc::resource_of(o.objs, o.handles, Handle(a[0])).err();
-        let j = if a[2] == 0 {
-            Ok(o.job)
-        } else {
-            ipc::job_of(o.objs, o.handles, Handle(a[2]), Rights::MANAGE)
-        };
-        if let Some(s) = first_error(&[r, j.err()]) {
-            return Err(s);
-        }
-        let job = j.map_err(|_| Status::BadHandle)?;
-        let b = o.vmos.dma_begin(o.jobs, pages, job).map_err(|x| match x {
-            VmoError::OutOfRange => Status::InvalidArgs,
-            _ => Status::NoMemory,
-        })?;
-        o.jobs.retain(job);
-        Ok((job, b))
-    });
-    let (job, mut b) = match begun.unwrap_or(Err(Status::BadState)) {
-        Ok(x) => x,
+    // (the build stays in this one place from its beginning to its end: it is not copied through the steps' frames, KT13)
+    let mut slot = None;
+    let job = match e
+        .obj(|o| dma_resolve(o, &a, &mut slot))
+        .unwrap_or(Err(Status::BadState))
+    {
+        Ok(j) => j,
         Err(s) => return err(s),
     };
-    let built = loop {
-        match e.frame(|db, mem, _| b.step_with(db, mem)) {
-            Ok(false) => e.relax(), // (between steps, with no lock held: OD168)
-            Ok(true) => break true,
-            Err(_) => break false,
-        }
-    };
-    let mut slot = Some(b);
-    let r = e.obj(|o| -> Reply {
-        let Some(b) = slot.take() else {
-            return err(Status::BadState);
-        };
-        if !built {
-            o.vmos.dma_abort(o.mm, o.jobs, b);
-            return err(Status::NoMemory);
-        }
-        let id = o
-            .vmos
-            .dma_finish(o.mm, o.jobs, b)
-            .map_err(|_| (Status::NoMemory, None, None))?;
-        let rights = Rights((Rights::VMO.0 & !Rights::EXECUTE.0) | Rights::DMA.0);
-        match ipc::vmo_object_create_with(
-            o.objs,
-            o.handles,
-            id,
-            rights,
-            &mut Quota {
-                jobs: o.jobs,
-                job: Some(o.job),
-            },
-        ) {
-            Ok(h) => Ok((Some(h.0), None)),
-            Err(s) => {
-                let _ = o.vmos.release(o.mm, o.jobs, id);
-                err(s)
-            }
-        }
-    });
+    let built = dma_build(e, &mut slot);
+    let r = e.obj(|o| dma_publish(o, &mut slot, built));
     // (the caller's process went while the frames were taken: what was built is given back)
     let r = r.unwrap_or_else(|| {
         if let Some(b) = slot.take() {
@@ -845,6 +869,92 @@ pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     });
     release_job(e, job);
     r
+}
+
+/// `vmo_create_dma_in`'s frames, taken and zeroed `RANGE_STEP` at a time under `FRAME` only: whether they all were.
+#[inline(never)]
+fn dma_build<E: IoEnv>(e: &mut E, slot: &mut Option<kcore::aspace::DmaBuild>) -> bool {
+    let Some(b) = slot.as_mut() else {
+        return false; // (not reached: `dma_resolve` put the build there)
+    };
+    loop {
+        match e.frame(|db, mem, _| b.step_with(db, mem)) {
+            Ok(false) => e.relax(), // (between steps, with no lock held: OD168)
+            Ok(true) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// `vmo_create_dma_in`'s first section: the resource and the job resolved (errors in the order of 4.7), the build begun (the VMO's charge) into
+/// `slot`, and the call's own use of the job. A frame of its own (KT13).
+#[inline(never)]
+fn dma_resolve<M: PhysMem>(
+    o: IoObj<'_, M>,
+    a: &[u64; 6],
+    slot: &mut Option<kcore::aspace::DmaBuild>,
+) -> Result<JobId, Status> {
+    let pages = a[1];
+    let r = ipc::resource_of(o.objs, o.handles, Handle(a[0])).err();
+    let j = if a[2] == 0 {
+        Ok(o.job)
+    } else {
+        ipc::job_of(o.objs, o.handles, Handle(a[2]), Rights::MANAGE)
+    };
+    if let Some(s) = first_error(&[r, j.err()]) {
+        return Err(s);
+    }
+    let job = j.map_err(|_| Status::BadHandle)?;
+    match o.vmos.dma_begin(o.jobs, pages, job) {
+        Ok(b) => *slot = Some(b),
+        Err(VmoError::OutOfRange) => return Err(Status::InvalidArgs),
+        Err(_) => return Err(Status::NoMemory),
+    }
+    o.jobs.retain(job);
+    Ok(job)
+}
+
+/// `vmo_create_dma_in`'s last section: the build finished (or, `built` false, given back: NO_MEMORY), the VMO's object and the caller's handle to
+/// it made. The build is taken from `slot` (left there if this does not run: the caller gives it back). A frame of its own (KT13).
+#[inline(never)]
+fn dma_publish<M: PhysMem>(
+    o: IoObj<'_, M>,
+    slot: &mut Option<kcore::aspace::DmaBuild>,
+    built: bool,
+) -> Reply {
+    let Some(b) = slot.take() else {
+        return err(Status::BadState);
+    };
+    if !built {
+        o.vmos.dma_abort(o.mm, o.jobs, b);
+        return err(Status::NoMemory);
+    }
+    let Ok(id) = o.vmos.dma_finish(o.mm, o.jobs, b) else {
+        return err(Status::NoMemory);
+    };
+    dma_handle(o, id)
+}
+
+/// The DMA VMO's object and the caller's handle to it (`dma_publish`); without them the VMO goes again. A frame of its own (KT13).
+#[inline(never)]
+fn dma_handle<M: PhysMem>(o: IoObj<'_, M>, id: u64) -> Reply {
+    let rights = Rights((Rights::VMO.0 & !Rights::EXECUTE.0) | Rights::DMA.0);
+    match ipc::vmo_object_create_with(
+        o.objs,
+        o.handles,
+        id,
+        rights,
+        &mut Quota {
+            jobs: o.jobs,
+            job: Some(o.job),
+        },
+    ) {
+        Ok(h) => Ok((Some(h.0), None)),
+        Err(s) => {
+            let _ = o.vmos.release(o.mm, o.jobs, id);
+            err(s)
+        }
+    }
 }
 
 // ---- interrupt vectors (IOMMU7; IOMMU-SPEC 8.3 to 8.5, 6.2, 10.6, 11.2) ---------------------------------------------------------------
