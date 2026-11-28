@@ -86,7 +86,7 @@ pub struct Process {
     /// The address space behind its `AS` lock (L17): shared by `Arc` so a syscall can hold the locks of the spaces it touches ([`klock::aslock::AsCell::hold`])
     /// while the process table is borrowed as the pure code likes.
     pub aspace: alloc::sync::Arc<klock::aslock::AsCell>,
-    pub handles: HandleTable,
+    pub handles: kcore::fbox::FBox<HandleTable>,
     /// The address-space identifier and the generation it was allocated in (L18); the allocator is `UserState::asids`.
     pub tag: kcore::asid::AsTag,
     pub vmos: Vec<u64>,
