@@ -476,6 +476,7 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_start(a: [u64; 6]) -> Reply {
+    let pin = thread::take_spawn_pin(); // (T226: the test-only pin is consumed by this call, whatever its outcome)
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
     }
@@ -495,7 +496,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
             };
             ksys::process_start(s, k.jobs, &mut lib, me, a).map_err(|e| (e, None, None))?
         };
-        spawn_registered(s, prepared, started);
+        spawn_registered(s, prepared, started, pin);
         Ok(())
     })?;
     Ok((None, None))
@@ -549,8 +550,16 @@ fn spawn_registered(
     s: &mut UserState,
     prepared: thread::PreparedThread,
     mut spawn: ksys::Spawn,
+    pin: Option<usize>,
 ) -> Tid {
-    let tid = thread::spawn_prepared(prepared, "user", spawn.prio, user_thread_main, spawn.token);
+    let tid = thread::spawn_prepared(
+        prepared,
+        "user",
+        spawn.prio,
+        user_thread_main,
+        spawn.token,
+        pin,
+    );
     ksys::thread_registered_by_spawner(s, tid, &mut spawn);
     thread::pi_register(tid); // (the donation graph, L23: its room was reserved by `prepare_user_thread`)
     if spawn.suspended {
@@ -564,6 +573,7 @@ fn spawn_registered(
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
+    let pin = thread::take_spawn_pin(); // (T226: the test-only pin is consumed by this call, whatever its outcome)
     if !thread::user_thread_ids_left() {
         return bad(Status::NoMemory);
     }
@@ -579,7 +589,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
             .map_err(|e| (e, None, None))?;
         drop(k);
         let handle = spawn.handle;
-        let tid = spawn_registered(s, prepared, spawn);
+        let tid = spawn_registered(s, prepared, spawn, pin);
         Ok((handle, tid))
     })?;
     Ok((Some(handle), Some(tid)))

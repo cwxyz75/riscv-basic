@@ -5,7 +5,7 @@
 //!
 //! The properties: with no deadline every taker owed a permit gets one (a lost wake leaves a taker asleep forever, which loom and
 //! shuttle report as a deadlock); with deadlines that pass at any moment, no permit is lost or made (takes plus what is left equal the
-//! posts), and a taker that gives up leaves no permit behind it that it could have taken.
+//! posts), and a taker whose deadline passes after a post still takes it (its last look after a timeout).
 //! Run with
 //!   RUSTFLAGS="--cfg loom"    cargo test -p kcore --release --test usync_concurrency
 //!   RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test usync_concurrency
@@ -179,6 +179,26 @@ fn a_deadline_races_a_post() {
     );
 }
 
+/// The post comes first, then the deadline passes at any moment: the taker must end with the permit, whether a wake, a changed word or
+/// its one last look after the timeout gave it (a taker that gave up with the permit there would leave it behind).
+fn a_deadline_after_a_post_still_takes_it() {
+    let m = model();
+    let count = Arc::new(AtomicU32::new(0));
+    let t = taker(&m, 1);
+    let (c2, t2) = (count.clone(), t.clone());
+    let h = thread::spawn(move || usync::wait_until(&c2, 1_000, &*t2));
+    usync::post(&count, &poster(&m));
+    let t3 = t.clone();
+    let timer = thread::spawn(move || fire(&t3));
+    let took = h.join().unwrap();
+    timer.join().unwrap();
+    assert!(
+        took.is_some(),
+        "the permit was posted before the deadline passed: {took:?}"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
 /// Two takers with deadlines, two posts: whatever the deadlines do, takes plus what is left is two; a taker that took after its
 /// deadline passed says so (`AfterTimeout`), which the suite's test counts as a lost wake only when every post came long before it.
 fn deadlines_and_posts_conserve_permits() {
@@ -242,6 +262,11 @@ fn loom_a_deadline_races_a_post() {
 }
 #[cfg(loom)]
 #[test]
+fn loom_a_deadline_after_a_post_still_takes_it() {
+    loom::model(a_deadline_after_a_post_still_takes_it);
+}
+#[cfg(loom)]
+#[test]
 fn loom_deadlines_and_posts_conserve_permits() {
     bounded(3).check(deadlines_and_posts_conserve_permits);
 }
@@ -265,6 +290,12 @@ fn shuttle_two_posts_release_two_sleepers() {
 fn shuttle_a_deadline_races_a_post() {
     shuttle::check_random(a_deadline_races_a_post, ITERS);
     shuttle::check_pct(a_deadline_races_a_post, ITERS, 3);
+}
+#[cfg(shuttle)]
+#[test]
+fn shuttle_a_deadline_after_a_post_still_takes_it() {
+    shuttle::check_random(a_deadline_after_a_post_still_takes_it, ITERS);
+    shuttle::check_pct(a_deadline_after_a_post_still_takes_it, ITERS, 3);
 }
 #[cfg(shuttle)]
 #[test]

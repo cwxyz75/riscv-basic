@@ -489,6 +489,7 @@ fn hart_idle_step() -> bool {
             crate::heap::return_magazines();
             crate::arch::tlb_flush_all();
             me.online.store(false, Ordering::SeqCst);
+            crate::pause::forget_armed(); // (T287: what it armed before going offline must not read as overdue when it comes back)
             me.hart_state.store(HART_OFFLINE, Ordering::Release);
             false
         }
@@ -699,9 +700,9 @@ pub fn spawn_prepared(
     prio: Prio,
     entry: fn(usize),
     arg: usize,
+    pin: Option<usize>,
 ) -> Tid {
     // (class N from here: the stack was the room that could be refused)
-    let pin = take_spawn_pin();
     heap::nofail(|| {
         let thread = kthread_on(p.0, name, entry, arg, true);
         register_kthread(thread, prio, pin)
@@ -775,9 +776,10 @@ pub fn pin_next_spawn() {
     SPAWN_PIN.store(current().saturating_add(1) << 8, Ordering::SeqCst);
 }
 
-/// The affinity of a user thread being created by the current thread: its hart if the creator asked for the pin (the slot is cleared),
-/// free placement otherwise.
-fn take_spawn_pin() -> Option<usize> {
+/// The affinity of a user thread the current thread's creating call (`thread_spawn`, `process_start`) makes: its hart if the creator asked
+/// for the pin, free placement otherwise. Called first in the call, so the slot is consumed by it whatever its outcome (a refused call
+/// leaves no pin for a later one).
+pub fn take_spawn_pin() -> Option<usize> {
     let want = current().saturating_add(1) << 8;
     (SPAWN_PIN.load(Ordering::Relaxed) == want
         && SPAWN_PIN

@@ -161,6 +161,14 @@ pub fn overdue_now() -> alloc::vec::Vec<u64> {
         .collect()
 }
 
+/// This hart is going offline: nothing it armed is waited for any more (the hart takes no wakes), so it is not counted as overdue when it
+/// comes back before it re-arms.
+pub fn forget_armed() {
+    if let Some(a) = ARMED.get(hart()) {
+        a.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
 /// What each hart has armed, relative to now in microseconds (a minus sign: due that long ago and not taken; "none": nothing armed),
 /// for a failure message (`harts_go_offline_and_come_back`, T287: whether the sleepers' deadlines sit on a hart that is not taking them).
 pub fn armed_report() -> alloc::string::String {

@@ -6823,9 +6823,9 @@ fn a_thread_killed_before_it_ran_runs_no_user_code() -> Outcome {
             ..rt::SpawnArgs::default()
         };
         let t = ok(sys::thread_spawn(p, &rec), "thread_spawn")?.a1 as u64;
-        // (2 ms of running, not blocking: a free thread would start on another hart meanwhile; the pinned one cannot, its hart is this
-        // thread's and this thread outranks it)
-        let until = sys::clock_ns() + 2_000_000;
+        // (20 ms of running, not blocking: a free thread starts on another hart meanwhile, as the kernel without the pin shows, ending the
+        // child before the kill; the pinned one cannot, its hart is this thread's and this thread outranks it)
+        let until = sys::clock_ns() + 20_000_000;
         while sys::clock_ns() < until {
             core::hint::spin_loop();
         }
@@ -14350,8 +14350,14 @@ fn sem_taken_reaches(want: u32, posted: u64) -> Outcome {
         nap_ticks(2);
     }
     // a permit taken only after the taker's futex wait timed out, with the post long before its deadline, was a wake that did not come
+    // (every post here comes within `SEM_POLL_TICKS` plus a nap of the workers' start, half their deadline: the check holds that up)
     ensure!(
-        (0..3).all(|i| SEM_HOW[i].load(Ordering::SeqCst) != 4),
+        (0..3).all(|i| {
+            let began = SEM_BEGAN[i].load(Ordering::SeqCst);
+            SEM_HOW[i].load(Ordering::SeqCst) != 4
+                || began == 0
+                || posted + 1_000 >= began - 1 + SEM_WORKER_TICKS
+        }),
         "a lost wake: a worker took its permit only after its futex wait timed out ({} how 4 is after a timeout)",
         sem_records(posted)
     );

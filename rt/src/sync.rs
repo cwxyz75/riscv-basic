@@ -215,8 +215,10 @@ impl kcore::usync::Futex for KernelFutex {
         match wait(word, expected, deadline) {
             Status::TimedOut => kcore::usync::Wait::TimedOut,
             Status::ShouldWait => kcore::usync::Wait::Differed,
-            // (OK, and anything else: look again; only TIMED_OUT says the deadline passed with the sleeper still in the table)
-            _ => kcore::usync::Wait::Woken,
+            // (OK: woken; INTERRUPTED: `thread_interrupt` ended the wait, look again)
+            Status::Ok | Status::Interrupted => kcore::usync::Wait::Woken,
+            // (any other status is a broken call, not a wake: give up rather than spin, after the one last look a timeout gets)
+            _ => kcore::usync::Wait::TimedOut,
         }
     }
     fn wake(&self, word: &AtomicU32, count: u32) -> usize {
