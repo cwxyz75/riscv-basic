@@ -773,6 +773,17 @@ fn start_commit(
     };
     let target = procs.get_mut(&tpid).expect("target exists");
     insert_bootstrap(target, objs, moved, first_gen);
+    started(target, a, (lib, span, tables));
+    Ok(())
+}
+
+/// The started process's record: its entry, argument, stack pointer and library (with the library's page-table charge), Running with one thread.
+#[inline(never)]
+fn started(
+    target: &mut crate::Process,
+    a: &[u64; 6],
+    (lib, span, tables): (crate::LibRange, u64, u64),
+) {
     target.entry = a[1];
     target.arg = a[4];
     target.start_sp = a[2];
@@ -782,7 +793,6 @@ fn start_commit(
     }
     target.state = crate::ProcState::Running;
     target.threads_alive = 1;
-    Ok(())
 }
 
 /// Undo `start_lib`: the library unmapped, its page-table charge and the thread's credited.
