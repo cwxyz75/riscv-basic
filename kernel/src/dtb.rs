@@ -96,34 +96,91 @@ pub fn require_extensions() {
     }
 }
 
-/// Does the kernel command line (`/chosen/bootargs`, from QEMU's `-append`) contain the word `arg`? Used by the
-/// benchmark switch (`bench=full`, SCHED-SMP-SPEC 6.1); false if there is no tree or no such property.
-pub fn boot_arg_present(arg: &str) -> bool {
+/// Where the tree's `/chosen` properties the kernel reads after boot lie in the blob, as `(offset, length)` pairs found once by `init_chosen` (the
+/// tree never changes, and parsing it is boot code: a parse on a call's path would put the parser's frames under a system call, KT13). The command
+/// line (`bootargs`), and the two seeds (`rng-seed`, `kaslr-seed`) a copy of the tree handed to a program has zeroed (HD1). A length of
+/// `usize::MAX` is "no such property"; the chosen properties are unknown until `CHOSEN_READY`.
+static BOOTARGS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(usize::MAX)];
+static SEEDS: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(0),
+    AtomicUsize::new(usize::MAX),
+];
+static CHOSEN_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Find the `/chosen` properties the kernel reads after boot (boot, once the heap exists: `kmain`). Each reader calls it too, so that one that runs
+/// before `kmain` gets here still sees the tree, but from `kmain` on it is done.
+pub fn init_chosen() {
+    if !CHOSEN_READY.load(Ordering::Acquire) {
+        find_chosen();
+    }
+}
+
+/// `init_chosen`'s work, once at boot (out of the readers' fast path).
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree's walk, once, from `kmain`)
+#[cold]
+#[inline(never)]
+fn find_chosen() {
     let Some(blob) = dtb_blob() else {
-        return false;
+        return; // (no tree: no command line and no seeds, and every reader says so)
     };
-    let Ok(nodes) = kcore::fdt::parse(blob) else {
-        return false;
+    // (the place in the blob itself: a parsed node holds a copy of its properties)
+    if let Some((off, len)) = kcore::fdt::chosen_prop_at(blob, "bootargs") {
+        BOOTARGS[0].store(off, Ordering::Relaxed);
+        BOOTARGS[1].store(len, Ordering::Relaxed);
+    }
+    let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
+    for (pair, seed) in SEEDS.chunks(2).zip([seeds.rng_seed, seeds.kaslr_seed]) {
+        if let (Some((off, len)), [o, l]) = (seed, pair) {
+            o.store(off, Ordering::Relaxed);
+            l.store(len, Ordering::Relaxed);
+        }
+    }
+    CHOSEN_READY.store(true, Ordering::Release);
+}
+
+/// The bytes of the property at `(offset, length)` in the blob (`None` for "no such property", or a slice the blob does not hold).
+fn chosen_slice(off: &AtomicUsize, len: &AtomicUsize) -> Option<&'static [u8]> {
+    init_chosen();
+    let (off, len) = (off.load(Ordering::Relaxed), len.load(Ordering::Relaxed));
+    if len == usize::MAX {
+        return None;
+    }
+    dtb_blob()?.get(off..off.checked_add(len)?)
+}
+
+/// The kernel command line (`/chosen/bootargs`, from QEMU's `-append`), as the tree holds it.
+fn bootargs() -> Option<&'static [u8]> {
+    chosen_slice(&BOOTARGS[0], &BOOTARGS[1])
+}
+
+/// The firmware's seeds in the tree, as `kcore::fdt::chosen_seeds` finds them (found once, at boot).
+pub fn chosen_seeds() -> kcore::fdt::ChosenSeeds {
+    init_chosen();
+    let at = |i: usize| {
+        let len = SEEDS[i + 1].load(Ordering::Relaxed);
+        (len != usize::MAX).then(|| (SEEDS[i].load(Ordering::Relaxed), len))
     };
-    nodes
-        .iter()
-        .find(|n| n.path == "/chosen")
-        .and_then(|n| n.prop("bootargs"))
-        .is_some_and(|v| {
-            v.split(|&b| b == 0 || b == b' ')
-                .any(|w| w == arg.as_bytes())
-        })
+    kcore::fdt::ChosenSeeds {
+        rng_seed: at(0),
+        kaslr_seed: at(2),
+    }
+}
+
+/// Does the kernel command line contain the word `arg`? Used by the benchmark switch (`bench=full`, SCHED-SMP-SPEC 6.1); false if there is no
+/// tree or no such property.
+pub fn boot_arg_present(arg: &str) -> bool {
+    bootargs().is_some_and(|v| {
+        v.split(|&b| b == 0 || b == b' ')
+            .any(|w| w == arg.as_bytes())
+    })
 }
 
 /// The value of the `name` word of the kernel command line, for words like `chaos=17` (`name` is `"chaos="`): the text after it.
 pub fn boot_arg_value(name: &str) -> Option<alloc::string::String> {
-    let blob = dtb_blob()?;
-    let nodes = kcore::fdt::parse(blob).ok()?;
-    let v = nodes
-        .iter()
-        .find(|n| n.path == "/chosen")?
-        .prop("bootargs")?;
-    v.split(|&b| b == 0 || b == b' ')
+    bootargs()?
+        .split(|&b| b == 0 || b == b' ')
         .filter_map(|w| core::str::from_utf8(w).ok())
         .find_map(|w| w.strip_prefix(name))
         .map(alloc::string::String::from)
@@ -155,7 +212,7 @@ const FF_NAMES: [&str; 5] = ["tid", "koid", "objgen", "handlegen", "fptoken"];
 /// Test builds only: a line saying what `ff=` asked for and what the kernel understood, so a run that was meant to start counters near their end
 /// cannot pass vacuously on a typo or a dropped boot argument (T189): `##FF tid=0x... koid=0x...` for the values it parsed, `##FF error ...` for
 /// a name it does not know or a value it cannot read. `None` when there is no `ff=` (or in a release build).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB in a test-only boot diagnostic (the formatter's frames), called once from `kmain`
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub fn ff_report() -> Option<alloc::string::String> {
     use core::fmt::Write;
     if crate::RELEASE {

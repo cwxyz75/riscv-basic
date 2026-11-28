@@ -226,6 +226,18 @@ hold a class more often than it may; and a release (`Held::release`, which `pop`
 removing just that entry (`klock/src/lib.rs`, `mod proofs`; under `cfg(kani)` the held stack is 8 deep, which no sequence of the proofs
 fills). Not in CI.
 
+**Kernel stack depth (KT13, T289).** Three checks, from cheap to real. Clippy's `large_stack_frames` is denied at 1 KiB in `kernel`,
+`ksys` and `kcore` (each has `clippy.toml`'s `stack-size-threshold`): its estimate is the sum of a function's MIR locals, about what an
+unoptimised frame holds. `scripts/stack_allows.py` (part of the docs check; `--self-test` plants the refusals, `--list` prints every allow)
+accepts an allow only as `KT13: boot or test only, on a stack nothing else is under` (a test file, or a function its `BOOT` list names) or
+`KT13: a const fn that builds a static at compile time`; it refuses `KT13: audited` in the kernel crate and pins the `kcore`/`ksys` frames
+T289 left at `AUDITED_LEFT`. The real depth is measured in every boot: `kernel_stack_budget` fails a thread that ended above 8 KiB of its
+16 KiB stack (`thread::STACK_BUDGET`, the same in the debug and the optimised build); the line `kernel: deepest kernel stack use among ended
+threads` leaves out the deliberate deep-stack test. By hand, `python3 scripts/stack_depth.py <kernel ELF> [--root NAME]... [--top N]
+[--budget BYTES]` bounds the paths no boot takes, from the linked kernel itself: every function's frame from its prologue, the direct calls
+(tail calls counted as calls), the deepest chain under `thread_bootstrap`, `user_thread_main` and `trap_handler` plus a nested trap on top;
+indirect calls are not followed and recursion is cut and listed (`--self-test` checks the parser on a planted disassembly). Not in CI.
+
 **Mutation testing.** `make os-mutants` (overnight; cargo-mutants) mutates `kcore`, `klock` and `iommucore` with their host tests as
 the oracle. A survivor that is not in `mutants-accepted.txt` with a reason fails the run. `PKG=` and `SHARD=` run a slice.
 

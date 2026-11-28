@@ -76,6 +76,7 @@ impl FrameDb {
     /// A database over several ranges (frame number, count), all free, with the metadata in `storage` (the kernel carves it out of boot
     /// memory before any allocator exists). `None` if `storage` is smaller than [`FrameDb::meta_len`] of the ranges.
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: off + count is at most storage.len(), checked first
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the frame database, built once at boot)
     pub fn with_ranges(ranges: &[(Pfn, usize)], storage: &'static mut [Meta]) -> Option<FrameDb> {
         if storage.len() < FrameDb::meta_len(ranges) {
             return None;

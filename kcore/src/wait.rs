@@ -319,54 +319,73 @@ impl WaitTable {
         // (the log names an object once for every `get_mut` of it: each object is looked at once per commit, forced if any of its entries was, and a port
         // that a bound object's touch would evaluate again is evaluated once. The log is short (a syscall touches a handful of objects), so this is a scan
         // of what was already seen, not a map: every commit pays for it)
-        let items = &dirty.items;
         if !overflow {
-            for (i, &(obj, forced)) in items.iter().enumerate() {
-                if items.iter().take(i).any(|&(o, _)| o == obj) {
-                    continue; // (looked at when it first appeared, with every entry of it)
-                }
-                let forced = forced
-                    || items
-                        .iter()
-                        .skip(i.saturating_add(1))
-                        .any(|&(o, f)| o == obj && f);
-                // (only an object somebody waits on is looked at, and remembered: at most one per registered thread, which `admit` made room for)
-                if self.has_waiter(obj) {
-                    if forced || !fired.contains(&obj) {
-                        self.fire(obj, forced, &signals, &call_ready, &mut woken);
-                    }
-                    if !fired.contains(&obj) {
-                        if fired.len() == fired.capacity() {
-                            overflow = true;
-                            break;
-                        }
-                        fired.push(obj);
-                    }
-                }
-                // the ports that bind the touched object
-                let mut stop = false;
-                binders(obj, &mut |port| {
-                    if stop || fired.contains(&port) || !self.has_waiter(port) {
-                        return;
-                    }
-                    if fired.len() == fired.capacity() {
-                        stop = true;
-                        return;
-                    }
-                    fired.push(port);
-                    self.fire(port, false, &signals, &call_ready, &mut woken);
-                });
-                if stop {
-                    overflow = true;
-                    break;
-                }
-            }
+            overflow = self.commit_items(
+                &dirty.items,
+                &signals,
+                &binders,
+                &call_ready,
+                &mut fired,
+                &mut woken,
+            );
             if overflow {
                 self.release_all(&mut woken);
             }
         }
         self.fired = fired;
         woken
+    }
+
+    /// `commit`'s walk of the dirty objects (a frame of its own: KT13): fire each one's waiters and its ports' (once each, a forced touch fires
+    /// again). True when the walk ran out of room in `fired` (the caller then releases everyone).
+    fn commit_items(
+        &mut self,
+        items: &[(ObjId, bool)],
+        signals: &impl Fn(ObjId) -> Option<u32>,
+        binders: &impl Fn(ObjId, &mut dyn FnMut(ObjId)),
+        call_ready: &impl Fn(ObjId, u32) -> bool,
+        fired: &mut Vec<ObjId>,
+        woken: &mut Vec<Waiter>,
+    ) -> bool {
+        for (i, &(obj, forced)) in items.iter().enumerate() {
+            if items.iter().take(i).any(|&(o, _)| o == obj) {
+                continue; // (looked at when it first appeared, with every entry of it)
+            }
+            let forced = forced
+                || items
+                    .iter()
+                    .skip(i.saturating_add(1))
+                    .any(|&(o, f)| o == obj && f);
+            // (only an object somebody waits on is looked at, and remembered: at most one per registered thread, which `admit` made room for)
+            if self.has_waiter(obj) {
+                if forced || !fired.contains(&obj) {
+                    self.fire(obj, forced, signals, call_ready, woken);
+                }
+                if !fired.contains(&obj) {
+                    if fired.len() == fired.capacity() {
+                        return true;
+                    }
+                    fired.push(obj);
+                }
+            }
+            // the ports that bind the touched object
+            let mut stop = false;
+            binders(obj, &mut |port| {
+                if stop || fired.contains(&port) || !self.has_waiter(port) {
+                    return;
+                }
+                if fired.len() == fired.capacity() {
+                    stop = true;
+                    return;
+                }
+                fired.push(port);
+                self.fire(port, false, signals, call_ready, woken);
+            });
+            if stop {
+                return true;
+            }
+        }
+        false
     }
 
     /// Does anyone wait on `obj`?
@@ -464,6 +483,7 @@ impl WaitTable {
     }
 
     /// Audit (W3): every registration names a live object, the chains hold exactly the registered records, each in the bucket of its object.
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit(&self, alive: impl Fn(ObjId) -> bool) -> Result<(), alloc::string::String> {
         let mut chained = 0usize;
         for (b, &(head, tail)) in self.buckets.iter().enumerate() {

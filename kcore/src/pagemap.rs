@@ -3,7 +3,6 @@
 //! outer vector of 196 KiB. Growth is **fallible** (KT9: class R): an insert that needs a new leaf reserves its room first and returns
 //! `NoMemory` with nothing changed; removal never allocates (a leaf whose last entry goes is freed).
 
-use crate::fbox::FBox;
 use crate::fmap::FMap;
 use crate::frame::Pfn;
 
@@ -34,10 +33,20 @@ impl Entry {
     }
 }
 
+/// A leaf's 64 slots, all `NONE`, or `None` when there is no memory (nothing is allocated then). The room is reserved exactly, so the box is
+/// the vector's own allocation (no shrink, which could not fail softly).
+fn new_slots() -> Option<alloc::boxed::Box<[u64]>> {
+    let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    v.try_reserve_exact(CHUNK as usize).ok()?;
+    v.resize(CHUNK as usize, NONE);
+    Some(v.into_boxed_slice())
+}
+
 /// One chunk: 64 slots and how many of them are not `NONE` (a frame or a hole). A leaf with `used == 0` does not exist.
 #[derive(Debug)]
 struct Leaf {
-    slots: FBox<[u64; CHUNK as usize]>,
+    /// (a boxed slice filled in place, not a boxed array: the array would be built on the stack first, half a KiB, KT13)
+    slots: alloc::boxed::Box<[u64]>,
     used: u8,
 }
 
@@ -149,8 +158,7 @@ impl PageMap {
             self.leaves
                 .reserve(1)
                 .map_err(|_| abi::status::Status::NoMemory)?;
-            let slots =
-                FBox::try_new([NONE; CHUNK as usize]).map_err(|_| abi::status::Status::NoMemory)?;
+            let slots = new_slots().ok_or(abi::status::Status::NoMemory)?;
             self.leaves.insert_reserved(key, Leaf { slots, used: 0 });
         }
         if let Some(leaf) = self.leaves.get_mut(&key) {

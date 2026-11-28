@@ -104,6 +104,7 @@ fn pages(addr: u64, size: u64) -> Option<(u64, u64)> {
 /// drives: the console UART, and anything else the caller names), minus `ram` byte ranges (a device range that overlaps RAM or a reserved
 /// range is not a window) and minus the ranges of the nodes the kernel or firmware drives, as sorted, non-overlapping page ranges
 /// `(start, end)` in bytes, adjacent ones merged.
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the device windows, built once at boot)
 pub fn device_windows(
     nodes: &[Node],
     excluded: &[(u64, u64)],

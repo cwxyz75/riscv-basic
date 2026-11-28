@@ -455,45 +455,60 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             if cfg!(feature = "fault-offline-skip-blocked") && state == State::Blocked {
                 continue;
             }
+            self.evacuate_one(v, tid, state);
+        }
+        self.lq(v).homed_count()
+    }
+
+    /// `evacuate` for one record (a frame of its own: KT13).
+    #[inline(never)]
+    fn evacuate_one(&self, v: usize, tid: Tid, state: State) {
+        {
             let Some(mut rec) = self.lq(v).record(tid).cloned() else {
-                continue;
+                return;
             };
             if state == State::Exited {
                 rec.affinity = None; // (nothing will run it again: where it waits to be reaped does not matter)
             }
             let dest = self.select_hart(&rec);
+            drop(rec);
             if dest == v || !self.is_online(dest) {
-                continue;
+                return;
             }
-            let moved = {
-                let (mut src, mut dst) = self.lq2(v, dest);
-                if dst.is_offline() {
-                    continue; // (it went offline since `select_hart` looked: the next pass chooses again)
-                }
-                if state == State::Blocked || state == State::Exited {
-                    match src.detach_blocked(tid) {
-                        Some(r) => {
-                            dst.attach_blocked(r, dest as u8);
-                            // (a sleeper's timer is now on `dest`, which may be asleep with nothing armed: it must look)
-                            true
-                        }
-                        None => false,
-                    }
-                } else {
-                    match src.detach_queued(tid) {
-                        Some(r) => {
-                            dst.attach(r, Enq::Migrated, dest as u8);
-                            true
-                        }
-                        None => false,
-                    }
-                }
-            };
-            if moved {
+            if self.evacuate_move(v, dest, tid, state) {
                 self.mark(dest);
             }
         }
-        self.lq(v).homed_count()
+    }
+
+    /// `evacuate_one`'s move of the record to `dest`, under both harts' locks in index order: whether it moved.
+    #[inline(never)]
+    fn evacuate_move(&self, v: usize, dest: usize, tid: Tid, state: State) -> bool {
+        {
+            {
+                let (mut src, mut dst) = self.lq2(v, dest);
+                if dst.is_offline() {
+                    return false; // (it went offline since `select_hart` looked: the next pass chooses again)
+                }
+                // (one record in this frame, whichever list it is on: KT13)
+                let blocked = state == State::Blocked || state == State::Exited;
+                let rec = if blocked {
+                    src.detach_blocked(tid)
+                } else {
+                    src.detach_queued(tid)
+                };
+                let Some(r) = rec else {
+                    return false;
+                };
+                if blocked {
+                    dst.attach_blocked(r, dest as u8);
+                    // (a sleeper's timer is now on `dest`, which may be asleep with nothing armed: it must look)
+                } else {
+                    dst.attach(r, Enq::Migrated, dest as u8);
+                }
+                true
+            }
+        }
     }
 
     /// Bring hart `v` back (PM1): online again, its clock set to `now`, placement may choose it. Its queues are empty (it was drained).
@@ -645,20 +660,36 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: runnable_since is not after the clock that stamped it (saturating_sub)
     pub fn starved(&self, now: Time, limit: Time) -> Option<(Tid, usize, usize)> {
         for g in 0..self.harts() {
-            let late: Vec<(Tid, Option<u8>)> = {
-                let q = self.lq(g);
-                q.tids()
-                    .filter(|&t| q.is_queued(t))
-                    .filter_map(|t| q.record(t).map(|r| (t, r)))
-                    .filter(|(_, r)| now.saturating_sub(r.runnable_since) > limit)
-                    .map(|(t, r)| (t, r.affinity))
-                    .collect()
-            };
-            for (t, aff) in late {
+            for (t, aff) in self.late_on(g, now, limit) {
                 if self.is_in_transit(t) {
                     continue;
                 }
-                let idle_hart = (0..self.harts()).find(|&x| {
+                if let Some(x) = self.idle_hart_for(aff) {
+                    return Some((t, g, x));
+                }
+            }
+        }
+        None
+    }
+
+    /// The threads queued on hart `g` for more than `limit` ns, with their affinities (`starved`; each step a frame of its own: KT13).
+    #[inline(never)]
+    fn late_on(&self, g: usize, now: Time, limit: Time) -> Vec<(Tid, Option<u8>)> {
+        let q = self.lq(g);
+        q.tids()
+            .filter(|&t| q.is_queued(t))
+            .filter_map(|t| q.record(t).map(|r| (t, r)))
+            .filter(|(_, r)| now.saturating_sub(r.runnable_since) > limit)
+            .map(|(t, r)| (t, r.affinity))
+            .collect()
+    }
+
+    /// An online hart idle with nobody on the way to it that a thread of affinity `aff` may run on (`starved`).
+    #[inline(never)]
+    fn idle_hart_for(&self, aff: Option<u8>) -> Option<usize> {
+        {
+            {
+                (0..self.harts()).find(|&x| {
                     self.is_online(x)
                         && aff.is_none_or(|a| a as usize == x)
                         && self.view_cur(x) == 0
@@ -666,13 +697,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                         // hart nobody told; with thousands of threads queued behind two busy harts and the big lock contended it is
                         // routinely so. A hart that is only *marked* is the lost-poke case and is still reported)
                         && self.transit.get(x).is_none_or(|t| t.load(Ordering::Acquire) == 0)
-                });
-                if let Some(x) = idle_hart {
-                    return Some((t, g, x));
-                }
+                })
             }
         }
-        None
     }
 
     /// When hart `hart`'s one-shot timer must fire next (`HartRq::next_event`): `None` is never.
@@ -932,26 +959,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 })
             };
             let Some((tid, _)) = found else { continue };
-            let moved = {
-                let (mut dst, mut src) = self.lq2(h, g);
-                let mine = dst.cur_eff().max(dst.queued_top().unwrap_or(0));
-                // the record may have moved, been taken, or changed while no lock was held
-                // (the best one this hart would actually run: a real-time thread is not for a hart whose share of the window is spent, and
-                // must not hide the normal ones below it)
-                let again = src.queued_top_where(&|t| {
-                    src.record(t)
-                        .is_some_and(|r| allowed(r, h) && dst.would_run(r.eff))
-                        && !self.is_in_transit(t)
-                });
-                match again {
-                    Some((t2, p)) if p > mine => {
-                        let rec = src.detach_queued(t2).expect("it was queued");
-                        dst.attach(rec, Enq::Migrated, h as u8);
-                        true
-                    }
-                    _ => false,
-                }
-            };
+            let moved = self.pull_one(h, g);
             if moved {
                 self.pulls.fetch_add(1, Ordering::Relaxed);
                 n += 1;
@@ -965,6 +973,30 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             }
         }
         n
+    }
+
+    /// `pull_work`'s move from hart `g`, under both harts' locks: whether a thread came over (a frame of its own: KT13).
+    #[allow(clippy::expect_used)] // INVARIANT: a thread `queued_top_where` found under this lock is queued
+    #[inline(never)]
+    fn pull_one(&self, h: usize, g: usize) -> bool {
+        let (mut dst, mut src) = self.lq2(h, g);
+        let mine = dst.cur_eff().max(dst.queued_top().unwrap_or(0));
+        // the record may have moved, been taken, or changed while no lock was held
+        // (the best one this hart would actually run: a real-time thread is not for a hart whose share of the window is spent, and
+        // must not hide the normal ones below it)
+        let again = src.queued_top_where(&|t| {
+            src.record(t)
+                .is_some_and(|r| allowed(r, h) && dst.would_run(r.eff))
+                && !self.is_in_transit(t)
+        });
+        match again {
+            Some((t2, p)) if p > mine => {
+                let rec = src.detach_queued(t2).expect("it was queued");
+                dst.attach(rec, Enq::Migrated, h as u8);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Hart `h` makes its own designation right: pull what outranks it, preempt for what waits, and push what it leaves.
@@ -1031,26 +1063,30 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// `push_queue(g)` on behalf of hart `caller`, which holds no lock (a pull that left threads behind on `g`).
     fn push_queue_from(&self, g: usize, caller: usize) {
-        let (top, free, low) = {
-            let src = self.lq(g);
-            (
-                src.queued_top_where(&|t| !self.is_in_transit(t))
-                    .map(|(t, _)| t),
-                src.queued_top_where(&|t| {
-                    !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.affinity.is_none())
-                })
-                .map(|(t, _)| t),
-                // (the best normal one: below a real-time thread that other harts may not run, such as while their share is spent, it
-                // would otherwise never be offered)
-                src.queued_top_where(&|t| {
-                    !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.eff < 32)
-                })
-                .map(|(t, _)| t),
-            )
-        };
+        let (top, free, low) = self.push_candidates(g);
         for t in [top, free, low].into_iter().flatten() {
             self.push_marks(t, g, caller);
         }
+    }
+
+    /// `push_queue_from`'s candidates on hart `g`: its top thread, its top thread that may run anywhere, and its top thread below the RT band.
+    #[inline(never)]
+    fn push_candidates(&self, g: usize) -> (Option<Tid>, Option<Tid>, Option<Tid>) {
+        let src = self.lq(g);
+        (
+            src.queued_top_where(&|t| !self.is_in_transit(t))
+                .map(|(t, _)| t),
+            src.queued_top_where(&|t| {
+                !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.affinity.is_none())
+            })
+            .map(|(t, _)| t),
+            // (the best normal one: below a real-time thread that other harts may not run, such as while their share is spent, it
+            // would otherwise never be offered)
+            src.queued_top_where(&|t| {
+                !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.eff < 32)
+            })
+            .map(|(t, _)| t),
+        )
     }
 
     /// Hart `h` services a mark (or any reason to look at the queues): the only way `cur[h]` changes other than by `h`'s
@@ -1295,26 +1331,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
             self.charge_now(home); // (a tickless hart's clock is as old as its last look: the wake is stamped with the time it happens)
                                    // where would it go? (a blocked thread is placed; the placement reads hints and needs the record)
-            let Some(rec) = ({
-                let q = self.lq(home);
-                q.record(tid).filter(|r| r.home.get() == home).cloned()
-            }) else {
+            let Some(target) = self.wake_target(home, tid, sync, caller) else {
                 self.home_of(tid).ok_or(Error::NoSuchThread)?; // gone (reaped)
                 continue; // it moved (or is moving): look again
-            };
-            // (a blocked thread still in transit is queued on the hart that is still executing it: that hart's own queue is the only one
-            // that cannot be served before its switch is done, and no other hart may pull it until then, G4)
-            let target = if rec.state == State::Blocked && !self.is_in_transit(tid) {
-                if sync
-                    && rec.affinity.is_none_or(|a| a as usize == caller)
-                    && self.is_online(caller)
-                {
-                    caller // (the waker blocks next: the woken thread runs here, 4.4 rule 2)
-                } else {
-                    self.select_hart(&rec)
-                }
-            } else {
-                home
             };
             let placed = if target == home {
                 let mut q = self.lq(home);
@@ -1347,6 +1366,29 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 Placed::Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Where `wake_inner` places `tid`, whose record is homed on `home` (`None`: the record is not there, or not homed there, any more). The record is
+    /// read here, in a frame of its own (KT13).
+    #[inline(never)]
+    fn wake_target(&self, home: usize, tid: Tid, sync: bool, caller: usize) -> Option<usize> {
+        let rec = {
+            let q = self.lq(home);
+            q.record(tid).filter(|r| r.home.get() == home).cloned()
+        }?;
+
+        // (a blocked thread still in transit is queued on the hart that is still executing it: that hart's own queue is the only one
+        // that cannot be served before its switch is done, and no other hart may pull it until then, G4)
+        let target = if rec.state == State::Blocked && !self.is_in_transit(tid) {
+            if sync && rec.affinity.is_none_or(|a| a as usize == caller) && self.is_online(caller) {
+                caller // (the waker blocks next: the woken thread runs here, 4.4 rule 2)
+            } else {
+                self.select_hart(&rec)
+            }
+        } else {
+            home
+        };
+        Some(target)
     }
 
     /// The wake, under the locks of the thread's hart (`src`) and, if it goes elsewhere, of the target (`dst`).
@@ -1520,6 +1562,18 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if p < cur {
             return false;
         }
+        self.balance_move(h, g, tid, p)
+    }
+
+    /// `balance`'s move of `tid` (top priority `p`) from hart `g`, under both harts' locks, if the picture still holds (a frame of its own: KT13).
+    #[allow(clippy::expect_used, clippy::arithmetic_side_effects)] // INVARIANT: a thread found under this lock is queued; queue lengths are small
+    #[inline(never)]
+    fn balance_move(&self, h: usize, g: usize, tid: Tid, p: Prio) -> bool {
+        let find = |src: &Hq<'_, N, R>| {
+            src.queued_top_where(&|t| {
+                src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
+            })
+        };
         let (mut dst, mut src) = self.lq2(h, g);
         if dst.is_offline() {
             return false;
@@ -1550,6 +1604,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         clippy::expect_used,
         clippy::indexing_slicing
     )] // INVARIANT: a count of the records seen
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit(&self, quiescent: bool) -> Result<(), String> {
         let n = self.harts();
         let table = self.rqs.table(); // (`TT` is ahead of `RQ` in the order)

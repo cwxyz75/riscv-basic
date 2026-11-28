@@ -201,6 +201,7 @@ impl Buddy {
     /// every frame of its block unreferenced; no frame is in two blocks; no two free buddies of the same order sit unmerged; every
     /// unreferenced frame is in a block; `free_count` is the total of the blocks.
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every index is checked against the range before use
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests and the boot self-tests)
     pub fn audit(&self, meta: &[Meta]) -> Result<(), String> {
         let mut covered = alloc::vec![false; self.count];
         let mut total = 0usize;

@@ -6,6 +6,7 @@
 //! `forbid(unsafe_code)`, `no_std` + `alloc`: nothing here touches hardware.
 #![no_std]
 #![forbid(unsafe_code)]
+#![deny(clippy::large_stack_frames)] // KT13 (T289): no frame over 1 KiB (`clippy.toml`): this code runs on the kernel stack too
 #![cfg_attr(
     not(test),
     deny(
@@ -182,7 +183,9 @@ pub(crate) fn handle_list(args: &[u8]) -> Result<Vec<Handle>, Status> {
 
 /// The calls on handles, events, channels, sockets and ports. `None`: `n` is not one of them (the caller handles it). The width of
 /// 32-bit arguments is checked by the caller with [`wide_argument_error`].
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and every `h(i)` is called with a constant below 6; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 is small)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: a is [u64; 6] and every `h(i)` is called with a constant below 6; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 is small)
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
     let Ctx {
         objs,
@@ -440,6 +443,7 @@ pub enum Committed {
 /// `defer_out` is copied into `deferred` (allocating now, before anything is taken) for the caller to copy out with the object lock let go
 /// and then commit (`deferred_commit`). A copy that fails takes nothing: the message stays queued. `channel_call`'s reply uses it too.
 #[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES, so nhandles * 8 is small
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub(crate) fn read_message<M: PhysMem>(
     objs: &mut Kobjs,
     handles: &mut HandleTable,
@@ -499,6 +503,7 @@ pub(crate) fn read_message<M: PhysMem>(
 /// Write a received message's handle numbers to `at`, as 8-byte little-endian words, in one copy (from the stack: nothing allocates but the
 /// copy's own page list, and a failure there is reported before the message is taken).
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < n <= MAX_MSG_HANDLES, so every slice is inside `words`
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 fn put_handle_words<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,

@@ -17,7 +17,7 @@ use kcore::Mm;
 pub const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
 
 /// What the caller does after `thread_spawn`: spawn the kernel thread `token` names, at priority `prio`, and return `handle`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct Spawn {
     pub token: usize,
     pub handle: u64,
@@ -33,6 +33,36 @@ pub struct Spawn {
     /// Does `a1` carry the tid (a spawned thread) or 0 (a process's first thread)?
     pub spawned: bool,
     pub image: Option<kcore::fbox::FBox<[u64; 32]>>,
+}
+
+// (by hand, not derived: the derived `fmt` builds arrays of every field's name and value, over KT13's 1 KiB frame in an unoptimised build)
+impl core::fmt::Debug for Spawn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("Spawn");
+        debug_spawn_0(self, &mut d);
+        debug_spawn_1(self, &mut d);
+        d.finish()
+    }
+}
+
+/// Fields of `Spawn`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_spawn_0(s: &Spawn, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("token", &s.token);
+    d.field("handle", &s.handle);
+    d.field("prio", &s.prio);
+    d.field("suspended", &s.suspended);
+    d.field("pid", &s.pid);
+    d.field("obj", &s.obj);
+}
+
+/// Fields of `Spawn`'s `Debug`, a few per frame (KT13).
+#[inline(never)]
+fn debug_spawn_1(s: &Spawn, d: &mut core::fmt::DebugStruct<'_, '_>) {
+    d.field("stack", &s.stack);
+    d.field("rr", &s.rr);
+    d.field("spawned", &s.spawned);
+    d.field("image", &s.image);
 }
 
 /// The register image (GENERAL layout: x1 to x31, then pc) a new thread starts from: `sp` in x2, `tp` in x4, `arg` in a0 and `a1` in a1.
@@ -115,6 +145,7 @@ pub fn new_start(
 )]
 // INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (64 bytes) at indices below 8
 #[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn thread_spawn<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -345,6 +376,7 @@ pub fn thread_spawn<M: PhysMem>(
 #[allow(clippy::expect_used, clippy::panic)]
 // INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists; a Created process's table is empty, so the moved handle is handle 1
 #[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn process_start(
     us: &mut UserState,
     jobs: &mut Jobs,

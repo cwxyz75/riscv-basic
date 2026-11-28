@@ -16,7 +16,9 @@ pub fn has_compatible(blob: &[u8], name: &str) -> bool {
     scan(blob, name).unwrap_or(false)
 }
 
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every access is through checked `get` slices; `at` advances by small fixed steps inside the structure block
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: every access is through checked `get` slices; `at` advances by small fixed steps inside the structure block
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree is parsed by boot code only: `dtb::init_chosen` keeps what calls read later)
 fn scan(blob: &[u8], name: &str) -> Option<bool> {
     if be32(blob, 0)? != MAGIC {
         return None;
@@ -80,7 +82,9 @@ struct NodeFacts<'a> {
 /// components from the root (`["soc", "serial@10000000"]`; the root itself is `[]`) and `cells` is the pair `(#address-cells,
 /// #size-cells)` its parent gave its children (the specification's defaults, 2 and 1, until a parent says otherwise; properties come
 /// before child nodes in the format, so the counts are known when the children are met). A malformed tree ends the walk.
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every access is through checked `get` slices or a depth checked against WALK_DEPTH; `at` advances inside the structure block
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: every access is through checked `get` slices or a depth checked against WALK_DEPTH; `at` advances inside the structure block
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree is parsed by boot code only)
 fn walk_props<'a>(blob: &'a [u8], f: &mut PropVisitor<'a, '_>) -> Option<()> {
     if be32(blob, 0)? != MAGIC {
         return None;
@@ -218,6 +222,20 @@ pub struct ChosenSeeds {
     pub kaslr_seed: Option<(usize, usize)>,
 }
 
+/// Where `/chosen/<name>` lies in the blob, as `(offset, length)` (the value's bytes, in place). `None` for no such property or a blob that is
+/// not a device tree.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a value slice lies inside the blob, so its address is not below the blob's
+pub fn chosen_prop_at(blob: &[u8], name: &str) -> Option<(usize, usize)> {
+    let mut found = None;
+    let base = blob.as_ptr() as usize;
+    walk_props(blob, &mut |path, _, n, value| {
+        if path == ["chosen"] && n == name {
+            found = Some((value.as_ptr() as usize - base, value.len()));
+        }
+    })?;
+    found
+}
+
 /// Find the seed properties of `/chosen`. `None` for a blob that is not a device tree.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a value slice lies inside the blob, so its address is not below the blob's
 pub fn chosen_seeds(blob: &[u8]) -> Option<ChosenSeeds> {
@@ -287,6 +305,7 @@ pub fn bootarg_present(blob: &[u8], word: &str) -> bool {
 
 /// The base address of the test finisher, a SiFive test device (`sifive,test1` or `sifive,test0`): the way a headless test run says pass or
 /// fail. `None` when the tree has none (real hardware): the kernel then ends through the firmware.
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (boot)
 pub fn test_finisher_base(blob: &[u8]) -> Option<u64> {
     // pass one: the path of the first node whose compatible names a SiFive test device (`reg` may come before `compatible` in a node, so
     // the address is read in a second pass)
@@ -513,7 +532,9 @@ pub struct VirtioMmio {
 }
 
 /// Parse the whole tree. Everything is bounds-checked; limits above bound the cost.
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the blob is boot-loader data: every access is through checked `get` slices and offsets advance inside the structure block (a bad blob is an Err, fuzzed in fdt_golden)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: the blob is boot-loader data: every access is through checked `get` slices and offsets advance inside the structure block (a bad blob is an Err, fuzzed in fdt_golden)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree is parsed by boot code only: `dtb::init_chosen` keeps what calls read later)
 pub fn parse(blob: &[u8]) -> Result<Vec<Node>, FdtError> {
     if be32(blob, 0) != Some(MAGIC) {
         return Err(FdtError::BadHeader);

@@ -13,7 +13,6 @@ pub(super) fn bad(s: Status) -> Reply {
 /// The process, thread, job and pager calls. A thin dispatcher: every arm is a function of its own that is never inlined here, so the
 /// frame on the stack of a call is that call's own and not the largest of all of them (KT13, T172: folded together the dispatcher was a
 /// 4.3 KiB frame under every one of these calls, and `process_kill`'s teardown and wakes went below it, the deepest path of the suite).
-#[allow(clippy::large_stack_frames)] // KT13: audited: clippy's estimate (1.5 KiB) adds up a result slot per arm, sixty of them; the optimised frame holds one, and the boot-time high-water budget check bounds the sum
 pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
     match n {
         nr::PROCESS_CREATE => process_create(a),
@@ -21,23 +20,41 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::THREAD_SET_SCHED => thread_set_sched(a),
         nr::THREAD_GET_SCHED => thread_get_sched(a),
         nr::JOB_KILL => job_kill(a),
-        nr::JOB_ROOT | nr::RESOURCE_ROOT | nr::DEBUG_ROOT | nr::PROCESS_SELF => {
-            process_table_call(n, a)
-        }
-        nr::PROCESS_MAP => process_table_call(n, a),
+        nr::JOB_ROOT
+        | nr::RESOURCE_ROOT
+        | nr::DEBUG_ROOT
+        | nr::PROCESS_SELF
+        | nr::PROCESS_MAP
+        | nr::PROCESS_MAP_INFO
+        | nr::VMO_CREATE_CHILD
+        | nr::PROCESS_CLONE_REGION
+        | nr::PROCESS_INFO
+        | nr::THREAD_INFO => process_table_call(n, a),
         nr::PROCESS_UNMAP => process_unmap_call(a),
         nr::PROCESS_PROTECT => process_protect_call(n, a),
-        nr::PROCESS_MAP_INFO => process_table_call(n, a),
         nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => vmo_range_call(n, a),
-        nr::VMO_CREATE_CHILD | nr::PROCESS_CLONE_REGION => process_table_call(n, a),
+        _ => process_call_more(n, a),
+    }
+}
+
+/// `process_call`'s second half (a frame of its own: each arm passes the arguments by value, and a frame holds one copy per arm, KT13).
+#[inline(never)]
+fn process_call_more(n: usize, a: [u64; 6]) -> Reply {
+    match n {
         nr::PROCESS_START => process_start(a),
         nr::PROCESS_KILL => process_kill(a),
         nr::PROCESS_SUSPEND => process_stop(a, true),
         nr::PROCESS_RESUME => process_stop(a, false),
-        nr::PROCESS_INFO => process_table_call(n, a),
         nr::THREAD_SPAWN => thread_spawn(a),
-        nr::THREAD_INFO => process_table_call(n, a),
         nr::THREAD_INTERRUPT => thread_interrupt(a),
+        _ => process_call_rest(n, a),
+    }
+}
+
+/// `process_call`'s exception, pager and thread-state calls.
+#[inline(never)]
+fn process_call_rest(n: usize, a: [u64; 6]) -> Reply {
+    match n {
         nr::PROCESS_EXCEPTION_CHANNEL => exception_channel_call(a, false),
         nr::JOB_EXCEPTION_CHANNEL => exception_channel_call(a, true),
         nr::EXCEPTION_RESUME => exception_resume_call(a),
@@ -134,7 +151,6 @@ impl ksys::Machine for KernelMachine {
 /// has it cleared, one address space at a time, found by the VMO's list of mappings, **C** every hart drops its translations and the frames go back.
 /// There is a switch point between batches. The VMO is busy from the first part to the last (`Vmos::range_end`, always run); a failure in the middle
 /// leaves the batches before it done.
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`: the batch of frames is on this frame
 #[inline(never)] // (KT13: its batch of frames must not sit in the frame of a caller on every call's path)
 fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
     // one part under the locks the part needs: `own` is the address space to hold (none for A and C); `f` gets the call's context
@@ -172,9 +188,13 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
         Ok(Ok(None)) => return Ok((None, None)),
         Ok(Err(e)) | Err(e) => return bad(e),
     };
+    // (the batch is filled in place by each step: one copy of its frames, in this frame, KT13)
+    let mut batch = ksys::RangeBatch::new();
     let r: Result<(), Status> = (|| loop {
         // A
-        let mut batch = section(true, None, |ctx| ksys::vmo_range_take(ctx, call))??;
+        section(true, None, |ctx| {
+            ksys::vmo_range_take(ctx, call, &mut batch)
+        })??;
         // B (a failure here stops the walk, not the batch: C still runs, or the frames taken would never go back)
         let mut walked: Result<(), Status> = Ok(());
         loop {
@@ -220,7 +240,6 @@ fn vmo_range_call(n: usize, a: [u64; 6]) -> Reply {
 /// `process_unmap` (T207 PR 3b): the regions are marked dying under the locks of the call (every failure is there), then the mappings go a batch at a
 /// time, each batch under the target's address-space lock and the memory locks with a shootdown before they are let go, and the switch point between
 /// two batches. A sibling that touches the range meanwhile takes an exception (a dying region is no region).
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
 #[inline(never)] // (KT13: its batch of frames must not sit in the frame of a caller on every call's path)
 fn process_unmap_call(a: [u64; 6]) -> Reply {
     // the first part: `AsLocks::all` (the handle names the target)
@@ -284,7 +303,6 @@ fn process_unmap_call(a: [u64; 6]) -> Reply {
 /// `process_protect` (T207 PR 3b): the regions take their new permissions under the locks of the call (every failure is there), then the page-table
 /// entries follow a batch at a time under the target's address-space lock, with the switch point between batches; the shootdown and the
 /// instruction-cache sync come before the call returns (M9).
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `process_table_call`
 #[inline(never)] // (KT13: its batch of frames must not sit in the frame of a caller on every call's path)
 fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
     let call = locked_state(|s| -> Result<ksys::ProtectCall, Status> {
@@ -349,44 +367,62 @@ fn process_protect_call(n: usize, a: [u64; 6]) -> Reply {
 }
 
 /// The calls that only read and change the process table (`ksys::proc_call`).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the call table's locals; T172 shrinks them)
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
     if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
         thread::charge_running(); // (the CPU time of what runs now, the caller included, is brought up to date before it is read: AB6)
     }
-    locked_state(|s| -> Reply {
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let mut machine = KernelMachine::default();
-        if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
-            machine.read_cpu(s, me, n, a); // (before the memory lock: AB6)
-        }
-        // (the calls that name a process, or all of them: every address space, before the memory locks; these touch none)
-        let _as = if matches!(
-            n,
-            nr::PROCESS_SELF
-                | nr::JOB_ROOT
-                | nr::RESOURCE_ROOT
-                | nr::DEBUG_ROOT
-                | nr::PROCESS_INFO
-                | nr::THREAD_INFO
-        ) {
-            AsLocks::none()
-        } else {
-            AsLocks::all(s).map_err(|e| (e, None, None))?
-        };
-        let k = kmem::get();
-        let mut ctx = ksys::PCtx {
-            objs: &mut s.objs,
-            procs: &mut s.procs,
-            me,
-            mm: k.mm,
-            vmos: k.vmos,
-            jobs: k.jobs,
-            machine: &mut machine,
-        };
-        ksys::proc_call(n, a, &mut ctx).unwrap_or_else(|| bad(Status::BadSyscall))
-    })
+    locked_state(|s| process_table_locked(s, n, a))
+}
+
+/// `process_table_call` under the object lock: the CPU times it may report, the address spaces it needs, then the call.
+#[inline(never)]
+fn process_table_locked(s: &mut UserState, n: usize, a: [u64; 6]) -> Reply {
+    let me = caller_pid(s).map_err(|e| (e, None, None))?;
+    let mut machine = KernelMachine::default();
+    if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
+        machine.read_cpu(s, me, n, a); // (before the memory lock: AB6)
+    }
+    // (the calls that name a process, or all of them: every address space, before the memory locks; these touch none)
+    let _as = if matches!(
+        n,
+        nr::PROCESS_SELF
+            | nr::JOB_ROOT
+            | nr::RESOURCE_ROOT
+            | nr::DEBUG_ROOT
+            | nr::PROCESS_INFO
+            | nr::THREAD_INFO
+    ) {
+        AsLocks::none()
+    } else {
+        AsLocks::all(s).map_err(|e| (e, None, None))?
+    };
+    proc_call_in(s, me, &mut machine, n, a)
+}
+
+/// `ksys::proc_call` over this machine's memory (the locks are the caller's).
+#[inline(never)]
+fn proc_call_in(
+    s: &mut UserState,
+    me: u64,
+    machine: &mut KernelMachine,
+    n: usize,
+    a: [u64; 6],
+) -> Reply {
+    let k = kmem::get();
+    let mut ctx = ksys::PCtx {
+        objs: &mut s.objs,
+        procs: &mut s.procs,
+        me,
+        mm: k.mm,
+        vmos: k.vmos,
+        jobs: k.jobs,
+        machine,
+    };
+    match ksys::proc_call(n, a, &mut ctx) {
+        Some(r) => r,
+        None => bad(Status::BadSyscall),
+    }
 }
 
 /// After a call or a fault: drop what the copy log made stale in every address space (COW1). A load when nothing is pending.
@@ -472,8 +508,6 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn process_start(a: [u64; 6]) -> Reply {
     let pin = thread::take_spawn_pin(); // (T226: the test-only pin is consumed by this call, whatever its outcome)
@@ -482,24 +516,47 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     }
     // The kernel stack is made first (NO_MEMORY with nothing changed), the thread is spawned in the same critical section that makes its start
     // and registers it (its first act is to take the object lock, so it cannot run before that is done: L20), and a refusal frees the stack.
-    locked_state(|s| -> Result<(), ReplyErr> {
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let _as = AsLocks::all(s).map_err(|e| (e, None, None))?;
-        let prepared = thread::prepare_user_thread().ok_or((Status::NoMemory, None, None))?;
-        // (the memory locks are let go before the spawn: a kernel stack comes from the frames, and the object lock comes before them)
-        let started = {
-            let mut k = kmem::get();
-            super::syslib::ensure(&mut k);
-            let mut lib = super::syslib::KernelLib {
-                mm: &mut *k.mm,
-                vmos: &mut *k.vmos,
-            };
-            ksys::process_start(s, k.jobs, &mut lib, me, a).map_err(|e| (e, None, None))?
-        };
-        spawn_registered(s, prepared, started, pin);
-        Ok(())
-    })?;
+    locked_state(|s| process_start_locked(s, a, pin))?;
     Ok((None, None))
+}
+
+/// `process_start` under the object lock: the stack, the start, the spawn.
+#[inline(never)]
+fn process_start_locked(
+    s: &mut UserState,
+    a: [u64; 6],
+    pin: Option<usize>,
+) -> Result<(), ReplyErr> {
+    let me = caller_pid(s).map_err(|e| (e, None, None))?;
+    process_start_steps(s, me, a, pin).map_err(|e| (e, None, None))
+}
+
+/// `process_start_locked` once the caller is known.
+#[inline(never)]
+fn process_start_steps(
+    s: &mut UserState,
+    me: u64,
+    a: [u64; 6],
+    pin: Option<usize>,
+) -> Result<(), Status> {
+    let _as = AsLocks::all(s)?;
+    let prepared = thread::prepare_user_thread().ok_or(Status::NoMemory)?;
+    // (the memory locks are let go before the spawn: a kernel stack comes from the frames, and the object lock comes before them)
+    let started = start_in(s, me, a)?;
+    spawn_registered(s, prepared, started, pin);
+    Ok(())
+}
+
+/// `ksys::process_start` with the system library mapped from this machine's memory (the memory locks are held only in this frame).
+#[inline(never)]
+fn start_in(s: &mut UserState, me: u64, a: [u64; 6]) -> Result<ksys::Spawn, Status> {
+    let mut k = kmem::get();
+    super::syslib::ensure(&mut k);
+    let mut lib = super::syslib::KernelLib {
+        mm: &mut *k.mm,
+        vmos: &mut *k.vmos,
+    };
+    ksys::process_start(s, k.jobs, &mut lib, me, a)
 }
 
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
@@ -569,8 +626,6 @@ fn spawn_registered(
 }
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     let pin = thread::take_spawn_pin(); // (T226: the test-only pin is consumed by this call, whatever its outcome)
@@ -579,20 +634,47 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     }
     // One critical section (KT9): the kernel stack first (NO_MEMORY with nothing changed), the call, the spawn and the spawner's half of the registration.
     // The new thread's first act is to take the object lock, so it cannot run a line of `user_thread_main` (or exit) before that half is done (L20).
-    let (handle, tid) = locked_state(|s| -> Result<(u64, Tid), ReplyErr> {
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let creator = creator_prio(s);
-        let _as = AsLocks::all(s).map_err(|e| (e, None, None))?;
-        let prepared = thread::prepare_user_thread().ok_or((Status::NoMemory, None, None))?;
-        let k = kmem::get();
-        let spawn = ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a)
-            .map_err(|e| (e, None, None))?;
-        drop(k);
-        let handle = spawn.handle;
-        let tid = spawn_registered(s, prepared, spawn, pin);
-        Ok((handle, tid))
-    })?;
+    let (handle, tid) = locked_state(|s| thread_spawn_locked(s, a, pin))?;
     Ok((Some(handle), Some(tid)))
+}
+
+/// `thread_spawn` under the object lock.
+#[inline(never)]
+fn thread_spawn_locked(
+    s: &mut UserState,
+    a: [u64; 6],
+    pin: Option<usize>,
+) -> Result<(u64, Tid), ReplyErr> {
+    let me = caller_pid(s).map_err(|e| (e, None, None))?;
+    thread_spawn_steps(s, me, a, pin).map_err(|e| (e, None, None))
+}
+
+/// `thread_spawn_locked` once the caller is known.
+#[inline(never)]
+fn thread_spawn_steps(
+    s: &mut UserState,
+    me: u64,
+    a: [u64; 6],
+    pin: Option<usize>,
+) -> Result<(u64, Tid), Status> {
+    let creator = creator_prio(s);
+    let _as = AsLocks::all(s)?;
+    let prepared = thread::prepare_user_thread().ok_or(Status::NoMemory)?;
+    let spawn = spawn_in(s, me, creator, a)?;
+    let handle = spawn.handle;
+    Ok((handle, spawn_registered(s, prepared, spawn, pin)))
+}
+
+/// `ksys::thread_spawn` over this machine's memory (the memory locks are held only in this frame).
+#[inline(never)]
+fn spawn_in(
+    s: &mut UserState,
+    me: u64,
+    creator: kcore::sched::Prio,
+    a: [u64; 6],
+) -> Result<ksys::Spawn, Status> {
+    let k = kmem::get();
+    ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a)
 }
 
 /// `thread_interrupt(thread)` (T56, SCHED-SMP-SPEC task 26): set the thread's interrupt flag and wake it. The next blocking
@@ -631,28 +713,31 @@ pub(super) fn pager_create_call() -> Reply {
 }
 
 /// `pager_supply(pager, vmo, offset, length, source, source_offset)` (MM9). A partly done supply still ends the waits of the pages it moved.
-#[allow(clippy::large_stack_frames)]
-// INVARIANT: the lock set of every address space and the supply's arguments: one frame on the syscall path, no recursion
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
-    let r = locked_state(|s| -> Reply {
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let _as = AsLocks::all(s).map_err(|e| (e, None, None))?;
-        let k = kmem::get();
-        ksys::pager::pager_supply(
-            s,
-            k.mm,
-            k.vmos,
-            k.jobs,
-            &mut KernelMachine::default(),
-            me,
-            a,
-        )
-        .map_err(|e| (e, None, None))?;
-        Ok((None, None))
+    let r = locked_state(|s| match pager_supply_locked(s, a) {
+        Ok(()) => Ok((None, None)),
+        Err(e) => bad(e),
     });
     super::waits::wake_pager_waiters();
     r
+}
+
+/// `pager_supply` under the object lock, every address space held (the supply may map into any of them).
+#[inline(never)]
+fn pager_supply_locked(s: &mut UserState, a: [u64; 6]) -> Result<(), Status> {
+    let me = caller_pid(s)?;
+    let _as = AsLocks::all(s)?;
+    let k = kmem::get();
+    ksys::pager::pager_supply(
+        s,
+        k.mm,
+        k.vmos,
+        k.jobs,
+        &mut KernelMachine::default(),
+        me,
+        a,
+    )
 }
 
 /// `pager_fail(pager, vmo, offset, length, status)` (MM9).
@@ -742,29 +827,36 @@ pub(super) fn thread_resume_call(a: [u64; 6]) -> Reply {
     Ok((None, None))
 }
 
-/// The user registers of a stopped thread, in the GENERAL layout: its starting image if it has not run, else its saved frame.
+/// The user registers of a stopped thread, in the GENERAL layout, into `out`: its starting image if it has not run, else its saved frame. False when
+/// there is neither. (Written in place: a register image is a quarter of a KiB, and a frame holds one copy of it, not one per path: KT13.)
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a register image on the stack (T172 shrinks them)
-fn general_of(
+fn general_into(
     s: &UserState,
     tid: Tid,
     frame: Option<*mut crate::trap::TrapFrame>,
-) -> Option<[u64; 32]> {
+    out: &mut [u64; 32],
+) -> bool {
     if let Some(image) = s.thread(tid).and_then(|t| t.initial_regs.as_deref()) {
-        return Some(*image);
+        *out = *image;
+        return true;
     }
     // (a write the thread has not applied yet is what it will have)
     if let Some(g) = s
         .thread(tid)
         .and_then(|t| t.pending_regs.as_deref())
-        .and_then(|p| p.general)
+        .and_then(|p| p.general.as_ref())
     {
-        return Some(g);
+        *out = *g;
+        return true;
     }
+    let Some(frame) = frame else {
+        return false;
+    };
     // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved registers and is mapped.
     // The object lock does not order this read against the thread's own writes to the frame: a thread whose wait just ended writes its reply before it parks,
     // so a read in that window can see old and new register values mixed (T241, part 2: not corruption).
-    Some(unsafe { (*frame?).general() })
+    *out = unsafe { (*frame).general() };
+    true
 }
 
 /// `thread_read_state(thread, kind, buffer, length)` and `thread_write_state(...)` (EX1): the registers of a thread that has stopped. The
@@ -811,12 +903,19 @@ fn le_array<const N: usize>(b: &[u8]) -> [u64; N] {
     out
 }
 
+/// The little-endian words of `b` into `out`, as many as both have.
+fn le_into(b: &[u8], out: &mut [u64]) {
+    for (o, c) in out.iter_mut().zip(b.as_chunks::<8>().0) {
+        *o = u64::from_le_bytes(*c);
+    }
+}
+
 /// `words` as little-endian bytes in a buffer reserved first: NO_MEMORY, with nothing done, when there is no room (T248).
-fn words_to_bytes(words: &[u64]) -> Result<alloc::vec::Vec<u8>, ReplyErr> {
+fn words_to_bytes(words: &[u64]) -> Result<alloc::vec::Vec<u8>, Status> {
     let mut bytes = alloc::vec::Vec::new();
     bytes
         .try_reserve_exact(words.len().saturating_mul(8))
-        .map_err(|_| (Status::NoMemory, None, None))?;
+        .map_err(|_| Status::NoMemory)?;
     for w in words {
         bytes.extend_from_slice(&w.to_le_bytes());
     }
@@ -824,7 +923,6 @@ fn words_to_bytes(words: &[u64]) -> Result<alloc::vec::Vec<u8>, ReplyErr> {
 }
 
 #[inline(never)]
-#[allow(clippy::large_stack_frames, clippy::indexing_slicing)] // KT13: audited, a register image on the stack (T172 shrinks them); INVARIANT: each layout was checked to have its exact size, so the word counts are 32 and 33
 fn state_write(
     s: &mut UserState,
     me: u64,
@@ -835,76 +933,102 @@ fn state_write(
     frame_ptr: Option<*mut crate::trap::TrapFrame>,
 ) -> Reply {
     use abi::thread_state as ts;
+    let _ = frame_ptr;
     // (the memory locks are held for the copy only: writing FP or vector state charges the job, which takes them itself)
-    let data = {
-        let _as = AsLocks::one(s, me);
-        let k = kmem::get();
-        let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        kcore::usercopy::copy_from_user(caller.aspace.held_mut(), k.mm, k.vmos, k.jobs, buf, len)
-            .map_err(|e| (e, None, None))?
+    let data = match copy_state_in(s, me, buf, len) {
+        Ok(data) => data,
+        Err(e) => return bad(e),
     };
     // (the two fixed layouts become words; the vector layout is written as bytes: it can be large and its allocation was the copy's)
     // A thread that has not run is written through its starting image. One that has is parked at the return to user mode holding a `&mut` to its
     // own frame, so nobody else writes the frame: the write is left for it (`pending_regs`) and it applies it itself when it wakes.
     let ran = !s.thread(tid).is_some_and(|t| t.initial_regs.is_some());
-    let _ = frame_ptr;
-    match kind {
-        ts::GENERAL => {
-            let g: [u64; 32] = le_array(&data);
-            // the pc is a user address, on a 2-byte boundary
-            if !(abi::user::BASE..abi::user::TOP).contains(&g[31]) || g[31] & 1 != 0 {
-                return bad(Status::InvalidArgs);
-            }
-            if let Some(image) = s
-                .thread_mut(tid)
-                .and_then(|t| t.initial_regs.as_deref_mut())
-            {
-                *image = g;
-            } else {
-                // (the record is made at an R point: no room is NO_MEMORY, with nothing written)
-                match s.pending_regs_entry(tid) {
-                    Ok(p) => p.general = Some(g),
-                    Err(e) => return bad(e),
-                }
-            }
-        }
-        ts::FP => {
-            let g: [u64; 33] = le_array(&data);
-            if ran {
-                if let Err(e) = s.pending_regs_entry(tid) {
-                    return bad(e);
-                }
-            }
-            if !crate::fp::write_fp(tid, job_of(s, tid), &g) {
-                return bad(Status::NoMemory);
-            }
-            if ran {
-                if let Ok(p) = s.pending_regs_entry(tid) {
-                    p.fp = true;
-                }
-            }
-        }
-        _ => {
-            if ran {
-                if let Err(e) = s.pending_regs_entry(tid) {
-                    return bad(e);
-                }
-            }
-            if !crate::fp::write_vec(tid, job_of(s, tid), &data) {
-                return bad(Status::NoMemory);
-            }
-            if ran {
-                if let Ok(p) = s.pending_regs_entry(tid) {
-                    p.vec = true;
-                }
-            }
+    let r = match kind {
+        ts::GENERAL => write_general(s, tid, &data),
+        ts::FP => write_fp_state(s, tid, ran, &data),
+        _ => write_vec_state(s, tid, ran, &data),
+    };
+    match r {
+        Ok(()) => Ok((None, None)),
+        Err(e) => bad(e),
+    }
+}
+
+/// The bytes of `thread_write_state` copied from the caller's buffer, under its address-space lock and the memory locks.
+#[inline(never)]
+fn copy_state_in(
+    s: &mut UserState,
+    me: u64,
+    buf: u64,
+    len: usize,
+) -> Result<alloc::vec::Vec<u8>, Status> {
+    let _as = AsLocks::one(s, me);
+    let k = kmem::get();
+    let caller = s.procs.get_mut(&me).ok_or(Status::BadState)?;
+    kcore::usercopy::copy_from_user(caller.aspace.held_mut(), k.mm, k.vmos, k.jobs, buf, len)
+}
+
+/// A GENERAL write: into the starting image of a thread that has not run, else left for the thread to apply (`pending_regs`).
+/// (the words are decoded where they go, not into a copy on the stack first: KT13)
+#[inline(never)]
+fn write_general(s: &mut UserState, tid: Tid, data: &[u8]) -> Result<(), Status> {
+    // the pc (word 31) is a user address, on a 2-byte boundary
+    let pc = data
+        .get(31 * 8..32 * 8)
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map_or(0, u64::from_le_bytes);
+    if !(abi::user::BASE..abi::user::TOP).contains(&pc) || pc & 1 != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    if let Some(image) = s
+        .thread_mut(tid)
+        .and_then(|t| t.initial_regs.as_deref_mut())
+    {
+        le_into(data, image);
+    } else {
+        // (the record is made at an R point: no room is NO_MEMORY, with nothing written)
+        let p = s.pending_regs_entry(tid)?;
+        le_into(data, p.general.insert([0; 32]));
+    }
+    Ok(())
+}
+
+/// An FP write (the record of a thread that ran is made first, at an R point).
+#[inline(never)]
+fn write_fp_state(s: &mut UserState, tid: Tid, ran: bool, data: &[u8]) -> Result<(), Status> {
+    let g: [u64; 33] = le_array(data);
+    if ran {
+        s.pending_regs_entry(tid)?;
+    }
+    if !crate::fp::write_fp(tid, job_of(s, tid), &g) {
+        return Err(Status::NoMemory);
+    }
+    if ran {
+        if let Ok(p) = s.pending_regs_entry(tid) {
+            p.fp = true;
         }
     }
-    Ok((None, None))
+    Ok(())
+}
+
+/// A VECTOR write (as `write_fp_state`).
+#[inline(never)]
+fn write_vec_state(s: &mut UserState, tid: Tid, ran: bool, data: &[u8]) -> Result<(), Status> {
+    if ran {
+        s.pending_regs_entry(tid)?;
+    }
+    if !crate::fp::write_vec(tid, job_of(s, tid), data) {
+        return Err(Status::NoMemory);
+    }
+    if ran {
+        if let Ok(p) = s.pending_regs_entry(tid) {
+            p.vec = true;
+        }
+    }
+    Ok(())
 }
 
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a register image on the stack (T172 shrinks them)
 fn state_read(
     s: &mut UserState,
     me: u64,
@@ -914,18 +1038,44 @@ fn state_read(
     frame_ptr: Option<*mut crate::trap::TrapFrame>,
 ) -> Reply {
     use abi::thread_state as ts;
-    let bytes: alloc::vec::Vec<u8> = match kind {
-        ts::GENERAL => {
-            let g = general_of(s, tid, frame_ptr).ok_or((Status::BadState, None, None))?;
-            words_to_bytes(&g)?
-        }
-        ts::FP => words_to_bytes(&crate::fp::read_fp(tid))?,
-        _ => crate::fp::read_vec(tid).ok_or((Status::NoMemory, None, None))?,
+    let bytes = match kind {
+        ts::GENERAL => general_bytes(s, tid, frame_ptr),
+        ts::FP => fp_bytes(tid),
+        _ => crate::fp::read_vec(tid).ok_or(Status::NoMemory),
     };
+    match bytes {
+        Ok(bytes) => copy_state_out(s, me, buf, &bytes),
+        Err(e) => bad(e),
+    }
+}
+
+/// A stopped thread's GENERAL registers as the layout's bytes.
+#[inline(never)]
+fn general_bytes(
+    s: &UserState,
+    tid: Tid,
+    frame_ptr: Option<*mut crate::trap::TrapFrame>,
+) -> Result<alloc::vec::Vec<u8>, Status> {
+    let mut g = [0u64; 32];
+    if !general_into(s, tid, frame_ptr, &mut g) {
+        return Err(Status::BadState);
+    }
+    words_to_bytes(&g)
+}
+
+/// A thread's FP registers as the layout's bytes.
+#[inline(never)]
+fn fp_bytes(tid: Tid) -> Result<alloc::vec::Vec<u8>, Status> {
+    words_to_bytes(&crate::fp::read_fp(tid))
+}
+
+/// The bytes of `thread_read_state` copied to the caller's buffer, under its address-space lock and the memory locks.
+#[inline(never)]
+fn copy_state_out(s: &mut UserState, me: u64, buf: u64, bytes: &[u8]) -> Reply {
     let _as = AsLocks::one(s, me);
     let k = kmem::get();
     let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-    kcore::usercopy::copy_to_user(caller.aspace.held_mut(), k.mm, k.vmos, k.jobs, buf, &bytes)
+    kcore::usercopy::copy_to_user(caller.aspace.held_mut(), k.mm, k.vmos, k.jobs, buf, bytes)
         .map_err(|e| (e, None, None))?;
     Ok((None, None))
 }
@@ -994,41 +1144,51 @@ pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
 
 /// `job_set_sched(job, max_prio, rt_budget_ns, cpu_weight)`: needs SET_LIMITS. No value may exceed the parent job's;
 /// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)] // (a frame of its own, not folded into `process_call`: KT13, T172)
 pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
     locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        // (`JOBS` is held only while the ledger is read: `thread::priority_of` takes the big kernel lock, which comes before it)
-        let job = {
-            let jobs = kmem::jobs();
-            let job = ksys::job_set_sched(&s.objs, &s.procs, jobs.jobs, me, a)
-                .map_err(|e| (e, None, None))?;
-            thread::job_sched().sync_budgets(jobs.jobs); // (the scheduler's mirror of every job's RT budget)
-            job
-        };
-        // PR1: the threads of the job and everything below it are held to the maximum their own job now allows. One thread at a time, in the same
-        // critical section: nothing is collected, so the call cannot fail for want of memory (T248)
-        let mut after = 0u64;
-        while let Some((&tid, t)) = s.threads.range(after.saturating_add(1)..).next() {
-            after = tid;
-            let max = {
-                let jobs = kmem::jobs();
-                let Some(pj) = s.procs.get(&t.pid).map(|p| p.job) else {
-                    continue;
-                };
-                match jobs.jobs.sched(pj) {
-                    Some(l) if jobs.jobs.is_within(pj, job) => l.max_prio,
-                    _ => continue,
-                }
-            };
-            if thread::priority_of(tid).is_some_and(|now| now > max) {
-                thread::set_priorities(&[(tid, max.max(1))]);
+        match job_set_limits_in(s, me, a) {
+            Ok(job) => {
+                cap_priorities(s, job);
+                Ok((None, None))
             }
+            Err(e) => bad(e),
         }
-        Ok((None, None))
     })
+}
+
+/// `job_set_sched`'s change to the ledger, and the scheduler's mirror of every job's RT budget. (`JOBS` is held only while the ledger is read:
+/// `thread::priority_of` takes the big kernel lock, which comes before it.)
+#[inline(never)]
+fn job_set_limits_in(s: &UserState, me: u64, a: [u64; 6]) -> Result<kcore::job::JobId, Status> {
+    let jobs = kmem::jobs();
+    let job = ksys::job_set_sched(&s.objs, &s.procs, jobs.jobs, me, a)?;
+    thread::job_sched().sync_budgets(jobs.jobs);
+    Ok(job)
+}
+
+/// PR1: the threads of `job` and everything below it are held to the maximum their own job now allows. One thread at a time, in the caller's
+/// critical section: nothing is collected, so the call cannot fail for want of memory (T248).
+#[inline(never)]
+fn cap_priorities(s: &UserState, job: kcore::job::JobId) {
+    let mut after = 0u64;
+    while let Some((&tid, t)) = s.threads.range(after.saturating_add(1)..).next() {
+        after = tid;
+        let max = {
+            let jobs = kmem::jobs();
+            let Some(pj) = s.procs.get(&t.pid).map(|p| p.job) else {
+                continue;
+            };
+            match jobs.jobs.sched(pj) {
+                Some(l) if jobs.jobs.is_within(pj, job) => l.max_prio,
+                _ => continue,
+            }
+        };
+        if thread::priority_of(tid).is_some_and(|now| now > max) {
+            thread::set_priorities(&[(tid, max.max(1))]);
+        }
+    }
 }
 
 /// `job_kill(job, code)`: end every process in the job and its descendants with exit code

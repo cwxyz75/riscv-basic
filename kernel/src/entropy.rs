@@ -49,7 +49,7 @@ fn read_zkr(out: &mut [u8; 32]) -> usize {
 }
 
 /// Key the pool (boot hart, after the heap, the trap vector and the clock exist).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub fn init(boot_hart_id: usize) {
     let blob = crate::dtb::dtb_blob();
     let nodes = blob

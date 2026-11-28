@@ -2,9 +2,6 @@
 
 use super::*;
 
-#[allow(clippy::expect_used)]
-// INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn user_thread_main(token: usize) {
     let top = thread::current_stack_top();
     // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
@@ -13,37 +10,7 @@ pub(super) fn user_thread_main(token: usize) {
     // jump to user mode (nothing user-visible runs under it).
     let _ = irq::save_and_disable();
     crate::bkl::lock();
-    let (ts, killed) = {
-        with_state(|s| {
-            let ts = s
-                .starts
-                .remove(&token)
-                .expect("a thread start was registered");
-            // (KT9: the spawner registered the thread, with its record, its register image and the donation graph's node, in the section that
-            // made it: all that is left here is what only the thread's own first slice can do)
-            let tid = thread::current();
-            // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
-            if let Some(p) = s.procs.get(&ts.pid) {
-                thread::set_job(tid, thread::job_sched().tag(p.job.index()));
-            }
-            let p = s
-                .procs
-                .get_mut(&ts.pid)
-                .expect("a process lives while one of its threads does");
-            // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
-            // no table yet): clamp it now (PR1; review of task 8).
-            let max = kmem::jobs()
-                .jobs
-                .sched(p.job)
-                .map_or(63, |j| j.max_prio)
-                .max(1);
-            let late_clamp = thread::priority_of(thread::current()).is_some_and(|now| now > max);
-            if late_clamp {
-                thread::set_priority(thread::current(), max);
-            }
-            (ts, p.killed)
-        })
-    };
+    let (ts, killed) = take_start(token);
     // Killed before it ever ran: it never runs user code.
     if let Some(code) = killed {
         crate::bkl::unlock();
@@ -69,10 +36,72 @@ pub(super) fn user_thread_main(token: usize) {
     // The address space's token is taken last, here, with interrupts off and the lock held and nothing that can sleep or switch between
     // this and `enter_user`: a tag taken earlier could be stale by now (the thread may have slept in a stopped process or been moved to
     // another hart after a generation turned), and the hart's generation flush belongs to the hart that enters (L18).
-    let token = with_state(|s| {
+    let token = enter_token(ts.pid);
+    crate::percpu::this()
+        .active_aspace
+        .store(token, Ordering::SeqCst);
+    crate::percpu::this()
+        .cur_pid
+        .store(ts.pid, Ordering::Relaxed); // (the lock-free calls read it: L14)
+                                           // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
+                                           // (loads from this thread's stack and CSR writes) run before `sret`.
+                                           // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
+                                           // vector state loaded if a write gave it any, in this hart's entry frame
+    let entry_frame = entry_frame_of(&ts);
+    crate::bkl::unlock();
+    user_mode_entered();
+    // SAFETY: the contract of `enter_user_frame`: `entry_frame` is this hart's static entry frame (it does not overlap the stack), `token` was taken under the
+    // object lock above, with no switch point after it, and names the live root of this thread's own process (upper half the kernel's), `top` is the top of this
+    // thread's own kernel stack, interrupts are off and no lock is held (the object lock was dropped just above); the call switches to that space and drops to
+    // U-mode with the image, and never returns (T242).
+    unsafe { crate::arch::enter_user_frame(entry_frame, token, top) }
+}
+
+/// The new thread's start record (taken out of the table) and the kill mark of its process, with its job's CPU account and its priority clamp
+/// set (each step of `user_thread_main` a frame of its own: KT13).
+#[allow(clippy::expect_used)]
+// INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
+#[inline(never)]
+fn take_start(token: usize) -> (ksys::ThreadStart, Option<i32>) {
+    with_state(|s| {
+        let ts = s
+            .starts
+            .remove(&token)
+            .expect("a thread start was registered");
+        // (KT9: the spawner registered the thread, with its record, its register image and the donation graph's node, in the section that
+        // made it: all that is left here is what only the thread's own first slice can do)
+        let tid = thread::current();
+        // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
+        if let Some(p) = s.procs.get(&ts.pid) {
+            thread::set_job(tid, thread::job_sched().tag(p.job.index()));
+        }
+        let p = s
+            .procs
+            .get_mut(&ts.pid)
+            .expect("a process lives while one of its threads does");
+        // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
+        // no table yet): clamp it now (PR1; review of task 8).
+        let max = kmem::jobs()
+            .jobs
+            .sched(p.job)
+            .map_or(63, |j| j.max_prio)
+            .max(1);
+        let late_clamp = thread::priority_of(thread::current()).is_some_and(|now| now > max);
+        if late_clamp {
+            thread::set_priority(thread::current(), max);
+        }
+        (ts, p.killed)
+    })
+}
+
+/// The address-space token the thread enters user mode with, its process's space and library published for this hart's lock-free paths.
+#[allow(clippy::expect_used)] // INVARIANT: the process of a running thread exists (under the big lock)
+#[inline(never)]
+fn enter_token(pid: u64) -> u64 {
+    with_state(|s| {
         let UserState { asids, procs, .. } = s;
         let p = procs
-            .get_mut(&ts.pid)
+            .get_mut(&pid)
             .expect("a process lives while one of its threads does");
         crate::percpu::this().cur_as.store(
             alloc::sync::Arc::as_ptr(&p.aspace).cast_mut(),
@@ -85,59 +114,57 @@ pub(super) fn user_thread_main(token: usize) {
             .cur_lib_end
             .store(p.libsys.text_end, Ordering::Relaxed);
         install_token_of(asids, p)
+    })
+}
+
+/// This hart's entry frame, written with the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at
+/// registration), with its FP and vector state loaded if a write gave it any (EX1).
+#[inline(never)]
+fn entry_frame_of(ts: &ksys::ThreadStart) -> *const crate::trap::TrapFrame {
+    let hart = crate::percpu::this().index.load(Ordering::Relaxed);
+    // SAFETY: the pointer is to this hart's one element, made without a reference to the array (the others' elements may be read by their harts
+    // meanwhile: a hart reads its own in `enter_user_frame`, after it dropped the lock), and the hart index is below the array's length (one element per hart). This hart alone writes it:
+    // the object lock is held and interrupts are off, the hart index was read after the last switch point of this thread, and the element is read
+    // again only by this hart's own `enter_user_frame` (T242), so this is the one reference to it while it lives. (Written in place, not built on the
+    // stack and copied: KT13.)
+    let slot = unsafe {
+        &mut *ENTRY_FRAMES
+            .0
+            .get()
+            .cast::<crate::trap::TrapFrame>()
+            .add(hart)
+    };
+    let written = with_state(|s| {
+        s.thread_mut(thread::current())
+            .and_then(|t| t.initial_regs.take())
     });
-    crate::percpu::this()
-        .active_aspace
-        .store(token, Ordering::SeqCst);
-    crate::percpu::this()
-        .cur_pid
-        .store(ts.pid, Ordering::Relaxed); // (the lock-free calls read it: L14)
-                                           // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
-                                           // (loads from this thread's stack and CSR writes) run before `sret`.
-                                           // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
-                                           // vector state loaded if a write gave it any, in this hart's entry frame
-    let entry_frame = {
-        let image = with_state(|s| {
-            s.thread_mut(thread::current())
-                .and_then(|t| t.initial_regs.take())
-                .map(kcore::fbox::FBox::into_inner)
-        });
-        let image = image.unwrap_or_else(|| {
-            let mut regs = ksys::initial_general(
-                ts.entry,
-                ts.sp,
-                ts.arg,
-                ts.tp,
-                if ts.spawned { thread::current() } else { 0 },
-            );
-            regs[11] = ts.a2;
-            regs
-        });
-        let mut frame = crate::trap::TrapFrame::from_general(&image);
-        crate::fp::mark_present(thread::current(), &mut frame);
-        crate::fp::return_to_user_held(&mut frame);
-        let hart = crate::percpu::this().index.load(Ordering::Relaxed);
-        // SAFETY: the pointer is to this hart's one element, made without a reference to the array (the others' elements may be read by their harts
-        // meanwhile: a hart reads its own in `enter_user_frame`, after it dropped the lock), and the hart index is below the array's length (one element per hart). This hart alone writes it:
-        // the object lock is held and interrupts are off, the hart index was read after the last switch point of this thread, and the element is read
-        // again only by this hart's own `enter_user_frame` (T242).
-        unsafe {
-            let slot = ENTRY_FRAMES
-                .0
-                .get()
-                .cast::<crate::trap::TrapFrame>()
-                .add(hart);
-            *slot = frame;
-            slot as *const crate::trap::TrapFrame
+    let made;
+    let image: &[u64; 32] = match &written {
+        Some(image) => image,
+        None => {
+            made = start_image(ts);
+            &made
         }
     };
-    crate::bkl::unlock();
-    user_mode_entered();
-    // SAFETY: the contract of `enter_user_frame`: `entry_frame` is this hart's static entry frame (it does not overlap the stack), `token` was taken under the
-    // object lock above, with no switch point after it, and names the live root of this thread's own process (upper half the kernel's), `top` is the top of this
-    // thread's own kernel stack, interrupts are off and no lock is held (the object lock was dropped just above); the call switches to that space and drops to
-    // U-mode with the image, and never returns (T242).
-    unsafe { crate::arch::enter_user_frame(entry_frame, token, top) }
+    *slot = crate::trap::TrapFrame::from_general(image);
+    crate::fp::mark_present(thread::current(), slot);
+    crate::fp::return_to_user_held(slot);
+    slot as *const crate::trap::TrapFrame
+}
+
+/// The registers a thread starts from when no image was written for it: its entry, stack, arguments and thread pointer.
+#[allow(clippy::indexing_slicing)] // INVARIANT: a general image has 32 words
+#[inline(never)]
+fn start_image(ts: &ksys::ThreadStart) -> [u64; 32] {
+    let mut regs = ksys::initial_general(
+        ts.entry,
+        ts.sp,
+        ts.arg,
+        ts.tp,
+        if ts.spawned { thread::current() } else { 0 },
+    );
+    regs[11] = ts.a2;
+    regs
 }
 
 /// A hart's frame for the drop to user mode: the register image a new thread starts from is built here (not on the stack the assembly then
@@ -299,14 +326,26 @@ const TEARDOWN_CHUNK: u64 = 64;
 /// its space, no call can name it), so what is left is the memory locks, taken for one chunk of at most `TEARDOWN_CHUNK` pages at a time and let go
 /// between chunks, which are switch points even for a caller whose trap left interrupts off, so that no section is proportional to what the process
 /// mapped or owned. Each chunk is shot down before its locks are let go (TLB2).
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)]
 pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
-    let mut process = process.into_inner();
+    // (the process stays in its box while the teardown works on it: only the end takes its cell out, KT13)
+    let mut process = process;
     // (KT9, T177: the address-space cell goes back to the pool when the space is out of it)
-    let mut cell = process.aspace;
-    let mut aspace = klock::aslock::AsCell::vacate(&mut cell);
+    let aspace = klock::aslock::AsCell::vacate(&mut process.aspace);
+    teardown_mappings(aspace);
+    teardown_vmos(&mut process);
+    // (a big VMO's pages go back in batches, with switch points between: no BKL is held here)
+    super::calls::drain_dying();
+    // 3. what the process was charged
+    crate::chaos::point(crate::chaos::Point::Teardown);
+    teardown_credits(&process);
+    let cell = process.into_inner().aspace;
+    any_state(|s| s.return_as_cell(cell));
+}
+
+/// `teardown_memory`, part 1.
+#[inline(never)]
+fn teardown_mappings(mut aspace: kcore::aspace::AddressSpace) {
     // 1. the mappings, a chunk at a time. Each chunk is unmapped and shot down in one interrupts-off section under the memory locks (TLB2: nothing it
     // frees, a table or a VMO's last frame, can be reused before every hart has dropped what it cached; X6: the hart cannot change under the shootdown);
     // then a switch point (X4: a trap from user mode arrives here with interrupts off, so the chunk boundary is where a tick's switch is taken)
@@ -335,6 +374,11 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
         }
         irq::restore(was);
     }
+}
+
+/// `teardown_memory`, part 2.
+#[inline(never)]
+fn teardown_vmos(process: &mut Process) {
     // 2. the VMOs the process owned: the pages of one that nothing else holds go back in chunks, then the VMO itself
     // (popped one at a time, from the process's own lists: nothing is collected, so this cannot fail for want of memory: T248)
     loop {
@@ -374,10 +418,11 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
         let k = kmem::mem();
         let _ = k.vmos.release(k.mm, k.jobs, id);
     }
-    // (a big VMO's pages go back in batches, with switch points between: no BKL is held here)
-    super::calls::drain_dying();
-    // 3. what the process was charged
-    crate::chaos::point(crate::chaos::Point::Teardown);
+}
+
+/// `teardown_memory`, part 3: the credits of what the process was charged.
+#[inline(never)]
+fn teardown_credits(process: &Process) {
     let k = kmem::mem();
     let tables: u64 = process.table_charge.values().sum();
     k.jobs.credit(process.job, Resource::Pages, tables);
@@ -388,8 +433,6 @@ pub(super) fn teardown_memory(process: kcore::fbox::FBox<Process>) {
     );
     k.jobs.credit(process.job, Resource::Processes, 1);
     k.jobs.release(process.job);
-    drop(k);
-    any_state(|s| s.return_as_cell(cell));
 }
 
 /// Unmap and free the stack `thread_spawn` gave thread `tid`, if it has one. The thread is in the kernel, on its
@@ -422,53 +465,11 @@ pub(super) fn exit_process(code: i32) -> ! {
 /// and the process ends when the last thread does. The process is torn down by its last thread
 /// (a process started by `process_start`), or by `finish` (one the kernel started).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: threads_alive >= 1 for a thread that is leaving
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn leave(code: i32, whole: bool) -> ! {
     if whole {
         LAST_EXIT_CYCLES.store(crate::timer::now(), Ordering::SeqCst);
     }
-    let me = any_state(|s| {
-        let tid = thread::current();
-        crate::fp::thread_gone(tid);
-        // (the thread's record goes, and with it its flags, its suspend state, its register images and its pending interrupt)
-        s.waits.retire(tid);
-        let rec = s.unregister_thread(tid);
-        sync_interrupts(s);
-        sync_suspends(s);
-        let rec = rec?;
-        let pid = rec.pid;
-        crate::heap::nofail(|| pi_thread_gone(s, tid, pid)); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
-        let UserState { objs, procs, .. } = s;
-        let p = procs.get_mut(&pid)?;
-        p.live_tids.remove(&tid);
-        // A code the process was already given by a kill wins over this thread's own.
-        let code = p.killed.unwrap_or(code);
-        let cpu = thread::charge_and_cpu_ns(); // (this thread's last interval counts; it runs here)
-        let tobj = rec.obj;
-        ipc::thread_cpu_final(objs, tobj, p.obj, cpu);
-        if let Some(o) = tobj {
-            ipc::thread_mark_terminated(objs, o, code);
-        }
-        p.threads_alive -= 1;
-        credit_thread(kmem::jobs().jobs, p.job);
-        if !whole {
-            // (a whole-process exit leaves the stacks to the teardown)
-            free_spawn_stack(p, tid);
-        }
-        if whole {
-            p.exit_code.get_or_insert(code);
-            p.killed.get_or_insert(code);
-            dying::note(pid, dying::Stage::Ending);
-            bump_attention();
-            // (siblings spinning in user mode on other harts must be told: with no periodic tick (L13) nothing else would stop them)
-            if !cfg!(feature = "fault-skip-kill-ipi") {
-                crate::smp::kick_others();
-            }
-        } else if p.threads_alive == 0 {
-            p.exit_code.get_or_insert(code);
-        }
-        Some((pid, p.detached, p.threads_alive))
-    });
+    let me = any_state(|s| leave_record(s, code, whole));
     match me {
         Some((pid, _, alive)) if alive > 0 => {
             notify(); // waiters on this thread
@@ -487,6 +488,57 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         _ => notify(),
     }
     thread::exit()
+}
+
+/// `leave` under the object lock: the thread's record goes, its CPU time and end are recorded, and (with `whole`) its process is marked ending.
+/// Its process's id, whether it is detached, and how many of its threads are left; `None` for a thread with no record.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: threads_alive >= 1 for a thread that is leaving
+#[inline(never)]
+fn leave_record(s: &mut UserState, code: i32, whole: bool) -> Option<(u64, bool, usize)> {
+    let tid = thread::current();
+    let (pid, tobj) = retire_thread(s, tid)?;
+    crate::heap::nofail(|| pi_thread_gone(s, tid, pid)); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
+    let UserState { objs, procs, .. } = s;
+    let p = procs.get_mut(&pid)?;
+    p.live_tids.remove(&tid);
+    // A code the process was already given by a kill wins over this thread's own.
+    let code = p.killed.unwrap_or(code);
+    let cpu = thread::charge_and_cpu_ns(); // (this thread's last interval counts; it runs here)
+    ipc::thread_cpu_final(objs, tobj, p.obj, cpu);
+    if let Some(o) = tobj {
+        ipc::thread_mark_terminated(objs, o, code);
+    }
+    p.threads_alive -= 1;
+    credit_thread(kmem::jobs().jobs, p.job);
+    if !whole {
+        // (a whole-process exit leaves the stacks to the teardown)
+        free_spawn_stack(p, tid);
+    }
+    if whole {
+        p.exit_code.get_or_insert(code);
+        p.killed.get_or_insert(code);
+        dying::note(pid, dying::Stage::Ending);
+        bump_attention();
+        // (siblings spinning in user mode on other harts must be told: with no periodic tick (L13) nothing else would stop them)
+        if !cfg!(feature = "fault-skip-kill-ipi") {
+            crate::smp::kick_others();
+        }
+    } else if p.threads_alive == 0 {
+        p.exit_code.get_or_insert(code);
+    }
+    Some((pid, p.detached, p.threads_alive))
+}
+
+/// The leaving thread's record goes, and with it its flags, its suspend state, its register images and its pending interrupt: its process and its
+/// thread object, `None` for a thread with no record.
+#[inline(never)]
+fn retire_thread(s: &mut UserState, tid: Tid) -> Option<(u64, Option<kcore::object::ObjId>)> {
+    crate::fp::thread_gone(tid);
+    s.waits.retire(tid);
+    let rec = s.unregister_thread(tid);
+    sync_interrupts(s);
+    sync_suspends(s);
+    rec.map(|r| (r.pid, r.obj))
 }
 
 /// Whether the calling thread has a pending `thread_interrupt` (for wait conditions; interrupts are off or the lock is held).

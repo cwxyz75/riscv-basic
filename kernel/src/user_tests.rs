@@ -92,7 +92,7 @@ static mut HELPER_END: Option<user::KernelEnd> = None;
 /// A stand-in server on the kernel side of init's bootstrap channel (see the comment in
 /// suite.rs above `wait_arguments_are_checked`): the first 4 bytes of a request are a
 /// transaction id, the 5th the operation.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a test-only kernel thread whose frame holds the arms of the helper's requests; the boot-time stack budget check bounds it
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn helper_main(_: usize) {
     // SAFETY: set by `run_all` just before this thread is spawned, taken once here.
     let end =
@@ -224,7 +224,7 @@ fn idle_harts_take_no_big_lock_for_their_ticks() -> Outcome {
 
 pub use crate::report::Report;
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub fn run_all() -> Report {
     let mut tests: alloc::vec::Vec<(String, Outcome)> = alloc::vec::Vec::new();
     let mut push = |name: &str, r: Outcome| tests.push((String::from(name), r));
@@ -422,7 +422,7 @@ pub fn run_all() -> Report {
         let _ = core::fmt::Write::write_fmt(
             &mut crate::console::Console,
             format_args!(
-                "kernel: deepest kernel stack use among ended threads: {used} of {} bytes (budget {})\n",
+                "kernel: deepest kernel stack use among ended threads (the deliberate deep-stack test left out): {used} of {} bytes (budget {})\n",
                 thread::STACK_BYTES,
                 thread::STACK_BUDGET
             ),

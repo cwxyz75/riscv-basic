@@ -221,12 +221,14 @@ impl UserState {
 
 impl UserState {
     /// A state with room for `slots` interrupt sources (the controller's source count plus one; 0 without a controller).
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the user state, built once at boot by `kernel::user::fresh_state`, and by the host tests)
     pub fn with_irq_slots(slots: usize) -> UserState {
         let mut s = UserState::new();
         s.irq_objs = alloc::vec![None; slots];
         s
     }
 
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the user state, built once at boot by `kernel::user::fresh_state`, and by the host tests)
     pub fn new() -> UserState {
         let mut s = UserState {
             objs: Kobjs::new(),
@@ -441,6 +443,7 @@ impl UserState {
 }
 
 impl Default for UserState {
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the user state, built once at boot by `kernel::user::fresh_state`, and by the host tests)
     fn default() -> Self {
         UserState::new()
     }

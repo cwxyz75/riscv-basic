@@ -139,7 +139,7 @@ fn this_file() -> Option<usize> {
 /// Read the interrupt controller out of the parsed tree and size the per-source state and the route table (needs the heap). `ram` is
 /// every range that is RAM or reserved: a controller whose registers lie in it, or beyond the direct map, is not used (it would alias
 /// memory the kernel owns). `kernel` are the sources the kernel itself owns (IOMMU-SPEC 8.6).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; boot only, once, on the boot stack (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 pub fn discover(
     nodes: &[kcore::fdt::Node],
     ram: &[(u64, u64)],

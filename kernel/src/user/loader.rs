@@ -10,8 +10,6 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     irq::without(|| start_locked(image, arg))
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::redundant_closure_call)]
 // (the closures stand for the critical sections `irq::without` made: the caller holds the big lock, which must not be taken again after the memory locks)
 #[allow(
@@ -20,6 +18,7 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     clippy::indexing_slicing
 )]
 // INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); a pid is a u64 counter that never wraps (a start at its end is refused)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the boot thread's start of `init`, or an SMP test's program)
 pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     if image.is_empty() {
         return Err(LoadError::NoProgram);

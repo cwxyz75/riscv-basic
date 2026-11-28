@@ -121,6 +121,7 @@ fn s_aplic(nodes: &[Node]) -> Option<(u32, u32)> {
 /// The memory windows of a PCI host's `ranges`: entries of (child address: 3 cells, parent address: the parent's
 /// `#address-cells`, size: the host's `#size-cells`), of which those whose space code (bits 25:24 of the first cell) is 32-bit
 /// (2) or 64-bit (3) memory. `None` if the property does not divide into whole entries or a cell count is not one this reads.
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree's IOMMU, read once at boot)
 fn pci_memory_windows(host: &Node) -> Option<Vec<(u64, u64)>> {
     let child_cells = *host.cells("#address-cells").first()? as usize;
     let size_cells = *host.cells("#size-cells").first()? as usize;
@@ -186,6 +187,7 @@ fn map_entries(host: &Node) -> Option<Vec<RawEntry>> {
 
 /// Find the one platform IOMMU, its sources (each on the supervisor-domain APLIC, with that controller's two-cell interrupt
 /// specifiers) and the PCI hosts whose `iommu-map` names it.
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the tree's IOMMU, read once at boot)
 pub fn discover(nodes: &[Node]) -> Result<Iommu, Absent> {
     let mut found = nodes
         .iter()
@@ -367,6 +369,7 @@ pub fn pci_windows(nodes: &[Node]) -> Vec<(u64, u64)> {
 /// One past the highest physical address the tree names: RAM, reserved memory, the `reg` of every node on a bus that passes
 /// addresses through, and the parent side of every PCI host's `ranges` (IOMMU-SPEC 3.3: a tree that names anything at or above
 /// `IO_BASE` is a boot refusal). `None` if some range overflows 64 bits.
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (read once at boot)
 pub fn highest_address(nodes: &[Node]) -> Option<u64> {
     let mut top = 0u64;
     let mut see = |(a, s): (u64, u64)| -> Option<()> {

@@ -48,7 +48,7 @@ fn rt_probe(n: usize) {
 /// SCHED-SMP-SPEC task 11: as many real-time threads as there are harts, all above the thread that starts them, all free to
 /// run anywhere, take every hart at once (each waits for the others to arrive, so one hart running two of them in turn would
 /// time out): the push marks and pulls spread them, and the starting thread is preempted to make room.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn rt_threads_take_the_harts() -> Result<(), String> {
     let n = smp::started();
     RT_ARRIVED.store(0, Ordering::SeqCst);
@@ -114,7 +114,7 @@ fn wake_deltas(n: usize) -> alloc::vec::Vec<u64> {
 }
 
 /// PM4 (KERNEL-V1-SPEC 5.6): two light periodic threads on four harts. Under `pack` at most two harts leave idle; under `spread` they sit on separate harts.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn pack_keeps_light_threads_on_few_harts() -> Result<(), String> {
     let n = smp::started();
     if n < 4 {
@@ -194,7 +194,7 @@ fn hart_window_snapshot(n: usize) -> alloc::vec::Vec<[u64; 7]> {
 }
 
 /// The window between two snapshots, per hart: the first five counters as deltas, then running and state as they ended.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB in a test (the formatting's temporaries), run only on a failure, no recursion
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn hart_window_report(a: &[[u64; 7]], b: &[[u64; 7]], elapsed_ns: u64) -> String {
     use core::fmt::Write as _;
     let mut out = String::new();
@@ -220,7 +220,7 @@ fn hart_window_report(a: &[[u64; 7]], b: &[[u64; 7]], elapsed_ns: u64) -> String
 
 /// PM1 (KERNEL-V1-SPEC 5.3): harts go offline and come back in a random order while sleepers keep waking (their timers migrate), the last online hart refuses, and the
 /// offline hart takes no wakes and shows as offline; everything is online again at the end.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn harts_go_offline_and_come_back() -> Result<(), String> {
     use crate::percpu::{HART_OFFLINE, HART_ONLINE};
     let n = smp::started();
@@ -378,7 +378,7 @@ fn harts_go_offline_and_come_back() -> Result<(), String> {
 /// PM2 (KERNEL-V1-SPEC 5.5): a hart with nothing to do for a long time enters the firmware's retentive suspend, and a hart whose next
 /// event is a hundred microseconds away uses `wfi`. On QEMU the two are equivalent in effect (OpenSBI's default retentive suspend is
 /// a `wfi`); the counters are what tells them apart.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn long_idle_suspends_and_a_short_sleeper_does_not() -> Result<(), String> {
     let n = smp::started();
     if n < 3 {
@@ -493,7 +493,7 @@ fn wait_for(ms: u64, mut ready: impl FnMut() -> bool) -> bool {
     ready()
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn harts_come_online() -> Result<(), String> {
     let n = smp::started();
     if smp::online() != n {
@@ -545,7 +545,7 @@ fn harts_come_online() -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn ipi_reaches_every_hart() -> Result<(), String> {
     let n = smp::started();
     for i in 1..n {
@@ -832,7 +832,7 @@ fn high_runner(_: usize) {
 /// Low-priority spinners occupy every secondary hart; a higher-priority thread woken from the
 /// boot hart (which is busy with a still higher one) must displace one of them: the hart is
 /// told by a reschedule IPI and the thread runs there.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn a_wake_preempts_a_lower_priority_hart() -> Result<(), String> {
     let n = smp::started();
     if n < 2 || thread::class_name() != "fixed-priority" {
@@ -977,7 +977,7 @@ fn protect_while_siblings_write() -> Result<(), String> {
 /// Processes with sibling threads running on other harts are ended from outside, over and over:
 /// the kernel must tear them down (page tables and frames freed and reused) without any hart
 /// still translating through a dead root, and nothing may leak.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     use crate::user;
     // (AB7: the first process of a boot makes the system library's shared VMOs, which stay: one round first, so that they are not counted as a leak)
@@ -1024,7 +1024,7 @@ fn user_clock_get_and_yield_take_no_big_lock() -> Result<(), String> {
     no_big_lock_for(82, "a user thread calling futex_wake")
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn no_big_lock_for(program: u64, what: &str) -> Result<(), String> {
     use crate::user;
     let n = smp::started();
@@ -1110,7 +1110,7 @@ fn no_big_lock_for(program: u64, what: &str) -> Result<(), String> {
 /// IPIs the secondary harts handle between the call and the victim's end (the control build
 /// without the kick sees none), and checks that the end came well within a timer tick (the
 /// tick alone would also do it, so that bound is a sanity check, not the guard).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn kill_a_spinner_on_another_hart() -> Result<(), String> {
     use crate::user;
     let n = smp::started();
@@ -1306,7 +1306,7 @@ fn churn_watch_line(secs: u64, window: u64) {
 
 /// Several processes churn objects, memory, mappings and threads at once on different harts,
 /// while the boot hart spawns and joins free kernel threads; then every leak oracle must be clean.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn smp_churn_stress() -> Result<(), String> {
     use crate::user;
     thread::sleep_ticks(10); // let earlier tests' exited threads be reaped before counting

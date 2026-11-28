@@ -287,7 +287,6 @@ fn takes_of(owner: u64) -> u64 {
 /// The deadlock detector's report (`spin_watchdog`): out of line, so the spin loop's frame stays small.
 #[cold]
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only path that ends in a panic (the formatted report)
 fn spin_report(what: &str, big: bool) -> ! {
     let me = percpu::this();
     let start = kcore::watchdog::SpinStart {

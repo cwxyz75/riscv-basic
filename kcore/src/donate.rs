@@ -226,6 +226,18 @@ impl Donations {
 
     /// `from` (which is about to block on `to`) lends its effective priority to `to` until `revoke(from)`.
     pub fn donate(&mut self, from: Tid, to: Tid) -> Result<Changes, DonateError> {
+        let mut out = Changes::new();
+        self.donate_into(from, to, &mut out)?;
+        Ok(out)
+    }
+
+    /// `donate`, its changes added to `out` (a change list is a few hundred bytes: one per frame, KT13).
+    pub fn donate_into(
+        &mut self,
+        from: Tid,
+        to: Tid,
+        out: &mut Changes,
+    ) -> Result<(), DonateError> {
         if !self.nodes.contains_key(&from) || !self.nodes.contains_key(&to) {
             return Err(DonateError::NoThread);
         }
@@ -247,24 +259,41 @@ impl Donations {
             return Err(DonateError::TooDeep);
         }
         self.link(from, to);
-        let mut out = Changes::new();
-        self.propagate(to, &mut out);
-        Ok(out)
+        self.propagate(to, out);
+        Ok(())
     }
 
     /// End `from`'s donation (its wait ended): whatever it lifted drops back.
     pub fn revoke(&mut self, from: Tid) -> Changes {
         let mut out = Changes::new();
-        let Some(to) = self.unlink(from) else {
-            return out;
-        };
-        self.propagate(to, &mut out);
+        self.revoke_into(from, &mut out);
         out
+    }
+
+    /// `revoke`, its changes added to `out`.
+    pub fn revoke_into(&mut self, from: Tid, out: &mut Changes) {
+        if let Some(to) = self.unlink(from) {
+            self.propagate(to, out);
+        }
     }
 
     /// Move `from`'s edge to `to` (revoke, then donate), as one change list. On a refusal the old edge is restored
     /// (nothing changes).
     pub fn retarget(&mut self, from: Tid, to: Tid) -> Result<Changes, DonateError> {
+        let mut all = Changes::new();
+        self.retarget_into(from, to, &mut all)?;
+        Ok(all)
+    }
+
+    /// `retarget`, its net changes added to `all` (each step a frame of its own: a change list and the priorities before are a few hundred
+    /// bytes each, KT13).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: nb counts distinct threads of two chains of at most MAX_DONATION_DEPTH + 1, the array's length; nodes on a chain exist (DN1)
+    pub fn retarget_into(
+        &mut self,
+        from: Tid,
+        to: Tid,
+        all: &mut Changes,
+    ) -> Result<(), DonateError> {
         let old = self.nodes.get(&from).ok_or(DonateError::NoThread)?.out;
         if !self.nodes.contains_key(&to) {
             return Err(DonateError::NoThread);
@@ -273,41 +302,64 @@ impl Donations {
         // (two chains of at most MAX_DONATION_DEPTH + 1 threads each: an array, nothing allocated)
         let mut before = [(0 as Tid, 0 as Prio); 2 * (MAX_DONATION_DEPTH + 1)];
         let mut nb = 0;
-        for start in [old, Some(to)].into_iter().flatten() {
-            let mut t = Some(start);
-            while let Some(x) = t {
-                if !before[..nb].iter().any(|&(y, _)| y == x) {
-                    before[nb] = (x, self.nodes[&x].eff);
-                    nb += 1;
-                }
-                t = self.nodes[&x].out;
-            }
+        if let Some(o) = old {
+            nb = self.chain_prios(o, &mut before, nb);
         }
-        let before = &before[..nb];
-        let first = self.revoke(from);
-        match self.donate(from, to) {
-            Ok(second) => {
-                // one list of *net* changes (a thread lowered by the revoke and raised back by the donation
-                // did not change), in the order the changes propagated
-                let mut all = Changes::new();
-                for c in first.as_slice().iter().chain(second.as_slice()) {
-                    let net = self.nodes[&c.tid].eff;
-                    let was = before.iter().find(|&&(t, _)| t == c.tid).map(|&(_, e)| e);
-                    let listed = all.items[..all.len].iter().any(|x| x.tid == c.tid);
-                    if !listed && was != Some(net) {
-                        all.push(Change {
-                            tid: c.tid,
-                            eff: net,
-                        });
-                    }
-                }
-                Ok(all)
+        nb = self.chain_prios(to, &mut before, nb);
+        self.retarget_move(from, to, old, &before[..nb], all)
+    }
+
+    /// Add the threads of `start`'s chain that are not in `before[..nb]` yet, with their effective priorities; the new count.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: as `retarget_into`
+    fn chain_prios(&self, start: Tid, before: &mut [(Tid, Prio)], mut nb: usize) -> usize {
+        let mut t = Some(start);
+        while let Some(x) = t {
+            if !before[..nb].iter().any(|&(y, _)| y == x) {
+                before[nb] = (x, self.nodes[&x].eff);
+                nb += 1;
             }
-            Err(e) => {
-                if let Some(o) = old {
-                    let _ = self.donate(from, o); // (restores the edge; cannot fail: it existed a moment ago)
-                }
-                Err(e)
+            t = self.nodes[&x].out;
+        }
+        nb
+    }
+
+    /// The move of `retarget_into`: revoke, donate, and the net list (a thread lowered by the revoke and raised back by the donation did not
+    /// change), in the order the changes propagated; on a refusal the old edge is restored.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: a changed thread is a node (DN1)
+    fn retarget_move(
+        &mut self,
+        from: Tid,
+        to: Tid,
+        old: Option<Tid>,
+        before: &[(Tid, Prio)],
+        all: &mut Changes,
+    ) -> Result<(), DonateError> {
+        let mut first = Changes::new();
+        self.revoke_into(from, &mut first);
+        let mut second = Changes::new();
+        if let Err(e) = self.donate_into(from, to, &mut second) {
+            if let Some(o) = old {
+                let _ = self.donate_into(from, o, &mut second); // (restores the edge; cannot fail: it existed a moment ago; its changes undo the revoke's and are dropped)
+            }
+            return Err(e);
+        }
+        self.net_changes(first.as_slice(), before, all);
+        self.net_changes(second.as_slice(), before, all);
+        Ok(())
+    }
+
+    /// Add to `all` the threads of `changes` whose effective priority is not what it was `before` and that it does not list yet.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: a changed thread is a node (DN1)
+    fn net_changes(&self, changes: &[Change], before: &[(Tid, Prio)], all: &mut Changes) {
+        for c in changes {
+            let net = self.nodes[&c.tid].eff;
+            let was = before.iter().find(|&&(t, _)| t == c.tid).map(|&(_, e)| e);
+            let listed = all.as_slice().iter().any(|x| x.tid == c.tid);
+            if !listed && was != Some(net) {
+                all.push(Change {
+                    tid: c.tid,
+                    eff: net,
+                });
             }
         }
     }
@@ -332,6 +384,7 @@ impl Donations {
 
     /// DN1 to DN3 from scratch: the edges are consistent, the graph is acyclic and no chain is too long, and every
     /// effective priority equals the recomputed maximum.
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an invariant check of the tests)
     pub fn audit(&self) -> Result<(), String> {
         for (&t, n) in self.nodes.iter() {
             if let Some(o) = n.out {

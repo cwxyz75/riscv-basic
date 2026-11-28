@@ -219,7 +219,6 @@ const COPY_CHUNK: usize = 16 * 1024;
 /// window between (T206), so no hold is proportional to the length. The destination is reserved first; any failure (a bad pointer, no memory, a page a
 /// pager owes, a sibling that unmapped the buffer between pieces) returns `None`, and the caller's own copy under the lock reports the error as always.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `stage_in`
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: done < len, so len - done and done + n (n <= len - done) cannot overflow
 fn copy_in_chunked(cell: &klock::aslock::AsCell, ptr: u64, len: usize) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
@@ -254,7 +253,6 @@ fn copy_in_chunked(cell: &klock::aslock::AsCell, ptr: u64, len: usize) -> Option
 /// memory locks only. Any failure (a bad pointer, no memory, a page a pager owes) returns `None`, and the call then does its own copy under the lock, in
 /// the order SYSCALLS.md gives its errors, and reports the same error it always did.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
     let (len, hlen) = match n {
         nr::SOCKET_WRITE => (a[2] as usize, 0),
@@ -283,8 +281,6 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
 /// more its bytes and handle words are copied under the caller's address-space lock and the memory locks only. Any failure returns `None` and the call copies for
 /// itself under the lock, so its errors and their order are unchanged.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the record is CHANNEL_CALL_ARGS_BYTES (56) long and the offsets read are below it; nhandles <= MAX_MSG_HANDLES was checked, so nhandles * 8 is small
 pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
     let cell = current_space()?;
@@ -312,8 +308,6 @@ pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
 /// copy-on-write, a page a pager owes) takes nothing and reports its status: the message stays queued. `None`: another read took what was
 /// claimed between the claim and the commit, and the caller makes the read again from the start.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn finish_read(d: &ksys::Deferred) -> Option<Reply> {
     if let Err(e) = copy_deferred(d) {
         return Some(Err((e, None, None)));
@@ -327,8 +321,6 @@ pub(super) fn finish_read(d: &ksys::Deferred) -> Option<Reply> {
 /// The copy of `finish_read`, in `COPY_CHUNK` pieces with an interrupts window between them (T206). The pager-need slot is put back as it was,
 /// except after a copy that stopped for a page a pager owes: then the need stays for `pager_after_call` (or `channel_call`) to wait on.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: at < d.data.len() in the loop, n <= len - at, so at + n <= len
 fn copy_deferred(d: &ksys::Deferred) -> Result<(), Status> {
     let Some(cell) = current_space() else {
@@ -359,7 +351,6 @@ fn copy_deferred(d: &ksys::Deferred) -> Result<(), Status> {
 /// process that was killed while its thread copied takes nothing: the message stays for another reader of the endpoint (the thread never
 /// returns to see it).
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `dispatch`
 fn commit_deferred(s: &mut UserState, d: &ksys::Deferred) -> ksys::Committed {
     let Ok(pid) = caller_pid(s) else {
         return ksys::Committed::Done(fail(Status::BadState));
@@ -388,40 +379,54 @@ fn commit_deferred(s: &mut UserState, d: &ksys::Deferred) -> ksys::Committed {
 /// `vmo_read` and `vmo_write` (T215): the handle under the object lock, the copy under the caller's address-space lock and the memory locks only, so the
 /// copy of up to 64 KiB (and a pager's wait for a page) no longer holds the object domain up. The pager-need slot is saved and put back as the quiet fault does.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the pager need the copy may carry); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn vmo_rw_call(writing: bool, a: [u64; 6]) -> Reply {
     let need = if writing { Rights::WRITE } else { Rights::READ };
     let (id, aspace) = vmo_resolve(a[0], need)?;
-    let (r, pager) = {
-        let _as = klock::aslock::AsCell::hold(&aspace);
-        let k = kmem::mem();
-        let saved = k.vmos.swap_need(None);
-        let r = ksys::vmo_rw_resolved(writing, aspace.held_mut(), k.mm, k.vmos, k.jobs, id, a);
-        let pager = k.vmos.swap_need(saved);
-        (r, pager)
-    };
-    if pager.is_some() {
-        kmem::get().vmos.swap_need(pager); // (`pager_after_call` reads it)
-    }
+    let (r, pager) = vmo_rw_locked(writing, id, &aspace, a);
+    put_need_back(pager);
     r
+}
+
+/// The copy of `vmo_rw_call`, under the caller's address-space lock and the memory locks: its reply, and the pager need it met (the slot itself is left
+/// as it was found).
+#[inline(never)]
+fn vmo_rw_locked(
+    writing: bool,
+    id: u64,
+    aspace: &alloc::sync::Arc<klock::aslock::AsCell>,
+    a: [u64; 6],
+) -> (Reply, Option<kcore::aspace::PagerNeed>) {
+    let _as = klock::aslock::AsCell::hold(aspace);
+    let k = kmem::mem();
+    let saved = k.vmos.swap_need(None);
+    let r = ksys::vmo_rw_resolved(writing, aspace.held_mut(), k.mm, k.vmos, k.jobs, id, a);
+    (r, k.vmos.swap_need(saved))
+}
+
+/// A pager need a call met with no big lock, put back in the slot under it (`pager_after_call` reads it).
+#[inline(never)]
+fn put_need_back(pager: Option<kcore::aspace::PagerNeed>) {
+    if pager.is_some() {
+        kmem::get().vmos.swap_need(pager);
+    }
 }
 
 /// `vmo_commit` (T215): the handle under the object lock, the zeroing of up to `MAX_COMMIT_PAGES` pages under the memory locks only.
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the pager need the copy may carry); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn vmo_commit_call(a: [u64; 6]) -> Reply {
     let (id, _aspace) = vmo_resolve(a[0], Rights::COMMIT)?;
-    let (r, pager) = {
-        let k = kmem::mem();
-        let saved = k.vmos.swap_need(None);
-        let r = ksys::vmo_commit_resolved(k.mm, k.vmos, k.jobs, id, a[1], a[2]);
-        let pager = k.vmos.swap_need(saved);
-        (r, pager)
-    };
-    if pager.is_some() {
-        kmem::get().vmos.swap_need(pager);
-    }
+    let (r, pager) = vmo_commit_locked(id, a[1], a[2]);
+    put_need_back(pager);
     r
+}
+
+/// The zeroing of `vmo_commit_call`, under the memory locks: its reply and the pager need it met.
+#[inline(never)]
+fn vmo_commit_locked(id: u64, offset: u64, len: u64) -> (Reply, Option<kcore::aspace::PagerNeed>) {
+    let k = kmem::mem();
+    let saved = k.vmos.swap_need(None);
+    let r = ksys::vmo_commit_resolved(k.mm, k.vmos, k.jobs, id, offset, len);
+    (r, k.vmos.swap_need(saved))
 }
 
 /// `hart_set_online(resource, index, online)` and `hart_info(resource, index)` (PM1): the resource is checked under the object lock, which is dropped before the call waits
@@ -467,128 +472,150 @@ fn backstop_stat(s: &UserState, which: u64) -> Option<u64> {
 }
 
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame just over 1 KiB (the state closure and the test-build arms); T172 shrinks them
 fn debug_stat_call(a: [u64; 6]) -> Reply {
     if a[1] == 164 {
         return debug_phys_of(a);
     }
-    locked_state(|s| -> Reply {
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
-            .map_err(|e| (e, None, None))?;
-        #[cfg(feature = "fault-alloc")]
-        match a[1] {
-            // KT9 (guest half): 200 arms the calling thread (`a2` = N), 201 disarms and says whether the failure was injected, 202 counts
-            200 => {
-                crate::heap::faultalloc::arm(a[2]);
-                return Ok((Some(0), None));
-            }
-            // 208: arm persistently: every class-R allocation from the Nth on fails
-            208 => {
-                crate::heap::faultalloc::arm_persist(a[2]);
-                return Ok((Some(0), None));
-            }
-            // 207: suspend (`a2` = 1) or resume (0) counting and failing, so that a scenario arms only the call under test
-            207 => {
-                crate::heap::faultalloc::pause(a[2] != 0);
-                return Ok((Some(0), None));
-            }
-            201 => return Ok((Some(u64::from(crate::heap::faultalloc::disarm())), None)),
-            202 => return Ok((Some(crate::heap::faultalloc::count()), None)),
-            // 205: run a whole reachability sweep now (a destruction that found no memory leaks its objects until one runs: KT9)
-            205 => {
-                // (a sweep already running began before what the caller just dropped: it is finished first, then a fresh one runs, T265)
-                while s.objs.sweep_active()
-                    && !matches!(
-                        s.sweep_slice(SWEEP_SLICE_BUDGET),
-                        kcore::object::SweepStep::Done(_)
-                    )
-                {}
-                s.sweep_start();
-                while s.objs.sweep_active()
-                    && !matches!(
-                        s.sweep_slice(SWEEP_SLICE_BUDGET),
-                        kcore::object::SweepStep::Done(_)
-                    )
-                {}
-                return Ok((Some(0), None));
-            }
-            // 206: the registry's live objects
-            206 => return Ok((Some(s.objs.live() as u64), None)),
-            // 204: the VMOs that exist, so a sweep can check a scenario leaves none behind
-            204 => return Ok((Some(kmem::get().vmos.count() as u64), None)),
-            _ => {}
-        }
-        // 145: where wired source `a2` is delivered, as (interrupt file << 16) | identity, or all ones without a Live route (IOMMU5: the
-        // suite aims a device's message at an identity the kernel gave an object, to see that it is refused). Read under this lock.
-        if a[1] == 145 {
-            let at = u32::try_from(a[2]).ok().and_then(crate::aia::route_of);
-            return Ok((Some(at.unwrap_or(u64::MAX)), None));
-        }
-        // 148 (IOMMU7): where the vector of the caller's interrupt handle `a2` sends its notices (the fenced entry's target), as
-        // (interrupt file << 16) | identity, or all ones for anything else
-        if a[1] == 148 {
-            let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
-            return Ok((Some(at.unwrap_or(u64::MAX)), None));
-        }
-        // 216 to 218 (T284, test kernels and the release-suite kernel; a release kernel answers 0 and does nothing). 216: whether a pause of
-        // the host covered the window from `a2` (nanoseconds on the clock `clock_ns` reads) to now for a test whose bound is `a3`
-        // microseconds (two harts took a timer interrupt more than `a3` late inside it, `kcore::pause::covering`), as (hart << 48) |
-        // microseconds late of the worst, 0 for none. 217: how long the harts were not taking their timer interrupts inside that window,
-        // summed over the harts, counting samples at least 2 ms late (microseconds). 218 (the one selector with an effect, bounded: the
-        // debug resource is the trusted suite's, HD4): for the next `a2` milliseconds (at most 60 s, so a test that dies with it on does
-        // not leave it on for long; 0 stops it) every hart keeps a timer deadline at most 1 ms ahead.
-        if a[1] == 216 || a[1] == 217 || a[1] == 218 {
-            #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
-            {
-                let now = crate::timer::now_ns();
-                let v = match a[1] {
-                    216 => match crate::pause::covering(a[2], now, a[3]) {
-                        kcore::pause::Cover::Pause { hart, late_us } => {
-                            kcore::pause::encode(Some((hart, late_us)))
-                        }
-                        _ => 0,
-                    },
-                    217 => crate::pause::paused_in(a[2], now),
-                    _ => {
-                        crate::pause::watch(a[2].min(60_000).saturating_mul(1_000_000));
-                        0
+    locked_state(|s| debug_stat_locked(s, a))
+}
+
+/// `debug_stat` under the object lock: the handle, then the counter.
+#[inline(never)]
+fn debug_stat_locked(s: &mut UserState, a: [u64; 6]) -> Reply {
+    let me = caller_pid(s).map_err(|e| (e, None, None))?;
+    let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+    ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
+        .map_err(|e| (e, None, None))?;
+    #[cfg(feature = "fault-alloc")]
+    if let Some(v) = fault_alloc_stat(s, a) {
+        return Ok((Some(v), None));
+    }
+    Ok((Some(debug_stat_value(s, me, a)), None))
+}
+
+/// `debug_stat`'s counters (the handle was checked).
+#[inline(never)]
+fn debug_stat_value(s: &UserState, me: u64, a: [u64; 6]) -> u64 {
+    let Some(p) = s.procs.get(&me) else {
+        return 0;
+    };
+    // 145: where wired source `a2` is delivered, as (interrupt file << 16) | identity, or all ones without a Live route (IOMMU5: the
+    // suite aims a device's message at an identity the kernel gave an object, to see that it is refused). Read under this lock.
+    if a[1] == 145 {
+        let at = u32::try_from(a[2]).ok().and_then(crate::aia::route_of);
+        return at.unwrap_or(u64::MAX);
+    }
+    // 148 (IOMMU7): where the vector of the caller's interrupt handle `a2` sends its notices (the fenced entry's target), as
+    // (interrupt file << 16) | identity, or all ones for anything else
+    if a[1] == 148 {
+        let at = crate::iommu::vector_route(&s.objs, &p.handles, a[2]);
+        return at.unwrap_or(u64::MAX);
+    }
+    // 216 to 218 (T284, test kernels and the release-suite kernel; a release kernel answers 0 and does nothing). 216: whether a pause of
+    // the host covered the window from `a2` (nanoseconds on the clock `clock_ns` reads) to now for a test whose bound is `a3`
+    // microseconds (two harts took a timer interrupt more than `a3` late inside it, `kcore::pause::covering`), as (hart << 48) |
+    // microseconds late of the worst, 0 for none. 217: how long the harts were not taking their timer interrupts inside that window,
+    // summed over the harts, counting samples at least 2 ms late (microseconds). 218 (the one selector with an effect, bounded: the
+    // debug resource is the trusted suite's, HD4): for the next `a2` milliseconds (at most 60 s, so a test that dies with it on does
+    // not leave it on for long; 0 stops it) every hart keeps a timer deadline at most 1 ms ahead.
+    if a[1] == 216 || a[1] == 217 || a[1] == 218 {
+        #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+        {
+            let now = crate::timer::now_ns();
+            let v = match a[1] {
+                216 => match crate::pause::covering(a[2], now, a[3]) {
+                    kcore::pause::Cover::Pause { hart, late_us } => {
+                        kcore::pause::encode(Some((hart, late_us)))
                     }
-                };
-                return Ok((Some(v), None));
-            }
-            #[cfg(all(feature = "release", not(feature = "release-suite")))]
-            return Ok((Some(0), None));
+                    _ => 0,
+                },
+                217 => crate::pause::paused_in(a[2], now),
+                _ => {
+                    crate::pause::watch(a[2].min(60_000).saturating_mul(1_000_000));
+                    0
+                }
+            };
+            return v;
         }
-        // 219 (T226, OD160; test kernels and the release-suite kernel, like 216 to 218; a release kernel answers 0 and does nothing): the next
-        // user thread the calling thread creates is placed only on the hart it is created on (a test-only pin: with a priority below
-        // its creator's it cannot run before the creator blocks, which makes "killed before it ran" deterministic). Answers 1 when set.
-        if a[1] == 219 {
-            #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
-            {
-                thread::pin_next_spawn();
-                return Ok((Some(1), None));
-            }
-            #[cfg(all(feature = "release", not(feature = "release-suite")))]
-            return Ok((Some(0), None));
+        #[cfg(all(feature = "release", not(feature = "release-suite")))]
+        return 0;
+    }
+    // 219 (T226, OD160; test kernels and the release-suite kernel, like 216 to 218; a release kernel answers 0 and does nothing): the next
+    // user thread the calling thread creates is placed only on the hart it is created on (a test-only pin: with a priority below
+    // its creator's it cannot run before the creator blocks, which makes "killed before it ran" deterministic). Answers 1 when set.
+    if a[1] == 219 {
+        #[cfg(not(all(feature = "release", not(feature = "release-suite"))))]
+        {
+            thread::pin_next_spawn();
+            return 1;
         }
-        // 132 (T243, debug builds): print every hart's scheduler state, the record of every thread that is not idle and the processes that are not
-        // finished, for a test that failed; the user state is the one this closure holds (`dump_state` opening it again would be two live `&mut`, T239)
-        if a[1] == 132 {
-            #[cfg(debug_assertions)]
-            {
-                thread::dump_sched();
-                super::dump_state(s);
-            }
-            return Ok((Some(0), None));
+        #[cfg(all(feature = "release", not(feature = "release-suite")))]
+        return 0;
+    }
+    // 132 (T243, debug builds): print every hart's scheduler state, the record of every thread that is not idle and the processes that are not
+    // finished, for a test that failed; the user state is the one this closure holds (`dump_state` opening it again would be two live `&mut`, T239)
+    if a[1] == 132 {
+        #[cfg(debug_assertions)]
+        {
+            thread::dump_sched();
+            super::dump_state(s);
         }
-        // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
-        if let Some(v) = backstop_stat(s, a[1]) {
-            return Ok((Some(v), None));
+        return 0;
+    }
+    // 120 to 124: the backstops (PL8), read from the state this closure holds (`wake_stat` would open it again: two live `&mut UserState`, KT14)
+    if let Some(v) = backstop_stat(s, a[1]) {
+        return v;
+    }
+    thread::wake_stat(a[1])
+}
+
+/// `debug_stat` 200 to 208 (KT9, the allocation-failure kernel): `None` for any other selector.
+#[cfg(feature = "fault-alloc")]
+#[inline(never)]
+fn fault_alloc_stat(s: &mut UserState, a: [u64; 6]) -> Option<u64> {
+    match a[1] {
+        // KT9 (guest half): 200 arms the calling thread (`a2` = N), 201 disarms and says whether the failure was injected, 202 counts
+        200 => {
+            crate::heap::faultalloc::arm(a[2]);
+            return Some(0);
         }
-        Ok((Some(thread::wake_stat(a[1])), None))
-    })
+        // 208: arm persistently: every class-R allocation from the Nth on fails
+        208 => {
+            crate::heap::faultalloc::arm_persist(a[2]);
+            return Some(0);
+        }
+        // 207: suspend (`a2` = 1) or resume (0) counting and failing, so that a scenario arms only the call under test
+        207 => {
+            crate::heap::faultalloc::pause(a[2] != 0);
+            return Some(0);
+        }
+        201 => return Some(u64::from(crate::heap::faultalloc::disarm())),
+        202 => return Some(crate::heap::faultalloc::count()),
+        // 205: run a whole reachability sweep now (a destruction that found no memory leaks its objects until one runs: KT9)
+        205 => {
+            // (a sweep already running began before what the caller just dropped: it is finished first, then a fresh one runs, T265)
+            while s.objs.sweep_active()
+                && !matches!(
+                    s.sweep_slice(SWEEP_SLICE_BUDGET),
+                    kcore::object::SweepStep::Done(_)
+                )
+            {}
+            s.sweep_start();
+            while s.objs.sweep_active()
+                && !matches!(
+                    s.sweep_slice(SWEEP_SLICE_BUDGET),
+                    kcore::object::SweepStep::Done(_)
+                )
+            {}
+            return Some(0);
+        }
+        // 206: the registry's live objects
+        206 => return Some(s.objs.live() as u64),
+        // 204: the VMOs that exist, so a sweep can check a scenario leaves none behind
+        204 => return Some(kmem::get().vmos.count() as u64),
+        _ => {}
+    }
+    None
 }
 
 /// `debug_stat` 164 (IOMMU12, test builds only): the physical address of the page the caller has mapped at user address `a2`, or all ones.
@@ -905,134 +932,17 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
     crate::chaos::point(crate::chaos::Point::ReturnToUser);
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
+/// A trap from user mode, by kind (each a frame of its own: KT13).
 pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     use crate::arch::{FaultKind, UserTrap};
     if frame.is_syscall() {
-        // AB8: the system call instruction is allowed only inside the system library; anywhere else it is an illegal instruction, and the
-        // process ends (or its exception port hears of it)
-        if !call_from_library_of_thread(frame.pc()) {
-            raise_fault(ksys::exception::Fault {
-                kind: abi::arch::fault::ILLEGAL,
-                pc: frame.pc(),
-                address: frame.pc(),
-                cause: 8,
-            });
-            return;
-        }
-        frame.skip_trap_instruction(); // past the call instruction
-        syscall(frame);
-        // (MM9) a kernel copy found a page of a pager's VMO missing: wait for it here, with no lock held
-        pager_after_call(frame);
-        // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced translations this and other harts may cache
-        super::calls::cow_sync();
+        user_syscall(frame);
         return;
     }
     match frame.decode_user() {
         UserTrap::Syscall => unreachable_syscall(),
         UserTrap::Fault(fault) if fault.kind == FaultKind::PageFault => {
-            let cause = fault.code;
-            let access = fault.access.unwrap_or(Access::Read);
-            let va = fault.address;
-            let mut pager_need = None;
-            let mut resolved = {
-                let pid = with_state(|s| s.pid_of(thread::current()));
-                match pid {
-                    Some(pid) if va < abi::user::TOP => {
-                        // (the address space is cloned out of the section: a reference count, no allocation)
-                        let aspace = with_state(|s| s.procs.get(&pid).map(|p| p.aspace.clone()))
-                            .expect("process exists");
-                        let _as = klock::aslock::AsCell::hold(&aspace);
-                        let k = kmem::get();
-                        let r = aspace
-                            .held_mut()
-                            .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
-                        if let Ok(m) = &r {
-                            if m.exec > 0 {
-                                // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
-                                crate::smp::icache_sync(m.exec);
-                            }
-                            // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
-                            // thread still runs under the old one)
-                            kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
-                        }
-                        if let Err(kcore::aspace::FaultError::NeedPager(n)) = &r {
-                            pager_need = Some(*n);
-                            // (the fault has the need in its error: the slot a kernel copy reads must not keep it for another thread's call)
-                            let _ = k.vmos.take_need();
-                        }
-                        if cfg!(feature = "fault-log") {
-                            if let Err(e) = &r {
-                                let _ = core::fmt::Write::write_fmt(
-                                    &mut crate::console::Console,
-                                    format_args!("kernel: handle_fault failed: {e:?} (pid {pid}, va {va:#x})\n"),
-                                );
-                            }
-                        }
-                        r.is_ok()
-                    }
-                    Some(pid) => {
-                        if cfg!(feature = "fault-log") {
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut crate::console::Console,
-                                format_args!("kernel: fault above TOP (pid {pid}, va {va:#x})\n"),
-                            );
-                        }
-                        false
-                    }
-                    None => {
-                        if cfg!(feature = "fault-log") {
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut crate::console::Console,
-                                format_args!(
-                                    "kernel: fault in thread {} with no process\n",
-                                    thread::current()
-                                ),
-                            );
-                        }
-                        false
-                    }
-                }
-            };
-            // (MM9) the page is a pager's and was not supplied: wait for it with no lock held (PG1); on a supply the access is tried again, and
-            // a pager that failed or died raises a PAGER exception
-            let mut pager_status = None;
-            if let Some(need) = pager_need {
-                match pager_wait(need, false) {
-                    Ok(()) => resolved = true,
-                    Err(status) => pager_status = Some(status),
-                }
-            }
-            // (MM8) a copy or a first touch of a page other mappings may show an older version of: drop those, on every hart
-            super::calls::cow_sync();
-            if resolved {
-                // (the pages the fault mapped were flushed one by one above)
-            } else {
-                // a diagnostic for headless debugging (off by default: the tests crash programs
-                // on purpose and the shell tests read the console line by line)
-                if cfg!(feature = "fault-log") {
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut crate::console::Console,
-                        format_args!(
-                            "kernel: user fault, cause {cause}, pc {:#x}, address {va:#x}, ra {:#x}, sp {:#x}\n",
-                            fault.pc,
-                            frame.arg(1),
-                            frame.arg(2)
-                        ),
-                    );
-                }
-                match pager_status {
-                    Some(status) => raise_fault(ksys::exception::Fault {
-                        kind: abi::arch::fault::PAGER,
-                        pc: fault.pc,
-                        address: fault.address,
-                        cause: i64::from(status.code()) as u64,
-                    }),
-                    None => fault_or_exit(&fault),
-                }
-            }
+            user_page_fault(frame, &fault)
         }
         UserTrap::Fault(fault)
             if fault.kind == FaultKind::Illegal && crate::fp::first_use(frame) =>
@@ -1043,6 +953,166 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
         }
         UserTrap::Fault(fault) => fault_or_exit(&fault),
     }
+}
+
+/// A system call instruction from user mode.
+#[inline(never)]
+fn user_syscall(frame: &mut crate::trap::TrapFrame) {
+    // AB8: the system call instruction is allowed only inside the system library; anywhere else it is an illegal instruction, and the
+    // process ends (or its exception port hears of it)
+    if !call_from_library_of_thread(frame.pc()) {
+        raise_fault(ksys::exception::Fault {
+            kind: abi::arch::fault::ILLEGAL,
+            pc: frame.pc(),
+            address: frame.pc(),
+            cause: 8,
+        });
+        return;
+    }
+    frame.skip_trap_instruction(); // past the call instruction
+    syscall(frame);
+    // (MM9) a kernel copy found a page of a pager's VMO missing: wait for it here, with no lock held
+    pager_after_call(frame);
+    // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced translations this and other harts may cache
+    super::calls::cow_sync();
+}
+
+/// A page fault from user mode: resolved in the process's address space, or waited for from its pager, or raised as an exception.
+#[inline(never)]
+fn user_page_fault(frame: &crate::trap::TrapFrame, fault: &crate::arch::Fault) {
+    let va = fault.address;
+    let (mut resolved, pager_need) = resolve_user_fault(va, fault.access.unwrap_or(Access::Read));
+    // (MM9) the page is a pager's and was not supplied: wait for it with no lock held (PG1); on a supply the access is tried again, and
+    // a pager that failed or died raises a PAGER exception
+    let mut pager_status = None;
+    if let Some(need) = pager_need {
+        match pager_wait(need, false) {
+            Ok(()) => resolved = true,
+            Err(status) => pager_status = Some(status),
+        }
+    }
+    // (MM8) a copy or a first touch of a page other mappings may show an older version of: drop those, on every hart
+    super::calls::cow_sync();
+    if resolved {
+        return; // (the pages the fault mapped were flushed one by one above)
+    }
+    // a diagnostic for headless debugging (off by default: the tests crash programs
+    // on purpose and the shell tests read the console line by line)
+    if cfg!(feature = "fault-log") {
+        fault_log_unresolved(frame, fault);
+    }
+    match pager_status {
+        Some(status) => raise_fault(ksys::exception::Fault {
+            kind: abi::arch::fault::PAGER,
+            pc: fault.pc,
+            address: fault.address,
+            cause: i64::from(status.code()) as u64,
+        }),
+        None => fault_or_exit(fault),
+    }
+}
+
+/// `fault-log`: a user fault that ends in an exception (a diagnostic for headless debugging).
+#[cold]
+#[inline(never)]
+fn fault_log_unresolved(frame: &crate::trap::TrapFrame, fault: &crate::arch::Fault) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut crate::console::Console,
+        format_args!(
+            "kernel: user fault, cause {}, pc {:#x}, address {:#x}, ra {:#x}, sp {:#x}\n",
+            fault.code,
+            fault.pc,
+            fault.address,
+            frame.arg(1),
+            frame.arg(2)
+        ),
+    );
+}
+
+/// The fault at `va` in the calling thread's address space, under its lock and the memory locks: whether it was resolved, and the pager need it
+/// met (the slot a kernel copy reads is emptied: the fault carries the need itself).
+#[allow(clippy::expect_used)] // INVARIANT: the process of a trapping thread exists
+#[inline(never)]
+fn resolve_user_fault(va: u64, access: Access) -> (bool, Option<kcore::aspace::PagerNeed>) {
+    let pid = with_state(|s| s.pid_of(thread::current()));
+    match pid {
+        Some(pid) if va < abi::user::TOP => {
+            // (the address space is cloned out of the section: a reference count, no allocation)
+            let aspace = with_state(|s| s.procs.get(&pid).map(|p| p.aspace.clone()))
+                .expect("process exists");
+            let _as = klock::aslock::AsCell::hold(&aspace);
+            let k = kmem::get();
+            let r = aspace
+                .held_mut()
+                .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
+            let mut pager_need = None;
+            if let Ok(m) = &r {
+                if m.exec > 0 {
+                    // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
+                    crate::smp::icache_sync(m.exec);
+                }
+                // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
+                // thread still runs under the old one)
+                kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
+            }
+            if let Err(kcore::aspace::FaultError::NeedPager(n)) = &r {
+                pager_need = Some(*n);
+                // (the fault has the need in its error: the slot a kernel copy reads must not keep it for another thread's call)
+                let _ = k.vmos.take_need();
+            }
+            if cfg!(feature = "fault-log") {
+                if let Err(e) = &r {
+                    fault_log_failed(e, pid, va);
+                }
+            }
+            (r.is_ok(), pager_need)
+        }
+        Some(pid) => {
+            if cfg!(feature = "fault-log") {
+                fault_log_above_top(pid, va);
+            }
+            (false, None)
+        }
+        None => {
+            if cfg!(feature = "fault-log") {
+                fault_log_no_process();
+            }
+            (false, None)
+        }
+    }
+}
+
+/// `fault-log`: a fault the address space did not resolve (the formatting in a frame of its own: KT13).
+#[cold]
+#[inline(never)]
+fn fault_log_failed(e: &kcore::aspace::FaultError, pid: u64, va: u64) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut crate::console::Console,
+        format_args!("kernel: handle_fault failed: {e:?} (pid {pid}, va {va:#x})\n"),
+    );
+}
+
+/// `fault-log`: a fault above the user half.
+#[cold]
+#[inline(never)]
+fn fault_log_above_top(pid: u64, va: u64) {
+    let _ = core::fmt::Write::write_fmt(
+        &mut crate::console::Console,
+        format_args!("kernel: fault above TOP (pid {pid}, va {va:#x})\n"),
+    );
+}
+
+/// `fault-log`: a fault in a thread with no process.
+#[cold]
+#[inline(never)]
+fn fault_log_no_process() {
+    let _ = core::fmt::Write::write_fmt(
+        &mut crate::console::Console,
+        format_args!(
+            "kernel: fault in thread {} with no process\n",
+            thread::current()
+        ),
+    );
 }
 
 /// A fault the kernel cannot resolve (EX2): offered to the process's exception channel, then its job's and each ancestor's; the thread stops until a
@@ -1109,21 +1179,39 @@ fn device_domain_call(
     true
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+/// A system call from user mode: the arguments, then the call's own path (each group a frame of its own, so that the largest of them, not
+/// their sum, is on the stack: KT13, T289), then the charge for what it added to the caller's handle table.
 pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
     let growth_at_entry = kcore::handle::growth_events();
-    let (n, a) = (
-        frame.arg(17) as usize,
-        [
-            frame.arg(10),
-            frame.arg(11),
-            frame.arg(12),
-            frame.arg(13),
-            frame.arg(14),
-            frame.arg(15),
-        ],
-    );
+    let n = frame.arg(17) as usize;
+    let a = syscall_args(frame);
+    if !syscall_special(frame, n, a) {
+        match direct_call(n, a) {
+            Some(r) => reply(frame, r),
+            None => object_call(frame, n, a),
+        }
+    }
+    // (MM5) whatever this call added to the caller's handle table is charged to its job now, between calls, never in the middle of one
+    settle_handle_table(growth_at_entry);
+}
+
+/// The six argument registers of a system call.
+fn syscall_args(frame: &crate::trap::TrapFrame) -> [u64; 6] {
+    [
+        frame.arg(10),
+        frame.arg(11),
+        frame.arg(12),
+        frame.arg(13),
+        frame.arg(14),
+        frame.arg(15),
+    ]
+}
+
+/// The calls that end the thread, answer in the frame themselves or take a path of their own (the device-domain calls, the process table);
+/// false for any other call.
+#[inline(never)]
+fn syscall_special(frame: &mut crate::trap::TrapFrame, n: usize, a: [u64; 6]) -> bool {
     match n {
         nr::THREAD_YIELD => {
             status_ret(frame, Status::Ok);
@@ -1135,11 +1223,6 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             note_clock_trap();
             frame.set_return(0, Some(thread::now_ns()), None)
         }
-        nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
-        nr::HART_SET_ONLINE | nr::HART_INFO | nr::SYSTEM_SUSPEND => reply(frame, hart_call(n, a)),
-        nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
-        nr::VMO_READ | nr::VMO_WRITE => reply(frame, vmo_rw_call(n == nr::VMO_WRITE, a)),
-        nr::VMO_COMMIT => reply(frame, vmo_commit_call(a)),
         // (IOMMU6) the device-domain calls: phases under the object lock, `IOMMU` and the memory locks, and the fence waits with none
         nr::IODOMAIN_CREATE
         | nr::IODOMAIN_MAP
@@ -1150,33 +1233,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::IODOMAIN_GRANT_VECTOR => {
             let _ = device_domain_call(frame, n, a, false);
         }
-        nr::OBJECT_WAIT => {
-            // (IOMMU-SPEC 8.5: the first wait on a vector moves it to this hart, with no lock held)
-            crate::iommu::first_wait(a[0]);
-            reply(frame, object_wait(a))
-        }
         // (IOMMU7) a vector's acknowledgement and `interrupt_deliver_here` are the device-domain layer's; a wired source's are `dispatch`'s
         // (the guard is the call: `device_domain_call` answers a vector's and replies; false sends a wired source on to `dispatch`)
-        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE if device_domain_call(frame, n, a, true) => {
-        }
-        nr::PORT_WAIT => {
-            // (a poll moves the port's cursor, which counts as a touch)
-            let r = port_wait(a);
-            commit_wake();
-            reply(frame, r);
-        }
-        nr::PORT_WAIT_MANY => {
-            let r = port_wait_many(a);
-            commit_wake();
-            reply(frame, r);
-        }
-        nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
-        nr::FUTEX_LOCK_PI => reply(frame, futex_lock_pi(a)),
-        nr::FUTEX_UNLOCK_PI => reply(frame, futex_unlock_pi(a)),
-        nr::FUTEX_WAKE => {
-            // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
-            let pid = locked_state(|s| caller_pid(s).unwrap_or(0));
-            reply(frame, futex_wake(pid, a));
+        nr::INTERRUPT_ACK | nr::INTERRUPT_DELIVER_HERE => {
+            return device_domain_call(frame, n, a, true)
         }
         nr::PROCESS_CREATE
         | nr::JOB_SET_SCHED
@@ -1233,79 +1293,118 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             notify();
             reply(frame, r);
         }
+        _ => return false,
+    }
+    true
+}
+
+/// The calls that are one function each and reply with what it returns; `None` for any other call.
+#[inline(never)]
+fn direct_call(n: usize, a: [u64; 6]) -> Option<Reply> {
+    let r: Reply = match n {
+        nr::DEBUG_STAT => debug_stat_call(a),
+        nr::HART_SET_ONLINE | nr::HART_INFO | nr::SYSTEM_SUSPEND => hart_call(n, a),
+        nr::DEBUG_WRITE => debug_write_call(a),
+        nr::VMO_READ | nr::VMO_WRITE => vmo_rw_call(n == nr::VMO_WRITE, a),
+        nr::VMO_COMMIT => vmo_commit_call(a),
+        nr::OBJECT_WAIT => {
+            // (IOMMU-SPEC 8.5: the first wait on a vector moves it to this hart, with no lock held)
+            crate::iommu::first_wait(a[0]);
+            object_wait(a)
+        }
+        nr::PORT_WAIT => {
+            // (a poll moves the port's cursor, which counts as a touch)
+            let r = port_wait(a);
+            commit_wake();
+            r
+        }
+        nr::PORT_WAIT_MANY => {
+            let r = port_wait_many(a);
+            commit_wake();
+            r
+        }
+        nr::FUTEX_WAIT => futex_wait(a),
+        nr::FUTEX_LOCK_PI => futex_lock_pi(a),
+        nr::FUTEX_UNLOCK_PI => futex_unlock_pi(a),
+        nr::FUTEX_WAKE => {
+            // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
+            let pid = locked_state(|s| caller_pid(s).unwrap_or(0));
+            futex_wake(pid, a)
+        }
         nr::CHANNEL_CALL => {
             let r = channel_call(a);
             notify();
-            reply(frame, r);
+            r
         }
-        _ => {
-            // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
-            sweep_before_create(n);
-            let mut staged = stage_in(n, a);
-            let result = loop {
-                let mut deferred = None;
-                let result = irq::without(|| dispatch(n, a, staged.take(), &mut deferred));
-                let Some(d) = deferred else {
-                    break result;
-                };
-                // (KT7, T266: under `chaos`, a delay and a yield here switch the reader out between its claim and its copy; nothing without the
-                // feature)
-                crate::chaos::point(crate::chaos::Point::CopyOut);
-                // (OD161) the copy, then the commit; `None`: another read took what this one claimed, so it reads again (the next message, or
-                // the status an empty queue gives)
-                if let Some(r) = finish_read(&d) {
-                    break r;
-                }
-            };
-            if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
-                // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
-                lend_to_reader();
-            }
-            // A syscall that can change a signal wakes every waiter (after the borrows of
-            // `dispatch` are gone, since waking may switch threads).
-            if matches!(
-                n,
-                nr::CHANNEL_WRITE
-                    | nr::CHANNEL_READ
-                    | nr::CHANNEL_READ_TXID
-                    | nr::HANDLE_CLOSE
-                    // a replaced handle's old value names nothing: waits on it end
-                    | nr::HANDLE_REPLACE
-                    | nr::EVENT_SIGNAL
-                    // creating objects can sweep garbage, which closes peers
-                    | nr::CHANNEL_CREATE
-                    | nr::EVENT_CREATE
-                    | nr::SOCKET_CREATE
-                    | nr::PORT_CREATE
-                    // data moved, space freed, or a binding that is ready at once
-                    | nr::SOCKET_WRITE
-                    | nr::SOCKET_READ
-                    | nr::SOCKET_SHUTDOWN
-                    | nr::PORT_BIND
-                    | nr::PORT_UNBIND
-                    | nr::PORT_REARM
-            ) {
-                if n == nr::HANDLE_CLOSE {
-                    // (T206) what the close left owed (a chain it freed) is paid before the call returns, a slice per critical section
-                    while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {
-                        crate::irq::window();
-                    }
-                    // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
-                    locked_state(ksys::exception::reap_closed_job_channels);
-                }
-                notify();
-            }
-            // Slice W step 3: wake the threads whose wait this syscall ended, by id (a handle removed
-            // by `replace` or sent away is a forced touch, made where it happens)
-            commit_wake();
-            reply(frame, result);
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// The object calls (L20: one section under the object lock, as the final design has them, SCHED-SMP-SPEC 3.3, T70), with the copy of a big read
+/// after it (OD161), the wakes the call made and the reply.
+#[inline(never)]
+fn object_call(frame: &mut crate::trap::TrapFrame, n: usize, a: [u64; 6]) {
+    // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
+    sweep_before_create(n);
+    let mut staged = stage_in(n, a);
+    let result = loop {
+        let mut deferred = None;
+        let result = irq::without(|| dispatch(n, a, staged.take(), &mut deferred));
+        let Some(d) = deferred else {
+            break result;
+        };
+        // (KT7, T266: under `chaos`, a delay and a yield here switch the reader out between its claim and its copy; nothing without the
+        // feature)
+        crate::chaos::point(crate::chaos::Point::CopyOut);
+        // (OD161) the copy, then the commit; `None`: another read took what this one claimed, so it reads again (the next message, or
+        // the status an empty queue gives)
+        if let Some(r) = finish_read(&d) {
+            break r;
         }
+    };
+    if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
+        // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
+        lend_to_reader();
     }
-    if n == nr::THREAD_YIELD {
-        // status already set above
+    // A syscall that can change a signal wakes every waiter (after the borrows of
+    // `dispatch` are gone, since waking may switch threads).
+    if matches!(
+        n,
+        nr::CHANNEL_WRITE
+            | nr::CHANNEL_READ
+            | nr::CHANNEL_READ_TXID
+            | nr::HANDLE_CLOSE
+            // a replaced handle's old value names nothing: waits on it end
+            | nr::HANDLE_REPLACE
+            | nr::EVENT_SIGNAL
+            // creating objects can sweep garbage, which closes peers
+            | nr::CHANNEL_CREATE
+            | nr::EVENT_CREATE
+            | nr::SOCKET_CREATE
+            | nr::PORT_CREATE
+            // data moved, space freed, or a binding that is ready at once
+            | nr::SOCKET_WRITE
+            | nr::SOCKET_READ
+            | nr::SOCKET_SHUTDOWN
+            | nr::PORT_BIND
+            | nr::PORT_UNBIND
+            | nr::PORT_REARM
+    ) {
+        if n == nr::HANDLE_CLOSE {
+            // (T206) what the close left owed (a chain it freed) is paid before the call returns, a slice per critical section
+            while locked_state(|s| !s.objs.release_step(kcore::object::RELEASE_UNITS)) {
+                crate::irq::window();
+            }
+            // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
+            locked_state(ksys::exception::reap_closed_job_channels);
+        }
+        notify();
     }
-    // (MM5) whatever this call added to the caller's handle table is charged to its job now, between calls, never in the middle of one
-    settle_handle_table(growth_at_entry);
+    // Slice W step 3: wake the threads whose wait this syscall ended, by id (a handle removed
+    // by `replace` or sent away is a forced touch, made where it happens)
+    commit_wake();
+    reply(frame, result);
 }
 
 /// The requests the call just read (`channel_read`, `channel_read_txid`) were sent by threads blocked in `channel_call`: each lends its priority to
@@ -1395,14 +1494,6 @@ fn sweep_before_create(n: usize) {
     }
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::expect_used,
-    clippy::indexing_slicing
-)]
-// INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
 pub(super) fn dispatch(
     n: usize,
     a: [u64; 6],
@@ -1412,13 +1503,7 @@ pub(super) fn dispatch(
     with_state(|s| dispatch_in(s, n, a, staged, deferred))
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, as `dispatch`
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::expect_used,
-    clippy::indexing_slicing
-)]
-// INVARIANT: as `dispatch`
+#[allow(clippy::expect_used)] // INVARIANT: the process of a calling thread exists
 fn dispatch_in(
     s: &mut UserState,
     n: usize,
@@ -1430,6 +1515,14 @@ fn dispatch_in(
     let Some(pid) = s.pid_of(tid) else {
         return fail(Status::BadState);
     };
+    // The syscall layer that needs no machine is in the `ksys` crate (TS3): the width check of the 32-bit arguments first, then the calls
+    // on handles, events, channels, sockets and ports, over this machine's memory.
+    if let Some(status) = ksys::wide_argument_error(n, &a) {
+        return fail(status);
+    }
+    if n == nr::JOB_INFO {
+        thread::charge_running(); // (`job_info` 9 and 10 read the CPU accounts: the caller's own running time is charged first)
+    }
     let UserState {
         objs,
         procs,
@@ -1437,164 +1530,226 @@ fn dispatch_in(
         ..
     } = s;
     let p: &mut ksys::Process = procs.get_mut(&pid).expect("process exists");
-    let h = |i: usize| Handle(a[i]);
-    // The syscall layer that needs no machine is in the `ksys` crate (TS3): the width check of the 32-bit arguments first, then the calls
-    // on handles, events, channels, sockets and ports, over this machine's memory.
-    let bad_args = ksys::wide_argument_error(n, &a);
-    if let Some(status) = bad_args {
-        return fail(status);
+    if let Some(r) = ksys_section(objs, p, n, a, staged, deferred) {
+        return r;
     }
-    if n == nr::JOB_INFO {
-        thread::charge_running(); // (`job_info` 9 and 10 read the CPU accounts: the caller's own running time is charged first)
-    }
-    {
-        // (the memory locks are held only inside this block and in the two calls below that need them: every other call may take the
-        // big kernel lock, which comes before them in the order)
-        let as_cell = p.aspace.clone();
-        let _as = klock::aslock::AsCell::hold(&as_cell); // (the caller's address space, before the memory locks)
-        let k = kmem::get();
-        let mut ctx = ksys::Ctx {
-            objs: &mut *objs,
-            handles: &mut p.handles,
-            job: p.job,
-            aspace: as_cell.held_mut(),
-            mm: k.mm,
-            vmos: k.vmos,
-            jobs: k.jobs,
-            faults: ksys::Faults {
-                skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
-            },
-            harts_online: crate::smp::online() as u64,
-            job_sched: crate::thread::job_sched(),
-            clock: crate::timer::now_ns,
-            windows: crate::kmem::device_windows(),
-            staged,
-            defer_out: true,
-            deferred: None,
-        };
-        if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
-            *deferred = ctx.deferred.take();
-            return r;
-        }
-        if let Some(r) = ksys::vmo_call(n, a, &mut ctx) {
-            return r;
-        }
-        if let Some(r) = ksys::job_call(n, a, &mut ctx) {
-            return r;
-        }
-    }
+    // (each call a frame of its own, so the largest of them, not their sum, is on the stack: KT13, T289)
     match n {
         // (`DEBUG_WRITE` is answered in `syscall`, before this table: it holds the big lock only for the handle and the tally)
-        nr::SYSTEM_SET_PLACEMENT => {
-            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            if thread::set_placement(a[1]) {
-                Ok((None, None))
-            } else {
-                fail(Status::InvalidArgs)
-            }
-        }
-        nr::RESOURCE_DTB => {
-            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            let Some(blob) =
-                crate::dtb::dtb_blob().filter(|b| b.len() <= abi::limits::MAX_DTB_BYTES)
-            else {
-                return fail(Status::NotSupported);
-            };
-            let pages = (blob.len() as u64).div_ceil(4096);
-            let k = kmem::get();
-            if k.vmos.reserve_one().is_err() {
-                return fail(Status::NoMemory);
-            }
-            let id = k.vmos.create_in(k.jobs, pages, p.job);
-            // the firmware's seeds are the kernel's (HD1): the copy the device manager sees has them zeroed
-            // (scrubbed in a heap copy first, so no frame of the VMO ever holds them)
-            let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
-            let mut copy = blob.to_vec();
-            for (off, len) in [seeds.rng_seed, seeds.kaslr_seed].into_iter().flatten() {
-                if let Some(range) = copy.get_mut(off..off.saturating_add(len)) {
-                    range.fill(0);
-                }
-            }
-            if k.vmos.write(k.mm, k.jobs, id, 0, &copy).is_err() {
-                let _ = k.vmos.release(k.mm, k.jobs, id);
-                return fail(Status::NoMemory);
-            }
-            let rights =
-                Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
-            match ipc::vmo_object_create_with(
-                objs,
-                &mut p.handles,
-                id,
-                rights,
-                &mut ipc::Quota {
-                    jobs: &mut *k.jobs,
-                    job: Some(p.job),
-                },
-            ) {
-                Ok(hd) => Ok((Some(hd.0), Some(blob.len() as u64))),
-                Err(e) => {
-                    let _ = k.vmos.release(k.mm, k.jobs, id);
-                    fail(e)
-                }
-            }
-        }
-        nr::INTERRUPT_CREATE => {
-            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            let irq = a[1];
-            // (only the sources the tree's admitted devices name on the APLIC: 0, a number past 32 bits and any other source are refused)
-            if irq == 0 || irq > u64::from(u32::MAX) || !crate::aia::irq_allowed(irq as u32) {
-                return fail(Status::InvalidArgs);
-            }
-            let slot = irq as usize;
-            // (T183: the table is sized by the highest allowed source, so an allowed source has a slot; a missing one is refused, not ignored)
-            let Some(&current) = irq_objs.get(slot) else {
-                return fail(Status::InvalidArgs);
-            };
-            let owned = matches!(current, Some(o)
-                if matches!(objs.get(o), Some(ipc::KObj::Interrupt(i)) if i.irq == irq as u32));
-            if owned {
-                return fail(Status::BadState);
-            }
-            // an identity on the calling hart's interrupt file first (IOMMU4: the kernel's choice, never source + 1), then the object
-            if let Err(e) = crate::aia::take(irq as u32) {
-                return fail(e);
-            }
-            match ipc::interrupt_object_create_in(
-                objs,
-                &mut p.handles,
-                irq as u32,
-                &mut quota(p.job),
-            ) {
-                Ok((hd, obj)) => {
-                    if let Some(s) = irq_objs.get_mut(slot) {
-                        *s = Some(obj);
-                    }
-                    crate::aia::enable(irq as u32);
-                    Ok((Some(hd.0), None))
-                }
-                Err(e) => {
-                    // (the identity goes back; the source stays masked, as it was)
-                    crate::aia::release(irq as u32);
-                    fail(e)
-                }
-            }
-        }
-        nr::INTERRUPT_DELIVER_HERE => {
-            // (a wired source: its identity moves to this hart's file, IOMMU-SPEC 8.5; a vector's was the device-domain layer's)
-            let (_, irq) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
-                .map_err(|e| (e, None, None))?;
-            crate::aia::move_here(irq).map_err(|e| (e, None, None))?;
-            Ok((None, None))
-        }
-        nr::INTERRUPT_ACK => {
-            let (obj, _) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
-                .map_err(|e| (e, None, None))?;
-            let (irq, claims) = ipc::interrupt_ack(objs, obj).map_err(|e| (e, None, None))?;
-            crate::aia::reenable(irq);
-            Ok((Some(claims), None))
-        }
+        nr::SYSTEM_SET_PLACEMENT => set_placement_call(objs, p, a),
+        nr::RESOURCE_DTB => resource_dtb_call(objs, p, a),
+        nr::INTERRUPT_CREATE => interrupt_create_call(objs, irq_objs, p, a),
+        nr::INTERRUPT_DELIVER_HERE => interrupt_deliver_here_call(objs, p, a),
+        nr::INTERRUPT_ACK => interrupt_ack_call(objs, p, a),
         _ => fail(Status::BadSyscall),
     }
+}
+
+/// The calls of the `ksys` crate (IPC, VMOs, jobs) over the caller's address space and the memory locks; `None` for a call none of them knows.
+/// (the memory locks are held only inside this section: every other call may take the big kernel lock, which comes before them in the order)
+#[inline(never)]
+fn ksys_section(
+    objs: &mut ipc::Kobjs,
+    p: &mut ksys::Process,
+    n: usize,
+    a: [u64; 6],
+    staged: Option<ksys::Staged>,
+    deferred: &mut Option<ksys::Deferred>,
+) -> Option<Reply> {
+    let as_cell = p.aspace.clone();
+    let _as = klock::aslock::AsCell::hold(&as_cell); // (the caller's address space, before the memory locks)
+    let k = kmem::get();
+    let mut ctx = ksys::Ctx {
+        objs,
+        handles: &mut p.handles,
+        job: p.job,
+        aspace: as_cell.held_mut(),
+        mm: k.mm,
+        vmos: k.vmos,
+        jobs: k.jobs,
+        faults: ksys::Faults {
+            skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
+        },
+        harts_online: crate::smp::online() as u64,
+        job_sched: crate::thread::job_sched(),
+        clock: crate::timer::now_ns,
+        windows: crate::kmem::device_windows(),
+        staged,
+        defer_out: true,
+        deferred: None,
+    };
+    ksys_calls(n, a, &mut ctx, deferred)
+}
+
+/// `ksys_section`'s calls, on the context it built (a frame of its own: KT13).
+#[inline(never)]
+fn ksys_calls(
+    n: usize,
+    a: [u64; 6],
+    ctx: &mut ksys::Ctx<'_, kmem::DirectMap>,
+    deferred: &mut Option<ksys::Deferred>,
+) -> Option<Reply> {
+    let r = ksys::ipc_call(n, a, ctx);
+    if r.is_some() {
+        core::mem::swap(deferred, &mut ctx.deferred);
+        return r;
+    }
+    let r = ksys::vmo_call(n, a, ctx);
+    if r.is_some() {
+        return r;
+    }
+    ksys::job_call(n, a, ctx)
+}
+
+/// `system_set_placement(resource, policy)`.
+#[inline(never)]
+fn set_placement_call(objs: &mut ipc::Kobjs, p: &ksys::Process, a: [u64; 6]) -> Reply {
+    ipc::resource_of(objs, &p.handles, Handle(a[0])).map_err(|e| (e, None, None))?;
+    if thread::set_placement(a[1]) {
+        Ok((None, None))
+    } else {
+        fail(Status::InvalidArgs)
+    }
+}
+
+/// `resource_dtb(resource)`: a VMO holding a copy of the device tree, its seeds zeroed.
+#[inline(never)]
+fn resource_dtb_call(objs: &mut ipc::Kobjs, p: &mut ksys::Process, a: [u64; 6]) -> Reply {
+    ipc::resource_of(objs, &p.handles, Handle(a[0])).map_err(|e| (e, None, None))?;
+    let Some(blob) = crate::dtb::dtb_blob().filter(|b| b.len() <= abi::limits::MAX_DTB_BYTES)
+    else {
+        return fail(Status::NotSupported);
+    };
+    let Some(id) = dtb_vmo(blob, p.job) else {
+        return fail(Status::NoMemory);
+    };
+    let rights = Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+    let k = kmem::get();
+    let made = ipc::vmo_object_create_with(
+        objs,
+        &mut p.handles,
+        id,
+        rights,
+        &mut ipc::Quota {
+            jobs: &mut *k.jobs,
+            job: Some(p.job),
+        },
+    );
+    match made {
+        Ok(hd) => Ok((Some(hd.0), Some(blob.len() as u64))),
+        Err(e) => {
+            let _ = k.vmos.release(k.mm, k.jobs, id);
+            fail(e)
+        }
+    }
+}
+
+/// The VMO of `resource_dtb`, charged to `job`: the tree's bytes with the firmware's seeds zeroed (HD1: they are the kernel's), scrubbed in a heap copy
+/// first so that no frame of the VMO ever holds them. `None`: no memory.
+#[inline(never)]
+fn dtb_vmo(blob: &[u8], job: JobId) -> Option<u64> {
+    let pages = (blob.len() as u64).div_ceil(4096);
+    let k = kmem::get();
+    k.vmos.reserve_one().ok()?;
+    let id = k.vmos.create_in(k.jobs, pages, job);
+    let copy = scrubbed_dtb(blob);
+    if k.vmos.write(k.mm, k.jobs, id, 0, &copy).is_err() {
+        let _ = k.vmos.release(k.mm, k.jobs, id);
+        return None;
+    }
+    Some(id)
+}
+
+/// A heap copy of the device tree with the firmware's seeds zeroed (HD1).
+#[inline(never)]
+fn scrubbed_dtb(blob: &[u8]) -> Vec<u8> {
+    let seeds = crate::dtb::chosen_seeds();
+    let mut copy = blob.to_vec();
+    for (off, len) in [seeds.rng_seed, seeds.kaslr_seed].into_iter().flatten() {
+        if let Some(range) = copy.get_mut(off..off.saturating_add(len)) {
+            range.fill(0);
+        }
+    }
+    copy
+}
+
+/// `interrupt_create(resource, irq)`: a wired source's object, its identity on the calling hart's interrupt file.
+#[inline(never)]
+fn interrupt_create_call(
+    objs: &mut ipc::Kobjs,
+    irq_objs: &mut [Option<kcore::object::ObjId>],
+    p: &mut ksys::Process,
+    a: [u64; 6],
+) -> Reply {
+    let irq = match interrupt_create_check(objs, irq_objs, p, a) {
+        Ok(irq) => irq,
+        Err(e) => return fail(e),
+    };
+    let slot = irq as usize;
+    // an identity on the calling hart's interrupt file first (IOMMU4: the kernel's choice, never source + 1), then the object
+    if let Err(e) = crate::aia::take(irq as u32) {
+        return fail(e);
+    }
+    match ipc::interrupt_object_create_in(objs, &mut p.handles, irq as u32, &mut quota(p.job)) {
+        Ok((hd, obj)) => {
+            if let Some(s) = irq_objs.get_mut(slot) {
+                *s = Some(obj);
+            }
+            crate::aia::enable(irq as u32);
+            Ok((Some(hd.0), None))
+        }
+        Err(e) => {
+            // (the identity goes back; the source stays masked, as it was)
+            crate::aia::release(irq as u32);
+            fail(e)
+        }
+    }
+}
+
+/// `interrupt_create`'s checks: the resource, the source (only the sources the tree's admitted devices name on the APLIC: 0, a number past 32 bits
+/// and any other source are refused) and its slot (T183: the table is sized by the highest allowed source, so an allowed source has a slot; a missing one
+/// is refused, not ignored), free.
+#[inline(never)]
+fn interrupt_create_check(
+    objs: &ipc::Kobjs,
+    irq_objs: &[Option<kcore::object::ObjId>],
+    p: &ksys::Process,
+    a: [u64; 6],
+) -> Result<u64, Status> {
+    ipc::resource_of(objs, &p.handles, Handle(a[0]))?;
+    let irq = a[1];
+    if irq == 0 || irq > u64::from(u32::MAX) || !crate::aia::irq_allowed(irq as u32) {
+        return Err(Status::InvalidArgs);
+    }
+    let Some(&current) = irq_objs.get(irq as usize) else {
+        return Err(Status::InvalidArgs);
+    };
+    let owned = matches!(current, Some(o)
+        if matches!(objs.get(o), Some(ipc::KObj::Interrupt(i)) if i.irq == irq as u32));
+    if owned {
+        return Err(Status::BadState);
+    }
+    Ok(irq)
+}
+
+/// `interrupt_deliver_here(interrupt)` for a wired source: its identity moves to this hart's file (IOMMU-SPEC 8.5; a vector's is the
+/// device-domain layer's).
+#[inline(never)]
+fn interrupt_deliver_here_call(objs: &mut ipc::Kobjs, p: &ksys::Process, a: [u64; 6]) -> Reply {
+    let (_, irq) = ipc::interrupt_of(objs, &p.handles, Handle(a[0]), Rights::MANAGE)
+        .map_err(|e| (e, None, None))?;
+    crate::aia::move_here(irq).map_err(|e| (e, None, None))?;
+    Ok((None, None))
+}
+
+/// `interrupt_ack(interrupt)` for a wired source.
+#[inline(never)]
+fn interrupt_ack_call(objs: &mut ipc::Kobjs, p: &ksys::Process, a: [u64; 6]) -> Reply {
+    let (obj, _) = ipc::interrupt_of(objs, &p.handles, Handle(a[0]), Rights::MANAGE)
+        .map_err(|e| (e, None, None))?;
+    let (irq, claims) = ipc::interrupt_ack(objs, obj).map_err(|e| (e, None, None))?;
+    crate::aia::reenable(irq);
+    Ok((Some(claims), None))
 }
 
 /// `##BENCH <name> <decimal value> <unit>`: names and units are single words of letters, digits, `_` and `/`.
@@ -1759,29 +1914,39 @@ fn show_debug_lines(lines: &[String]) {
 /// `debug_write(debug, ptr, len)` (HD4): the big lock is held only to check the handle and, at the end, to add the verdicts to the tally; the copy from
 /// the program's memory takes its address-space lock and the memory locks, and the console's own lock keeps a line whole, so a program that prints
 /// does not hold up every other hart's syscalls for the length of a serial write (the latency profile of 2026-11-23: 18 s of big-lock wait behind it).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the reply and the copy's error types); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn debug_write_call(a: [u64; 6]) -> Reply {
     let (aspace, ptr, len) = debug_write_check(a)?;
     // No big lock from here: the copy, the splitting and the console. (No caller holds a borrow of the state across a syscall's dispatch.)
     let depth = crate::bkl::release_all();
-    let bytes = match copy_debug_bytes(&aspace, ptr, len) {
-        Ok(bytes) => bytes,
-        Err((status, need)) => {
-            crate::bkl::reacquire(depth);
+    let copied = copy_debug_bytes(&aspace, ptr, len);
+    drop(aspace);
+    let status = match copied {
+        Ok(bytes) => {
+            show_debug_write(&bytes);
+            None
+        }
+        Err((status, need)) => Some((status, need)),
+    };
+    crate::bkl::reacquire(depth);
+    match status {
+        None => Ok((None, None)),
+        Some((status, need)) => {
             if let Some(need) = need {
                 kmem::get().vmos.swap_need(Some(*need)); // (the call that waited for a pager's page: `pager_after_call` reads it)
             }
-            return Err((status, None, None));
+            fail(status)
         }
-    };
-    drop(aspace);
+    }
+}
+
+/// The lines of a `debug_write`, counted and shown (no big lock).
+#[inline(never)]
+fn show_debug_write(bytes: &[u8]) {
     let mut partial = String::new();
-    let lines = debug_lines(&mut partial, &bytes);
+    let lines = debug_lines(&mut partial, bytes);
     // (the verdicts are counted before they are shown: the kernel's own `##DONE` line reads the tally)
     tally_verdicts(&lines);
     show_debug_lines(&lines);
-    crate::bkl::reacquire(depth);
-    Ok((None, None))
 }
 
 /// `decode_user` says Syscall only for a trap `is_syscall` already took.

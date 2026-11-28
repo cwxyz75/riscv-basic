@@ -21,6 +21,7 @@ use klock::aslock::AsCell;
 /// `kernel_half_ok` is whether the kernel's page-table half is still as snapshotted; `kernel` its table.
 #[allow(clippy::too_many_arguments)] // (the machine's parts, as the other calls take them)
 #[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn process_create<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -128,6 +129,7 @@ pub fn process_create<M: PhysMem>(
 /// The record of a new process, in the Created state, around a vacant pooled address-space cell (armed later) and with no object yet. Its own function so that
 /// the frame of the big literal is not part of `process_create`'s.
 #[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 fn new_process(
     aspace: alloc::sync::Arc<AsCell>,
     tag: kcore::asid::AsTag,

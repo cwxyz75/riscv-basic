@@ -38,11 +38,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KERNEL_LMA");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=build.rs");
-    // KT13: an optimised build gets the wider stack budget (thread.rs, T173)
-    println!("cargo:rustc-check-cfg=cfg(kernel_optimized)");
-    if std::env::var("OPT_LEVEL").is_ok_and(|l| l != "0") {
-        println!("cargo:rustc-cfg=kernel_optimized");
-    }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     // AB7: the system library, built (and checked) here from `abi::syscall::TABLE`, and embedded; the kernel maps it into every process.

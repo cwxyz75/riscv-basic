@@ -233,8 +233,7 @@ fn kernel() -> KernelRef {
 
 /// Turn the code that is running (the boot thread) into a thread (its id follows the harts' idle ids) and start the idle
 /// thread. Needs the heap. Interrupts must still be off.
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 #[allow(clippy::expect_used)]
 // INVARIANT: boot code: the boot thread's priority is valid and the idle and boot records are created once
 pub fn init(boot_prio: Prio) {
@@ -712,7 +711,7 @@ pub fn spawn_prepared(
 /// Where the timers of `tids` sit, for a failure message (T287, T49: a stopped vCPU shows every deadline on an online hart that has
 /// not taken it; a timer left behind shows a deadline on the offline hart): per thread its home hart, its state and its deadline
 /// relative to now (microseconds; negative: overdue), then per hart its next event relative to now ("none": nothing).
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (a thread record and the formatting), run only on a test's failure, no recursion
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (an SMP test's failure message)
 pub fn timer_report(tids: &[Tid]) -> alloc::string::String {
     use core::fmt::Write as _;
     let rel = |t: u64, now: u64| -> i64 {
@@ -1061,28 +1060,46 @@ pub fn reschedule_fast() -> bool {
 /// Print what the scheduler knows (for `debug_stat` 132: `user::trap::debug_stat_call`, which also prints the user state its call holds).
 /// Interrupts off (`sched()` requires it).
 #[cfg(debug_assertions)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report that holds a thread record
 pub(crate) fn dump_sched() {
-    use core::fmt::Write;
-    let sc = sched();
-    let mut out = crate::console::Console;
     for i in 0..crate::smp::started() {
-        let _ = writeln!(
-            out,
-            "##SCHED hart {i}: current {} queued {} marked {} in transit {:?} next event {:?}",
-            sc.current_on(i),
-            sc.queued_on(i),
-            sc.resched_pending(i),
-            sc.in_transit(i),
-            sc.next_event_on(i)
-        );
+        dump_hart(i);
     }
+    let sc = sched();
     for t in sc.tids() {
         if (0..crate::smp::started()).any(|i| sc.idle(i) == t) {
             continue;
         }
-        let _ = writeln!(out, "##SCHED thread {t}: {:?}", sc.record(t));
+        dump_thread(t);
     }
+}
+
+/// `dump_sched`'s line for hart `i` (each line a frame of its own: KT13).
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn dump_hart(i: usize) {
+    use core::fmt::Write;
+    let sc = sched();
+    let _ = writeln!(
+        crate::console::Console,
+        "##SCHED hart {i}: current {} queued {} marked {} in transit {:?} next event {:?}",
+        sc.current_on(i),
+        sc.queued_on(i),
+        sc.resched_pending(i),
+        sc.in_transit(i),
+        sc.next_event_on(i)
+    );
+}
+
+/// `dump_sched`'s line for thread `t`.
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn dump_thread(t: Tid) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        crate::console::Console,
+        "##SCHED thread {t}: {:?}",
+        sched().record(t)
+    );
 }
 
 /// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds), now a timer entry (L13): a hart with queued work arms an event every
@@ -1096,10 +1113,7 @@ pub(crate) fn dump_sched() {
 /// one that counted (`kcore::watchdog`): a hart the host did not run (an oversubscribed host, the host-stall injector) is not the
 /// scheduler's fault, and the sample is void. A hart that shows no progress for 10 s while the thread waits is reported as stalled.
 #[cfg(debug_assertions)]
-#[allow(clippy::panic, clippy::indexing_slicing)]
-// INVARIANT: the per-hart arrays are indexed `% MAX_HARTS`; the panic is the detector's report
-// KT13: audited, a frame over 1 KiB on a path that ends in a panic (the report holds a thread record)
-#[allow(clippy::large_stack_frames)]
+#[allow(clippy::indexing_slicing)] // INVARIANT: the per-hart arrays are indexed `% MAX_HARTS`
 fn starvation_watchdog(h: usize, now: u64) {
     use kcore::watchdog::{Verdict, Watchdog};
     /// Each sampling hart's `kcore::watchdog::Watchdog`, as its five words; only that hart touches its row (in its timer handler,
@@ -1129,32 +1143,70 @@ fn starvation_watchdog(h: usize, now: u64) {
     for (slot, v) in row.iter().zip(w.to_words()) {
         slot.store(v, Ordering::Relaxed);
     }
-    let report = |what: core::fmt::Arguments| {
-        let sc = sched();
-        let harts: alloc::vec::Vec<_> = (0..started)
-            .map(|i| {
-                (
-                    sc.current_on(i),
-                    sc.queued_on(i),
-                    sc.resched_pending(i),
-                    sc.in_transit(i),
-                    sc.next_event_on(i),
-                )
-            })
-            .collect();
-        let tid = w.tid;
-        panic!("{what} (per hart: current, queued, marked, in transit, next event: {harts:?}; the thread: {:?})", sc.record(tid));
-    };
+    if !matches!(verdict, Verdict::Quiet) {
+        starvation_report(verdict, w.tid, started);
+    }
+}
+
+/// The watchdog's report, a panic (`##PANIC starved thread` or `stalled hart`), with every hart's scheduler state and the thread's record. A frame of
+/// its own, out of the timer interrupt's path (KT13).
+#[cfg(debug_assertions)]
+#[allow(clippy::panic)] // INVARIANT: the panic is the detector's report
+#[cold]
+#[inline(never)]
+fn starvation_report(verdict: kcore::watchdog::Verdict, tid: Tid, started: usize) -> ! {
+    let what = verdict_text(verdict);
+    let harts = hart_states(started);
+    panic!(
+        "{what} (per hart: current, queued, marked, in transit, next event: {harts}; the thread: {})",
+        thread_record_text(tid)
+    );
+}
+
+/// The watchdog's verdict as the first words of its report.
+#[cfg(debug_assertions)]
+#[cold]
+#[inline(never)]
+fn verdict_text(verdict: kcore::watchdog::Verdict) -> alloc::string::String {
+    use kcore::watchdog::Verdict;
     match verdict {
-        Verdict::Quiet => {}
-        Verdict::Starved { tid, on, idle } => report(format_args!(
+        Verdict::Starved { tid, on, idle } => alloc::format!(
             "starved thread {tid}: queued on hart {on} for more than 500 ms while hart {idle} idles, and hart {on} took interrupts meanwhile"
-        )),
-        Verdict::Stalled { tid, on, quiet_ns } => report(format_args!(
+        ),
+        Verdict::Stalled { tid, on, quiet_ns } => alloc::format!(
             "stalled hart {on}: it took no interrupt for {} ms while thread {tid} was queued on it (interrupts off, or a lost poke on a hart with nothing armed)",
             quiet_ns / MS
-        )),
+        ),
+        Verdict::Quiet => alloc::string::String::new(),
     }
+}
+
+/// Every hart's scheduler state (current, queued, marked, in transit, next event), as text.
+#[cfg(debug_assertions)]
+#[cold]
+#[inline(never)]
+fn hart_states(started: usize) -> alloc::string::String {
+    let sc = sched();
+    let harts: alloc::vec::Vec<_> = (0..started)
+        .map(|i| {
+            (
+                sc.current_on(i),
+                sc.queued_on(i),
+                sc.resched_pending(i),
+                sc.in_transit(i),
+                sc.next_event_on(i),
+            )
+        })
+        .collect();
+    alloc::format!("{harts:?}")
+}
+
+/// A thread's scheduler record, as text.
+#[cfg(debug_assertions)]
+#[cold]
+#[inline(never)]
+fn thread_record_text(tid: Tid) -> alloc::string::String {
+    alloc::format!("{:?}", sched().record(tid))
 }
 
 #[cfg(debug_assertions)]
@@ -1431,23 +1483,25 @@ pub fn push_owed() {
 
 /// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
 /// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
-#[allow(clippy::large_stack_frames)] // KT13: audited, the fixed change list (304 bytes) is moved a few times; T172 shrinks it
 pub fn pi_donate(from: Tid, to: Tid) {
     irq::off(|| {
-        pi_op_changes(|d| match d.donate(from, to) {
-            Ok(ch) => ((), ch),
-            Err(e) => {
-                // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
-                if matches!(
-                    e,
-                    kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
-                ) {
-                    DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
-                }
-                ((), kcore::donate::Changes::default())
-            }
-        });
+        pi_op_changes(|d| ((), donate_changes(d, from, to)));
     });
+}
+
+/// The graph's donation from `from` to `to` and the priority changes it makes (none for a refused one, which is counted). A frame of its own: the
+/// change list is a few hundred bytes, and a frame holds it once (KT13).
+#[inline(never)]
+fn donate_changes(d: &mut kcore::donate::Donations, from: Tid, to: Tid) -> kcore::donate::Changes {
+    let r = d.donate(from, to);
+    // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
+    if matches!(
+        r,
+        Err(kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep)
+    ) {
+        DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+    r.unwrap_or_default()
 }
 
 /// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
@@ -2032,7 +2086,7 @@ struct ThreadReport {
 /// most [`REPORT_THREADS`] of them. A thread running on a hart or in transit is named but its stack is not read (its saved context is
 /// stale or half written).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: addresses inside one kernel stack, read a word at a time; counts far below usize::MAX
-#[allow(clippy::large_stack_frames)] // KT13: audited, a failure-only report of the leak checks, run once on the boot thread's stack after init has ended
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (a leak test's report, on the boot thread after init has ended)
 pub fn report_threads(skip: &[Tid]) {
     use core::fmt::Write as _;
     let (text_lo, text_hi) = crate::kmem::sections().text;
@@ -2176,15 +2230,10 @@ pub fn user_frame_ptr(tid: Tid) -> Option<*mut crate::trap::TrapFrame> {
 /// shallower, so this is a lower bound, close in practice).
 static STACK_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// The kernel stack budget (KT13): a stack is 16 KiB, and no thread may go deeper than half of it in a build without optimisation (the
-/// debug build the suite mostly runs), so the unmeasured worst case (an interrupt on top of the deepest call chain, a longer path than
-/// the suite takes) has as much room again. **Optimised builds are held to 12 KiB for now** (T173): there, inlining makes the path that
-/// reaps a dead thread on the next thread's fresh stack (`reap_prev` in `thread_bootstrap`: the stack's pages, the page tables, the run
-/// queues) the deepest in the system, 9.4 KiB, and shrinking it is its own item; the budget drops to 8 KiB when T173 is done.
-#[cfg(not(kernel_optimized))]
+/// The kernel stack budget (KT13): a stack is 16 KiB, and no thread may go deeper than half of it, in the debug build and the optimised one
+/// alike, so the unmeasured worst case (an interrupt on top of the deepest call chain, a longer path than the suite takes) has as much room
+/// again. Checked at every thread's exit in every boot (`kernel_stack_budget`); `scripts/stack_depth.py` bounds the paths no boot takes.
 pub const STACK_BUDGET: usize = 8 * 1024;
-#[cfg(kernel_optimized)]
-pub const STACK_BUDGET: usize = 9 * 1024;
 
 /// The first thread seen over the budget: its stack use, or 0 while none is (the thread's id is in `OVER_BUDGET_TID`; atomics only, so the
 /// check at a thread's exit is lock-free).
@@ -2239,10 +2288,11 @@ static EXEMPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 fn note_stack_use(tid: Tid, t: &KThread) {
     if let Some(stack) = t.stack.as_ref() {
         let used = stack_used(stack);
+        if EXEMPT.load(core::sync::atomic::Ordering::SeqCst) == tid.saturating_add(1) {
+            return; // (the deliberate deep stack of the budget test: neither the high water nor the check counts it)
+        }
         STACK_HIGH_WATER.fetch_max(used, core::sync::atomic::Ordering::Relaxed);
-        if over_budget(used)
-            && EXEMPT.load(core::sync::atomic::Ordering::SeqCst) != tid.saturating_add(1)
-        {
+        if over_budget(used) {
             let mut words = [0u64; 2];
             for (i, b) in t.name.bytes().take(16).enumerate() {
                 if let Some(w) = words.get_mut(i / 8) {
@@ -2266,7 +2316,7 @@ fn note_stack_use(tid: Tid, t: &KThread) {
     }
 }
 
-/// The deepest kernel stack use seen so far among threads that have ended.
+/// The deepest kernel stack use seen so far among threads that have ended (the exempt thread of the budget test left out).
 pub fn stack_high_water() -> usize {
     STACK_HIGH_WATER.load(core::sync::atomic::Ordering::Relaxed)
 }

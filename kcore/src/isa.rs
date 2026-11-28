@@ -16,6 +16,7 @@ pub const REQUIRED_EXTENSIONS: &[&str] = &[
 
 /// The extension names a `cpu` node advertises: the NUL-separated list of `riscv,isa-extensions`, else the parsed `riscv,isa` string
 /// (the base letters after `rv64` or `rv32` as single-letter extensions, then each `_`-separated name).
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under (the harts' extensions, read at boot)
 pub fn extensions_of(cpu: &Node) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(v) = cpu.prop("riscv,isa-extensions") {

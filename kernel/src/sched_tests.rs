@@ -500,7 +500,7 @@ fn queue_waiter(id: usize) {
     DONE_COUNT.fetch_add(1, SeqCst);
 }
 
-#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
 fn two_waiters_on_one_queue_wake_in_order() -> Outcome {
     clean(|| {
         RELEASED.store(0, SeqCst);
@@ -859,7 +859,7 @@ mod priority {
 
     /// The latency probe: sleep 3 ticks until 50 wakes are measured, recording how late each was. A sleep that a pause of the host
     /// covered (T284: a timer interrupt of any hart taken more than the bound late inside it) is taken again, at most three in a row.
-    #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB in a test thread (the samples' vector and the re-sampling state), no recursion
+    #[allow(clippy::large_stack_frames)] // KT13: boot or test only, on a stack nothing else is under
     fn probe(_: usize) {
         use kcore::pause::{Resampler, Verdict};
         let mut late = alloc::vec::Vec::new();
