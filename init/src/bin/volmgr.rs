@@ -5,6 +5,11 @@
 //! the registry as `vol-uuid-<hex>` and, if the table maps the uuid, `vol-<name>`. A volume server that dies is restarted
 //! (it remounts from the newest valid superblock), its names republished; clients see `UNAVAILABLE` meanwhile.
 //!
+//! Discovery follows `mounts::discovery` (T286): a device that is `Busy` (its previous driver winding down) is opened again for up
+//! to 5 s; a probe that cannot read the device just after it was `Busy` is tried again for up to 5 s more (the old driver's last
+//! moments are not a verdict on the disk); a readable device with no volume is never probed twice. Each stage is said on the
+//! console with the clock (`volmgr: t=<ms> ...`) and how long it took, so that a slow start names its slow stage.
+//!
 //! (The registry's names are flat, so the spec's `/svc/vol/by-uuid/<hex>` and `/svc/vol/<name>` are `vol-uuid-<hex>` and
 //! `vol-<name>` for now: work item T118.)
 //!
@@ -27,7 +32,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use mounts::{Decision, Found};
+use mounts::{discovery, Decision, Found};
 use proto::bootimg;
 use proto::devmgr;
 use proto::startup::{Role, Startup};
@@ -73,16 +78,122 @@ fn open_block(dm: u64, txid: u32, index: u16) -> Option<(devmgr::Status, Option<
     Some((status, (r.a2 == 1).then_some(hs[0])))
 }
 
-/// OpenBlock, retrying while the previous driver for the device winds down.
+/// OpenBlock, retrying while the previous driver for the device winds down (`Busy`, up to `discovery::BUSY_MS`).
 fn open_block_retry(dm: u64, txid: &mut u32, index: u16) -> Option<(devmgr::Status, Option<u64>)> {
-    let until = sys::clock_get() + 5000;
+    let mut d = discovery::Device::new(sys::clock_get());
     loop {
         *txid += 1;
         let (st, h) = open_block(dm, *txid, index)?;
-        if st != devmgr::Status::Busy || sys::clock_get() >= until {
+        if d.opened(opened(st, h), sys::clock_get()) != discovery::Next::OpenAgain {
             return Some((st, h));
         }
         let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
+    }
+}
+
+/// The device manager's answer, as the discovery decision sees it.
+fn opened(st: devmgr::Status, h: Option<u64>) -> discovery::Opened {
+    match (st, h) {
+        (devmgr::Status::Ok, Some(_)) => discovery::Opened::Ok,
+        (devmgr::Status::Busy, _) => discovery::Opened::Busy,
+        (devmgr::Status::NoDevice, _) => discovery::Opened::NoDevice,
+        _ => discovery::Opened::Failed,
+    }
+}
+
+/// What discovery found on one device.
+enum Discovered {
+    /// A volume, and the channel to its driver.
+    Volume(fsfmt::Superblock, u64),
+    /// Not served (said on the console).
+    Ignored,
+    /// There is no such device.
+    End,
+    /// The device manager did not answer.
+    Lost,
+}
+
+/// Open and probe device `index`, retrying as `mounts::discovery` decides (T286: a probe that fails just after the device was Busy
+/// is the old driver's last moments, not a verdict). Each outcome is said with the clock and how long it took, so that a slow start
+/// names its slow stage.
+fn discover(dm: u64, txid: &mut u32, index: u16) -> Discovered {
+    let t0 = sys::clock_get();
+    let mut d = discovery::Device::new(t0);
+    let mut probes = 0u32;
+    loop {
+        *txid += 1;
+        let Some((st, h)) = open_block(dm, *txid, index) else {
+            return Discovered::Lost;
+        };
+        match d.opened(opened(st, h), sys::clock_get()) {
+            discovery::Next::OpenAgain => {
+                let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
+                continue;
+            }
+            discovery::Next::End => return Discovered::End,
+            discovery::Next::Probe => {}
+            _ => {
+                let now = sys::clock_get();
+                say!(
+                    "volmgr: t={now} device {index}: {st:?} after {} ms, ignored",
+                    now - t0
+                );
+                if let Some(h) = h {
+                    sys::handle_close(h);
+                }
+                return Discovered::Ignored;
+            }
+        }
+        let Some(ch) = h else {
+            return Discovered::Ignored;
+        };
+        probes += 1;
+        let p0 = sys::clock_get();
+        let probe = match BlkDevice::open(ch) {
+            Some(mut dev) => fsfmt::probe_volume(&mut dev),
+            None => fsfmt::Probe::Unreadable,
+        };
+        let now = sys::clock_get();
+        let kind = match &probe {
+            fsfmt::Probe::Volume(_) => discovery::Probed::Volume,
+            fsfmt::Probe::NotVolume => discovery::Probed::NotVolume,
+            fsfmt::Probe::Unreadable => discovery::Probed::Unreadable,
+        };
+        let busy = if d.was_busy() { ", after Busy" } else { "" };
+        match (d.probed(kind, now), probe) {
+            (discovery::Next::Use, fsfmt::Probe::Volume(sb)) => {
+                say!(
+                    "volmgr: t={now} device {index}: doofs volume {} {:?} (probe {probes} took {} ms, {} ms in all{busy})",
+                    mounts::uuid_hex(&sb.uuid),
+                    sb.label_str(),
+                    now - p0,
+                    now - t0
+                );
+                return Discovered::Volume(sb, ch);
+            }
+            (discovery::Next::OpenAgain, _) => {
+                say!(
+                    "volmgr: t={now} device {index}: unreadable (probe {probes} took {} ms{busy}): probing again",
+                    now - p0
+                );
+                sys::handle_close(ch);
+                let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
+            }
+            (_, p) => {
+                let what = if matches!(p, fsfmt::Probe::Unreadable) {
+                    "unreadable"
+                } else {
+                    "not a doofs volume"
+                };
+                say!(
+                    "volmgr: t={now} device {index}: {what} (probe {probes} took {} ms, {} ms in all{busy}), ignored",
+                    now - p0,
+                    now - t0
+                );
+                sys::handle_close(ch);
+                return Discovered::Ignored;
+            }
+        }
     }
 }
 
@@ -163,19 +274,23 @@ fn start(
     v.proc = Some(p);
     // wait until the server is ready (or gone): a name published before that would hand clients a connection to a server that
     // may then exit (a mount that fails)
+    let t0 = sys::clock_get();
     let w = sys::object_wait(
         ready_mine,
         signals::READABLE | signals::PEER_CLOSED,
-        sys::clock_get() + 15_000,
+        t0 + discovery::READY_MS,
     );
     let mut b = [0u8; 1];
     let got = w.status == 0
         && sys::channel_read(ready_mine, b.as_mut_ptr(), 1, core::ptr::null_mut(), 0).status == 0;
     sys::handle_close(ready_mine);
+    let now = sys::clock_get();
     if !got {
         say!(
-            "volmgr: the volume server for {} did not come up",
-            v.uuid_hex
+            "volmgr: t={now} the volume server for {} did not come up ({} after {} ms)",
+            v.uuid_hex,
+            if w.status == 0 { "it ended" } else { "no word" },
+            now - t0
         );
         sys::process_kill(p, -1);
         sys::handle_close(p);
@@ -185,11 +300,18 @@ fn start(
     // (after a restart the old listeners closed with the old server and the registry has marked the names stale, which the
     // caller waited for: a publish replaces a stale name; a publish that fails closes the listener, so the server is useless)
     for (name, theirs) in published {
-        if reg.publish(name.as_bytes(), theirs).is_err() {
+        if let Err(e) = reg.publish(name.as_bytes(), theirs) {
+            say!("volmgr: t={now} publish {name}: status {e}");
             sys::process_kill(p, -1);
             return false;
         }
     }
+    say!(
+        "volmgr: t={} volume {}: ready in {} ms, published",
+        sys::clock_get(),
+        v.uuid_hex,
+        now - t0
+    );
     true
 }
 
@@ -235,24 +357,8 @@ pub fn app_main() -> i32 {
     let mut found: Vec<Found> = Vec::new();
     let mut chans: Vec<u64> = Vec::new();
     for index in 0..MAX_DEVICES {
-        let Some((st, h)) = open_block_retry(dm, &mut txid, index) else {
-            break;
-        };
-        if st == devmgr::Status::NoDevice {
-            break;
-        }
-        let (devmgr::Status::Ok, Some(ch)) = (st, h) else {
-            say!("volmgr: device {index}: {st:?}");
-            continue;
-        };
-        let probed = BlkDevice::open(ch).and_then(|mut d| fsfmt::probe(&mut d));
-        match probed {
-            Some(sb) => {
-                say!(
-                    "volmgr: device {index}: doofs volume {} {:?}",
-                    mounts::uuid_hex(&sb.uuid),
-                    sb.label_str()
-                );
+        match discover(dm, &mut txid, index) {
+            Discovered::Volume(sb, ch) => {
                 found.push(Found {
                     device: index,
                     uuid: sb.uuid,
@@ -260,10 +366,8 @@ pub fn app_main() -> i32 {
                 });
                 chans.push(ch);
             }
-            None => {
-                say!("volmgr: device {index}: not a doofs volume, ignored");
-                sys::handle_close(ch);
-            }
+            Discovered::Ignored => {}
+            Discovered::End | Discovered::Lost => break,
         }
     }
     // ---- naming and serving

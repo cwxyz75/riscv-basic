@@ -24,7 +24,10 @@ pub use device::{DevError, Device, MemDevice, BLOCK};
 pub use pool::Pool;
 pub use superblock::Superblock;
 pub use tree::{Snapshot, Tree, TreeError, Verified};
-pub use volume::{check, mkfs, mount, probe, verify_all, Report, VolError, Volume, KEY_EXTENT};
+pub use volume::{
+    check, mkfs, mount, probe, probe_volume, verify_all, Probe, Report, VolError, Volume,
+    KEY_EXTENT,
+};
 
 /// Longest key and longest value the tree stores (FS-SPEC section 12: names up to 255 bytes, inline values up to 1 KiB; a key may hold an escaped 255-byte index value and an id).
 pub const MAX_KEY: usize = 600;

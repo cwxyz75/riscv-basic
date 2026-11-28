@@ -193,3 +193,219 @@ pub fn plan(table: &[Entry], found: &[Found]) -> Vec<(Found, Decision)> {
     }
     out
 }
+
+/// How `volmgr` opens and probes one device (FS-SPEC section 6, step 5d; T286, T209): a pure state machine over the device
+/// manager's answers, the probe's verdicts and the clock, so that its budgets are host-tested and proved, and the callers that wait
+/// for `volmgr` (a test, a supervisor) can add them up.
+///
+/// - The device manager answers `Busy` while the device's previous driver winds down: open again, for up to [`discovery::BUSY_MS`]
+///   from the first open.
+/// - A probe that could not read the device ([`discovery::Probed::Unreadable`]) after a `Busy` is the old driver's last moments,
+///   not a verdict on the disk: open and probe again, for up to [`discovery::PROBE_RETRY_MS`] from that first failure (a `Busy`
+///   meanwhile is waited for inside the same window). An unreadable device that was never `Busy` is a failing device and is
+///   ignored, as is one still unreadable when the window closes. A readable device with no volume
+///   ([`discovery::Probed::NotVolume`]) is never probed again: a hostile device costs one probe.
+/// - Nothing is asked of the device manager later than [`discovery::DEVICE_BOUND_MS`] after the first open: one device costs at
+///   most that, plus the open or probe under way when it passes.
+pub mod discovery {
+    /// How long a device that answers `Busy` is waited for, from its first open (ms).
+    pub const BUSY_MS: u64 = 5000;
+    /// How long an unreadable device that was `Busy` before is probed again, from its first failed probe (ms).
+    pub const PROBE_RETRY_MS: u64 = 5000;
+    /// The latest a device's discovery opens it again, after its first open (ms).
+    pub const DEVICE_BOUND_MS: u64 = BUSY_MS + PROBE_RETRY_MS;
+    /// How long a volume server may take to mount its volume and say it is ready (ms): `volmgr` publishes its names only then.
+    pub const READY_MS: u64 = 15_000;
+
+    /// The device manager's answer to an open.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Opened {
+        /// A channel to a new driver.
+        Ok,
+        /// The previous driver is still winding down.
+        Busy,
+        /// No device with this number: the end of the list.
+        NoDevice,
+        /// Anything else (refused, failed, no answer).
+        Failed,
+    }
+
+    /// What a probe found (`fsfmt::Probe`, without the superblock).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Probed {
+        Volume,
+        NotVolume,
+        Unreadable,
+    }
+
+    /// What to do next.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Next {
+        /// Open the device again (after a short pause).
+        OpenAgain,
+        /// Probe the channel the open gave.
+        Probe,
+        /// A volume: serve it.
+        Use,
+        /// Not served: not a volume, failing, or still busy or unreadable when its bound passed.
+        Ignore,
+        /// There is no such device: discovery is over.
+        End,
+    }
+
+    /// One device's discovery.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Device {
+        started: u64,
+        busy: bool,
+        first_failure: Option<u64>,
+    }
+
+    impl Device {
+        /// Discovery of a device starts with its first open, at `now` (ms).
+        pub fn new(now: u64) -> Device {
+            Device {
+                started: now,
+                busy: false,
+                first_failure: None,
+            }
+        }
+
+        /// The latest time anything is asked again.
+        fn cap(&self) -> u64 {
+            self.started.saturating_add(DEVICE_BOUND_MS)
+        }
+
+        /// Until when a `Busy` answer is waited for.
+        fn busy_until(&self) -> u64 {
+            let first = self.started.saturating_add(BUSY_MS);
+            match self.first_failure {
+                Some(f) => first.max(f.saturating_add(PROBE_RETRY_MS)).min(self.cap()),
+                None => first,
+            }
+        }
+
+        /// Whether the device answered `Busy` at some point of this discovery.
+        pub fn was_busy(&self) -> bool {
+            self.busy
+        }
+
+        /// The device manager answered an open with `r` at `now`.
+        pub fn opened(&mut self, r: Opened, now: u64) -> Next {
+            match r {
+                Opened::Ok => Next::Probe,
+                Opened::NoDevice => Next::End,
+                Opened::Failed => Next::Ignore,
+                Opened::Busy => {
+                    self.busy = true;
+                    if now < self.busy_until() {
+                        Next::OpenAgain
+                    } else {
+                        Next::Ignore
+                    }
+                }
+            }
+        }
+
+        /// The probe of the channel found `p` at `now`.
+        pub fn probed(&mut self, p: Probed, now: u64) -> Next {
+            match p {
+                Probed::Volume => Next::Use,
+                Probed::NotVolume => Next::Ignore,
+                Probed::Unreadable => {
+                    if !self.busy {
+                        return Next::Ignore;
+                    }
+                    let first = *self.first_failure.get_or_insert(now);
+                    if now < first.saturating_add(PROBE_RETRY_MS).min(self.cap()) {
+                        Next::OpenAgain
+                    } else {
+                        Next::Ignore
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(kani)]
+    mod proofs {
+        use super::*;
+
+        fn any_opened() -> Opened {
+            match kani::any::<u8>() % 4 {
+                0 => Opened::Ok,
+                1 => Opened::Busy,
+                2 => Opened::NoDevice,
+                _ => Opened::Failed,
+            }
+        }
+
+        fn any_probed() -> Probed {
+            match kani::any::<u8>() % 3 {
+                0 => Probed::Volume,
+                1 => Probed::NotVolume,
+                _ => Probed::Unreadable,
+            }
+        }
+
+        /// Every run of up to eight answers, at any non-decreasing times from any start: a volume is always used, a readable
+        /// non-volume never probed again, an unreadable device never retried unless it was Busy before, a failed or missing device
+        /// never opened again, and nothing is asked of the device manager at or past `DEVICE_BOUND_MS` after the first open
+        /// (`cargo kani -p mounts`, by hand: OD177, OD182).
+        #[kani::proof]
+        #[kani::unwind(9)]
+        fn the_decisions_keep_their_bounds() {
+            let start: u64 = kani::any();
+            kani::assume(start <= u64::MAX / 2);
+            let mut d = Device::new(start);
+            let mut now = start;
+            let mut busy_seen = false;
+            let mut probing = false;
+            for _ in 0..8 {
+                let step: u64 = kani::any();
+                kani::assume(step <= u64::MAX / 32);
+                now += step;
+                let next = if probing {
+                    let p = any_probed();
+                    let n = d.probed(p, now);
+                    match p {
+                        Probed::Volume => assert!(n == Next::Use),
+                        Probed::NotVolume => assert!(n == Next::Ignore),
+                        Probed::Unreadable => {
+                            assert!(n == Next::OpenAgain || n == Next::Ignore);
+                            if !busy_seen {
+                                assert!(n == Next::Ignore);
+                            }
+                        }
+                    }
+                    n
+                } else {
+                    let o = any_opened();
+                    busy_seen |= o == Opened::Busy;
+                    let n = d.opened(o, now);
+                    match o {
+                        Opened::Ok => assert!(n == Next::Probe),
+                        Opened::NoDevice => assert!(n == Next::End),
+                        Opened::Failed => assert!(n == Next::Ignore),
+                        Opened::Busy => {
+                            assert!(n == Next::OpenAgain || n == Next::Ignore);
+                            // the first wait for a Busy device is never cut short of BUSY_MS
+                            if now < start + BUSY_MS {
+                                assert!(n == Next::OpenAgain);
+                            }
+                        }
+                    }
+                    n
+                };
+                if next == Next::OpenAgain {
+                    assert!(now < start + DEVICE_BOUND_MS);
+                }
+                match next {
+                    Next::OpenAgain => probing = false,
+                    Next::Probe => probing = true,
+                    Next::Use | Next::Ignore | Next::End => return,
+                }
+            }
+        }
+    }
+}
