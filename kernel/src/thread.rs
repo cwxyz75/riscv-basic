@@ -1219,6 +1219,16 @@ pub fn wake(tid: Tid) {
     });
 }
 
+/// `wake`, saying whether the wake counted: the thread was blocked (now runnable) or prepared (now notified). A test hook
+/// (`wake_before_block_is_not_lost`: a waker that repeats only the wakes that found nobody waiting).
+pub fn wake_counted(tid: Tid) -> bool {
+    irq::off(|| {
+        let counted = sched().wake_counted_on(hart(), tid) == Ok(true);
+        note_resched();
+        counted
+    })
+}
+
 /// Sleep for `ns` nanoseconds (or until woken): the same as `sleep_ticks`, at the clock's own resolution.
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn sleep_ns(ns: u64) {

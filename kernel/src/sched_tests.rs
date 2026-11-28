@@ -203,8 +203,11 @@ static WBB_WOKEN: AtomicBool = AtomicBool::new(false);
 /// How long the rescuer of `wake_before_block_is_not_lost` waits before it wakes a test thread that blocked although a wake had
 /// arrived: a lost wake would otherwise hang the boot (nothing else wakes the test thread) instead of failing the test.
 const WBB_RESCUE_TICKS: u64 = 2_000;
-/// A pause of the host later than this inside the second half's window has the window taken again (its bound is 3 to 13 ticks).
+/// A pause of the host later than this inside the second half's window has the window taken again (its bound is 3 to
+/// `12 + LATE_TICKS` ticks).
 const WBB_PAUSE_US: u64 = 5_000;
+/// The second half's waker found its counted wake lost: the thread stayed blocked for `WBB_RESCUE_TICKS` after it.
+static WBB_LOST: AtomicBool = AtomicBool::new(false);
 
 fn wake_before_block_is_not_lost() -> Outcome {
     let me = thread::current();
@@ -286,19 +289,34 @@ fn wbb_judge(
 /// The second half of `wake_before_block_is_not_lost`.
 #[inline(never)]
 fn wbb_a_real_block_is_woken(me: kcore::sched::Tid) -> Outcome {
-    // Nothing is left over: now block for real, woken by a thread that wakes us after 3 ticks, and again each tick until we say we
-    // are awake (a pause of the host before our `block` must not turn its one wake into a lost one: a wake is never remembered). A
-    // window that a pause of the host covered (T284: two harts' timer interrupts more than `WBB_PAUSE_US` late inside it) is taken
-    // again, at most three in a row.
+    // Nothing is left over: now block for real, woken by a thread that wakes us after 3 ticks. A wake that finds us not yet blocked
+    // (a pause of the host before our `block`) does not count and is not remembered, so the waker repeats it each tick until one
+    // counts; after a counted wake it waits for us to say we are awake, and if we do not within `WBB_RESCUE_TICKS` it records the wake
+    // as lost and wakes us again (a failure, not a hang). The window starts before the waker is made, so every wake comes at least
+    // 3 ticks into it. A window that a pause of the host covered (T284: two harts' timer interrupts more than `WBB_PAUSE_US` late
+    // inside it) is taken again, at most three in a row.
     crate::pause::watch(10_000 * 1_000_000);
+    WBB_LOST.store(false, SeqCst);
     let mut rs = kcore::pause::Resampler::new();
     let waited = loop {
         WBB_WOKEN.store(false, SeqCst);
+        let n1 = thread::now_ns();
+        let t1 = thread::ticks();
         let waker = thread::spawn(
             "waker",
             NORMAL,
             |me| {
                 thread::sleep_ticks(3);
+                while !WBB_WOKEN.load(SeqCst) && !thread::wake_counted(me as u64) {
+                    thread::sleep_ticks(1);
+                }
+                for _ in 0..WBB_RESCUE_TICKS {
+                    if WBB_WOKEN.load(SeqCst) {
+                        return;
+                    }
+                    thread::sleep_ticks(1);
+                }
+                WBB_LOST.store(true, SeqCst);
                 while !WBB_WOKEN.load(SeqCst) {
                     thread::wake(me as u64);
                     thread::sleep_ticks(1);
@@ -306,8 +324,6 @@ fn wbb_a_real_block_is_woken(me: kcore::sched::Tid) -> Outcome {
             },
             me as usize,
         );
-        let n1 = thread::now_ns();
-        let t1 = thread::ticks();
         thread::block();
         let waited = thread::ticks() - t1;
         let n2 = thread::now_ns();
@@ -329,6 +345,10 @@ fn wbb_a_real_block_is_woken(me: kcore::sched::Tid) -> Outcome {
         }
     };
     crate::pause::watch(0);
+    ensure(
+        !WBB_LOST.load(SeqCst),
+        "a wake to a blocked thread was lost (it stayed blocked after a wake that counted)",
+    )?;
     ensure(
         (3..=12 + LATE_TICKS).contains(&waited), // (a real clock and one-shot timers: the emulator's interrupt jitter shows)
         &format!("blocked for {waited} ticks, wanted about 3"),
