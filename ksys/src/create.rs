@@ -21,7 +21,6 @@ use klock::aslock::AsCell;
 /// `kernel_half_ok` is whether the kernel's page-table half is still as snapshotted; `kernel` its table.
 #[allow(clippy::too_many_arguments)] // (the machine's parts, as the other calls take them)
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn process_create<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -74,22 +73,7 @@ pub fn process_create<M: PhysMem>(
     // (KT9, T177: everything that can fail for want of memory comes first, before the object exists; what follows allocates nothing. The cell comes from the
     // pool, the record is one fallible box, the table has room)
     let tag = us.asids.alloc();
-    let made = (|| {
-        us.procs.reserve(1).map_err(|_| Status::NoMemory)?;
-        let cell = us.as_pool.pop().ok_or(Status::NoMemory)?;
-        let mut table_charge = kcore::fmap::FMap::new();
-        if table_charge.try_insert(u64::MAX, 1).is_err() {
-            us.as_pool.push(cell);
-            return Err(Status::NoMemory);
-        }
-        match FBox::try_new(new_process(cell, tag, job, table_charge, stack_hint)) {
-            Ok(b) => Ok(b),
-            Err(p) => {
-                us.as_pool.push(p.aspace);
-                Err(Status::NoMemory)
-            }
-        }
-    })();
+    let made = make_record(us, tag, job, stack_hint);
     let mut record = match made {
         Ok(r) => r,
         Err(e) => {
@@ -126,20 +110,30 @@ pub fn process_create<M: PhysMem>(
     Ok(handle.0)
 }
 
-/// The record of a new process, in the Created state, around a vacant pooled address-space cell (armed later) and with no object yet. Its own function so that
-/// the frame of the big literal is not part of `process_create`'s.
+/// `process_create`'s allocations, before the object exists (KT9, T177): room in the table, a pooled address-space cell, the root table's charge
+/// entry, and the record's box, with the record in it. `NoMemory`: nothing is kept (the cell goes back to the pool). A frame of its own (KT13).
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
-fn new_process(
-    aspace: alloc::sync::Arc<AsCell>,
+fn make_record(
+    us: &mut UserState,
     tag: kcore::asid::AsTag,
     job: kcore::job::JobId,
-    table_charge: kcore::fmap::FMap<u64, u64>,
     stack_hint: u64,
-) -> Process {
-    Process {
+) -> Result<FBox<Process>, Status> {
+    us.procs.reserve(1).map_err(|_| Status::NoMemory)?;
+    let cell = us.as_pool.pop().ok_or(Status::NoMemory)?;
+    let mut table_charge = kcore::fmap::FMap::new();
+    if table_charge.try_insert(u64::MAX, 1).is_err() {
+        us.as_pool.push(cell);
+        return Err(Status::NoMemory);
+    }
+    let Some(room) = FBox::room() else {
+        us.as_pool.push(cell);
+        return Err(Status::NoMemory);
+    };
+    // (the record is built in its box: KT13)
+    Ok(room.fill_with(move || Process {
         live_tids: Default::default(),
-        aspace,
+        aspace: cell,
         handles: HandleTable::new(MAX_HANDLES),
         tag,
         vmos: Vec::new(),
@@ -162,5 +156,5 @@ fn new_process(
         stack_hint,
         privileged: false,
         libsys: Default::default(),
-    }
+    }))
 }

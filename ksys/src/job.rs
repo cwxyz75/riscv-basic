@@ -41,7 +41,6 @@ fn read_limits<M: PhysMem>(c: &mut Ctx<'_, M>, ptr: u64) -> Result<Limits, Statu
 }
 
 /// `None`: `n` is not one of these calls.
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
     let h = Handle(a[0]);
     let e = |s: Status| (s, None, None);

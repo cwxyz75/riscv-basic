@@ -69,7 +69,6 @@ pub type ProcTable = kcore::fmap::FMap<u64, kcore::fbox::FBox<Process>>;
 
 /// Put a process in the table (the boot loader and the host tests, which have nobody to tell). Panics when there is no memory.
 #[allow(clippy::expect_used)] // INVARIANT: boot and test setup only: allocation failure there is a failure to start
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn put_process(procs: &mut ProcTable, pid: u64, p: Process) {
     let b = kcore::fbox::FBox::try_new(p)
         .ok()
@@ -230,7 +229,6 @@ fn range_status(e: kcore::aspace::VmoError) -> Status {
 /// `vmo_decommit` / `vmo_set_size`, first part (T207 PR 3a): resolve and check the arguments, refuse what is refused, and mark the VMO busy.
 /// `Ok(None)`: nothing to take away (a growth, or an empty range); otherwise the steps follow (`vmo_range_step` until it says done, then
 /// `Vmos::range_end`, whatever the steps answered).
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn vmo_range_begin<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
     n: usize,
@@ -311,7 +309,6 @@ pub struct RangeBatch {
 
 impl RangeBatch {
     /// An empty batch, for `vmo_range_take` to fill (the caller keeps it in one place: its frames are half a KiB, KT13).
-    #[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
     pub const fn new() -> RangeBatch {
         RangeBatch {
             frames: [0; kcore::aspace::RANGE_STEP],
@@ -475,7 +472,6 @@ pub const UNMAP_STEP_PTES: u64 = 64;
 
 /// `process_unmap`, first part: resolve and check the arguments, split the regions at the edges and mark the ones inside dying. Every failure is
 /// here, before the first page goes.
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn process_unmap_begin<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
     a: [u64; 6],
@@ -615,7 +611,6 @@ pub struct ProtectCall {
 }
 
 /// `process_protect`, first part: every check, the split, and the new permissions of the regions. Every failure is here.
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn process_protect_begin<M: PhysMem, X: Machine>(
     c: &mut PCtx<'_, M, X>,
     a: [u64; 6],
@@ -870,7 +865,6 @@ fn snapshot_protect<M: PhysMem, X: Machine>(
 /// `None`: `n` is not one of these calls.
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)]
 // INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn proc_call<M: PhysMem, X: Machine>(
     n: usize,
     a: [u64; 6],

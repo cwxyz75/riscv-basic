@@ -30,9 +30,48 @@ impl<T> FBox<T> {
         }
     }
 
+    /// Make the box, then the value in it: `make` runs only once the room is had, so a large value is built in its own frame and moved
+    /// once, not carried through the caller's (KT13). Without memory, `make` is given back unrun.
+    pub fn try_new_with<F: FnOnce() -> T>(make: F) -> Result<FBox<T>, F> {
+        let mut vec: Vec<T> = Vec::new();
+        if vec.try_reserve_exact(1).is_err() {
+            return Err(make);
+        }
+        vec.push(make());
+        match vec.into_boxed_slice().try_into() {
+            Ok(b) => Ok(FBox(b)),
+            // (cannot happen: the length is one)
+            Err(_) => unreachable!("a one-element vector is a one-element box"),
+        }
+    }
+
+    /// The room for a box, had now: [`Room::fill_with`] then cannot fail. `None` without memory.
+    pub fn room() -> Option<Room<T>> {
+        let mut vec: Vec<T> = Vec::new();
+        vec.try_reserve_exact(1).ok()?;
+        Some(Room(vec))
+    }
+
     pub fn into_inner(self) -> T {
         let [v] = *self.0;
         v
+    }
+}
+
+/// The room for one `FBox<T>` (`FBox::room`): an empty vector with room for exactly one element.
+#[derive(Debug)]
+pub struct Room<T>(Vec<T>);
+
+impl<T> Room<T> {
+    /// The box, with the value `make` builds in it (`make` runs in its own frame, so a large value is not carried through the caller's: KT13).
+    /// Allocates nothing.
+    pub fn fill_with<F: FnOnce() -> T>(mut self, make: F) -> FBox<T> {
+        self.0.push(make());
+        match self.0.into_boxed_slice().try_into() {
+            Ok(b) => FBox(b),
+            // (cannot happen: the length is one)
+            Err(_) => unreachable!("a one-element vector is a one-element box"),
+        }
     }
 }
 

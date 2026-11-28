@@ -145,7 +145,6 @@ pub fn new_start(
 )]
 // INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (64 bytes) at indices below 8
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn thread_spawn<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -376,7 +375,6 @@ pub fn thread_spawn<M: PhysMem>(
 #[allow(clippy::expect_used, clippy::panic)]
 // INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists; a Created process's table is empty, so the moved handle is handle 1
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn process_start(
     us: &mut UserState,
     jobs: &mut Jobs,

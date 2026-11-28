@@ -14,7 +14,6 @@ use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
 /// `None`: `n` is not a VMO call (the caller handles it).
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 // INVARIANT: a is [u64; 6] and every `h(i)` is called with a constant below 6; offsets and lengths are bounded (len <= MAX_MSG_BYTES, commit pages <= MAX_COMMIT_PAGES) before any sum, and `checked_add` guards the VMO range
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
     if !matches!(
         n,
@@ -188,7 +187,6 @@ pub fn vmo_commit_resolved<M: PhysMem>(
 /// caller holds its lock) and the VMO, with the memory locks only (L20, T215: no object lock for the copy).
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 // INVARIANT: a is [u64; 6] and every index is a constant below 6; len <= MAX_MSG_BYTES before any sum, and `checked_add` guards the VMO range
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn vmo_rw_resolved<M: PhysMem>(
     writing: bool,
     aspace: &mut kcore::aspace::AddressSpace,

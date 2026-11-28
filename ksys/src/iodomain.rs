@@ -479,7 +479,6 @@ fn create_in<E: IoEnv>(e: &mut E, a: [u64; 6], job: JobId) -> Reply {
 // ---- iodomain_map ----------------------------------------------------------------------------------------------------------------
 
 /// `iodomain_map(domain, vmo, vmo_offset, pages, access) -> io_address` (4.3, amendment part 1).
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn iodomain_map<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let (offset, pages, access) = (a[2], a[3], a[4]);
     let writes = access & io::WRITE != 0;
@@ -556,7 +555,6 @@ pub fn iodomain_map<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 fn map_in<E: IoEnv>(
     e: &mut E,
     d: DomainId,
@@ -776,7 +774,6 @@ pub fn iodomain_fault_read<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
 
 /// `vmo_create_dma_in(resource, pages, job) -> vmo` (4.7; amendment part 1 point 5: the frames are taken and zeroed `RANGE_STEP` at a
 /// time under `FRAME` only, while no handle names the VMO).
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn vmo_create_dma_in<E: IoEnv>(e: &mut E, a: [u64; 6]) -> Reply {
     let pages = a[1];
     let begun = e.obj(|o| -> Result<(JobId, kcore::aspace::DmaBuild), Status> {

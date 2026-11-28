@@ -382,7 +382,6 @@ pub fn channel_call_send<M: PhysMem>(
 /// `channel_call_send` with the request's bytes and handle words already copied in by the caller before it took the object lock (T215): `staged` is used in place
 /// of the two copies (the record is read here as always, so every check and its order are unchanged).
 #[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: as `channel_call_send`
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn channel_call_send_staged<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
@@ -527,7 +526,6 @@ pub fn channel_call_reply<M: PhysMem>(
 /// for the caller to copy out after it let the object lock go and then commit (T215, OD161): the destinations were checked and the bytes
 /// copied, nothing is taken yet.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, clippy's estimate over 1 KiB, left by T289 (see work/T289.md)
 pub fn channel_call_reply_deferred<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
