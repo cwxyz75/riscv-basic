@@ -287,10 +287,18 @@ fn harts_go_offline_and_come_back() -> Result<(), String> {
             break;
         }
         if t1 < t0 + (baseline / 4).max(2) {
+            // (T287: where the sleepers' timers sit and what each hart has armed, read as the window is judged, and the pause record of
+            // the window: a stopped vCPU shows deadlines on online harts overdue and not taken, a timer left behind shows a deadline on
+            // the offline hart)
             result = Err(format!(
-                "round {round}: the sleepers made {} wakes in 10 ms with hart {v} offline (baseline {baseline}); {}",
+                "round {round}: the sleepers made {} wakes in 10 ms with hart {v} offline (baseline {baseline}); {}; timers:{} armed \
+                 (us from now):{}; harts late now (us): {:?}; host paused in the window (us, summed): {}",
                 t1 - t0,
-                hart_window_report(&s0, &s1, n1.saturating_sub(n0))
+                hart_window_report(&s0, &s1, n1.saturating_sub(n0)),
+                thread::timer_report(&sleepers),
+                crate::pause::armed_report(),
+                crate::pause::overdue_now(),
+                crate::pause::paused_in(n0, thread::now_ns())
             ));
             break;
         }
@@ -1025,12 +1033,34 @@ fn no_big_lock_for(program: u64, what: &str) -> Result<(), String> {
     }
     let (pid, tid) = user::start(user::CRASH_ELF, program).map_err(|e| format!("{e:?}"))?;
     let mut host = None;
-    for _ in 0..5000 {
+    let started_ns = thread::now_ns();
+    for i in 0..5000 {
         // (the hart that is running the thread: `in_user` is no test for one that traps all the time; the test thread itself sleeps, so
         // hart 0 is as good a host as any other)
         host = (0..n).find(|&i| percpu::hart(i).running.load(Ordering::Relaxed) == tid);
         if host.is_some() {
             break;
+        }
+        if i == 300 {
+            // T287 (T167): a fresh user thread not running after 300 ticks was seen (0.7 to 2.4 s at two harts on a loaded host): say
+            // where it waits (its state, home and deadline, every hart's running thread, next event and armed timer, the pause record),
+            // and in a debug build the scheduler's queues, so the next occurrence names its cause whether or not the test then fails
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                crate::console::Console,
+                "##SLOW no_big_lock_for {what} (thread {tid}) not running after 300 ticks: state {};{} running {:?}; armed (us from now):{}; \
+                 harts late now (us) {:?}; host paused since its start (us, summed) {}",
+                thread::debug_state(tid),
+                thread::timer_report(&[tid]),
+                (0..n)
+                    .map(|i| percpu::hart(i).running.load(Ordering::Relaxed))
+                    .collect::<alloc::vec::Vec<_>>(),
+                crate::pause::armed_report(),
+                crate::pause::overdue_now(),
+                crate::pause::paused_in(started_ns, thread::now_ns())
+            );
+            #[cfg(debug_assertions)]
+            crate::irq::without(thread::dump_sched);
         }
         thread::sleep_ticks(1);
     }

@@ -5,8 +5,9 @@
 //! it, and the third such window in a row fails the test; a window with no such pause is always kept, however late its own sample.
 
 use kcore::pause::{
-    covering, covers, decode, encode, overlap, pack, parse_stall_arg, paused_total, rearm, unpack,
-    worst_of, Cover, HartRing, Resampler, Verdict, FLOOR_US, MAX_COVERED_IN_A_ROW, RING,
+    covering, covering_with, covers, decode, encode, overlap, pack, parse_stall_arg, paused_total,
+    rearm, unpack, worst_of, Cover, HartRing, Resampler, Verdict, FLOOR_US, MAX_COVERED_IN_A_ROW,
+    RING,
 };
 
 /// A small deterministic generator (xorshift64*), so a failing case can be replayed from its seed.
@@ -383,5 +384,53 @@ fn a_pause_covers_a_window_only_when_two_harts_saw_it() {
     assert_eq!(
         paused_total(&rings, 40_000, 60_000, 0),
         9_000 + 3_000 + 10_200
+    );
+}
+
+/// T287: a hart that is late **now** (its interrupt due and not yet taken when the window is judged) counts like a ring sample: two harts
+/// still stopped at the end of a window are a pause that no ring has seen yet (`harts_go_offline_and_come_back` judged its window while
+/// the host still had two harts stopped). One overdue hart alone is not, and an overdue span within the bound does not count.
+#[test]
+fn harts_overdue_now_count_as_late_inside_the_window() {
+    let rings: Vec<HartRing> = (0..4).map(|_| HartRing::new()).collect();
+    assert_eq!(
+        covering_with(&rings, &[0, 9_000, 0, 0], 40_000, 50_000, 2_000),
+        Cover::OneHart {
+            hart: 1,
+            late_us: 9_000
+        }
+    );
+    assert_eq!(
+        covering_with(&rings, &[0, 9_000, 0, 7_000], 40_000, 50_000, 2_000),
+        Cover::Pause {
+            hart: 1,
+            late_us: 9_000
+        }
+    );
+    // within the bound: not late
+    assert_eq!(
+        covering_with(&rings, &[0, 1_500, 0, 1_900], 40_000, 50_000, 2_000),
+        Cover::None
+    );
+    // an overdue hart corroborates a ring sample of another, and the worst of the two is named
+    rings[2].record(45_000, 12_000);
+    assert_eq!(
+        covering_with(&rings, &[0, 3_000, 0, 0], 40_000, 50_000, 2_000),
+        Cover::Pause {
+            hart: 2,
+            late_us: 12_000
+        }
+    );
+    // no overdue list (or a short one) is the plain rule
+    assert_eq!(
+        covering_with(&rings, &[], 40_000, 50_000, 2_000),
+        covering(&rings, 40_000, 50_000, 2_000)
+    );
+    assert_eq!(
+        covering_with(&rings, &[0], 40_000, 50_000, 2_000),
+        Cover::OneHart {
+            hart: 2,
+            late_us: 12_000
+        }
     );
 }

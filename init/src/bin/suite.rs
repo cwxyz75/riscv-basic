@@ -2082,9 +2082,17 @@ fn launch_image_with(
 }
 
 fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
-    // (T265: a deadline that a pause of the host covered says nothing about the teardown: a stop of the emulator longer than the wait
+    let r = wait_signal(proc, sig::TERMINATED, ticks, "the process ended")?;
+    ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
+    Ok(())
+}
+
+/// Wait up to `ticks` for `signal` on `h`, telling a host pause from a kernel delay (T265, T287): the result of the wait that saw it.
+fn wait_signal(h: u64, signal: u32, ticks: u64, what: &str) -> Result<Ret, Detail> {
+    // (T265: a deadline that a pause of the host covered says nothing about the kernel: a stop of the emulator longer than the wait
     // times it out however promptly the kernel works, as the host-stall injector shows. A window the pause detector says a pause covered
-    // is waited again, at most three times in a row; a timeout with no pause in its window fails, and says what the detector saw.)
+    // is waited again, at most three times in a row; a timeout with no pause in its window fails, and says what the detector saw.
+    // T287: the short waits with bare deadlines ("a thread ended", "an exception message arrives") are this wait too.)
     // (every hart keeps a deadline near while it waits, so that a stop of the emulator makes two harts late wherever it lands, which is
     // the detector's rule for a pause: without it an idle hart has no deadline to be late for. A wait that ends at once costs nothing.)
     let mut covered = 0;
@@ -2096,10 +2104,10 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
         } else {
             PauseWatch::start(ticks.saturating_add(100))
         };
-        let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
+        let r = sys::object_wait(h, signal, sys::clock_get() + ticks);
         if r.status == S::TimedOut.code() {
-            if let Some((h, us)) = host_pause_since(since, 2_000) {
-                pause_line("wait_ended", h, us);
+            if let Some((hart, us)) = host_pause_since(since, 2_000) {
+                pause_line("wait_signal", hart, us);
                 covered += 1;
                 if covered < 3 {
                     continue;
@@ -2109,18 +2117,17 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
             let _ = core::fmt::Write::write_fmt(
                 &mut d,
                 format_args!(
-                    "the process ended: got {} (timed out after {ticks} ms; {covered} windows before it covered by a host pause; the \
+                    "{what}: got {} (timed out after {ticks} ms; {covered} windows before it covered by a host pause; the \
                      harts were stopped {} us in this one, summed; signals {:#x})",
                     r.status,
                     host_paused_us_since(since),
-                    sys::object_signals(proc).a1
+                    sys::object_signals(h).a1
                 ),
             );
             return Err(d);
         }
-        ensure_eq!(r.status, 0, "the process ended");
-        ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
-        return Ok(());
+        ensure_eq!(r.status, 0, "{what}");
+        return Ok(r);
     }
 }
 
@@ -4748,8 +4755,7 @@ extern "C" fn ex2_writer(_arg: usize) -> ! {
 type Ex2Message = (u64, u64, u64, u64, u64, u64, u64);
 
 fn ex2_message(ch: u64) -> Result<Ex2Message, Detail> {
-    let r = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 1000);
-    ensure_eq!(r.status, 0, "an exception message arrives");
+    wait_signal(ch, sig::READABLE, 1000, "an exception message arrives")?;
     let mut b = [0u8; 40];
     let mut hs = [0u64; 4];
     let r = ok(
@@ -6784,52 +6790,61 @@ fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
     Ok(())
 }
 
-fn child_with_a_ready_exit_thread() -> Result<(u64, u64, u64), Detail> {
-    let (p, m) = launch(25)?;
-    let v = vmo(4)?;
-    let base = map_child_stack(p, v)?;
-    nap(3)?;
-    // a thread that would exit(42) at once
-    let t = ok(
-        sys::thread_on_stack(p, child_entry(p)?, base + 4 * 4096, 8),
-        "thread_on_stack",
-    )?
-    .a1 as u64;
-    Ok((p, m, t))
-}
-
 fn a_thread_killed_before_it_ran_runs_no_user_code() -> Outcome {
-    // The thread is made on another hart's behalf and can start there as soon as it exists, so whether the kill lands before it runs is a race that only one hart
-    // decides (T226: a deterministic version needs the placement masks of SC2). The property is about the runs the kill does win: such a run must end with the
-    // kill's code for the process and for the thread, and no run may end any other way than the thread having exited first with its own code (42).
-    let mut won = 0;
-    for _ in 0..40 {
-        let (p, _m, t) = child_with_a_ready_exit_thread()?;
+    // T226 (OD160): the thread is made pinned to this thread's hart (the test-only pin, `debug_stat` 219) at a priority below this
+    // thread's, so it cannot run before this thread blocks, which it does only after the kill (in `wait_ended`): the kill comes first at
+    // every hart count, every time. (Made free, it could start on another hart as soon as it existed, and the test was a race.)
+    let mine = ok(sys::thread_get_sched(0), "thread_get_sched")?.a1 as u32 & 0xff;
+    ensure!(
+        mine > 1,
+        "the suite runs above the lowest priority (it runs at {mine})"
+    );
+    for round in 0..10 {
+        let (p, m) = launch(25)?;
+        let v = vmo(4)?;
+        let base = map_child_stack(p, v)?;
+        nap(3)?;
+        let pinned = rt::syscall(
+            nr_debug_stat(),
+            [rt::debug::handle() as usize, 219, 0, 0, 0, 0],
+        );
+        ensure_eq!(
+            (pinned.status, pinned.a1),
+            (0, 1),
+            "the test-only pin is set"
+        );
+        // a thread that would exit(42) at once
+        let rec = rt::SpawnArgs {
+            entry: child_entry(p)?,
+            arg: 8,
+            flags: rt::abi::spawn::CALLER_STACK,
+            sp: base + 4 * 4096,
+            priority: mine - 1,
+            ..rt::SpawnArgs::default()
+        };
+        let t = ok(sys::thread_spawn(p, &rec), "thread_spawn")?.a1 as u64;
+        // (2 ms of running, not blocking: a free thread would start on another hart meanwhile; the pinned one cannot, its hart is this
+        // thread's and this thread outranks it)
+        let until = sys::clock_ns() + 2_000_000;
+        while sys::clock_ns() < until {
+            core::hint::spin_loop();
+        }
         ensure_eq!(
             st(sys::process_kill(p, 55)),
             Some(S::Ok),
             "kill before it ran"
         );
         wait_ended(p, 1000)?;
-        let code = sys::process_info(p).a1 as i64;
-        if code == 55 {
-            thread_ended_with(t, 55)?;
-            won += 1;
-            if won >= 3 {
-                return Ok(());
-            }
-        } else {
-            ensure_eq!(
-                code,
-                42,
-                "the thread ran first and exited with its own code"
-            );
+        ensure_eq!(
+            sys::process_info(p).a1 as i64,
+            55,
+            "round {round}: the kill's code, not the thread's own (42)"
+        );
+        thread_ended_with(t, 55)?;
+        for h in [t, p, v, m] {
+            sys::handle_close(h);
         }
     }
-    ensure!(
-        won > 0,
-        "in forty tries the kill never came before the thread ran"
-    );
     Ok(())
 }
 
@@ -14227,6 +14242,27 @@ static ONCE: Once = Once::new();
 static ONCE_RUNS: AtomicU32 = AtomicU32::new(0);
 static SEM: Semaphore = Semaphore::new(0);
 static SEM_TAKEN: AtomicU32 = AtomicU32::new(0);
+/// T287 (T222): each semaphore worker's record, so the test can tell a late taker from a lost wake: when it began to wait (tick + 1; 0:
+/// not yet), when it took a permit (tick + 1; 0: not yet), and how (`sem_how`: 0 not yet, 1 at once, 2 after a wake, 3 after a changed
+/// word, 4 only after its futex wait timed out, 5 it gave up with none).
+static SEM_BEGAN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static SEM_TOOK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static SEM_HOW: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+/// A worker's own deadline (ticks from when it begins to wait): twice the test's poll, so a permit that is posted and not taken shows
+/// as a worker still asleep beside a count above zero when the poll ends (a lost wake), not as a timed-out worker that then took it.
+const SEM_WORKER_TICKS: u64 = 20_000;
+const SEM_POLL_TICKS: u64 = 10_000;
+
+fn sem_how(t: Option<rt::sync::Took>) -> u32 {
+    use rt::sync::Took;
+    match t {
+        Some(Took::AtOnce) => 1,
+        Some(Took::AfterWake) => 2,
+        Some(Took::AfterDiffered) => 3,
+        Some(Took::AfterTimeout) => 4,
+        None => 5,
+    }
+}
 
 extern "C" fn once_worker(_: usize) -> ! {
     ONCE.call_once(|| {
@@ -14238,11 +14274,88 @@ extern "C" fn once_worker(_: usize) -> ! {
     sys::thread_exit(i32::from(!ok_run))
 }
 
-extern "C" fn sem_worker(_: usize) -> ! {
-    if SEM.wait_until(sys::clock_get() + 5000) {
+extern "C" fn sem_worker(i: usize) -> ! {
+    let began = sys::clock_get();
+    if let Some(slot) = SEM_BEGAN.get(i) {
+        slot.store(began + 1, Ordering::SeqCst);
+    }
+    let took = SEM.wait_until_how(began + SEM_WORKER_TICKS);
+    if let (Some(at), Some(how)) = (SEM_TOOK.get(i), SEM_HOW.get(i)) {
+        if took.is_some() {
+            at.store(sys::clock_get() + 1, Ordering::SeqCst);
+        }
+        how.store(sem_how(took), Ordering::SeqCst);
+    }
+    if took.is_some() {
         SEM_TAKEN.fetch_add(1, Ordering::SeqCst);
     }
     sys::thread_exit(0)
+}
+
+/// The semaphore workers' records, for a failure message: per worker (began, took, how), ticks relative to `posted`.
+fn sem_records(posted: u64) -> alloc::string::String {
+    let rel = |v: u64| -> alloc::string::String {
+        if v == 0 {
+            alloc::string::String::from("not yet")
+        } else {
+            alloc::format!("{}", (v - 1) as i64 - posted as i64)
+        }
+    };
+    let mut out = alloc::string::String::new();
+    for i in 0..3 {
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                " worker {i}: began {}, took {}, how {};",
+                rel(SEM_BEGAN[i].load(Ordering::SeqCst)),
+                rel(SEM_TOOK[i].load(Ordering::SeqCst)),
+                SEM_HOW[i].load(Ordering::SeqCst)
+            ),
+        );
+    }
+    out
+}
+
+/// Wait (at most `SEM_POLL_TICKS`) until `want` permits have been taken since the posts at `posted`. A poll that ends short names the
+/// cause: permits left with a worker still asleep in its wait is a lost wake; a worker that never began to wait is a late thread (T167).
+fn sem_taken_reaches(want: u32, posted: u64) -> Outcome {
+    let until = posted + SEM_POLL_TICKS;
+    while SEM_TAKEN.load(Ordering::SeqCst) < want {
+        if sys::clock_get() >= until {
+            let asleep = (0..3)
+                .filter(|&i| {
+                    SEM_BEGAN[i].load(Ordering::SeqCst) != 0
+                        && SEM_HOW[i].load(Ordering::SeqCst) == 0
+                })
+                .count();
+            let never = (0..3)
+                .filter(|&i| SEM_BEGAN[i].load(Ordering::SeqCst) == 0)
+                .count();
+            let cause = if SEM.available() > 0 && asleep > 0 {
+                "a lost wake: a permit is there and a worker still sleeps"
+            } else if never > 0 {
+                "a late thread: a worker never began to wait"
+            } else {
+                "neither a lost wake nor a late thread"
+            };
+            ensure!(
+                false,
+                "{want} permits taken: got {} in {SEM_POLL_TICKS} ticks after the posts; {} left; {cause} (ticks since the posts;{} how: \
+                 1 at once, 2 after a wake, 3 after a changed word, 4 after a timeout, 5 none)",
+                SEM_TAKEN.load(Ordering::SeqCst),
+                SEM.available(),
+                sem_records(posted)
+            );
+        }
+        nap_ticks(2);
+    }
+    // a permit taken only after the taker's futex wait timed out, with the post long before its deadline, was a wake that did not come
+    ensure!(
+        (0..3).all(|i| SEM_HOW[i].load(Ordering::SeqCst) != 4),
+        "a lost wake: a worker took its permit only after its futex wait timed out ({} how 4 is after a timeout)",
+        sem_records(posted)
+    );
+    Ok(())
 }
 
 fn once_and_semaphore() -> Outcome {
@@ -14265,23 +14378,27 @@ fn once_and_semaphore() -> Outcome {
         ensure_eq!(sys::thread_info(t).a1 as i64, 0, "every caller saw it done");
         sys::handle_close(t);
     }
-    // a semaphore: three sleepers, two posts release exactly two
+    // a semaphore: three sleepers, two posts release exactly two (T287, T222: the test waits for the takers instead of a fixed nap, and
+    // each worker says how it took its permit, so a late sleeper and a lost wake are told apart)
     SEM_TAKEN.store(0, Ordering::SeqCst);
-    for _ in 0..3 {
-        ts.push(new_thread(sem_worker, 0)?);
+    for i in 0..3 {
+        SEM_BEGAN[i].store(0, Ordering::SeqCst);
+        SEM_TOOK[i].store(0, Ordering::SeqCst);
+        SEM_HOW[i].store(0, Ordering::SeqCst);
     }
-    nap_ticks(30);
+    for i in 0..3 {
+        ts.push(new_thread(sem_worker, i)?);
+    }
+    nap_ticks(30); // (the sleepers usually reach the futex first; the protocol is correct for any order)
+    let posted = sys::clock_get();
     SEM.post();
     SEM.post();
-    nap_ticks(60);
+    sem_taken_reaches(2, posted)?;
+    nap_ticks(60); // (a third taker would show by now if two posts had released three)
     ensure_eq!(SEM_TAKEN.load(Ordering::SeqCst), 2, "two posts, two taken");
+    let posted = sys::clock_get();
     SEM.post();
-    nap_ticks(60);
-    ensure_eq!(
-        SEM_TAKEN.load(Ordering::SeqCst),
-        3,
-        "the third post releases the last"
-    );
+    sem_taken_reaches(3, posted)?;
     ensure!(!SEM.try_wait(), "nothing left over");
     for t in ts {
         sys::handle_close(t);
@@ -20972,17 +21089,23 @@ extern "C" fn rt_probe(_: usize) -> ! {
     let name = "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not";
     // (T284: a wait that a pause of the host covered, a timer interrupt of any hart more than the bound late inside it, is taken
     // again, at most three in a row: the third fails the test, since a host that does not run the hart is a failure too)
+    // (T287: the negative control, at the hogs' priority, asks only whether one window with the host running shows the probe held back
+    // by a slice: a covered window is no evidence either way and three in a row only that the host was busy, so the control keeps
+    // looking, for at most 200 windows, and stops at the first kept window past its bound, as the kernel twin does)
+    let control = RT_PROBE_PRIO.load(Ordering::SeqCst) != 40;
+    let mut windows = 0;
     while kept < 30 {
+        windows += 1;
         let start = sys::clock_ns();
         let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
         sys::object_wait(gate, 1 << 24, target);
         // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
         let late = sys::clock_ns().saturating_sub(target * 1_000_000);
         let late = late / 1000; // microseconds
-        let bound = if RT_PROBE_PRIO.load(Ordering::SeqCst) == 40 {
-            RT_BOUND_US
-        } else {
+        let bound = if control {
             RT_CONTROL_BOUND_US
+        } else {
+            RT_BOUND_US
         };
         if let Some((h, us)) = host_pause_since(start, bound) {
             pause_line(name, h, us);
@@ -20990,7 +21113,7 @@ extern "C" fn rt_probe(_: usize) -> ! {
             if worst_pause & ((1 << 48) - 1) < us {
                 worst_pause = (h << 48) | us;
             }
-            if in_a_row == 3 {
+            if in_a_row >= 3 && !(control && windows < 200) {
                 RT_GAVE_UP.store((h << 48) | us, Ordering::SeqCst);
                 break;
             }
@@ -21004,6 +21127,9 @@ extern "C" fn rt_probe(_: usize) -> ! {
             worst = late;
         } else {
             second = second.max(late);
+        }
+        if control && late > bound {
+            break;
         }
     }
     RT_RETAKEN.store(retaken, Ordering::SeqCst);
@@ -23068,8 +23194,7 @@ fn ten_thousand_threads_leak_nothing() -> Outcome {
             "thread_spawn: status {} in round {round}",
             r.status
         );
-        let w = sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 500);
-        ensure_eq!(w.status, 0, "a thread ended");
+        wait_signal(r.a1 as u64, sig::TERMINATED, 500, "a thread ended")?;
         sys::handle_close(r.a1 as u64);
         if round % 2000 == 1999 {
             // (the test takes minutes on a slow machine and says nothing otherwise: the harness's no-output limit is 180 s)
@@ -23096,8 +23221,7 @@ fn thousands_of_threads_come_and_go() -> Outcome {
             r.status
         );
         let t = r.a1 as u64;
-        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
-        ensure_eq!(w.status, 0, "a thread ended");
+        wait_signal(t, sig::TERMINATED, 500, "a thread ended")?;
         sys::handle_close(t);
     }
     Ok(())

@@ -124,6 +124,9 @@ LAST_BENCH = []
 # injector must show at least one stall, and its guest must have seen one (`a_host_stall_is_seen_by_the_guest`).
 HOSTSTALL = re.compile(r"^##HOSTSTALL (\d+\.\d{3}) (\d+\.\d{3})$")
 PAUSE = re.compile(r"^##PAUSE (\w+) hart (\d+) late (\d+) us$")
+# T287 (T167): `##SLOW <test> <what>`, a test's record of something that came late but did not fail it (a thread not yet running at 300
+# ticks, with where it waited): a passing boot prints it as a note, so the next occurrence is read from any log, not only a failing one.
+SLOW = re.compile(r"^##SLOW (\w+) (.+)$")
 LAST_HOSTSTALLS = []
 HOST_STALL_TEST = "a_host_stall_is_seen_by_the_guest"
 # `## iommu: fault cause=<decimal> dev=<bb:dd.f> iova=0x<hex> <read|write|exec|none>` (IOMMU-SPEC 7.2) and `## iommu: fence timeout dev=<bb:dd.f>`
@@ -1343,6 +1346,8 @@ def parse(lines):
             pass  # (T284: a window of a timing test that a pause of the host covered, re-sampled; it stays in the serial log)
         elif line.startswith("##SCHED "):
             pass  # (T243: the scheduler report a failing test asks for with `debug_stat(132)`; it stays in the serial log)
+        elif SLOW.match(line):
+            pass  # (T287: printed as a note when the boot passes, below; it stays in the serial log)
         else:
             bad.append(line)
     return boot, tests, done, panics, bad
@@ -1688,6 +1693,9 @@ def main() -> int:
                 tts.sort(reverse=True)
                 print(f"suite guest time: {sum(t for t, _ in tts) / 1000:.0f} s over {len(tts)} tests; slowest: "
                       + ", ".join(f"{n} {t / 1000:.1f} s" for t, n in tts[:6]))
+            for l in lines:
+                if m := SLOW.match(l):
+                    print(f"note: {m[1]}: {m[2]}")
             # T286 (T209): a volume server that took seconds to mount and say ready passes now (the tests wait out the volume
             # manager's budgets), so a slow one is said here, with any host pause the detector saw, for the next one to be read
             slow = [int(m[1]) for m in re.finditer(r"volmgr: t=\d+ volume \S+: ready in (\d+) ms", text) if int(m[1]) >= 5000]

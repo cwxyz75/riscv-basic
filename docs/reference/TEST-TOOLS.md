@@ -99,7 +99,11 @@ to say nothing about whether that happened. Two tools now say it:
   holds interrupts off or waits for a lock in its timer handler does it on one hart. While a test measures, every hart keeps a deadline
   at most 1 ms ahead (the heartbeat, `pause::watch`, `debug_stat` 218), and after taking a timer interrupt a hart arms a 1 ms sentinel
   until its handler arms the next event, so a stopped hart is late for something wherever the stop lands (without these, stalls were
-  seen to land between a taken interrupt and the re-arm, unseen). The tests take a covered window again, print `##PAUSE <test> hart
+  seen to land between a taken interrupt and the re-arm, unseen). A hart that is late **now**, its armed interrupt overdue and not taken
+  when the window is judged, counts as late inside it (T287: a window was judged while the host still had two harts stopped, and no ring
+  had seen them yet). The negative controls of the latency probes (`the_latency_test_can_fail` and the user twin) do not give up on three
+  covered windows: a covered window is no evidence either way, so they look for at most 200 windows and stop at the first kept one past
+  their bound. The tests take a covered window again, print `##PAUSE <test> hart
   <h> late <us> us` for it, and fail after three covered windows in a row (`host pause: ...` in the message); a late window with no
   pause fails on the bound as before, and names a one-hart lateness it saw. Two planted delays are the controls, in
   `os-boot-test-sched-neg`: `fault-rt-wake-late` (every real-time wake 5 ms late, the interrupts on time) and
@@ -111,6 +115,17 @@ to say nothing about whether that happened. Two tools now say it:
   when it happens at every wake, and the `latency-trace` build (`make os-latency`) measures such spans directly. Record
   mode is a further discriminator: it runs every hart in one TCG thread, so a failure that also shows under `OS_RECORD` is not a pause
   of one hart.
+
+**A late thread or a lost wake?** (T287) A test that waits for something to happen polls for it with a deadline far above any host
+pause, instead of a fixed nap, and when the deadline passes it says which: the semaphore test (`once_and_semaphore`) has each worker
+record how it took its permit (`kcore::usync::Took`: at once, after a wake, after a changed word, only after its futex wait timed out),
+and fails "a lost wake" for a permit left with a worker asleep or taken only after a timeout, "a late thread" for a worker that never
+began to wait. The protocol itself is checked on the host under loom and shuttle over a model futex built on the kernel's futex table
+(`kcore/tests/usync_concurrency.rs`, part of `make os-models`). A test may print `##SLOW <test> <what>` for something that came late
+without failing it (T167: a fresh user thread not running after 300 ticks, with its state, home, deadline, every hart's running thread,
+next event and armed timer, and the pause record): the harness prints it as `note:` when the boot passes. `harts_go_offline_and_come_back`
+says, when it fails, where each sleeper's timer sits, what each hart has armed, which harts are late now and the pause record of the
+window: a stopped vCPU shows deadlines overdue on online harts, a timer left behind shows one on the offline hart.
 
 On the development machine (macOS) the detector also showed the emulator taking a timer interrupt programmed T ahead about T / 2 late,
 every time, with the hart running and interrupts on (a 3 ms sleep about 1.6 ms, a 10 ms slice end 5.04 to 5.09 ms): a host lateness that

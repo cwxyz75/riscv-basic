@@ -471,6 +471,23 @@ fn equal_priority_hogs_share_the_cpu() -> Outcome {
     })
 }
 
+/// Sleep a tick at a time until `ready` holds, for at most `ticks` (T287: a fixed nap assumes the host runs the hart through it; a pause
+/// of the host inside the nap makes the sleeper's own timer overdue, so on resume it preempts the threads it was waiting for before they
+/// ran: `two_waiters_on_one_queue_wake_in_order` "got 1, want 2", `wake_many_makes_every_waiter_runnable_before_any_runs` "the two
+/// waiters did not block", in boots beside other boots and under chaos). Whether it held at the end.
+fn settles(ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
+    for _ in 0..ticks {
+        if ready() {
+            return true;
+        }
+        thread::sleep_ticks(1);
+    }
+    ready()
+}
+
+/// How long `settles` waits for something that takes a wake and a few microseconds of running: far beyond any pause of the host.
+const SETTLE_TICKS: u64 = 2_000;
+
 static RELEASED: AtomicU64 = AtomicU64::new(0);
 static DONE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FIRST_DONE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -492,9 +509,16 @@ fn two_waiters_on_one_queue_wake_in_order() -> Outcome {
         let q = thread::new_queue();
         QUEUE.store(q as u64, SeqCst);
         let a = thread::spawn("waiter-a", NORMAL, queue_waiter, 0);
-        thread::sleep_ticks(2 + LATE_TICKS); // a is queued first
+        // (T287: each step waits until it has happened, not a fixed nap: a waiter is queued once it is blocked)
+        ensure(
+            settles(SETTLE_TICKS, || thread::is_blocked(a)),
+            "waiter a never blocked on the queue",
+        )?; // a is queued first
         let b = thread::spawn("waiter-b", NORMAL, queue_waiter, 1);
-        thread::sleep_ticks(2 + LATE_TICKS);
+        ensure(
+            settles(SETTLE_TICKS, || thread::is_blocked(b)),
+            "waiter b never blocked on the queue",
+        )?;
         ensure_eq(
             DONE_COUNT.load(SeqCst),
             0,
@@ -502,7 +526,11 @@ fn two_waiters_on_one_queue_wake_in_order() -> Outcome {
         )?;
         RELEASED.store(1, SeqCst);
         ensure(thread::wake_one(q), "wake_one found nobody waiting")?;
-        thread::sleep_ticks(2 + LATE_TICKS);
+        ensure(
+            settles(SETTLE_TICKS, || DONE_COUNT.load(SeqCst) >= 1),
+            "the waiter one wake_one released never finished",
+        )?;
+        thread::sleep_ticks(2 + LATE_TICKS); // (a second waiter released by the one wake would show by now)
         ensure_eq(
             DONE_COUNT.load(SeqCst),
             1,
@@ -515,7 +543,7 @@ fn two_waiters_on_one_queue_wake_in_order() -> Outcome {
         )?;
         RELEASED.store(1, SeqCst);
         thread::wake_all(q);
-        thread::sleep_ticks(2 + LATE_TICKS);
+        settles(SETTLE_TICKS, || DONE_COUNT.load(SeqCst) >= 2);
         ensure_eq(
             DONE_COUNT.load(SeqCst),
             2,
@@ -691,10 +719,12 @@ mod priority {
                 0,
             );
             H2.store(h2, SeqCst);
-            // main (priority 40) sleeps: both waiters run to their wait and block
-            thread::sleep_ticks(3);
+            // main (priority 40) sleeps: both waiters run to their wait and block (T287: until they have, not a fixed 3 ticks, which
+            // a pause of the host inside the nap cut short: main's overdue timer preempted the waiters before they reached the wait)
             ensure(
-                thread::is_blocked(h1) && thread::is_blocked(h2),
+                settles(SETTLE_TICKS, || {
+                    thread::is_blocked(h1) && thread::is_blocked(h2)
+                }),
                 "the two waiters did not block",
             )?;
             let low = thread::spawn(
@@ -706,7 +736,7 @@ mod priority {
                 },
                 h1 as usize,
             );
-            thread::sleep_ticks(5);
+            settles(SETTLE_TICKS, || RAN.load(SeqCst) >= 2);
             ensure_eq(RAN.load(SeqCst), 2, "waiters that ran after the batch wake")?;
             ensure(
                 !SAW_H2_BLOCKED.load(SeqCst),
@@ -802,6 +832,8 @@ mod priority {
     /// machine's emulator took the 10 ms slice-end interrupt the control waits for about 5 ms late every time, which the real-time bound
     /// would have called a pause in every window; with the heartbeat no timer is armed that far ahead while the probe measures.)
     static PROBE_FOR: AtomicUsize = AtomicUsize::new(0);
+    /// The most windows the negative control takes looking for one kept window (T287: about 13 ms each).
+    const CONTROL_WINDOWS: u32 = 200;
     const PROBES: [(&str, u64); 2] = [
         ("realtime_thread_stays_responsive_under_load", 4_000),
         ("the_latency_test_can_fail", 6_000),
@@ -827,21 +859,38 @@ mod priority {
 
     /// The latency probe: sleep 3 ticks until 50 wakes are measured, recording how late each was. A sleep that a pause of the host
     /// covered (T284: a timer interrupt of any hart taken more than the bound late inside it) is taken again, at most three in a row.
+    #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB in a test thread (the samples' vector and the re-sampling state), no recursion
     fn probe(_: usize) {
         use kcore::pause::{Resampler, Verdict};
         let mut late = alloc::vec::Vec::new();
         let mut rs = Resampler::new();
         let (name, bound_us) = PROBES[PROBE_FOR.load(SeqCst) % PROBES.len()];
         let guest_time = crate::dtb::boot_arg_present("guesttime");
+        // (T287: the negative control asks only whether one window with the host running shows the equal-priority probe held back by
+        // the hogs' slices: a covered window is no evidence either way, and three covered in a row say only that the host was busy (the
+        // injector at 10 ms every 40 ms gave up every boot), so the control keeps looking, for at most `CONTROL_WINDOWS`, and stops at
+        // the first kept window past its bound. The real-time bound keeps the rule: a host that never runs the hart fails it.)
+        let control = PROBE_FOR.load(SeqCst) == 1;
+        let mut windows = 0;
         while late.len() < 50 {
+            windows += 1;
             // (nanoseconds on the real clock: there is no tick to round to)
             let start = thread::now_ns();
             let target = start + 3_000_000;
             thread::sleep_ticks(3);
             let end = thread::now_ns();
             match rs.judge(window_pause(start, end, bound_us, guest_time), bound_us) {
-                Verdict::Keep => late.push(end.saturating_sub(target)),
+                Verdict::Keep => {
+                    let l = end.saturating_sub(target);
+                    late.push(l);
+                    if control && l > bound_us * 1000 {
+                        break;
+                    }
+                }
                 Verdict::Retake { hart, late_us } => crate::pause::report(name, hart, late_us),
+                Verdict::GiveUp { hart, late_us } if control && windows < CONTROL_WINDOWS => {
+                    crate::pause::report(name, hart, late_us);
+                }
                 Verdict::GiveUp { hart, late_us } => {
                     crate::pause::report(name, hart, late_us);
                     GAVE_UP.store(kcore::pause::encode(Some((hart, late_us))), SeqCst);

@@ -701,10 +701,89 @@ pub fn spawn_prepared(
     arg: usize,
 ) -> Tid {
     // (class N from here: the stack was the room that could be refused)
+    let pin = take_spawn_pin();
     heap::nofail(|| {
         let thread = kthread_on(p.0, name, entry, arg, true);
-        register_kthread(thread, prio, None)
+        register_kthread(thread, prio, pin)
     })
+}
+
+/// Where the timers of `tids` sit, for a failure message (T287, T49: a stopped vCPU shows every deadline on an online hart that has
+/// not taken it; a timer left behind shows a deadline on the offline hart): per thread its home hart, its state and its deadline
+/// relative to now (microseconds; negative: overdue), then per hart its next event relative to now ("none": nothing).
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (a thread record and the formatting), run only on a test's failure, no recursion
+pub fn timer_report(tids: &[Tid]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let rel = |t: u64, now: u64| -> i64 {
+        if t >= now {
+            (t.saturating_sub(now) / 1000) as i64
+        } else {
+            0i64.saturating_sub((now.saturating_sub(t) / 1000) as i64)
+        }
+    };
+    let mut out = alloc::string::String::new();
+    let was = irq::save_and_disable();
+    let now = now_ns();
+    {
+        let sc = sched();
+        for &t in tids {
+            match sc.record(t) {
+                Some(r) => {
+                    let _ = write!(
+                        out,
+                        " thread {t}: hart {} {:?} deadline {};",
+                        r.home.get(),
+                        r.state,
+                        r.deadline
+                            .map_or(alloc::string::String::from("none"), |d| alloc::format!(
+                                "{:+}",
+                                rel(d, now)
+                            ))
+                    );
+                }
+                None => {
+                    let _ = write!(out, " thread {t}: gone;");
+                }
+            }
+        }
+        let _ = write!(out, " next events:");
+        for h in 0..crate::smp::started() {
+            match sc.next_event_on(h) {
+                Some(e) => {
+                    let _ = write!(out, " {h}: {:+}", rel(e, now));
+                }
+                None => {
+                    let _ = write!(out, " {h}: none");
+                }
+            }
+        }
+    }
+    irq::restore(was);
+    out
+}
+
+/// The test-only pin (T226, OD160; `debug_stat` 219, test kernels): the next user thread that thread `creator` creates is placed only on the hart
+/// the creator runs on when it creates it: (creator tid + 1) << 8, or 0 for none. One slot: the suite is the only caller.
+static SPAWN_PIN: AtomicU64 = AtomicU64::new(0);
+
+/// Pin the next user thread the calling thread creates to the hart it creates it on (`debug_stat` 219).
+#[cfg_attr(
+    all(feature = "release", not(feature = "release-suite")),
+    allow(dead_code)
+)] // (a release kernel answers 219 with 0)
+pub fn pin_next_spawn() {
+    SPAWN_PIN.store(current().saturating_add(1) << 8, Ordering::SeqCst);
+}
+
+/// The affinity of a user thread being created by the current thread: its hart if the creator asked for the pin (the slot is cleared),
+/// free placement otherwise.
+fn take_spawn_pin() -> Option<usize> {
+    let want = current().saturating_add(1) << 8;
+    (SPAWN_PIN.load(Ordering::Relaxed) == want
+        && SPAWN_PIN
+            .compare_exchange(want, 0, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok())
+    .then(hart)
 }
 
 /// A kernel thread's stack and first context. The stack comes from frames, not the heap, and has a guard page below it

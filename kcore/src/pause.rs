@@ -168,10 +168,28 @@ pub enum Cover {
 /// the host stops every vCPU at once (the injector stops the whole process); a kernel that holds interrupts off, waits for a lock in
 /// the timer handler, or delays a wake, does it on one hart, so the rule cannot excuse it on a machine of several harts.
 pub fn covering(rings: &[HartRing], start_us: u64, end_us: u64, bound_us: u64) -> Cover {
+    covering_with(rings, &[], start_us, end_us, bound_us)
+}
+
+/// [`covering`], also counting the harts that are late **now**: `overdue[h]` is how long (microseconds) hart `h` has had an interrupt
+/// due and not taken at the moment the window is judged (0: none; a missing entry is 0). Such a hart has not run since its interrupt
+/// fell due (or has run with interrupts off), and a ring cannot show it until the hart takes the interrupt, which a test that judges
+/// its window at once would never see (T287: a window ended with two harts still stopped by the host, their sleepers' wakes overdue,
+/// and the pause was not seen). The window ends at the moment of judging, so an overdue span always meets it.
+pub fn covering_with(
+    rings: &[HartRing],
+    overdue: &[u64],
+    start_us: u64,
+    end_us: u64,
+    bound_us: u64,
+) -> Cover {
     let mut late: alloc::vec::Vec<(usize, u64)> = rings
         .iter()
         .enumerate()
-        .map(|(h, r)| (h, r.worst_in(start_us, end_us)))
+        .map(|(h, r)| {
+            let now = overdue.get(h).copied().unwrap_or(0);
+            (h, r.worst_in(start_us, end_us).max(now))
+        })
         .filter(|&(_, l)| l > bound_us)
         .collect();
     late.sort_unstable_by_key(|&(_, l)| core::cmp::Reverse(l));

@@ -127,9 +127,65 @@ fn rings() -> &'static [HartRing] {
 }
 
 /// Whether a pause covers `[start_ns, end_ns]` (the `now_ns` clock) for a test whose bound is `bound_us`: seen on two harts (on a
-/// one-hart machine, the one), `kcore::pause::covering`.
+/// one-hart machine, the one), `kcore::pause::covering_with`. Besides the interrupts already taken late, a hart that is late **now**
+/// counts (`overdue_now`): a test judges its window as it ends, when a hart that the host still has stopped has not yet taken the
+/// interrupt that would record it (T287).
 pub fn covering(start_ns: u64, end_ns: u64, bound_us: u64) -> kcore::pause::Cover {
-    kcore::pause::covering(rings(), start_ns / 1000, end_ns.div_ceil(1000), bound_us)
+    let overdue = overdue_now();
+    kcore::pause::covering_with(
+        rings(),
+        &overdue,
+        start_ns / 1000,
+        end_ns.div_ceil(1000),
+        bound_us,
+    )
+}
+
+/// How long (microseconds) each online hart other than this one has had a timer interrupt due and not taken, now (0: none). This hart
+/// is excluded: it is running this code. An offline hart is excluded: it takes no wakes, and what it has armed says nothing.
+pub fn overdue_now() -> alloc::vec::Vec<u64> {
+    let me = hart();
+    let now = crate::timer::now();
+    (0..crate::smp::started().clamp(1, MAX_HARTS))
+        .map(|h| {
+            if h == me || !crate::percpu::hart(h).online.load(Ordering::Acquire) {
+                return 0;
+            }
+            let armed = ARMED.get(h).map_or(u64::MAX, |a| a.load(Ordering::Relaxed));
+            if armed != u64::MAX && now > armed {
+                crate::timer::ns_from_cycles(now - armed) / 1000
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// What each hart has armed, relative to now in microseconds (a minus sign: due that long ago and not taken; "none": nothing armed),
+/// for a failure message (`harts_go_offline_and_come_back`, T287: whether the sleepers' deadlines sit on a hart that is not taking them).
+pub fn armed_report() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut out = alloc::string::String::new();
+    let now = crate::timer::now();
+    for h in 0..crate::smp::started().clamp(1, MAX_HARTS) {
+        let armed = ARMED.get(h).map_or(u64::MAX, |a| a.load(Ordering::Relaxed));
+        if armed == u64::MAX {
+            let _ = write!(out, " {h}: none");
+        } else if armed >= now {
+            let _ = write!(
+                out,
+                " {h}: +{}",
+                crate::timer::ns_from_cycles(armed - now) / 1000
+            );
+        } else {
+            let _ = write!(
+                out,
+                " {h}: -{}",
+                crate::timer::ns_from_cycles(now - armed) / 1000
+            );
+        }
+    }
+    out
 }
 
 /// Samples less late than this are not counted by `paused_in`: the emulator's ordinary lateness is a hart that ran.

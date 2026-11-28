@@ -201,10 +201,33 @@ impl Default for Once {
     }
 }
 
-/// A counting semaphore.
+/// A counting semaphore: the protocol is `kcore::usync` (T287), run here over the kernel's futex; the host checks the same code under
+/// loom and shuttle over a model futex (`kcore/tests/usync_concurrency.rs`).
 pub struct Semaphore {
     count: AtomicU32,
 }
+
+/// The kernel's futex, for `kcore::usync`.
+struct KernelFutex;
+
+impl kcore::usync::Futex for KernelFutex {
+    fn wait(&self, word: &AtomicU32, expected: u32, deadline: u64) -> kcore::usync::Wait {
+        match wait(word, expected, deadline) {
+            Status::TimedOut => kcore::usync::Wait::TimedOut,
+            Status::ShouldWait => kcore::usync::Wait::Differed,
+            // (OK, and anything else: look again; only TIMED_OUT says the deadline passed with the sleeper still in the table)
+            _ => kcore::usync::Wait::Woken,
+        }
+    }
+    fn wake(&self, word: &AtomicU32, count: u32) -> usize {
+        wake(word, count)
+    }
+    fn expired(&self, deadline: u64) -> bool {
+        expired(deadline)
+    }
+}
+
+pub use kcore::usync::Took;
 
 impl Semaphore {
     pub const fn new(count: u32) -> Semaphore {
@@ -214,37 +237,30 @@ impl Semaphore {
     }
 
     pub fn post(&self) {
-        self.count.fetch_add(1, Ordering::Release);
-        wake(&self.count, 1);
+        kcore::usync::post(&self.count, &KernelFutex);
     }
 
     pub fn try_wait(&self) -> bool {
-        let mut c = self.count.load(Ordering::Relaxed);
-        while c > 0 {
-            match self
-                .count
-                .compare_exchange_weak(c, c - 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                Err(now) => c = now,
-            }
-        }
-        false
+        kcore::usync::try_wait(&self.count)
     }
 
     /// Take one, giving up at `deadline`; false if it passed.
     pub fn wait_until(&self, deadline: u64) -> bool {
-        loop {
-            if self.try_wait() {
-                return true;
-            }
-            if wait(&self.count, 0, deadline) == Status::TimedOut || expired(deadline) {
-                return self.try_wait();
-            }
-        }
+        self.wait_until_how(deadline).is_some()
+    }
+
+    /// As `wait_until`, saying how the permit was taken (`Took::AfterTimeout`: only after the futex reported a timeout, which for a
+    /// permit posted before the deadline is a lost wake; T222's test reads it).
+    pub fn wait_until_how(&self, deadline: u64) -> Option<Took> {
+        kcore::usync::wait_until(&self.count, deadline, &KernelFutex)
     }
 
     pub fn wait(&self) {
         self.wait_until(FOREVER);
+    }
+
+    /// The permits there now (for a test's failure message: a count above zero with a taker still asleep is a lost wake).
+    pub fn available(&self) -> u32 {
+        self.count.load(Ordering::Relaxed)
     }
 }
