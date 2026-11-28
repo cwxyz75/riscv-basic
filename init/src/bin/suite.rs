@@ -11940,9 +11940,10 @@ fn blk_reports_read_only_io_errors_and_timeouts() -> Outcome {
     let dj = ok(
         sys::handle_duplicate(d.job, Rights::SAME.0),
         "dup the driver's job",
-    )?
-    .a1 as u64;
+    )
+    .map(|r| r.a1 as u64);
     let released = rig.release(d);
+    let dj = dj?;
     let settled = released.and_then(|_| {
         job_use_settles(dj, 4, 0, 3000)?;
         job_use_settles(dj, 2, 0, 3000)

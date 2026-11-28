@@ -208,8 +208,11 @@ LAST_DEVMGR_PCI = []
 
 
 def fault_disks_on():
-    """Whether this boot has the fault disks (PCI_FAULT_DISKS): the kernel-only boot with the disks and the PCI functions."""
-    return SHARD == "k" and os.environ.get("OS_DISK") != "0" and os.environ.get("OS_PCI_TEST") != "0"
+    """Whether this boot has the fault disks (PCI_FAULT_DISKS): the kernel-only boot with the disks and the PCI functions, not under
+    record and replay (blkreplay reads its image node directly, so a drive's throttle would not apply, and the throttle's timers run
+    on the host's clock, which replay does not reproduce)."""
+    return (SHARD == "k" and os.environ.get("OS_DISK") != "0" and os.environ.get("OS_PCI_TEST") != "0"
+            and not os.environ.get("OS_RECORD") and not os.environ.get("OS_REPLAY"))
 
 
 def disk_throttle(name):
@@ -217,6 +220,9 @@ def disk_throttle(name):
     e.g. `OS_DISK_THROTTLE=pd1:iops-total=20` makes the second disk a slow one (`throttling.<option>` on its `-drive`), to show a
     budget that a slow device overruns. Not used by any gate."""
     out = ""
+    if os.environ.get("OS_DISK_THROTTLE") and (os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY")):
+        sys.exit("OS_DISK_THROTTLE does not work under record and replay (blkreplay bypasses a drive's throttle, and its timers "
+                 "run on the host's clock)")
     for part in filter(None, os.environ.get("OS_DISK_THROTTLE", "").split(";")):
         drive, _, opts = part.partition(":")
         if not opts or not re.fullmatch(r"pd[0-3]", drive):
@@ -245,12 +251,12 @@ def pci_args():
                               f"file.image.filename={read_only_disk()},readonly=on", ""),
                       ("pd3", f"file={slow_disk()},format=raw", f",throttling.bps-total={SLOW_DISK_BPS}")]
         for name, spec, top in disks:
-            # (`top`: the throttle. Under record and replay it goes on the drive below the blkreplay filter, whose completions
-            # blkreplay records: the throttle's timers run on the host's clock, which replay does not reproduce)
+            # (`top`: the throttle, on the drive the device sees; there is none under record and replay: `fault_disks_on`,
+            # `disk_throttle`)
             top += disk_throttle(name)
             if os.environ.get("OS_RECORD") or os.environ.get("OS_REPLAY"):
                 ro = ",readonly=on" if "readonly=on" in spec else ""
-                drive += ["-drive", f"{spec},if=none,id={name}-direct{top}",
+                drive += ["-drive", f"{spec},if=none,id={name}-direct",
                           "-drive", f"driver=blkreplay,if=none,image={name}-direct,id={name}{ro}"]
             else:
                 drive += ["-drive", f"{spec},if=none,id={name}{top}"]

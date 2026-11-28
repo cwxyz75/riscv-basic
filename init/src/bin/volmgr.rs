@@ -123,6 +123,7 @@ fn discover(dm: u64, txid: &mut u32, index: u16) -> Discovered {
     let t0 = sys::clock_get();
     let mut d = discovery::Device::new(t0);
     let mut probes = 0u32;
+    let mut failed_said = false;
     loop {
         *txid += 1;
         let Some((st, h)) = open_block(dm, *txid, index) else {
@@ -132,6 +133,14 @@ fn discover(dm: u64, txid: &mut u32, index: u16) -> Discovered {
             discovery::Next::OpenAgain => {
                 if let Some(h) = h {
                     sys::handle_close(h);
+                }
+                if st != devmgr::Status::Busy && !failed_said {
+                    // (said once: an open that failed after Busy, the old driver's claim still being taken down)
+                    failed_said = true;
+                    say!(
+                        "volmgr: t={} device {index}: open {st:?} after Busy: opening again",
+                        sys::clock_get()
+                    );
                 }
                 let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 20);
                 continue;

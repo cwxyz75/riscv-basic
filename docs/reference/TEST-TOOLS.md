@@ -122,7 +122,8 @@ read-only disk of 1 MiB (`readonly=on`, so the device offers `VIRTIO_BLK_F_RO`) 
 rule under `raw`), and at `00:09.0` a disk throttled to 2 KiB/s (`throttling.bps-total`: a request right after another waits about four
 seconds, past `blkd`'s two, while the emulator runs on; a device reset drains a throttled request at once).
 `blk_reports_read_only_io_errors_and_timeouts` asserts `ReadOnly`, `IoError` and `Timeout` on them and kills a driver while the device
-holds its request; the harness fails a kernel-only boot that did not reach its end. Only that boot has them: a System test (the
+holds its request; the harness fails a kernel-only boot that did not reach its end. Only that boot has them, and not under record
+and replay (`blkreplay` reads its image node directly, past a drive's throttle, and the throttle's timers run on the host's clock): a System test (the
 volume manager, a session) probes every disk and would pay the throttled one's seconds. By hand, `OS_DISK_THROTTLE=<drive>:<options>`
 (`pd0` to `pd3`, several separated by `;`) adds `throttling.<option>` to a drive, e.g. `OS_DISK_THROTTLE=pd1:iops-total=4` makes the
 second disk a slow one for the filesystem and volume-manager tests of shard a. `.github/actions/install-qemu/check-qemu.sh` checks
